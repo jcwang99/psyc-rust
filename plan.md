@@ -64,12 +64,13 @@ E2EE 增量版本管理系统
      3.6 Local Index
 
   4. 存储与同步平面
-     4.1 BlobStore
-     4.2 RefStore
-     4.3 Backend Adapter
-     4.4 Push / Fetch / Clone
-     4.5 Operation Journal
-     4.6 GC / Verify / Repair
+     4.1 StorageLayout
+     4.2 BlobStore
+     4.3 RefStore
+     4.4 Backend Adapter
+     4.5 Push / Fetch / Clone
+     4.6 Operation Journal
+     4.7 GC / Verify / Repair
 
   5. 访问与呈现平面
      5.1 CLI
@@ -119,7 +120,7 @@ E2EE 增量版本管理系统
                                   v
 +---------------------------------------------------------------------------+
 |                           存储与同步平面                                    |
-|      BlobStore       RefStore       Backend Capability       Journal         |
+|   StorageLayout     BlobStore     RefStore     Backend Capability     Journal |
 +---------------------------------------------------------------------------+
                                   |
 =============================================================================
@@ -138,6 +139,8 @@ E2EE 增量版本管理系统
 - 本地索引是 cache，不是事实源。
 - CLI/Web/VFS/SDK 都通过同一编排层访问核心能力。
 - 存储后端通过能力声明接入，不把后端差异泄漏到核心领域。
+- 核心领域只依赖逻辑 `ObjectId`，不得依赖远端物理路径、prefix list 或 object naming 规则。
+- `StorageLayout` 负责逻辑对象到物理存储布局的映射，P0/P1 使用 direct layout，P3 新增 rewrite/oram layout 时不重写核心对象模型。
 - MVP 先证明对象模型、加密模型和同步一致性，再扩展 VFS、团队共享和高级 GC。
 
 ## 2. 阶段路线树
@@ -228,12 +231,14 @@ P3-A 历史强撤销
   - epoch rewrite plan
   - old epoch retirement
   - encrypted object rewrite journal
+  - layout rewrite root publish
 
 P3-B 访问模式隐藏
   - ORAM-style storage layout
   - padded access schedule
   - traffic shaping
   - cost model and policy control
+  - oblivious layout root
 
 P3-C 可写 VFS
   - writable mount
@@ -659,8 +664,14 @@ pack:
   encrypted payload containing many objects
 
 pack_index:
-  object_id -> pack_id, offset, length
+  object_id -> physical_object_ref, offset, length, layout_id
 ```
+
+规则：
+
+- `pack_id` 不是远端路径，必须通过 `StorageLayout` 解析为物理位置。
+- pack index 只能暴露逻辑对象到 `PhysicalObjectRef` 的映射，不得要求上层知道 remote key、bucket、prefix 或 ORAM position。
+- range read、VFS 和 clone 必须通过 `StorageLayout` + pack index 读取，不得直接拼接远端路径。
 
 Pack Index 设计：
 
@@ -689,6 +700,7 @@ pack-index/
 - 每个 pack 自带不可变 `.idx`，发布后不修改。
 - 新 pack 发布新的 index segment，不修改全局大 index。
 - index root 只保存 segment 清单和 generation。
+- index root 必须记录 `layout_id` 和 layout generation。
 - 支持 CAS 的后端可 CAS 更新 index root。
 - 不支持 CAS 的后端只能在 single-writer 模式下执行 index root 更新和 compaction。
 - 客户端必须维护本地 pack index cache，避免每次 fetch 全量拉取。
@@ -699,7 +711,8 @@ pack-index/
 read index root
   -> fetch missing index segments
   -> update local pack index cache
-  -> lookup object_id -> pack_id, offset, length
+  -> lookup object_id -> physical_object_ref, offset, length, layout_id
+  -> resolve physical_object_ref through StorageLayout
 ```
 
 Compaction：
@@ -709,6 +722,8 @@ Compaction：
 - compaction 生成新的高层 index segment，不原地修改旧 segment。
 - compaction 成功发布新 root 后，旧 segment 由 GC 在安全窗口后清理。
 - 弱后端 compaction 必须 single-writer 或禁用。
+- compaction 不得改变逻辑 ObjectId，只能生成新的 physical_object_ref 和 layout generation。
+- P3 历史强撤销和 ORAM layout 都复用 compaction/rewrite 的发布协议。
 
 上传健壮性：
 
@@ -773,7 +788,7 @@ KDF 参数写入 keyring header。
 
 - 用一个随机仓库主密钥派生所有用途子密钥。
 
-结构：
+direct/pack layout 的物理结构示例：
 
 ```text
 repo_master_key(epoch)
@@ -889,6 +904,8 @@ min_retention_days: 30
 - P2 设备撤销必须同时移除该设备 envelope 并推进 `active_epoch`，新对象使用新 epoch 的 `repo_master_key` 派生密钥加密。
 - 已获得旧 epoch key 的设备仍可读取旧对象；若远端存储访问凭证未吊销，且没有 epoch 轮转，它也能读取未来对象，因此禁止把“仅删除 envelope”称为有效撤销。
 - P3 实现历史数据强撤销，必须通过全仓库重加密、旧 epoch 退休和对象重写 journal 完成。
+- P3 历史强撤销不得原地覆盖旧对象，必须生成新 physical refs、新 layout generation，再原子发布 layout root 和 ref。
+- P3 历史强撤销完成后，旧 epoch physical refs 只能在 GC 确认没有可读 layout generation 引用后删除。
 
 回滚防护：
 
@@ -907,6 +924,7 @@ min_retention_days: 30
 - 设备撤销必须包含 keyring envelope 移除、`active_epoch` 推进和未来对象改用新 epoch 加密。
 - P2 设备撤销阻止未来数据访问。
 - P3 历史强撤销通过重加密历史数据移除旧 epoch 访问能力。
+- P3 历史强撤销复用 `StorageLayout` rewrite 协议，不改变 Snapshot DAG 的逻辑历史结构。
 - 存储后端访问凭证撤销属于外部权限面，必须在产品文档中单独提示；密钥轮转不能阻止已持有远端读权限的设备下载旧密文。
 
 技术：
@@ -1257,54 +1275,103 @@ path_token = BLAKE3_keyed(repo_path_index_key, normalized_path)
 
 ```text
 Storage & Sync Plane
-  1. BlobStore
-  2. RefStore
-  3. Backend Capability
-  4. Backend Adapter
-     4.1 Local Folder
-     4.2 S3-compatible
-     4.3 WebDAV/Alist
-     4.4 Memory
-  5. Sync Engine
-     5.1 push
-     5.2 fetch
-     5.3 clone
-     5.4 pull
-  6. Operation Journal
-  7. Upload Resume
-  8. GC / Verify / Repair
+  1. StorageLayout
+  2. BlobStore
+  3. RefStore
+  4. Backend Capability
+  5. Backend Adapter
+     5.1 Local Folder
+     5.2 S3-compatible
+     5.3 WebDAV/Alist
+     5.4 Memory
+  6. Sync Engine
+     6.1 push
+     6.2 fetch
+     6.3 clone
+     6.4 pull
+  7. Operation Journal
+  8. Upload Resume
+  9. GC / Verify / Repair
 ```
 
-### 6.3 BlobStore
+### 6.3 StorageLayout
 
 职责：
 
-- 读写不可变对象。
+- 隔离逻辑 `ObjectId` 与远端物理存储位置。
+- 支撑 direct layout、pack layout、rewrite layout 和 P3 ORAM layout。
+- 给 GC、verify、repair、VFS、clone 提供统一的对象定位和枚举入口。
+
+结构：
+
+```text
+StorageLayout
+  layout_id
+  layout_generation
+  logical_object_id -> PhysicalObjectRef
+
+PhysicalObjectRef
+  layout_id
+  container_id
+  offset_optional
+  length
+  access_hint
+```
+
+规则：
+
+- `ObjectId` 不得直接作为远端路径使用。
+- P0 direct layout 可以把 `ObjectId` 映射为简单 loose object 物理引用，但该映射必须封装在 `StorageLayout` 内。
+- P1 pack layout 把 `ObjectId` 映射到 pack container + offset + length。
+- P3 rewrite/oram layout 可以改变 physical object ref、访问调度和远端位置，但不得改变 Object Model、Manifest Store 和 Snapshot DAG。
+- P3 ORAM layout 必须把访问计划、padding schedule、reshuffle generation 作为 layout metadata 管理。
+- ORAM layout 不得要求 `BlobStore` 理解 `ObjectId`，也不得要求 GC 直接解释 ORAM bucket 内容。
+- GC 只能通过 `StorageLayout` 枚举 physical refs 与 logical refs 的关系，不得直接扫描远端 prefix 后推断对象可达性。
+- VFS range read 只能请求 logical file/chunk range，由 layout 解析到物理读取计划。
+- layout root 更新必须具备 generation 和 CAS/lease 发布协议，避免 rewrite 或 ORAM 更新与普通 push 互相覆盖。
+
+阶段：
+
+- P0：direct layout。
+- P1：pack layout。
+- P3：rewrite layout 和 ORAM layout。
+
+### 6.4 BlobStore
+
+职责：
+
+- 读写物理不可变对象。
 
 接口：
 
 ```rust
 #[async_trait]
 pub trait BlobStore: Send + Sync {
-    async fn put_if_absent(&self, id: &ObjectId, bytes: Bytes) -> Result<PutResult>;
-    async fn get(&self, id: &ObjectId) -> Result<Bytes>;
-    async fn get_range(&self, id: &ObjectId, range: ByteRange) -> Result<Bytes>;
-    async fn exists(&self, id: &ObjectId) -> Result<bool>;
-    async fn stat(&self, id: &ObjectId) -> Result<ObjectStat>;
-    async fn list_prefix(
+    async fn put_physical(&self, reference: &PhysicalObjectRef, bytes: Bytes) -> Result<PutResult>;
+    async fn get_physical(&self, reference: &PhysicalObjectRef) -> Result<Bytes>;
+    async fn get_physical_range(&self, reference: &PhysicalObjectRef, range: ByteRange) -> Result<Bytes>;
+    async fn exists_physical(&self, reference: &PhysicalObjectRef) -> Result<bool>;
+    async fn stat_physical(&self, reference: &PhysicalObjectRef) -> Result<ObjectStat>;
+    async fn list_physical(
         &self,
-        prefix: &str,
+        scope: ListScope,
         cursor: Option<String>,
         limit: usize,
     ) -> Result<ListPage>;
 }
 ```
 
+规则：
+
+- `BlobStore` 只处理物理对象，不理解 `ObjectId`、snapshot、tree 或 file 语义。
+- 逻辑对象读写必须先经过 `StorageLayout` 解析。
+- 后端 adapter 可以有 prefix/list 能力，但上层不得把 prefix 结构当作对象模型的一部分。
+
 阶段：
 
 - MVP。
 
-### 6.4 RefStore
+### 6.5 RefStore
 
 职责：
 
@@ -1332,7 +1399,7 @@ pub trait RefStore: Send + Sync {
 - CAS 失败必须显式冲突。
 - 不允许最后写入者静默覆盖。
 
-### 6.5 Backend Capability
+### 6.6 Backend Capability
 
 职责：
 
@@ -1352,6 +1419,8 @@ pub struct BackendCapability {
     pub supports_transaction_markers: bool,
     pub supports_reliable_remote_time: bool,
     pub supports_object_generation_or_etag: bool,
+    pub supports_layout_root_cas: bool,
+    pub supports_oblivious_access_schedule: bool,
 }
 ```
 
@@ -1365,6 +1434,8 @@ pub struct BackendCapability {
 | no atomic rename | pack 使用 publish marker 和校验 |
 | no remote lock/lease | 禁用 destructive GC 或要求离线单写者维护窗口 |
 | no reliable remote time/version | 禁用 `gc --execute` 和无人值守 single-writer push |
+| no layout root CAS/lease | 禁用 layout rewrite、pack compaction 发布和 P3 ORAM layout 更新 |
+| no oblivious access support | 禁用 P3 ORAM layout |
 
 写者模式：
 
@@ -1386,7 +1457,7 @@ WriterMode
 - 无 CAS 且无可靠远端 lease 的后端默认禁止后台自动 push；用户显式 `--force-single-writer-risk` 只能用于人工恢复或明确单写者维护窗口。
 - WebDAV/Alist 默认按 single-writer 后端处理，除非适配器证明其具有可靠 CAS/lock 能力。
 
-### 6.6 Backend Adapter
+### 6.7 Backend Adapter
 
 后端优先级：
 
@@ -1398,13 +1469,14 @@ WriterMode
 技术：
 
 - `opendal` 作为后端接入基础。
-- 但核心语义仍由 `BlobStore` / `RefStore` 定义。
+- 但核心语义仍由 `StorageLayout` / `BlobStore` / `RefStore` 定义。
 
 适配器准入测试：
 
 - put/get。
-- put_if_absent。
-- range read。
+- physical put/get/list。
+- physical range read。
+- layout root CAS/lease。
 - paged list。
 - conditional ref update。
 - remote lock/lease acquire and heartbeat。
@@ -1413,17 +1485,19 @@ WriterMode
 - Unicode path handling。
 - retry on transient failure。
 
-### 6.7 Sync Engine
+### 6.8 Sync Engine
 
 Push：
 
 ```text
 resolve backend writer mode
   -> acquire writer lease if single-writer
+  -> read layout root and layout generation
   -> create remote write intent if supported
   -> read remote ref
   -> compare expected head
   -> upload missing objects
+  -> publish layout updates if needed
   -> write snapshot
   -> pre-commit lease and intent validation
   -> CAS update ref
@@ -1444,6 +1518,8 @@ Push 规则：
 - 增量 verify 必须确认 snapshot、tree、file、chunk 或 pack index 引用的所有对象仍在远端可读；确认后才能重新进入最终 CAS。
 - pre-commit validation 还必须验证 snapshot parent chain 的远端 ancestor closure，不得发布 parent 在远端缺失的 snapshot。
 - CAS 冲突失败后，本地操作结果必须进入 `needs-rebase` 状态；再次 push 该快照或其子快照前，必须重新检查 parent chain 并补传缺失 ancestor。
+- 如果本次 push 产生新的 physical refs 或 pack refs，最终 ref CAS 前必须确认 layout root 已发布且 layout generation 未被其他 writer 覆盖。
+- ref CAS 和 layout root 发布必须形成可恢复的两阶段协议：对象可先上传，layout 可先发布，但 ref 不得指向 layout 不可解析的对象。
 - Operation Journal 中的 `uploaded` 状态只能表示“曾经上传成功”，不能作为最终 ref 发布前对象仍存活的证明。
 
 远端 write intent：
@@ -1508,7 +1584,7 @@ read public.json
   -> rebuild local index
 ```
 
-### 6.8 Operation Journal
+### 6.9 Operation Journal
 
 职责：
 
@@ -1568,6 +1644,17 @@ pack_uploads(
   retry_count,
   last_error
 )
+
+layout_rewrites(
+  operation_id,
+  layout_id,
+  from_generation,
+  to_generation,
+  state,        // planned, rewriting, published, failed
+  updated_at,
+  retry_count,
+  last_error
+)
 ```
 
 Append-only WAL 备选格式：
@@ -1601,7 +1688,7 @@ WAL 规则：
 
 - P0-B。
 
-### 6.9 Upload Resume
+### 6.10 Upload Resume
 
 恢复流程：
 
@@ -1644,7 +1731,7 @@ jitter: true
 - chunk 可抽样 read-back。
 - 最终 CAS 前，snapshot 可达 manifest 和 chunk/pack 索引引用必须至少完成一次完整存在性校验。
 
-### 6.10 GC / Verify / Repair
+### 6.11 GC / Verify / Repair
 
 MVP：
 
@@ -1664,6 +1751,7 @@ gc --execute --grace-period 30d
 GC 安全原则：
 
 - GC 不能只凭 ref reachability 判断删除。
+- GC 不能直接以远端 prefix/list 结果推断逻辑对象可达性，必须通过 `StorageLayout` 建立 logical refs 到 physical refs 的映射。
 - destructive GC 必须确认远端没有 active write intent 或未过期 transaction lease。
 - 无 remote lock/lease、无可靠 transaction marker、弱 list 的后端默认禁止 `gc --execute`。
 - 对 single-writer 后端，`gc --execute` 只能在明确离线维护窗口执行。
@@ -1677,20 +1765,22 @@ GC 流程：
 ```text
 check backend capability
   -> acquire gc lease if supported
+  -> read layout root and layout generation
   -> sample remote clock/version semantics
   -> list active write intents
   -> abort execute if active intent exists
   -> read all refs
   -> walk reachable snapshot/tree/file/chunk
   -> build reachable set
-  -> paged list remote
+  -> resolve reachable ObjectId set through StorageLayout
+  -> paged list physical refs through StorageLayout scope
   -> exclude objects newer than gc_safe_horizon
   -> exclude recent unreferenced snapshots and ancestors within unpublished grace period
   -> exclude objects covered by active or recent write intents
-  -> find unreachable objects
+  -> find unreachable physical refs
   -> apply grace period
   -> dry-run report
-  -> re-read refs and active intents before delete
+  -> re-read refs, active intents, and layout root before delete
   -> execute with deletion journal
 ```
 
@@ -1707,6 +1797,14 @@ GC 必须跳过或中止：
 - 后端 list 语义不足以可靠发现 active intent。
 - 无法用远端 Last-Modified、generation、ETag 或等价能力确认 intent 新鲜度。
 - 删除执行前复查发现 ref 或 intent 集合发生变化。
+- 删除执行前复查发现 layout root generation 发生变化。
+
+Layout rewrite 与 GC：
+
+- pack compaction、历史强撤销重加密、ORAM reshuffle 都属于 layout rewrite。
+- layout rewrite 发布新 root 前，旧 physical refs 必须保留到 rewrite grace period 之后。
+- GC 必须同时理解 current layout root 和仍在 grace period 内的 previous layout roots。
+- 删除 physical refs 前必须确认没有任何可读 layout generation 引用它们。
 
 过期判定：
 
@@ -1865,7 +1963,7 @@ e2v gc --execute --grace-period 30d
 
 为什么后置：
 
-- 依赖 range read。
+- 依赖 logical range read 到 physical read plan 的映射。
 - 依赖本地 cache。
 - 依赖目录按需加载。
 - 依赖错误恢复。
@@ -1884,6 +1982,8 @@ e2v gc --execute --grace-period 30d
 
 - VFS 必须区分 snapshot-pinned mount 和 live branch mount。
 - snapshot-pinned mount 的 inode/file handle 绑定不可变 snapshot，不受后台 fetch 影响。
+- VFS 文件句柄必须绑定 snapshot id、file object id 和 layout generation。
+- VFS 不得缓存或持久化远端 physical path；range read 必须通过 `StorageLayout` 生成 read plan。
 - live branch mount 在 Sync Engine 更新 Local Index 或 ref view 后，必须通过 IPC、事件总线或共享订阅通知 VFS。
 - VFS 收到 live branch 更新后，必须主动向内核发起目录项、inode、attribute 和 page cache invalidation。
 - Linux FUSE 需要使用 `FUSE_NOTIFY_INVAL_INODE`、`FUSE_NOTIFY_INVAL_ENTRY` 或等价机制；Windows WinFSP 和 macFUSE 必须使用对应平台的 invalidation API。
@@ -2084,9 +2184,11 @@ max_concurrent_uploads: configurable
 | uploading objects | 检查已上传对象，继续上传 |
 | writing snapshot | 检查 snapshot 是否存在，不存在则重写 |
 | updating ref | 读取 ref，判断 CAS 是否成功 |
+| publishing layout root | 读取 layout root generation，判断发布是否成功 |
 | gc dry-run | 丢弃 |
 | gc execute | 读取删除日志，继续或报告人工确认 |
 | repack | 未发布 pack index 的 partial pack 可清理 |
+| layout rewrite | 读取 rewrite journal，继续发布或保留旧 layout generation |
 
 阶段：
 
@@ -2133,6 +2235,8 @@ E_BACKEND_SINGLE_WRITER_ONLY
 E_REMOTE_WRITE_INTENT_ACTIVE
 E_GC_FENCING_UNAVAILABLE
 E_PACK_INDEX_CONFLICT
+E_LAYOUT_ROOT_CONFLICT
+E_LAYOUT_REF_UNRESOLVED
 ```
 
 诊断命令：
@@ -2185,6 +2289,8 @@ e2v doctor --bundle
 - GC 不得删除仍在 unpublished snapshot grace period 内的无 ref snapshot 及其 ancestor。
 - 客户端本地时钟大幅偏移时，GC 和无人值守 push 不得依赖本地时间完成危险操作。
 - Operation Journal 在百万对象上传时不得整文件重写。
+- layout root 发布与 ref CAS 交错失败时，恢复后不得出现 ref 指向 layout 不可解析对象。
+- pack compaction、历史强撤销、ORAM reshuffle 产生的新 layout generation 必须可恢复发布或安全回滚。
 
 VFS 测试：
 
@@ -2198,9 +2304,11 @@ VFS 测试：
 - uploading chunk。
 - writing snapshot。
 - updating ref。
+- publishing layout root。
 - writing pack。
 - publishing pack index。
 - updating index root。
+- layout rewrite。
 - gc execute。
 
 调度测试：
@@ -2263,6 +2371,7 @@ crates/
     branch/
 
   e2v-store/
+    layout.rs
     blob_store.rs
     ref_store.rs
     capability.rs
@@ -2286,6 +2395,7 @@ crates/
     pack_writer.rs
     pack_index.rs
     range_reader.rs
+    rewrite.rs
 
   e2v-cli/
     main.rs
@@ -2308,6 +2418,7 @@ crates/
 - `e2v-core` 不依赖具体存储后端。
 - `e2v-core` 不依赖 CLI/Web/VFS。
 - `e2v-store` 不理解明文文件语义。
+- `e2v-store` 必须通过 `StorageLayout` 暴露逻辑对象到物理对象的映射，不允许上层依赖远端路径规则。
 - `e2v-sync` 负责编排上传、下载和 ref 更新。
 - `e2v-index` 可删除重建。
 - `e2v-vfs` 只能依赖稳定 read/browse API。
@@ -2321,6 +2432,7 @@ crates/
 | async runtime | tokio | MVP | I/O 和任务编排 |
 | CPU 并行 | rayon / blocking pool | MVP/P1 | hash/encrypt/chunking |
 | 后端抽象 | opendal | MVP | S3/WebDAV/local 等适配 |
+| 存储布局 | StorageLayout | MVP/P1/P3 | direct / pack / rewrite / ORAM layout |
 | 后端写者模式 | CAS / single-writer + writer lease | P0-B | 无 CAS 后端禁止多写者，single-writer 必须有远端 lease |
 | CDC | fastcdc | MVP | 通用内容定义切块 |
 | Chunking Policy | profile + dedup stats | P1 | 处理高熵和大二进制退化 |
@@ -2336,6 +2448,8 @@ crates/
 | Path Policy | portable-strict + escaped checkout | MVP/P1 | 跨平台路径兼容 |
 | Operation Journal | SQLite / append-only WAL | P0-B | 海量对象断点续传状态 |
 | Pack Index | immutable segment + compaction | P1 | 避免全局 index 覆盖和千次请求 |
+| 历史强撤销 | layout rewrite + re-encryption | P3 | 通过新 layout generation 发布重加密对象 |
+| 访问模式隐藏 | ORAM-style StorageLayout | P3 | 隔离访问调度与核心 Object Model |
 
 ## 11. 原计划覆盖确认
 
@@ -2400,6 +2514,8 @@ crates/
     -> 有界队列、执行域隔离、背压向 reader 传播、等待可取消
   - Pack Index 全局覆盖或分散读取瓶颈
     -> immutable index segment / local cache / compaction
+  - P3 历史强撤销或 ORAM 推翻 P0/P1 存储设计
+    -> P0 引入 StorageLayout；核心只依赖 ObjectId；GC/VFS/pack 只通过 layout 解析 physical refs
   - 单级巨型目录导致 manifest 内存爆炸
     -> Tree Sharding / max manifest size / streaming tree walk
   - 小对象数量爆炸
@@ -2407,7 +2523,7 @@ crates/
   - 高熵或压缩数据导致 CDC 去重退化
     -> Chunking Policy Engine / dedup stats / format-aware roadmap
   - VFS 复杂度失控
-    -> P2 只读，依赖 range read 和 cache
+    -> P2 只读，依赖 logical range read、StorageLayout read plan 和 cache
   - VFS live branch page cache 读到旧视图或混合版本
     -> snapshot-pinned handle 语义、live mount invalidation、必要时 direct I/O
   - 元数据隐私与稀疏检出冲突
@@ -2448,6 +2564,7 @@ crates/
 | padding policy | MVP 支持 `none` 和 manifest 随机 padding；P1 支持固定桶 padding |
 | 源文件一致性 | 大文件优先平台快照；否则读前/读后 metadata 校验 |
 | 解密认证边界 | 未完成 AEAD 验证的明文不得暴露到最终输出或响应 |
+| StorageLayout | MVP 引入 direct layout，禁止核心依赖远端物理路径 |
 | 本地索引 | P1 实现 SQLite + FTS5 |
 
 ### 13.2 P0-B 前
@@ -2470,7 +2587,7 @@ crates/
 | 问题 | 已定决策 |
 | --- | --- |
 | packfile | 加密整体 pack |
-| pack index | 不可变 segment + 本地 cache + compaction |
+| pack index | 不可变 segment + 本地 cache + compaction；索引指向 physical refs 而不是远端路径 |
 | Tree Sharding | P1 必须实现；若 MVP 覆盖十万级小文件则前置 |
 | Chunking Policy | 增加 large-binary profile 和 dedup stats |
 | SQLite 路径索引 | 允许本地保存路径信息；manifest cache DB 加密；明确隐私影响 |
@@ -2493,5 +2610,5 @@ crates/
 | 问题 | 已定决策 |
 | --- | --- |
 | encrypted remote search | 排除，不进入路线图 |
-| 历史数据强撤销 | P3 实现；需要全仓库重加密、旧 epoch 退休和对象重写 journal |
-| ORAM / 访问模式隐藏 | P3 实现；需要 ORAM-style storage layout、padded access schedule、traffic shaping 和成本策略 |
+| 历史数据强撤销 | P3 实现；通过 layout rewrite、全仓库重加密、旧 epoch 退休和对象重写 journal 发布 |
+| ORAM / 访问模式隐藏 | P3 实现；通过 ORAM-style StorageLayout、padded access schedule、traffic shaping 和成本策略实现 |
