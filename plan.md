@@ -20,7 +20,7 @@
 1. 整个系统分成哪些子架构？
 2. 每个子架构里有哪些模块？
 3. 每个模块怎么设计、用什么技术？
-4. 这些设计如何支撑扩展性、健壮性和后续演进？
+4. 这些设计如何支撑扩展性、健壮性和阶段演进？
 
 ## 1. 总架构
 
@@ -85,7 +85,7 @@ E2EE 增量版本管理系统
      6.4 崩溃恢复
      6.5 可观测性
      6.6 测试矩阵
-     6.7 格式兼容与迁移
+      6.7 格式版本边界
 ```
 
 ### 1.3 总体分层图
@@ -202,7 +202,7 @@ P1-D 显式 GC 与防腐
   - gc execute
 ```
 
-### 2.3 P2+
+### 2.3 P2
 
 ```text
 P2-A 只读 VFS
@@ -222,6 +222,24 @@ P2-C SDK / C-ABI
   - stable Rust API
   - opaque C handles
   - Local HTTP API stabilization
+
+P3-A 历史强撤销
+  - full repository re-encryption
+  - epoch rewrite plan
+  - old epoch retirement
+  - encrypted object rewrite journal
+
+P3-B 访问模式隐藏
+  - ORAM-style storage layout
+  - padded access schedule
+  - traffic shaping
+  - cost model and policy control
+
+P3-C 可写 VFS
+  - writable mount
+  - conflict handling
+  - atomic writeback
+  - cache coherency
 ```
 
 ## 3. 数据平面架构
@@ -240,7 +258,7 @@ Data Plane
   2. Chunker
      2.1 FastCDC Chunker
      2.2 Chunk Profile
-     2.3 Future Semantic Chunker
+     2.3 P2 Semantic Chunker
      2.4 Chunking Policy Engine
   3. Hasher
      3.1 BLAKE3 keyed object ID
@@ -278,13 +296,18 @@ Data Plane
 技术：
 
 - Rust std/fs 或 `walkdir`。
-- 后续可接入平台文件通知，但不进入 MVP。
 
 健壮性：
 
 - 扫描期间文件变化时，应记录警告并重试该文件。
 - 权限不足文件应跳过并报告，而不是中断整个 commit。
 - 提交前必须执行路径策略校验，避免把目标平台永远无法检出的路径固化进不可变 tree。
+- commit 必须定义源文件一致性策略，避免读取到不存在于任何时刻的 torn read。
+- 对大文件、数据库文件、虚拟机镜像、模型权重等长时间读取对象，默认必须执行读前和读后的 metadata 校验，包括 size、mtime、平台可用的 change id 或 inode generation。
+- 如果读后校验发现文件变化，必须丢弃该文件本次产生的临时 chunk/file object，并重试或报告文件不稳定。
+- 支持平台级只读快照的环境应优先从快照视图读取，例如 Windows VSS、Linux LVM/btrfs/zfs snapshot。
+- 如果无法获得平台快照，系统不得把活跃文件的一次长时间读取结果标记为强一致快照，只能按不稳定源处理。
+- 对用户明确标记为 active database / VM image 的路径，MVP 要求停写或使用外部快照；不稳定读取结果不能作为强一致快照输入。
 
 阶段：
 
@@ -323,14 +346,15 @@ portable-strict
 - Object Model 内部统一保存 NFC 名称，但 checkout 不能假设目标文件系统会按字节保留 NFC。
 - checkout 后必须执行平台路径 read-back 校验，确认写入名称、读取名称、重新扫描后的 normalized name 三者在路径策略下等价。
 - macOS/APFS/HFS+ 必须单独测试 NFC/NFD、大小写折叠、组合音标和 emoji variation 等路径样例。
-- 如果平台返回的名称与内部 NFC 名称规范化等价但字节形态不同，客户端必须在本地 checkout metadata 中记录映射，用于后续 scan/checkout 幂等判断。
+- 如果平台返回的名称与内部 NFC 名称规范化等价但字节形态不同，客户端必须在本地 checkout metadata 中记录映射，用于 scan/checkout 幂等判断。
 - 该映射只属于本地工作区状态，不进入远端 manifest，不作为事实源。
 
-后续扩展：
+阶段归属：
 
-- `platform-native`：允许平台原生路径，适合单平台仓库。
-- `escaped-checkout`：跨平台检出时将不兼容名称映射为转义名称，并生成冲突报告。
-- Linux 原生 bytes path 支持属于 P2+，不进入 MVP。
+- MVP 实现 `portable-strict`。
+- P1 实现 `platform-native`，允许平台原生路径，适合单平台仓库。
+- P1 实现 `escaped-checkout`，跨平台检出时将不兼容名称映射为转义名称，并生成冲突报告。
+- P2 实现 Linux 原生 bytes path 支持，并明确跨平台 checkout 映射规则。
 
 ### 3.4 Chunker
 
@@ -395,10 +419,10 @@ P1：
 - 对已知高熵扩展名给出提示，例如 `.zip`, `.7z`, `.gz`, `.mp4`, `.mov`, `.pt`, `.safetensors`, `.onnx`。
 - 支持用户显式指定 chunker/profile。
 
-P2+：
+P2：
 
 - format-aware chunker，例如 safetensors 按 tensor block、tar 按成员文件、parquet 按 row group。
-- fixed-size block 作为可选策略，而不是高熵文件的唯一默认降级。
+- fixed-size block 作为策略引擎支持的 chunker 类型，用于用户显式选择或策略判定。
 
 Dedup 统计：
 
@@ -411,7 +435,7 @@ chunker_id
 chunker_config_id
 ```
 
-当某类文件连续多次低去重时，客户端应提示用户切换 profile 或接受近似全量上传成本。
+当某类文件连续多次低去重时，客户端应提示用户切换 profile，并报告近似全量上传成本。
 
 扩展契约：
 
@@ -443,7 +467,7 @@ chunker_config_id
 - 同一个文件不同版本可以使用不同 chunker。
 - chunker 参数变化必须改变 `chunker_config_id`。
 - 不认识 chunker 的客户端不得重写该 file object。
-- 语义级 chunker 属于 P2+，不进入 MVP。
+- 语义级 chunker 属于 P2。
 
 ### 3.5 Hasher
 
@@ -472,7 +496,7 @@ object_id = BLAKE3_keyed(repo_object_id_key, canonical_plaintext)
 - keyed object ID 防止跨仓库已知明文枚举，但不隐藏同一仓库内的内容重合度。
 - 如果远端能观察 loose object 名称、pack index 或上传模式，它可以统计 object 复用频率和相等性。
 - 对固定 header、空块、模板化二进制格式等数据，频率特征可能泄露数据类型或内容轮廓。
-- 这是 CDC 去重与收敛对象 ID 的已知妥协。若要隐藏访问模式和频率，需要 ORAM 或 padding/bucketing 级别设计，不进入 MVP/P1 默认目标。
+- CDC 去重会暴露同仓库内对象相等性；P3 引入 ORAM / 访问模式隐藏以降低该泄露。
 
 技术：
 
@@ -498,6 +522,8 @@ EncryptedObject {
   format_version,
   object_type,
   crypto_suite,
+  key_epoch,
+  padding_policy,
   object_id,
   nonce,
   ciphertext,
@@ -514,12 +540,49 @@ repo_id
 object_type
 object_id
 crypto_suite
+key_epoch
+padding_policy
 ```
+
+大小与流量侧信道：
+
+- 加密只隐藏内容，不隐藏上传时序、对象数量、对象大小、pack 大小和访问模式。
+- CDC chunk size 序列、manifest 大小、tree fanout 和 pack/index 访问模式可能泄露数据类型、目录规模或与公开数据集的相似性。
+- MVP/P1 威胁模型不包含高级流量分析或国家级观察者；P3 通过 ORAM-style layout、padding 和 traffic shaping 扩展该威胁模型。
+- Encryptor 必须支持可配置 padding policy；MVP 实现 `none` 和 manifest 随机 padding，P1 实现固定桶策略。
+
+Padding Policy：
+
+```text
+PaddingPolicy
+  none
+  fixed-block-4k
+  fixed-block-64k
+  randomized-manifest-padding
+  pack-level-padding
+```
+
+规则：
+
+- padding 必须位于 AEAD 认证范围内，解密后由对象解码器剥离。
+- object ID 仍基于 canonical plaintext，不包含随机 padding，避免同内容去重失效；因此 padding 只能隐藏大小，不能隐藏同仓库对象相等性。
+- 对 manifest/tree/snapshot 等小对象，优先使用随机长度 padding 或固定桶对齐，降低目录结构大小泄露。
+- 对 chunk 对象，padding 会增加存储和带宽成本，并可能削弱 range read 和 pack locality；MVP 对 chunk 使用 `none`，P1 实现固定桶策略。
+- padding policy 是对象加密参数的一部分，必须进入对象 header 和 AEAD AD。
+
+认证边界：
+
+- 解密流程必须遵守先认证后释放明文的原则。
+- 单个 chunk 对象必须作为最小认证单元；checkout、serve、VFS 不得把未通过 AEAD 验证的明文字节暴露给目标文件、HTTP 响应或调用方。
+- P1 pack 和大对象内部流式加密必须采用分段认证结构，每个内部段独立携带认证标签和序号域分离。
+- 验证失败时必须中止当前对象读取，并清理该对象已经写入的临时输出；失败对象不得进入可见 checkout 路径。
+- checkout 应先写入临时路径，只有所有目标 chunk 认证和 object ID 校验完成后，才能原子发布最终文件。
+- VFS 和 HTTP Range 读取只能返回已经完成认证的 chunk 或内部段。
 
 技术：
 
 - 首选 `XChaCha20-Poly1305`。
-- 可选 `AES-256-GCM`。
+- P1 实现 `AES-256-GCM` 作为第二 suite。
 
 nonce：
 
@@ -665,7 +728,7 @@ Compaction：
 - 仓库内对象 ID key 的派生。
 - 对象加密 key 的派生。
 - keyring 管理。
-- 多设备和后续团队共享的密钥封包。
+- 多设备和团队共享的密钥封包。
 
 ### 4.2 模块树
 
@@ -729,7 +792,7 @@ repo_master_key(epoch)
 - 子密钥必须带用途域分离。
 - 对象必须记录 `key_epoch`，用于选择对应 epoch 的子密钥解密。
 - 仓库配置必须记录 `active_epoch`，新对象只能使用 active epoch 加密。
-- `repo_object_id_key` 是否随 epoch 轮转必须作为格式决策显式记录；默认 P2 撤销轮转所有对象 ID、加密、nonce、ref 相关子密钥，避免被撤销设备计算未来对象 ID。
+- P2 撤销必须轮转 `repo_object_id_key`、加密、nonce、ref、path index 相关子密钥，避免被撤销设备计算未来对象 ID。
 - 旧 epoch 只用于读取旧对象，不得用于写入新对象。
 
 阶段：
@@ -823,9 +886,9 @@ min_retention_days: 30
 
 - 保留旧 keyring 有利于灾难恢复，但可能削弱撤销语义。
 - MVP 不支持团队撤销。
-- P2 设备撤销默认必须同时移除该设备 envelope 并推进 `active_epoch`，新对象使用新 epoch 的 `repo_master_key` 派生密钥加密。
+- P2 设备撤销必须同时移除该设备 envelope 并推进 `active_epoch`，新对象使用新 epoch 的 `repo_master_key` 派生密钥加密。
 - 已获得旧 epoch key 的设备仍可读取旧对象；若远端存储访问凭证未吊销，且没有 epoch 轮转，它也能读取未来对象，因此禁止把“仅删除 envelope”称为有效撤销。
-- 若要强制历史不可读，必须执行数据重加密，单独设计。
+- P3 实现历史数据强撤销，必须通过全仓库重加密、旧 epoch 退休和对象重写 journal 完成。
 
 回滚防护：
 
@@ -842,34 +905,32 @@ min_retention_days: 30
 
 - 先多设备，后团队。
 - 设备撤销必须包含 keyring envelope 移除、`active_epoch` 推进和未来对象改用新 epoch 加密。
-- 设备撤销只能阻止未来数据访问，不保证撤销历史数据访问。
-- 真正移除历史访问能力需要重加密历史数据，成本高，单独设计。
+- P2 设备撤销阻止未来数据访问。
+- P3 历史强撤销通过重加密历史数据移除旧 epoch 访问能力。
 - 存储后端访问凭证撤销属于外部权限面，必须在产品文档中单独提示；密钥轮转不能阻止已持有远端读权限的设备下载旧密文。
 
-候选技术：
+技术：
 
 - X25519/HPKE 风格 envelope。
 - 不建议直接背上完整 PGP 复杂度。
 
-### 4.7 Crypto Suite 迁移
+### 4.7 Crypto Suite 边界
 
 职责：
 
-- 支持算法升级。
-- 支持旧对象继续读取。
+- 明确对象使用的加密算法套件。
+- 避免同一仓库内对象缺少可验证的算法参数。
 
 设计：
 
 - 每个对象带 `crypto_suite`。
-- 仓库配置带 `supported_features`。
-- 旧对象不强制重写。
-- 新对象可使用新 suite。
-- 旧客户端遇到未知必需 feature 必须拒绝写入。
+- 仓库配置记录默认 `crypto_suite`。
+- 当前阶段只定义默认 suite 和对象 header 标记。
+- 读取对象时必须按对象 header 的 `crypto_suite` 选择算法；不认识的 suite 直接拒绝处理。
 
 阶段：
 
-- MVP 写版本字段。
-- P1/P2 做迁移命令。
+- MVP 写入 `crypto_suite` 字段。
 
 ## 5. 元数据与版本平面架构
 
@@ -919,25 +980,29 @@ Metadata & Version Plane
 
 必须使用 canonical encoding，不能依赖不稳定 JSON 字段顺序。
 
-候选编码：
+格式边界：
 
-- `postcard`
-- `bincode` 加显式版本约束
-- canonical CBOR
-- 自定义 canonical binary format
+- 当前阶段只定义对象类型、必需字段和 canonical encoding。
+- 新增对象字段必须先进入 Object Model 的显式 schema，并纳入 canonical encoding、object ID 和 AEAD 认证范围。
+- 不允许隐式忽略 manifest 字段；解码器遇到当前 schema 不认识的对象格式时必须拒绝处理。
+
+编码决策：
+
+- MVP 使用 `postcard` 加显式版本约束。
+- P1 如需跨语言稳定规范，再引入 canonical CBOR 或自定义 canonical binary format。
 
 路径名称：
 
 - MVP 的 tree entry 只接受 `portable-strict` 路径策略下的 normalized UTF-8 名称。
 - tree 中保存的是加密后的文件名和目录项。
 - path policy 必须写入仓库配置或 snapshot metadata，避免不同客户端对同一 tree 使用不同解释。
-- P2+ 可扩展 raw bytes path，但必须明确跨平台 checkout 映射规则。
+- P2 实现 raw bytes path，并必须明确跨平台 checkout 映射规则。
 
 Manifest 大小上限：
 
 任何单个 manifest 对象都必须有大小上限，避免巨型目录导致内存峰值失控。
 
-建议默认：
+默认上限：
 
 ```text
 max_manifest_plaintext_size: 4 MiB
@@ -1069,6 +1134,9 @@ chunks -> files -> trees -> snapshot -> ref
 
 - snapshot 写入成功但 ref 更新失败时，不丢弃 snapshot。
 - ref 更新失败产生显式冲突。
+- CAS 失败后，本地必须把该 snapshot 标记为 `unpublished` 或 `needs-rebase`，不得把它当成已经被远端 ref 保护的普通 head。
+- 基于 `unpublished` snapshot 再次 push 前，必须验证该 snapshot 及其 parent chain 在目标远端完整存在，或先重新上传缺失 ancestor。
+- 发起 push 前，不得只信任 Local Index 里的 parent 状态；将要作为 parent 的 snapshot 必须在远端执行 exists/read-back 校验。
 
 阶段：
 
@@ -1115,8 +1183,8 @@ ref_token = BLAKE3_keyed(repo_ref_key, "branch:" || branch_name)
 技术：
 
 - P1：SQLite。
-- P1：SQLite FTS5 可选。
-- P2：RocksDB 可选，用于极大规模 key-value cache。
+- P1：SQLite FTS5。
+- P2：RocksDB，用于极大规模 key-value cache。
 
 索引内容：
 
@@ -1133,8 +1201,8 @@ ref_token = BLAKE3_keyed(repo_ref_key, "branch:" || branch_name)
 | --- | --- | --- | --- |
 | metadata search | P1 | 是 | 本地索引可见文件属性 |
 | filename FTS | P1 | 是 | 本地索引可见文件名 |
-| content FTS | P2 | 否 | 本地保存明文内容索引 |
-| encrypted remote search | 非目标 | 否 | 不进入路线图 |
+| content FTS | P2 | 实现能力，仓库需用户显式开启 | 本地保存明文内容索引 |
+| encrypted remote search | 排除 | 不实现 | 不进入路线图 |
 
 性能目标：
 
@@ -1161,7 +1229,7 @@ root tree
           -> selected chunks
 ```
 
-P1 可选路径 token：
+P1 路径 token：
 
 ```text
 path_token = BLAKE3_keyed(repo_path_index_key, normalized_path)
@@ -1171,7 +1239,7 @@ path_token = BLAKE3_keyed(repo_path_index_key, normalized_path)
 
 - 路径 token 加速定位。
 - 会泄露相同路径 token 的相等性。
-- 默认关闭，由用户按隐私/性能选择。
+- P1 实现路径 token 索引；仓库需用户显式开启，启用后必须在仓库配置中记录该隐私降级。
 
 ## 6. 存储与同步平面架构
 
@@ -1374,6 +1442,8 @@ Push 规则：
 - pre-commit validation 必须确认自己的 write intent 仍未过期、writer lease 仍归当前 operation 持有、远端 ref 仍等于 expected head。
 - 如果 intent 或 writer lease 已过期，不得直接 CAS 更新 ref；客户端必须先续期 intent/lease，并对本次 snapshot 可达对象执行增量 `verify remote`。
 - 增量 verify 必须确认 snapshot、tree、file、chunk 或 pack index 引用的所有对象仍在远端可读；确认后才能重新进入最终 CAS。
+- pre-commit validation 还必须验证 snapshot parent chain 的远端 ancestor closure，不得发布 parent 在远端缺失的 snapshot。
+- CAS 冲突失败后，本地操作结果必须进入 `needs-rebase` 状态；再次 push 该快照或其子快照前，必须重新检查 parent chain 并补传缺失 ancestor。
 - Operation Journal 中的 `uploaded` 状态只能表示“曾经上传成功”，不能作为最终 ref 发布前对象仍存活的证明。
 
 远端 write intent：
@@ -1599,6 +1669,8 @@ GC 安全原则：
 - 对 single-writer 后端，`gc --execute` 只能在明确离线维护窗口执行。
 - grace period 不能依赖单个客户端本地时钟，必须使用远端对象时间、远端 generation/ETag、transaction heartbeat 的远端观测时间和安全窗口。
 - 如果后端不能提供可靠远端时间或等价版本语义，`gc --execute` 必须禁用。
+- 对近期创建但未被 ref 指向的 snapshot，必须使用比普通 loose object 更长的 unpublished snapshot grace period，避免清理 CAS 失败后尚未 rebase 的本地游离快照。
+- 删除任何 snapshot 前，必须确认不存在仍在 grace period 内的子孙 snapshot 依赖它作为 ancestor。
 
 GC 流程：
 
@@ -1613,6 +1685,7 @@ check backend capability
   -> build reachable set
   -> paged list remote
   -> exclude objects newer than gc_safe_horizon
+  -> exclude recent unreferenced snapshots and ancestors within unpublished grace period
   -> exclude objects covered by active or recent write intents
   -> find unreachable objects
   -> apply grace period
@@ -1646,6 +1719,7 @@ GC 必须跳过或中止：
 
 ```text
 gc_safe_horizon: max(30d, configured_max_push_duration * 3)
+unpublished_snapshot_grace_period: >= 30d
 intent_heartbeat_interval: 10m
 intent_expiry: 72h 或用户配置
 ```
@@ -1785,9 +1859,9 @@ e2v gc --execute --grace-period 30d
 阶段：
 
 - P2-A：Linux FUSE 只读。
-- P2-B：Windows WinFSP 调研。
-- P2-C：macOS macFUSE 调研。
-- P3：可写 VFS 单独设计。
+- P2-B：Windows WinFSP 只读。
+- P2-C：macOS macFUSE 只读。
+- P3：可写 VFS。
 
 为什么后置：
 
@@ -1802,9 +1876,20 @@ e2v gc --execute --grace-period 30d
 | 缓存类型 | 默认 | 是否加密 | 说明 |
 | --- | --- | --- | --- |
 | remote object cache | 开启 | 是，保存密文 | 缓存 chunk/pack 密文 |
-| manifest cache | 开启 | 本地 DB 可加密 | 缓存 manifest |
+| manifest cache | 开启 | 本地 DB 加密 | 缓存 manifest |
 | plaintext page cache | 内存 | 否 | 进程内 LRU |
-| plaintext temp file | 关闭 | 可选 | 用户显式开启 |
+| plaintext temp file | 关闭 | 否 | 用户显式开启时才允许明文临时文件 |
+
+一致性模型：
+
+- VFS 必须区分 snapshot-pinned mount 和 live branch mount。
+- snapshot-pinned mount 的 inode/file handle 绑定不可变 snapshot，不受后台 fetch 影响。
+- live branch mount 在 Sync Engine 更新 Local Index 或 ref view 后，必须通过 IPC、事件总线或共享订阅通知 VFS。
+- VFS 收到 live branch 更新后，必须主动向内核发起目录项、inode、attribute 和 page cache invalidation。
+- Linux FUSE 需要使用 `FUSE_NOTIFY_INVAL_INODE`、`FUSE_NOTIFY_INVAL_ENTRY` 或等价机制；Windows WinFSP 和 macFUSE 必须使用对应平台的 invalidation API。
+- 如果平台或实现无法可靠 invalidation，live branch mount 必须关闭内核 page cache 或使用 direct I/O，以正确性优先。
+- 已打开文件句柄必须绑定打开时的 snapshot/file object；不能在同一 handle 中混读旧版本和新版本 chunk。
+- live branch 更新后，新打开的 handle 读取新版本，旧 handle 继续读取打开时版本，或返回明确的 stale handle 错误。
 
 “零落盘”语义：
 
@@ -1879,7 +1964,7 @@ C-ABI 原则：
 - 崩溃恢复。
 - 可观测性。
 - 测试矩阵。
-- 格式兼容和迁移。
+- 格式版本边界。
 
 ### 8.2 模块树
 
@@ -1907,6 +1992,11 @@ Runtime & Reliability Plane
 
 - CPU 密集任务不得阻塞 tokio runtime。
 - 上传并发、hash 并发、encrypt 并发分别限流。
+- I/O、CPU、上传三个执行域之间必须通过有界队列连接，禁止无界 producer。
+- CPU 执行域不得执行网络或磁盘阻塞 I/O。
+- Tokio runtime 不得同步等待 CPU 池中依赖 Tokio 消费结果的任务，CPU 池也不得同步等待 Tokio 任务释放容量。
+- 如果使用 rayon，必须有专用池和清晰的返回通道，不得让全局 rayon 池参与可能反向等待 tokio 的流程。
+- MVP 推荐使用 tokio blocking pool 或等价隔离执行上下文处理 hash/encrypt/chunking，避免跨 runtime 回调导致事件循环饿死。
 
 阶段：
 
@@ -1924,6 +2014,10 @@ Runtime & Reliability Plane
 - 限制 pending upload queue。
 - 限制明文 buffer。
 - 限制 pack writer buffer。
+- 背压必须从 uploader 向 encrypt/hash/chunker/reader 逐级传播。
+- 当远端限流或上传停滞时，reader 和 chunker 必须停止产生新明文 buffer，而不是继续填满 CPU 队列。
+- 有界队列容量必须按内存预算推导，不能只按任务数量配置。
+- 背压等待必须可取消，避免 shutdown、错误恢复或重试时出现永久挂起。
 
 默认目标：
 
@@ -2059,6 +2153,8 @@ e2v doctor --bundle
 - checkout 后内容与源目录一致。
 - branch 创建不复制对象。
 - macOS/APFS、Windows、Linux 下 NFC/NFD、大小写折叠、组合音标路径的 scan -> checkout -> scan 必须幂等。
+- commit 期间源文件 size、mtime 或 change id 变化时，必须丢弃该文件本次临时对象并重试或报错。
+- 对长时间读取的大文件，平台快照视图和读前/读后校验路径都必须覆盖测试。
 
 安全测试：
 
@@ -2068,6 +2164,10 @@ e2v doctor --bundle
 - 错误密码无法解锁 keyring。
 - 裸公开文件无法推导 object ID。
 - 被撤销设备拿到旧 epoch key 后，不得解密撤销后新 epoch 对象。
+- 对象缺少当前 schema 的必需字段时必须拒绝解码。
+- 启用 padding policy 后，篡改 padding 或 padding length 必须导致 AEAD 或解码失败。
+- checkout、HTTP Range、VFS 不得暴露未完成 AEAD 验证的明文字节。
+- AEAD 验证失败时，checkout 临时输出必须被清理，最终路径不得出现脏文件。
 
 同步测试：
 
@@ -2080,9 +2180,18 @@ e2v doctor --bundle
 - active write intent 存在时，`gc --execute` 必须中止。
 - write intent heartbeat 过期前，GC 不得删除相关时间窗口内对象。
 - write intent 过期后恢复的 push，在最终 ref CAS 前必须重新 verify 可达对象并续期 lease/intent。
+- CAS 失败后基于 unpublished snapshot 再次 push 时，必须验证远端 parent chain 完整或补传缺失 ancestor。
 - GC 删除前 ref 或 intent 集合变化时，必须中止或重新计算。
+- GC 不得删除仍在 unpublished snapshot grace period 内的无 ref snapshot 及其 ancestor。
 - 客户端本地时钟大幅偏移时，GC 和无人值守 push 不得依赖本地时间完成危险操作。
 - Operation Journal 在百万对象上传时不得整文件重写。
+
+VFS 测试：
+
+- snapshot-pinned mount 后台 fetch 不得改变已打开文件句柄内容。
+- live branch mount 后台 fetch 后必须 invalidation 目录项、inode、attribute 和 page cache。
+- 无可靠 invalidation 的平台必须使用 direct I/O 或关闭内核 page cache。
+- 已打开文件句柄不得混读旧版本和新版本 chunk。
 
 崩溃测试：
 
@@ -2094,6 +2203,12 @@ e2v doctor --bundle
 - updating index root。
 - gc execute。
 
+调度测试：
+
+- 远端上传限流时，reader/chunker/hash/encrypt 必须因背压停止继续扩大内存占用。
+- CPU 执行域和 tokio I/O 执行域互相等待时不得死锁，错误和取消必须能传播。
+- 有界队列容量耗尽时，系统必须进入可观测等待状态，而不是 CPU 归零永久挂起。
+
 性能测试数据集：
 
 | 数据集 | 规模 | 用途 |
@@ -2104,7 +2219,7 @@ e2v doctor --bundle
 | media set | 10k images/videos | 混合数据 |
 | history | 500 snapshots | 索引和历史查询 |
 
-### 8.9 Format Compatibility
+### 8.9 Format Boundary
 
 每个对象必须包含：
 
@@ -2113,6 +2228,7 @@ format_version
 object_type
 crypto_suite
 key_epoch
+padding_policy
 chunker_config_id
 ```
 
@@ -2121,26 +2237,16 @@ chunker_config_id
 ```text
 repo_format_version
 min_client_version
-supported_features
 active_epoch
-```
-
-Feature flags：
-
-```text
-feature.packfile.v1
-feature.tree_paging.v1
-feature.path_index.v1
-feature.xchacha20poly1305.v1
-feature.key_epoch.v1
 ```
 
 规则：
 
-- 旧对象尽量不重写。
-- 新对象可使用新格式。
-- 旧客户端遇到未知必需 feature 必须拒绝写入。
-- 迁移命令必须支持 dry-run。
+- 当前阶段只定义单一 repo format 的边界和必需字段。
+- 所有对象必须带 `format_version`，用于拒绝处理不属于当前 schema 的对象。
+- schema 变更必须显式升级 `repo_format_version`，不能靠“忽略未知字段”继续写入。
+- 对象编码必须 canonical，确保相同逻辑对象在不同客户端生成相同 object ID。
+- 格式演进必须通过新的 `repo_format_version` 设计文档进入计划。
 
 ## 9. Rust 工程结构
 
@@ -2222,7 +2328,7 @@ crates/
 | KDF | argon2id | MVP | 用户密码解锁 |
 | AEAD | XChaCha20-Poly1305 / AES-GCM | MVP | 优先降低 nonce 误用风险 |
 | 本地索引 | SQLite / FTS5 | P1 | 搜索和 cache |
-| 大规模 KV cache | RocksDB 可选 | P2 | 极大规模索引 |
+| 大规模 KV cache | RocksDB | P2 | 极大规模索引 |
 | CLI | clap | MVP | 命令行 |
 | Web | axum | P0-C | 本地预览 |
 | VFS | fuser / WinFSP / macFUSE | P2 | 只读优先 |
@@ -2269,7 +2375,7 @@ crates/
   - keyring 损坏导致仓库永久不可解密
     -> generation + atomic publish + fsync + 保留历史 keyring
   - 加密去重泄露已知明文
-    -> keyed hash，不做跨仓库去重；同仓库频率泄露作为 accepted risk
+    -> keyed hash，不做跨仓库去重；同仓库频率泄露列入明确隐私边界
   - AEAD nonce 复用
     -> 派生 nonce 或使用大 nonce AEAD
   - ref 并发覆盖
@@ -2278,10 +2384,20 @@ crates/
     -> write intent / transaction lease / gc fencing / pre-commit verify / 弱后端禁用 execute
   - 客户端时钟偏移导致 GC 误删
     -> GC 和 intent expiry 基于远端时间或版本语义，本地时钟不能作为删除事实源
+  - CAS 失败后的游离 snapshot 被 GC 后造成 parent 断裂
+    -> unpublished/needs-rebase 状态、pre-push ancestor closure 校验、unpublished snapshot grace period
+  - schema 边界不清导致字段被静默忽略
+    -> 当前阶段采用显式 schema，未知格式拒绝处理，禁止隐式忽略字段
+  - 活跃大文件 torn read 形成不存在的快照内容
+    -> 平台快照优先；读前/读后 metadata 校验；变化则丢弃临时对象并重试或报错
+  - 未认证明文提前暴露到本地或 VFS/HTTP
+    -> chunk/内部段级认证；临时输出；认证失败清理并拒绝发布
 
 中高风险
   - JSON 大 Journal 导致内存和 I/O 爆炸
     -> SQLite object state table 或 append-only WAL
+  - tokio 与 CPU 池背压反噬导致死锁
+    -> 有界队列、执行域隔离、背压向 reader 传播、等待可取消
   - Pack Index 全局覆盖或分散读取瓶颈
     -> immutable index segment / local cache / compaction
   - 单级巨型目录导致 manifest 内存爆炸
@@ -2292,8 +2408,12 @@ crates/
     -> Chunking Policy Engine / dedup stats / format-aware roadmap
   - VFS 复杂度失控
     -> P2 只读，依赖 range read 和 cache
+  - VFS live branch page cache 读到旧视图或混合版本
+    -> snapshot-pinned handle 语义、live mount invalidation、必要时 direct I/O
   - 元数据隐私与稀疏检出冲突
-    -> 逐层解密，路径 token 可选
+    -> 逐层解密；P1 实现路径 token，仓库启用时记录隐私降级
+  - 加密对象大小和流量模式泄露数据轮廓
+    -> P1 padding policy 降低大小指纹；P3 ORAM/访问模式隐藏降低访问模式泄露
   - WebDAV 能力不稳定
     -> capability detection，弱能力降级
   - 设备撤销后继续读取未来数据
@@ -2305,16 +2425,16 @@ crates/
   - SQLite 被误当事实源
     -> 本地 cache，可删除重建
   - 本地索引泄露明文路径
-    -> 明确本地威胁边界，可选 DB 加密
+    -> 明确本地威胁边界，本地 manifest cache DB 加密
   - 多设备撤销语义复杂
-    -> 撤销未来访问，不承诺历史不可读
+    -> P2 撤销未来访问；P3 历史强撤销通过全仓库重加密移除旧 epoch 访问能力
 ```
 
-## 13. 待决策清单
+## 13. 架构决策清单
 
 ### 13.1 MVP 前
 
-| 问题 | 推荐默认 |
+| 问题 | 已定决策 |
 | --- | --- |
 | canonical encoding | 明确版本约束的二进制编码 |
 | AEAD | XChaCha20-Poly1305 优先 |
@@ -2324,11 +2444,15 @@ crates/
 | path policy | portable-strict |
 | 路径规范化 | checkout 后 read-back 校验，macOS/APFS 纳入测试 |
 | manifest 上限 | 设置 max manifest size 和 max tree entries |
-| 本地索引 | 不进入 MVP |
+| schema 边界 | 显式 schema；未知格式拒绝处理 |
+| padding policy | MVP 支持 `none` 和 manifest 随机 padding；P1 支持固定桶 padding |
+| 源文件一致性 | 大文件优先平台快照；否则读前/读后 metadata 校验 |
+| 解密认证边界 | 未完成 AEAD 验证的明文不得暴露到最终输出或响应 |
+| 本地索引 | P1 实现 SQLite + FTS5 |
 
 ### 13.2 P0-B 前
 
-| 问题 | 推荐默认 |
+| 问题 | 已定决策 |
 | --- | --- |
 | 首个远端后端 | S3-compatible |
 | WebDAV | P1-B |
@@ -2338,24 +2462,36 @@ crates/
 | remote write intent | P0-B 设计，供 GC fencing 使用；最终 CAS 前必须校验新鲜度 |
 | GC 时间源 | 远端 Last-Modified/generation/ETag 或等价语义，本地时钟不能作为事实源 |
 | read-back 校验 | snapshot/ref 必须；最终 CAS 前校验可达对象存在性 |
+| ancestor closure | push 前验证 parent chain 远端完整，CAS 失败 snapshot 标记 needs-rebase |
+| unpublished snapshot GC | 无 ref snapshot 使用 >=30d grace period，并保留其 ancestor |
 
 ### 13.3 P1 前
 
-| 问题 | 推荐默认 |
+| 问题 | 已定决策 |
 | --- | --- |
 | packfile | 加密整体 pack |
 | pack index | 不可变 segment + 本地 cache + compaction |
 | Tree Sharding | P1 必须实现；若 MVP 覆盖十万级小文件则前置 |
 | Chunking Policy | 增加 large-binary profile 和 dedup stats |
-| SQLite 明文路径 | 允许，仅本地，明确隐私影响 |
-| 路径 token 索引 | 可选关闭 |
+| SQLite 路径索引 | 允许本地保存路径信息；manifest cache DB 加密；明确隐私影响 |
+| 路径 token 索引 | P1 实现；仓库启用时记录隐私降级 |
 | GC | 默认 dry-run；execute 需要 transaction/lease/fencing 能力 |
+| 背压模型 | 有界队列贯穿 reader/chunker/hash/encrypt/uploader，执行域互不反向阻塞 |
 
 ### 13.4 P2 前
 
-| 问题 | 推荐默认 |
+| 问题 | 已定决策 |
 | --- | --- |
 | VFS | 第一版只读 |
+| VFS 一致性 | snapshot-pinned 默认；live branch 必须支持 cache invalidation 或 direct I/O |
 | 明文缓存 | 默认不落盘 |
-| 多设备撤销 | key epoch 轮转后只阻止未来访问，历史不可读需要重加密 |
+| 多设备撤销 | P2 key epoch 轮转阻止未来访问；P3 历史强撤销重加密旧对象 |
 | C-ABI | Rust API 稳定后发布 |
+
+### 13.5 P3 已定决策
+
+| 问题 | 已定决策 |
+| --- | --- |
+| encrypted remote search | 排除，不进入路线图 |
+| 历史数据强撤销 | P3 实现；需要全仓库重加密、旧 epoch 退休和对象重写 journal |
+| ORAM / 访问模式隐藏 | P3 实现；需要 ORAM-style storage layout、padded access schedule、traffic shaping 和成本策略 |
