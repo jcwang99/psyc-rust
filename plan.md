@@ -62,15 +62,19 @@ E2EE 增量版本管理系统
      3.4 Snapshot
      3.5 Branch / Ref
      3.6 Local Index
+     3.7 Read Service
 
   4. 存储与同步平面
      4.1 StorageLayout
-     4.2 BlobStore
-     4.3 RefStore
-     4.4 Backend Adapter
-     4.5 Push / Fetch / Clone
-     4.6 Operation Journal
-     4.7 GC / Verify / Repair
+     4.2 LogicalObjectStore
+     4.3 BlobStore
+     4.4 RefStore
+     4.5 LayoutRootStore
+     4.6 TransactionPublisher
+     4.7 Backend Adapter
+     4.8 Push / Fetch / Clone
+     4.9 Operation Journal
+     4.10 GC / Verify / Repair
 
   5. 访问与呈现平面
      5.1 CLI
@@ -86,7 +90,7 @@ E2EE 增量版本管理系统
      6.4 崩溃恢复
      6.5 可观测性
      6.6 测试矩阵
-      6.7 格式版本边界
+     6.7 格式版本边界
 ```
 
 ### 1.3 总体分层图
@@ -120,7 +124,7 @@ E2EE 增量版本管理系统
                                   v
 +---------------------------------------------------------------------------+
 |                           存储与同步平面                                    |
-|   StorageLayout     BlobStore     RefStore     Backend Capability     Journal |
+| LogicalObjectStore  StorageLayout  BlobStore  RefStore  LayoutRoot  Journal |
 +---------------------------------------------------------------------------+
                                   |
 =============================================================================
@@ -140,8 +144,41 @@ E2EE 增量版本管理系统
 - CLI/Web/VFS/SDK 都通过同一编排层访问核心能力。
 - 存储后端通过能力声明接入，不把后端差异泄漏到核心领域。
 - 核心领域只依赖逻辑 `ObjectId`，不得依赖远端物理路径、prefix list 或 object naming 规则。
-- `StorageLayout` 负责逻辑对象到物理存储布局的映射，P0/P1 使用 direct layout，P3 新增 rewrite/oram layout 时不重写核心对象模型。
+- `StorageLayout` 负责逻辑对象到物理存储布局的映射，P0 使用 direct layout，P1 新增 pack layout，P3 新增 rewrite/oram layout 时不重写核心对象模型。
+- P0 必须先建立 `Repository Facade`、`WorkingTree`、`LogicalObjectStore`、`ReadService` 和 `TransactionPublisher` 边界，再实现 CLI 命令，避免后续 Web/VFS/SDK 反向重写核心流程。
+- Manifest、Web、VFS、SDK 不得直接访问 `BlobStore` 或拼接 physical path，只能通过 `LogicalObjectStore`、`ReadService` 和 `StorageLayout` 读写对象。
+- ref 更新、layout root 发布、writer lease、write intent 和恢复逻辑必须由 `TransactionPublisher` 统一编排，不能散落在 CLI、Sync Engine 或后端适配器里。
 - MVP 先证明对象模型、加密模型和同步一致性，再扩展 VFS、团队共享和高级 GC。
+
+### 1.5 P0 防重构边界
+
+P0 不是“先把 CLI 写通再抽象”。为了避免 P1/P2 大规模重构，P0 必须先固定这些薄边界：
+
+```text
+Repository Facade
+  -> init / commit / checkout / snapshots / verify
+  -> push / fetch / clone / serve
+
+WorkingTree
+  -> scan / path policy / source consistency / checkout writer
+
+LogicalObjectStore
+  -> canonical encode / object id / encrypt / decrypt / layout resolve
+
+ReadService
+  -> open snapshot / read dir / open file / read range
+
+TransactionPublisher
+  -> writer lease / write intent / layout root CAS / ref CAS / recovery
+```
+
+边界规则：
+
+- CLI 只调用 `Repository Facade`，不得直接调用 chunker、manifest、BlobStore 或 RefStore。
+- Web UI、Local HTTP API、VFS 和 SDK 只调用 `ReadService` 或稳定 facade，不得复制目录遍历、range read 和解密认证逻辑。
+- Commit 通过 `WorkingTree` 获得稳定输入，通过 `LogicalObjectStore` 写对象，通过 Snapshot Manager 形成 DAG，再通过 facade 更新本地状态。
+- Push 通过 `TransactionPublisher` 完成 write intent、layout root 和 ref 的两阶段发布，Sync Engine 不得自行拼接发布协议。
+- P0 direct layout 可以非常薄，但必须实现同一接口；P1 pack、P3 rewrite/ORAM 只能替换 layout/object-store 实现，不能要求上层重写。
 
 ## 2. 阶段路线树
 
@@ -149,6 +186,11 @@ E2EE 增量版本管理系统
 
 ```text
 P0-A 本地加密快照引擎
+  - Repository Facade
+  - WorkingTree boundary
+  - LogicalObjectStore direct layout
+  - ReadService snapshot/dir/file/range API
+  - local direct layout root/generation
   - init
   - commit
   - snapshots
@@ -157,6 +199,8 @@ P0-A 本地加密快照引擎
   - FastCDC
   - keyed object ID
   - encrypted chunk/file/tree/snapshot
+  - default branch/ref token
+  - Tree Sharding if target includes 100k+ small files
 
 P0-B 单远端同步
   - S3-compatible backend
@@ -164,6 +208,9 @@ P0-B 单远端同步
   - fetch
   - clone
   - ref CAS
+  - layout root publish protocol
+  - TransactionPublisher
+  - remote write intent
   - operation journal
   - upload resume
 
@@ -184,11 +231,13 @@ P1-A 分支与本地索引
   - SQLite index
   - metadata search
   - filename search
+  - Tree Sharding if not already required by MVP scale target
 
 P1-B WebDAV 与后端降级
   - WebDAV/Alist adapter
   - capability detection
-  - weak CAS fallback
+  - single-writer lease fallback
+  - risky write mode disabled by default
 
 P1-C Packfile 与性能优化
   - pack writer
@@ -196,6 +245,7 @@ P1-C Packfile 与性能优化
   - range read
   - local cache
   - benchmark
+  - pack/index implementation behind LogicalObjectStore and StorageLayout
 
 P1-D 显式 GC 与防腐
   - verify snapshot
@@ -209,7 +259,9 @@ P1-D 显式 GC 与防腐
 
 ```text
 P2-A 只读 VFS
-  - Linux FUSE
+  - P2-A1 Linux FUSE
+  - P2-A2 Windows WinFSP
+  - P2-A3 macOS macFUSE
   - read-only mount
   - range read
   - encrypted cache
@@ -225,6 +277,11 @@ P2-C SDK / C-ABI
   - stable Rust API
   - opaque C handles
   - Local HTTP API stabilization
+```
+
+### 2.4 P3
+
+```text
 
 P3-A 历史强撤销
   - full repository re-encryption
@@ -317,6 +374,24 @@ Data Plane
 阶段：
 
 - MVP。
+
+WorkingTree 边界：
+
+`WorkingTree` 负责所有与真实工作目录相关的副作用，核心对象模型不得直接访问文件系统。
+
+接口职责：
+
+- `scan`：执行 ignore、路径策略、文件 metadata 采集和源文件一致性策略。
+- `open_stable_file`：按平台快照或读前/读后 metadata 校验提供稳定读输入。
+- `plan_checkout`：在写入前完成路径 dry-run、冲突检测、磁盘空间和权限预检查。
+- `write_checkout_temp`：只写临时路径，所有 chunk 认证和 object ID 校验完成后再原子发布。
+- `record_platform_name_mapping`：记录 macOS/APFS/HFS+ 等平台的本地路径 read-back 映射。
+
+规则：
+
+- Commit、checkout、Web、VFS、SDK 不得各自实现路径策略；必须通过 `WorkingTree` 或 `ReadService` 使用同一套规则。
+- `WorkingTree` 输出给 Object Model 的路径必须已经按当前 `PathPolicy` 规范化并通过校验。
+- `WorkingTree` 只属于本地工作区边界，不进入远端事实源；本地 platform name mapping 可删除并通过重新 scan 恢复。
 
 路径策略：
 
@@ -793,6 +868,7 @@ direct/pack layout 的物理结构示例：
 ```text
 repo_master_key(epoch)
   -> repo_object_id_key
+  -> repo_manifest_id_key
   -> repo_chunk_enc_key
   -> repo_manifest_enc_key
   -> repo_ref_key
@@ -807,7 +883,7 @@ repo_master_key(epoch)
 - 子密钥必须带用途域分离。
 - 对象必须记录 `key_epoch`，用于选择对应 epoch 的子密钥解密。
 - 仓库配置必须记录 `active_epoch`，新对象只能使用 active epoch 加密。
-- P2 撤销必须轮转 `repo_object_id_key`、加密、nonce、ref、path index 相关子密钥，避免被撤销设备计算未来对象 ID。
+- P2 撤销必须轮转 `repo_object_id_key`、manifest id、加密、nonce、ref、path index 相关子密钥，避免被撤销设备计算未来对象 ID、目录分片 key 或路径 token。
 - 旧 epoch 只用于读取旧对象，不得用于写入新对象。
 
 阶段：
@@ -968,8 +1044,10 @@ Metadata & Version Plane
      1.1 chunk
      1.2 file
      1.3 tree
-     1.4 snapshot
-     1.5 ref
+     1.4 directory_root
+     1.5 tree_shard
+     1.6 snapshot
+     1.7 ref
   2. Manifest Store
      2.1 object decoder
      2.2 batch reader
@@ -979,7 +1057,8 @@ Metadata & Version Plane
   4. Snapshot Manager
   5. Branch / Ref Manager
   6. Local Index
-  7. Sparse Checkout
+  7. Read Service
+  8. Sparse Checkout
 ```
 
 ### 5.3 Object Model
@@ -991,6 +1070,8 @@ Metadata & Version Plane
 | `chunk` | 文件内容分块 | 是 | MVP |
 | `file` | chunk 列表、文件属性、chunker 信息 | 是 | MVP |
 | `tree` | 目录项、文件名、子目录指针 | 是 | MVP |
+| `directory_root` | 大目录分片根、分片 fanout、排序策略 | 是 | MVP/P1 |
+| `tree_shard` | 大目录分片项 | 是 | MVP/P1 |
 | `snapshot` | root tree、父快照、提交信息 | 是 | MVP |
 | `ref` | 分支名 token 到 snapshot 指针 | 是 | MVP/P1 |
 | `pack` | 多对象物理打包 | 是 | P1 |
@@ -1012,7 +1093,7 @@ Metadata & Version Plane
 路径名称：
 
 - MVP 的 tree entry 只接受 `portable-strict` 路径策略下的 normalized UTF-8 名称。
-- tree 中保存的是加密后的文件名和目录项。
+- tree plaintext 中保存 normalized entry name；整个 tree object 作为 manifest 加密对象写入远端，因此远端不可见明文文件名和目录项。
 - path policy 必须写入仓库配置或 snapshot metadata，避免不同客户端对同一 tree 使用不同解释。
 - P2 实现 raw bytes path，并必须明确跨平台 checkout 映射规则。
 
@@ -1029,6 +1110,12 @@ max_tree_entries_per_object: 4096
 ```
 
 超过上限时必须使用 Tree Sharding，不允许构建超大单体 tree object。
+
+Tree Sharding 阶段边界：
+
+- 如果 MVP 明确支持十万级小文件或百万级目录压力测试，`directory_root` 和 `tree_shard` 必须在 P0-A 实现。
+- 如果 MVP 只验证小规模本地快照，可先只实现单体 `tree`，但 P0 schema 必须保留 `directory_root`、`tree_shard` 对象类型编号和拒绝未知格式的升级路径。
+- P1 必须实现 Tree Sharding；实现后不能改变已有单体 `tree` 的 object ID 语义，只能让新快照在超过阈值时写入分片结构。
 
 ### 5.4 Merkle DAG
 
@@ -1124,14 +1211,9 @@ scan directory
 
 阶段：
 
-- MVP 可以先实现单 tree object，但必须保留对象格式扩展位。
-- 如果 MVP 目标包含十万级小文件，Tree Sharding 应前置实现。
-- P1 必须实现 Tree Sharding。
-
-阶段：
-
-- MVP 可简单实现。
-- P1 加批量和分页。
+- P0-A：ManifestStore 必须提供 streaming tree walk API；小规模 MVP 可先写单体 `tree`，但 schema 必须保留 `directory_root` 和 `tree_shard` 对象类型编号。
+- P0-A：如果 MVP 目标包含十万级小文件或百万级目录压力测试，Tree Sharding 必须前置实现。
+- P1：如果 P0 未实现 Tree Sharding，P1 必须补齐；同时加入批量读取、分页、manifest cache 和目录遍历性能优化。
 
 ### 5.6 Snapshot Manager
 
@@ -1232,7 +1314,55 @@ filename search P95 < 300 ms
 index rebuild throughput > 20,000 entries/s
 ```
 
-### 5.9 Sparse Checkout
+### 5.9 Read Service
+
+职责：
+
+- 为 CLI checkout、Web、Local HTTP API、VFS 和 SDK 提供统一只读视图。
+- 隔离 ManifestStore、StorageLayout、LogicalObjectStore、cache 和认证边界。
+- 避免每个访问入口重复实现目录遍历、文件打开和 range read。
+
+接口：
+
+```rust
+#[async_trait]
+pub trait ReadService: Send + Sync {
+    async fn open_snapshot(&self, id: &ObjectId) -> Result<SnapshotHandle>;
+    async fn resolve_branch(&self, token: &RefToken) -> Result<SnapshotHandle>;
+    async fn read_dir(
+        &self,
+        snapshot: &SnapshotHandle,
+        path: &SnapshotPath,
+        options: ReadDirOptions,
+    ) -> Result<DirPage>;
+    async fn open_file(
+        &self,
+        snapshot: &SnapshotHandle,
+        path: &SnapshotPath,
+    ) -> Result<FileHandle>;
+    async fn read_range(
+        &self,
+        file: &FileHandle,
+        range: ByteRange,
+    ) -> Result<Bytes>;
+}
+```
+
+规则：
+
+- `SnapshotHandle` 必须绑定 snapshot id 和 layout generation，避免读取过程中混用不同 layout。
+- `FileHandle` 必须绑定 file object id、chunk list、crypto suite、key epoch 和 layout generation。
+- `read_range` 必须只返回已经完成 AEAD 认证和 object ID 校验的字节。
+- Web、HTTP API、VFS、SDK 不得直接解密 chunk 或直接访问 `BlobStore`。
+- snapshot-pinned 读取默认稳定；live branch 读取必须显式重新 resolve branch，不能静默改变已有 handle。
+
+阶段：
+
+- P0-A：支持 snapshot browse、directory browse、open file、read range 的内部 API。
+- P0-C：Web 和 Local HTTP API 使用同一 `ReadService`。
+- P2：VFS 只读实现只依赖 `ReadService`，不绕过到 ManifestStore 或 StorageLayout。
+
+### 5.10 Sparse Checkout
 
 职责：
 
@@ -1276,22 +1406,25 @@ path_token = BLAKE3_keyed(repo_path_index_key, normalized_path)
 ```text
 Storage & Sync Plane
   1. StorageLayout
-  2. BlobStore
-  3. RefStore
-  4. Backend Capability
-  5. Backend Adapter
-     5.1 Local Folder
-     5.2 S3-compatible
-     5.3 WebDAV/Alist
-     5.4 Memory
-  6. Sync Engine
-     6.1 push
-     6.2 fetch
-     6.3 clone
-     6.4 pull
-  7. Operation Journal
-  8. Upload Resume
-  9. GC / Verify / Repair
+  2. LogicalObjectStore
+  3. BlobStore
+  4. RefStore
+  5. LayoutRootStore
+  6. TransactionPublisher
+  7. Backend Capability
+  8. Backend Adapter
+     8.1 Local Folder
+     8.2 S3-compatible
+     8.3 WebDAV/Alist
+     8.4 Memory
+  9. Sync Engine
+     9.1 push
+     9.2 fetch
+     9.3 clone
+     9.4 pull
+  10. Operation Journal
+  11. Upload Resume
+  12. GC / Verify / Repair
 ```
 
 ### 6.3 StorageLayout
@@ -1336,7 +1469,52 @@ PhysicalObjectRef
 - P1：pack layout。
 - P3：rewrite layout 和 ORAM layout。
 
-### 6.4 BlobStore
+### 6.4 LogicalObjectStore
+
+职责：
+
+- 提供逻辑对象读写入口，封装 canonical encode、object ID、加密、解密、认证和 layout 解析。
+- 让 ManifestStore、Snapshot Manager、Sync Engine、ReadService 不直接接触物理对象路径。
+- 在 P0 direct layout、P1 pack layout、P3 rewrite/ORAM layout 之间保持上层 API 稳定。
+
+接口：
+
+```rust
+#[async_trait]
+pub trait LogicalObjectStore: Send + Sync {
+    async fn put_object(
+        &self,
+        object_type: ObjectType,
+        plaintext: CanonicalObjectBytes,
+        options: PutObjectOptions,
+    ) -> Result<StoredObject>;
+    async fn get_object(&self, id: &ObjectId, expected_type: ObjectType) -> Result<PlainObject>;
+    async fn get_object_range(
+        &self,
+        id: &ObjectId,
+        expected_type: ObjectType,
+        range: ByteRange,
+    ) -> Result<Bytes>;
+    async fn exists_object(&self, id: &ObjectId) -> Result<bool>;
+    async fn resolve_object(&self, id: &ObjectId) -> Result<PhysicalReadPlan>;
+}
+```
+
+规则：
+
+- `put_object` 负责生成 keyed `ObjectId`、选择 active epoch、写入 AEAD header，并通过 `StorageLayout` 生成 physical ref。
+- `get_object` 必须先通过 AEAD 认证，再释放 plaintext 给上层解码器。
+- `get_object_range` 只能用于支持独立认证边界的对象或 chunk/pack 内部段；不得返回未认证片段。
+- `exists_object` 是逻辑对象存在性检查，不等价于某个 physical path 存在。
+- ManifestStore 只能依赖 `LogicalObjectStore` 读取 manifest 对象，不得依赖 `BlobStore`。
+
+阶段：
+
+- P0：direct layout + loose encrypted object。
+- P1：pack layout 和 pack index 作为实现细节接入。
+- P3：rewrite/ORAM layout 只替换 physical read/write plan。
+
+### 6.5 BlobStore
 
 职责：
 
@@ -1371,7 +1549,7 @@ pub trait BlobStore: Send + Sync {
 
 - MVP。
 
-### 6.5 RefStore
+### 6.6 RefStore
 
 职责：
 
@@ -1399,7 +1577,79 @@ pub trait RefStore: Send + Sync {
 - CAS 失败必须显式冲突。
 - 不允许最后写入者静默覆盖。
 
-### 6.6 Backend Capability
+### 6.7 LayoutRootStore
+
+职责：
+
+- 管理当前可读 layout root、layout generation 和历史 layout root 保留窗口。
+- 为 pack compaction、layout rewrite、历史强撤销和 ORAM reshuffle 提供统一发布入口。
+
+接口：
+
+```rust
+#[async_trait]
+pub trait LayoutRootStore: Send + Sync {
+    async fn read_layout_root(&self) -> Result<LayoutRoot>;
+    async fn compare_and_swap_layout_root(
+        &self,
+        expected: LayoutRootVersion,
+        next: LayoutRoot,
+    ) -> Result<CasResult>;
+    async fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>>;
+}
+```
+
+规则：
+
+- direct layout 也必须有 layout root，即使内容只有 `layout_id`、generation 和 direct mapping policy。
+- ref 不得指向 layout root 无法解析的 object；发布顺序必须由 `TransactionPublisher` 保证。
+- GC 必须同时保留 current layout root 和 grace period 内的 previous layout roots。
+- 不支持 layout root CAS/lease 的后端不得执行 pack index compaction、layout rewrite 或 ORAM 更新。
+
+阶段：
+
+- P0-A：本地 direct layout 必须有 layout root 和 generation，供 ReadService、checkout 和 verify 绑定读取视图。
+- P0-B：定义远端 layout root CAS/lease 发布边界。
+- P1：pack index root 通过同一发布边界接入。
+- P3：rewrite/ORAM root 复用同一发布边界。
+
+### 6.8 TransactionPublisher
+
+职责：
+
+- 统一编排 writer lease、remote write intent、layout root 发布、ref CAS、journal recovery 和 pre-commit verify。
+- 把远端发布协议从 CLI、Sync Engine 和 backend adapter 中抽离出来。
+
+接口：
+
+```rust
+#[async_trait]
+pub trait TransactionPublisher: Send + Sync {
+    async fn begin(&self, plan: PublishPlan) -> Result<PublishSession>;
+    async fn record_uploaded(&self, session: &PublishSession, object: PublishedObject) -> Result<()>;
+    async fn publish_layout_if_needed(&self, session: &PublishSession) -> Result<LayoutRootVersion>;
+    async fn pre_commit_verify(&self, session: &PublishSession) -> Result<()>;
+    async fn publish_ref(&self, session: &PublishSession, next: EncryptedRef) -> Result<CasResult>;
+    async fn complete(&self, session: PublishSession) -> Result<()>;
+    async fn recover(&self, operation_id: &OperationId) -> Result<RecoveryAction>;
+}
+```
+
+规则：
+
+- `begin` 必须根据 backend capability 选择 multi-writer、single-writer 或 read-only 模式。
+- `publish_ref` 前必须确认 write intent 和 writer lease 新鲜、layout root 可解析、ancestor closure 完整、目标 ref 仍等于 expected head。
+- Operation Journal 中的 `uploaded` 只能作为恢复线索，不能替代 `pre_commit_verify`。
+- Sync Engine 只提交 `PublishPlan`，不得自行更新 ref 或 layout root。
+- GC、repair、pack compaction 和历史强撤销必须复用同一 transaction/recovery 模型。
+
+阶段：
+
+- P0-B：push/fetch/clone 发布协议和 upload resume。
+- P1：pack index root、GC execute 和 repair 接入。
+- P3：layout rewrite、历史强撤销和 ORAM reshuffle 接入。
+
+### 6.9 Backend Capability
 
 职责：
 
@@ -1457,7 +1707,7 @@ WriterMode
 - 无 CAS 且无可靠远端 lease 的后端默认禁止后台自动 push；用户显式 `--force-single-writer-risk` 只能用于人工恢复或明确单写者维护窗口。
 - WebDAV/Alist 默认按 single-writer 后端处理，除非适配器证明其具有可靠 CAS/lock 能力。
 
-### 6.7 Backend Adapter
+### 6.10 Backend Adapter
 
 后端优先级：
 
@@ -1469,7 +1719,7 @@ WriterMode
 技术：
 
 - `opendal` 作为后端接入基础。
-- 但核心语义仍由 `StorageLayout` / `BlobStore` / `RefStore` 定义。
+- 但核心语义仍由 `LogicalObjectStore` / `StorageLayout` / `BlobStore` / `RefStore` / `LayoutRootStore` 定义。
 
 适配器准入测试：
 
@@ -1485,41 +1735,39 @@ WriterMode
 - Unicode path handling。
 - retry on transient failure。
 
-### 6.8 Sync Engine
+### 6.11 Sync Engine
 
 Push：
 
 ```text
-resolve backend writer mode
-  -> acquire writer lease if single-writer
-  -> read layout root and layout generation
-  -> create remote write intent if supported
+build PublishPlan
+  -> TransactionPublisher.begin
   -> read remote ref
   -> compare expected head
   -> upload missing objects
-  -> publish layout updates if needed
+  -> TransactionPublisher.record_uploaded
   -> write snapshot
-  -> pre-commit lease and intent validation
-  -> CAS update ref
-  -> close remote write intent
-  -> release writer lease if single-writer
+  -> TransactionPublisher.publish_layout_if_needed
+  -> TransactionPublisher.pre_commit_verify
+  -> TransactionPublisher.publish_ref
+  -> TransactionPublisher.complete
 ```
 
 Push 规则：
 
-- multi-writer push 必须依赖后端 CAS/conditional put。
-- single-writer 后端不得允许两个设备同时 push。
+- multi-writer push 必须依赖后端 CAS/conditional put，并由 `TransactionPublisher` 执行最终发布。
+- single-writer 后端不得允许两个设备同时 push，writer lease 必须由 `TransactionPublisher` 获取、续期和释放。
 - `write intent` 是远端可见的上传意图，用于告知 GC 有未发布对象正在写入。
 - 大型 push 必须定期刷新 write intent heartbeat。
 - push 崩溃后，write intent 在超时前会阻止 destructive GC。
 - 执行最终 ref CAS 前必须做 pre-commit lease and intent validation。
 - pre-commit validation 必须确认自己的 write intent 仍未过期、writer lease 仍归当前 operation 持有、远端 ref 仍等于 expected head。
-- 如果 intent 或 writer lease 已过期，不得直接 CAS 更新 ref；客户端必须先续期 intent/lease，并对本次 snapshot 可达对象执行增量 `verify remote`。
+- 如果 intent 或 writer lease 已过期，不得直接 CAS 更新 ref；`TransactionPublisher` 必须先续期 intent/lease，并对本次 snapshot 可达对象执行增量 `verify remote`。
 - 增量 verify 必须确认 snapshot、tree、file、chunk 或 pack index 引用的所有对象仍在远端可读；确认后才能重新进入最终 CAS。
 - pre-commit validation 还必须验证 snapshot parent chain 的远端 ancestor closure，不得发布 parent 在远端缺失的 snapshot。
 - CAS 冲突失败后，本地操作结果必须进入 `needs-rebase` 状态；再次 push 该快照或其子快照前，必须重新检查 parent chain 并补传缺失 ancestor。
-- 如果本次 push 产生新的 physical refs 或 pack refs，最终 ref CAS 前必须确认 layout root 已发布且 layout generation 未被其他 writer 覆盖。
-- ref CAS 和 layout root 发布必须形成可恢复的两阶段协议：对象可先上传，layout 可先发布，但 ref 不得指向 layout 不可解析的对象。
+- 如果本次 push 产生新的 physical refs 或 pack refs，`publish_ref` 前必须确认 layout root 已发布且 layout generation 未被其他 writer 覆盖。
+- ref CAS 和 layout root 发布必须由 `TransactionPublisher` 形成可恢复的两阶段协议：对象可先上传，layout 可先发布，但 ref 不得指向 layout 不可解析的对象。
 - Operation Journal 中的 `uploaded` 状态只能表示“曾经上传成功”，不能作为最终 ref 发布前对象仍存活的证明。
 
 远端 write intent：
@@ -1584,7 +1832,7 @@ read public.json
   -> rebuild local index
 ```
 
-### 6.9 Operation Journal
+### 6.12 Operation Journal
 
 职责：
 
@@ -1688,7 +1936,7 @@ WAL 规则：
 
 - P0-B。
 
-### 6.10 Upload Resume
+### 6.13 Upload Resume
 
 恢复流程：
 
@@ -1731,7 +1979,7 @@ jitter: true
 - chunk 可抽样 read-back。
 - 最终 CAS 前，snapshot 可达 manifest 和 chunk/pack 索引引用必须至少完成一次完整存在性校验。
 
-### 6.11 GC / Verify / Repair
+### 6.14 GC / Verify / Repair
 
 MVP：
 
@@ -1957,8 +2205,8 @@ e2v gc --execute --grace-period 30d
 阶段：
 
 - P2-A：Linux FUSE 只读。
-- P2-B：Windows WinFSP 只读。
-- P2-C：macOS macFUSE 只读。
+- P2-A2：Windows WinFSP 只读。
+- P2-A3：macOS macFUSE 只读。
 - P3：可写 VFS。
 
 为什么后置：
@@ -2329,7 +2577,7 @@ VFS 测试：
 
 ### 8.9 Format Boundary
 
-每个对象必须包含：
+每个加密对象 header 必须包含：
 
 ```text
 format_version
@@ -2337,8 +2585,17 @@ object_type
 crypto_suite
 key_epoch
 padding_policy
-chunker_config_id
 ```
+
+按对象类型进入 canonical plaintext schema 的字段：
+
+| 字段 | 必需对象 | 说明 |
+| --- | --- | --- |
+| `chunker_id` | `file` | 标识该文件版本使用的 chunker |
+| `chunker_config_id` | `file` | 标识 chunker 参数，参数变化必须改变该值 |
+| `path_policy` | `snapshot` 或 repo config | 固定 tree/path 解释规则 |
+| `layout_generation` | ref view、layout root、operation journal 或 read handle | 绑定读取/发布时使用的 layout generation；不得进入 immutable Snapshot DAG |
+| `schema_version` | 所有 manifest plaintext | 约束 canonical decoding，不允许隐式忽略未知字段 |
 
 仓库配置包含：
 
@@ -2363,6 +2620,9 @@ active_epoch
 ```text
 crates/
   e2v-core/
+    facade.rs
+    read_service.rs
+    working_tree.rs
     object/
     crypto/
     chunk/
@@ -2372,8 +2632,10 @@ crates/
 
   e2v-store/
     layout.rs
+    logical_object_store.rs
     blob_store.rs
     ref_store.rs
+    layout_root_store.rs
     capability.rs
     local_backend.rs
     opendal_backend.rs
@@ -2385,6 +2647,7 @@ crates/
     cas.rs
     journal.rs
     transaction.rs
+    publisher.rs
 
   e2v-index/
     sqlite.rs
@@ -2417,9 +2680,14 @@ crates/
 
 - `e2v-core` 不依赖具体存储后端。
 - `e2v-core` 不依赖 CLI/Web/VFS。
+- `e2v-core::facade` 是 CLI/Web/SDK 的主要入口；CLI 不直接调用底层 store 或 sync 模块。
+- `e2v-core::working_tree` 是唯一允许直接处理工作目录路径策略和 checkout 写入副作用的核心模块。
+- `e2v-core::read_service` 是 Web/HTTP/VFS/SDK 的统一只读入口。
 - `e2v-store` 不理解明文文件语义。
+- `e2v-store::logical_object_store` 封装 encode/hash/encrypt/decrypt/layout resolve，不把 physical refs 暴露给 ManifestStore。
 - `e2v-store` 必须通过 `StorageLayout` 暴露逻辑对象到物理对象的映射，不允许上层依赖远端路径规则。
-- `e2v-sync` 负责编排上传、下载和 ref 更新。
+- `e2v-sync` 负责编排上传、下载和 ref/layout 发布。
+- `e2v-sync::publisher` 是唯一允许组合 writer lease、write intent、layout root CAS 和 ref CAS 的模块。
 - `e2v-index` 可删除重建。
 - `e2v-vfs` 只能依赖稳定 read/browse API。
 - `e2v-api` 不绕过编排层。
@@ -2433,6 +2701,9 @@ crates/
 | CPU 并行 | rayon / blocking pool | MVP/P1 | hash/encrypt/chunking |
 | 后端抽象 | opendal | MVP | S3/WebDAV/local 等适配 |
 | 存储布局 | StorageLayout | MVP/P1/P3 | direct / pack / rewrite / ORAM layout |
+| 逻辑对象读写 | LogicalObjectStore | P0-A | 封装 encode/hash/encrypt/decrypt/layout resolve |
+| 只读访问服务 | ReadService | P0-A/P0-C/P2 | 统一 Web/HTTP/VFS/SDK 的 snapshot/dir/file/range 读取 |
+| 发布协议 | TransactionPublisher | P0-B/P1/P3 | 统一 write intent、layout root CAS、ref CAS 和恢复 |
 | 后端写者模式 | CAS / single-writer + writer lease | P0-B | 无 CAS 后端禁止多写者，single-writer 必须有远端 lease |
 | CDC | fastcdc | MVP | 通用内容定义切块 |
 | Chunking Policy | profile + dedup stats | P1 | 处理高熵和大二进制退化 |
@@ -2506,6 +2777,10 @@ crates/
     -> 平台快照优先；读前/读后 metadata 校验；变化则丢弃临时对象并重试或报错
   - 未认证明文提前暴露到本地或 VFS/HTTP
     -> chunk/内部段级认证；临时输出；认证失败清理并拒绝发布
+  - P0 CLI 直连底层模块导致 Web/VFS/SDK 反向重构
+    -> P0-A 前置 Repository Facade、WorkingTree、LogicalObjectStore、ReadService；CLI 只调用 facade
+  - layout root 与 ref 发布协议散落导致不可恢复状态
+    -> P0-B 引入 TransactionPublisher，统一 writer lease、write intent、layout root CAS、ref CAS 和 recovery
 
 中高风险
   - JSON 大 Journal 导致内存和 I/O 爆炸
@@ -2517,7 +2792,7 @@ crates/
   - P3 历史强撤销或 ORAM 推翻 P0/P1 存储设计
     -> P0 引入 StorageLayout；核心只依赖 ObjectId；GC/VFS/pack 只通过 layout 解析 physical refs
   - 单级巨型目录导致 manifest 内存爆炸
-    -> Tree Sharding / max manifest size / streaming tree walk
+    -> Tree Sharding / max manifest size / streaming tree walk；若 MVP 覆盖 100k+ 小文件则 P0 前置
   - 小对象数量爆炸
     -> packfile
   - 高熵或压缩数据导致 CDC 去重退化
@@ -2565,6 +2840,10 @@ crates/
 | 源文件一致性 | 大文件优先平台快照；否则读前/读后 metadata 校验 |
 | 解密认证边界 | 未完成 AEAD 验证的明文不得暴露到最终输出或响应 |
 | StorageLayout | MVP 引入 direct layout，禁止核心依赖远端物理路径 |
+| Repository Facade | P0-A 前置，CLI/Web/SDK 不直接调用底层模块 |
+| WorkingTree | P0-A 前置，统一 scan、路径策略、源文件一致性和 checkout 写入 |
+| LogicalObjectStore | P0-A 前置，封装逻辑对象 encode/hash/encrypt/decrypt/layout resolve |
+| ReadService | P0-A 前置内部 API，P0-C Web/HTTP 复用，P2 VFS 复用 |
 | 本地索引 | P1 实现 SQLite + FTS5 |
 
 ### 13.2 P0-B 前
@@ -2581,6 +2860,8 @@ crates/
 | read-back 校验 | snapshot/ref 必须；最终 CAS 前校验可达对象存在性 |
 | ancestor closure | push 前验证 parent chain 远端完整，CAS 失败 snapshot 标记 needs-rebase |
 | unpublished snapshot GC | 无 ref snapshot 使用 >=30d grace period，并保留其 ancestor |
+| TransactionPublisher | P0-B 前置，统一 writer lease、write intent、layout root CAS、ref CAS 和恢复 |
+| layout root | direct layout 也必须有 root 和 generation，P1/P3 复用发布协议 |
 
 ### 13.3 P1 前
 
@@ -2588,7 +2869,7 @@ crates/
 | --- | --- |
 | packfile | 加密整体 pack |
 | pack index | 不可变 segment + 本地 cache + compaction；索引指向 physical refs 而不是远端路径 |
-| Tree Sharding | P1 必须实现；若 MVP 覆盖十万级小文件则前置 |
+| Tree Sharding | P1 必须实现；若 MVP 覆盖十万级小文件则 P0-A 前置 |
 | Chunking Policy | 增加 large-binary profile 和 dedup stats |
 | SQLite 路径索引 | 允许本地保存路径信息；manifest cache DB 加密；明确隐私影响 |
 | 路径 token 索引 | P1 实现；仓库启用时记录隐私降级 |
