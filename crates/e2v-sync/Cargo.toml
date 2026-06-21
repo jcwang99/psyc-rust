@@ -1,0 +1,15 @@
+[package]
+name = "e2v-sync"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+e2v-core = { path = "../e2v-core" }
+e2v-store = { path = "../e2v-store" }
+
+[dev-dependencies]
+tempfile.workspace = true
