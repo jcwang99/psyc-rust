@@ -247,6 +247,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "e2v-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "e2v-core",
+ "e2v-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
