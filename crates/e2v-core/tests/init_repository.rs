@@ -1,0 +1,2058 @@
+use std::fs;
+
+use anyhow::Result;
+use e2v_core::{CheckoutOptions, CommitOptions, InitOptions, ManifestObject, ManifestStore, ManifestStoreApi, RepositoryFacade, TreeWalkEntry};
+use e2v_core::testing::{with_snapshot_reader_and_policy_for_test, with_snapshot_reader_for_test, with_stable_read_policy_for_test, StableReadPolicy, TestSnapshotReader};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tempfile::tempdir;
+
+fn init_options(repo_root: &std::path::Path) -> InitOptions {
+    InitOptions {
+        repo_root: repo_root.to_path_buf(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    }
+}
+
+trait StreamingTreeWalkTestExt {
+    fn walk_tree_streaming_for_test(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Box<dyn Iterator<Item = Result<TreeWalkEntry>>>>;
+}
+
+impl StreamingTreeWalkTestExt for ManifestStore {
+    fn walk_tree_streaming_for_test(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Box<dyn Iterator<Item = Result<TreeWalkEntry>>>> {
+        Ok(Box::new(self.walk_tree_iter(snapshot_id)?))
+    }
+}
+
+#[test]
+fn init_creates_control_plane_files_for_local_direct_layout() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade.init(init_options(&repo_root)).unwrap();
+
+    assert_eq!(state.layout_generation, 1);
+    assert_eq!(state.branch.name, "main");
+    assert!(!state.branch.token_hex.is_empty());
+
+    let e2v_dir = repo_root.join(".e2v");
+    assert!(e2v_dir.exists(), "expected control directory to exist");
+    assert!(e2v_dir.join("objects").is_dir(), "expected objects directory");
+    assert!(e2v_dir.join("journal").is_dir(), "expected journal directory");
+    assert!(e2v_dir.join("config.json").is_file(), "expected config file");
+    assert!(e2v_dir.join("layout_root.json").is_file(), "expected layout root file");
+    assert!(e2v_dir.join("refs").join("default.json").is_file(), "expected default ref file");
+    assert!(e2v_dir.join("keyring").join("keyring.current").is_file(), "expected current keyring pointer");
+    assert!(e2v_dir.join("keyring").join("keyring.1").is_file(), "expected first keyring generation");
+    let leftover_temps = fs::read_dir(e2v_dir.join("keyring"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(
+        leftover_temps.is_empty(),
+        "expected no leftover temp files, found {leftover_temps:?}"
+    );
+
+    let control_plane_leftovers = fs::read_dir(&e2v_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(
+        control_plane_leftovers.is_empty(),
+        "expected no leftover control-plane temp files, found {control_plane_leftovers:?}"
+    );
+}
+
+#[test]
+fn init_persists_openable_repository_state() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+    let opened = facade.open(&repo_root).unwrap();
+
+    assert_eq!(opened, created);
+}
+
+#[test]
+fn keyring_generation_does_not_store_plaintext_repo_keys() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let keyring_bytes = fs::read(repo_root.join(".e2v").join("keyring").join("keyring.1")).unwrap();
+    let keyring_text = String::from_utf8_lossy(&keyring_bytes);
+
+    assert!(!keyring_text.contains("repo_dedup_key_hex"));
+    assert!(!keyring_text.contains("repo_ref_key_hex"));
+    assert!(!keyring_text.contains("repo_manifest_enc_key_hex"));
+    assert!(!keyring_text.contains("repo_nonce_key_hex"));
+}
+
+#[test]
+fn wrong_password_cannot_unlock_keyring() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let error = facade
+        .unlock(
+            &repo_root,
+            "totally wrong password",
+        )
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("password")
+            || error.to_string().contains("unlock")
+            || error.to_string().contains("keyring"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn change_password_rotates_keyring_generation_and_requires_new_password() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    let keyring_dir = repo_root.join(".e2v").join("keyring");
+    assert!(keyring_dir.join("keyring.1").is_file());
+    assert!(keyring_dir.join("keyring.2").is_file());
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(keyring_dir.join("keyring.current")).unwrap()).unwrap();
+    assert_eq!(pointer["current"].as_str(), Some("keyring.2"));
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let old_error = facade
+        .unlock(&repo_root, "correct horse battery staple")
+        .unwrap_err();
+    assert!(
+        old_error.to_string().contains("wrong password")
+            || old_error.to_string().contains("unlock")
+            || old_error.to_string().contains("keyring"),
+        "unexpected error: {old_error:#}"
+    );
+
+    let reopened = facade
+        .unlock(&repo_root, "new horse battery staple")
+        .unwrap();
+
+    assert_eq!(reopened.repo_root, created.repo_root);
+    assert_eq!(reopened.branch.name, created.branch.name);
+}
+
+#[test]
+fn change_password_rejects_wrong_old_password_without_side_effects() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let error = facade
+        .change_password(
+            &repo_root,
+            "definitely wrong password",
+            "new horse battery staple",
+        )
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("wrong password")
+            || error.to_string().contains("unlock")
+            || error.to_string().contains("keyring"),
+        "unexpected error: {error:#}"
+    );
+    assert!(!repo_root.join(".e2v").join("keyring").join("keyring.2").exists());
+    assert!(!repo_root.join(".e2v").join("journal").join("keyring-update.json").exists());
+}
+
+#[test]
+fn unlock_recovers_interrupted_keyring_pointer_publish() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let keyring_current = repo_root.join(".e2v").join("keyring").join("keyring.current");
+    let journal_path = repo_root.join(".e2v").join("journal").join("keyring-update.json");
+    let pointer_one: serde_json::Value =
+        serde_json::from_slice(&fs::read(&keyring_current).unwrap()).unwrap();
+    assert_eq!(pointer_one["current"].as_str(), Some("keyring.1"));
+    let facade_for_change = RepositoryFacade::new();
+    facade_for_change
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    fs::write(
+        &keyring_current,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 1u64,
+            "current": "keyring.1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &journal_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 2u64,
+            "current": "keyring.2",
+            "stage": "writing_pointer"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let reopened = facade
+        .unlock(&repo_root, "new horse battery staple")
+        .unwrap();
+
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(&keyring_current).unwrap()).unwrap();
+    assert_eq!(pointer["current"].as_str(), Some("keyring.2"));
+    assert!(!journal_path.exists());
+    assert_eq!(reopened.branch.name, "main");
+}
+
+#[test]
+fn unlock_recovers_when_generation_exists_but_journal_is_still_writing_generation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let keyring_current = repo_root.join(".e2v").join("keyring").join("keyring.current");
+    let journal_path = repo_root.join(".e2v").join("journal").join("keyring-update.json");
+    let pointer_one: serde_json::Value =
+        serde_json::from_slice(&fs::read(&keyring_current).unwrap()).unwrap();
+    assert_eq!(pointer_one["current"].as_str(), Some("keyring.1"));
+
+    RepositoryFacade::new()
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    fs::write(
+        &keyring_current,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 1u64,
+            "current": "keyring.1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &journal_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 2u64,
+            "current": "keyring.2",
+            "stage": "writing_generation"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let reopened = facade
+        .unlock(&repo_root, "new horse battery staple")
+        .unwrap();
+
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(&keyring_current).unwrap()).unwrap();
+    assert_eq!(pointer["current"].as_str(), Some("keyring.2"));
+    assert!(!journal_path.exists());
+    assert_eq!(reopened.branch.name, "main");
+}
+
+#[test]
+fn unlock_restores_access_after_fresh_process_lock_state() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let open_error = facade.open(&repo_root).unwrap_err();
+    assert!(
+        open_error.to_string().contains("locked")
+            || open_error.to_string().contains("unlock")
+            || open_error.to_string().contains("keyring"),
+        "unexpected error: {open_error:#}"
+    );
+
+    let reopened = facade
+        .unlock(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    assert_eq!(reopened, created);
+}
+
+#[test]
+fn commit_prefers_snapshot_reader_for_large_file_input() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let snapshot_bytes = vec![b'S'; 9 * 1024 * 1024];
+    let disk_bytes = vec![b'D'; 9 * 1024 * 1024];
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let facade = with_snapshot_reader_for_test(Arc::new(TestSnapshotReader {
+        result: Ok(snapshot_bytes.clone()),
+        calls: Arc::clone(&calls),
+    }));
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("large.txt"), &disk_bytes).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot-preferred".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.txt").unwrap();
+    let content = read_service.read_range(&file, 0, snapshot_bytes.len()).unwrap();
+
+    assert_eq!(content, snapshot_bytes);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn commit_falls_back_to_disk_when_snapshot_reader_fails() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let snapshot_bytes = vec![b'S'; 9 * 1024 * 1024];
+    let disk_bytes = vec![b'D'; 9 * 1024 * 1024];
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let facade = with_snapshot_reader_for_test(Arc::new(TestSnapshotReader {
+        result: Err("snapshot unavailable".to_string()),
+        calls: Arc::clone(&calls),
+    }));
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("large.txt"), &disk_bytes).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot-fallback".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.txt").unwrap();
+    let content = read_service.read_range(&file, 0, disk_bytes.len()).unwrap();
+
+    assert_eq!(content, disk_bytes);
+    assert_ne!(content, snapshot_bytes);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn commit_honors_custom_volatile_retry_budget_on_real_unstable_file() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = with_stable_read_policy_for_test(StableReadPolicy {
+        metadata_retry_attempts: 2,
+        volatile_retry_attempts: 1,
+    });
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let file_path = repo_root.join("large.txt");
+    fs::write(&file_path, vec![b'A'; 9 * 1024 * 1024]).unwrap();
+    let keep_writing = Arc::new(AtomicBool::new(true));
+    let writer_flag = Arc::clone(&keep_writing);
+    let writer_path = file_path.clone();
+    let writer = std::thread::spawn(move || {
+        let mut toggle = false;
+        while writer_flag.load(Ordering::SeqCst) {
+            let fill = if toggle { b'B' } else { b'C' };
+            let _ = fs::write(&writer_path, vec![fill; 9 * 1024 * 1024]);
+            toggle = !toggle;
+        }
+    });
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "volatile-budget".to_string(),
+        })
+        .unwrap();
+
+    keep_writing.store(false, Ordering::SeqCst);
+    let _ = writer.join();
+
+    assert_eq!(commit.committed_files, 0);
+    assert_eq!(commit.warnings.len(), 1);
+    assert!(commit.warnings[0].contains("large.txt"));
+    assert!(
+        commit.warnings[0].contains("unstable") || commit.warnings[0].contains("skipped"),
+        "unexpected warning: {}",
+        commit.warnings[0]
+    );
+}
+
+#[test]
+fn commit_can_use_snapshot_reader_and_custom_stable_read_policy_together() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let snapshot_bytes = vec![b'S'; 9 * 1024 * 1024];
+    let disk_bytes = vec![b'D'; 9 * 1024 * 1024];
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let facade = with_snapshot_reader_and_policy_for_test(
+        Arc::new(TestSnapshotReader {
+            result: Ok(snapshot_bytes.clone()),
+            calls: Arc::clone(&calls),
+        }),
+        StableReadPolicy {
+            metadata_retry_attempts: 5,
+            volatile_retry_attempts: 1,
+        },
+    );
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("large.txt"), &disk_bytes).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "combined-facade-options".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.txt").unwrap();
+    let content = read_service.read_range(&file, 0, snapshot_bytes.len()).unwrap();
+
+    assert_eq!(content, snapshot_bytes);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn clearing_test_unlock_cache_only_evicts_the_requested_repo() {
+    let temp = tempdir().unwrap();
+    let repo_root_a = temp.path().join("repo-a");
+    let repo_root_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_root_a).unwrap();
+    fs::create_dir_all(&repo_root_b).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created_a = facade.init(init_options(&repo_root_a)).unwrap();
+    let created_b = facade.init(init_options(&repo_root_b)).unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root_a.join(".e2v"));
+
+    let open_error = facade.open(&repo_root_a).unwrap_err();
+    assert!(
+        open_error.to_string().contains("locked")
+            || open_error.to_string().contains("unlock")
+            || open_error.to_string().contains("keyring"),
+        "unexpected error: {open_error:#}"
+    );
+
+    let opened_b = facade.open(&repo_root_b).unwrap();
+
+    assert_eq!(opened_b, created_b);
+    let reopened_a = facade
+        .unlock(&repo_root_a, "correct horse battery staple")
+        .unwrap();
+    assert_eq!(reopened_a, created_a);
+}
+
+#[test]
+fn init_uses_the_requested_default_branch_for_ref_state() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "trunk".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(state.branch.name, "trunk");
+    let opened = facade.open(&repo_root).unwrap();
+    assert_eq!(opened.branch.name, "trunk");
+}
+
+#[test]
+fn init_rejects_non_empty_repository_directory() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::write(repo_root.join("hello.txt"), "world").unwrap();
+
+    let facade = RepositoryFacade::new();
+    let error = facade.init(init_options(&repo_root)).unwrap_err();
+
+    assert!(
+        error.to_string().contains("empty"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn commit_writes_snapshot_and_updates_default_ref() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "initial snapshot".to_string(),
+        })
+        .unwrap();
+
+    assert!(!commit.snapshot_id.is_empty());
+    assert_eq!(commit.committed_files, 1);
+    assert_eq!(commit.new_bytes, "hello world".len() as u64);
+    assert_eq!(commit.reused_bytes, 0);
+
+    let objects_dir = repo_root.join(".e2v").join("objects");
+    let object_files = fs::read_dir(&objects_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(
+        object_files.len() >= 4,
+        "expected chunk/file/tree/snapshot objects, found {object_files:?}"
+    );
+
+    let snapshots = facade.snapshots(&repo_root).unwrap();
+    assert_eq!(snapshots[0].snapshot_id, commit.snapshot_id);
+}
+
+#[test]
+fn commit_ignores_control_plane_directory_contents() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "tracked").unwrap();
+    fs::write(repo_root.join(".e2v").join("ignore-me.txt"), "control").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "ignore control plane".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(commit.committed_files, 1);
+}
+
+#[test]
+fn second_commit_links_to_previous_snapshot_as_parent() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "v1").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "v2").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let snapshots = facade.snapshots(&repo_root).unwrap();
+
+    assert_eq!(snapshots[0].snapshot_id, second.snapshot_id);
+    assert_eq!(snapshots[0].parent_snapshot_id.as_deref(), Some(first.snapshot_id.as_str()));
+}
+
+#[test]
+fn repeated_identical_commit_reports_reused_bytes() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "same-content").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(first.reused_bytes, 0);
+    assert_eq!(first.new_bytes, "same-content".len() as u64);
+    assert_eq!(second.new_bytes, 0);
+    assert_eq!(second.reused_bytes, "same-content".len() as u64);
+}
+
+#[test]
+fn snapshots_lists_latest_commit_first() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "v1").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "v2").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let snapshots = facade.snapshots(&repo_root).unwrap();
+
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].snapshot_id, second.snapshot_id);
+    assert_eq!(snapshots[0].message, "second");
+    assert_eq!(snapshots[1].message, "first");
+}
+
+#[test]
+fn read_service_reads_directory_and_file_content_from_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let entries = read_service.read_dir(&snapshot, "").unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "hello.txt");
+    assert_eq!(entries[0].kind, "file");
+
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    assert_eq!(file.layout_generation(), snapshot.layout_generation);
+    assert_eq!(file.crypto_suite(), "xchacha20poly1305");
+    assert_eq!(file.key_epoch(), 1);
+    assert_eq!(file.chunker_id(), "fastcdc");
+    let content = read_service.read_range(&file, 0, 5).unwrap();
+
+    assert_eq!(String::from_utf8(content).unwrap(), "hello");
+}
+
+#[test]
+fn read_service_clamps_ranges_that_extend_past_end_of_file() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let content = read_service.read_range(&file, 6, 99).unwrap();
+
+    assert_eq!(String::from_utf8(content).unwrap(), "world");
+}
+
+#[test]
+fn read_service_can_browse_nested_directories_and_files() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "nested".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let root_entries = read_service.read_dir(&snapshot, "").unwrap();
+
+    assert_eq!(root_entries.len(), 1);
+    assert_eq!(root_entries[0].name, "nested");
+    assert_eq!(root_entries[0].kind, "tree");
+
+    let nested_entries = read_service.read_dir(&snapshot, "nested").unwrap();
+    assert_eq!(nested_entries.len(), 1);
+    assert_eq!(nested_entries[0].name, "hello.txt");
+    assert_eq!(nested_entries[0].kind, "file");
+
+    let file = read_service.open_file(&snapshot, "nested/hello.txt").unwrap();
+    let content = read_service.read_range(&file, 0, 99).unwrap();
+    assert_eq!(String::from_utf8(content).unwrap(), "hello nested");
+}
+
+#[test]
+fn read_service_normalizes_decomposed_unicode_paths() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let decomposed = format!("e\u{301}.txt");
+    fs::write(repo_root.join(&decomposed), "hello unicode").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "unicode".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, &decomposed).unwrap();
+    let content = read_service.read_range(&file, 0, 99).unwrap();
+
+    assert_eq!(String::from_utf8(content).unwrap(), "hello unicode");
+}
+
+#[test]
+fn unicode_name_scan_checkout_scan_is_idempotent() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let decomposed = format!("e\u{301}.txt");
+    fs::write(repo_root.join(&decomposed), "hello unicode").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "unicode".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+
+    let checkout_names = std::fs::read_dir(&checkout_target)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some(".e2v-checkout-mapping.json") {
+                None
+            } else {
+                Some(entry.file_name().to_string_lossy().to_string())
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(checkout_names.len(), 1);
+
+    let working_tree = e2v_core::testing::new_working_tree_for_test(&checkout_target);
+    let scanned = working_tree.scan_dir(&checkout_target, true).unwrap();
+    let scanned_names = scanned.into_iter().map(|entry| entry.name).collect::<Vec<_>>();
+
+    assert_eq!(scanned_names, vec!["\u{e9}.txt".to_string()]);
+}
+
+#[test]
+fn checkout_restores_snapshot_into_target_directory() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(checkout_target.join("root.txt")).unwrap(),
+        "root"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout_target.join("nested").join("hello.txt")).unwrap(),
+        "hello nested"
+    );
+    let mapping_path = checkout_target.join(".e2v-checkout-mapping.json");
+    let mapping = fs::read_to_string(mapping_path).unwrap();
+    assert!(mapping.contains("root.txt"));
+    assert!(mapping.contains("nested/hello.txt"));
+}
+
+#[test]
+fn commit_ignores_local_checkout_mapping_artifact() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+    fs::write(
+        repo_root.join(".e2v-checkout-mapping.json"),
+        r#"[{"snapshot_path":"root.txt","local_path":"C:\\demo\\root.txt"}]"#,
+    )
+    .unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let entries = read_service.read_dir(&snapshot, "").unwrap();
+
+    assert!(entries.iter().any(|entry| entry.name == "root.txt"));
+    assert!(!entries.iter().any(|entry| entry.name == ".e2v-checkout-mapping.json"));
+}
+
+#[test]
+fn checkout_does_not_restore_control_plane_directory() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+
+    facade
+        .checkout(CheckoutOptions {
+            repo_root,
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+
+    assert!(!checkout_target.join(".e2v").exists());
+}
+
+#[test]
+fn checkout_rejects_conflicts_with_existing_directories() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(checkout_target.join("root.txt")).unwrap();
+
+    let error = facade
+        .checkout(CheckoutOptions {
+            repo_root,
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target,
+        })
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("checkout conflict"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn checkout_preflights_all_paths_before_writing_any_files() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("z-nested")).unwrap();
+    fs::write(repo_root.join("a-root.txt"), "root").unwrap();
+    fs::write(repo_root.join("z-nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(checkout_target.join("z-nested").join("hello.txt")).unwrap();
+
+    let error = facade
+        .checkout(CheckoutOptions {
+            repo_root,
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("checkout conflict"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !checkout_target.join("a-root.txt").exists(),
+        "checkout wrote files before preflight completed"
+    );
+}
+
+#[test]
+fn checkout_rejects_parent_path_file_conflicts_before_writing_any_files() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+    fs::write(checkout_target.join("nested"), "blocking-file").unwrap();
+
+    let error = facade
+        .checkout(CheckoutOptions {
+            repo_root,
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("checkout conflict"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !checkout_target.join("root.txt").exists(),
+        "checkout wrote files before parent-path preflight completed"
+    );
+    assert!(
+        !checkout_target.join("nested").join("hello.txt").exists(),
+        "checkout wrote nested files despite parent path conflict"
+    );
+}
+
+#[test]
+fn checkout_does_not_publish_any_files_until_all_reads_verify() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("a-first.txt"), "first").unwrap();
+    fs::write(repo_root.join("z-second.txt"), "second").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let bad_file = read_service.open_file(&snapshot, "z-second.txt").unwrap();
+    let bad_chunk_id = bad_file.debug_chunk_ids()[0].clone();
+    let bad_chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{bad_chunk_id}.json"));
+    let mut bytes = fs::read(&bad_chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&bad_chunk_path, bytes).unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+
+    let error = facade
+        .checkout(CheckoutOptions {
+            repo_root,
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !checkout_target.join("a-first.txt").exists(),
+        "checkout published early files before all reads verified"
+    );
+    let leftover_temps = fs::read_dir(&checkout_target)
+        .unwrap()
+        .flat_map(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                vec![path]
+            } else {
+                fs::read_dir(path)
+                    .unwrap()
+                    .map(|child| child.unwrap().path())
+                    .collect::<Vec<_>>()
+            }
+        })
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("e2v-tmp"))
+        .collect::<Vec<_>>();
+    assert!(
+        leftover_temps.is_empty(),
+        "expected no leftover temp files, found {leftover_temps:?}"
+    );
+}
+
+#[test]
+fn commit_uses_repo_scoped_snapshot_ids_for_identical_content() {
+    let temp = tempdir().unwrap();
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::create_dir_all(&repo_b).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_a)).unwrap();
+    facade.init(init_options(&repo_b)).unwrap();
+
+    fs::write(repo_a.join("hello.txt"), "same-content").unwrap();
+    fs::write(repo_b.join("hello.txt"), "same-content").unwrap();
+
+    let left = facade
+        .commit(CommitOptions {
+            repo_root: repo_a,
+            message: "same-message".to_string(),
+        })
+        .unwrap();
+    let right = facade
+        .commit(CommitOptions {
+            repo_root: repo_b,
+            message: "same-message".to_string(),
+        })
+        .unwrap();
+
+    assert_ne!(left.snapshot_id, right.snapshot_id);
+}
+
+#[test]
+fn commit_uses_repo_scoped_chunk_ids_for_identical_content() {
+    let temp = tempdir().unwrap();
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::create_dir_all(&repo_b).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_a)).unwrap();
+    facade.init(init_options(&repo_b)).unwrap();
+
+    fs::write(repo_a.join("hello.txt"), "same-content").unwrap();
+    fs::write(repo_b.join("hello.txt"), "same-content").unwrap();
+
+    let left = facade
+        .commit(CommitOptions {
+            repo_root: repo_a.clone(),
+            message: "same-message".to_string(),
+        })
+        .unwrap();
+    let right = facade
+        .commit(CommitOptions {
+            repo_root: repo_b.clone(),
+            message: "same-message".to_string(),
+        })
+        .unwrap();
+
+    let left_read_service = facade.read_service(&repo_a).unwrap();
+    let left_snapshot = left_read_service.open_snapshot(&left.snapshot_id).unwrap();
+    let left_file = left_read_service.open_file(&left_snapshot, "hello.txt").unwrap();
+
+    let right_read_service = facade.read_service(&repo_b).unwrap();
+    let right_snapshot = right_read_service.open_snapshot(&right.snapshot_id).unwrap();
+    let right_file = right_read_service.open_file(&right_snapshot, "hello.txt").unwrap();
+
+    assert_ne!(left_file.debug_chunk_ids()[0], right_file.debug_chunk_ids()[0]);
+}
+
+#[test]
+fn committed_objects_do_not_store_plaintext_file_or_path_bytes() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "plain-check".to_string(),
+        })
+        .unwrap();
+
+    let object_bytes = fs::read_dir(repo_root.join(".e2v").join("objects"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+
+    for bytes in object_bytes {
+        assert!(
+            !bytes.windows(b"hello world".len()).any(|window| window == b"hello world"),
+            "object bytes leaked file content"
+        );
+        assert!(
+            !bytes.windows(b"hello.txt".len()).any(|window| window == b"hello.txt"),
+            "object bytes leaked file name"
+        );
+    }
+}
+
+#[test]
+fn read_service_rejects_tampered_snapshot_objects() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tamper".to_string(),
+        })
+        .unwrap();
+
+    let snapshot_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", commit.snapshot_id));
+    let mut bytes = fs::read(&snapshot_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&snapshot_path, bytes).unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let error = read_service.open_snapshot(&commit.snapshot_id).unwrap_err();
+
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn local_default_ref_does_not_store_plaintext_branch_or_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(InitOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "trunk".to_string(),
+    })
+    .unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let ref_bytes = fs::read(repo_root.join(".e2v").join("refs").join("default.json")).unwrap();
+    assert!(
+        !ref_bytes.windows(b"trunk".len()).any(|window| window == b"trunk"),
+        "ref bytes leaked branch name"
+    );
+    assert!(
+        !ref_bytes
+            .windows(commit.snapshot_id.len())
+            .any(|window| window == commit.snapshot_id.as_bytes()),
+        "ref bytes leaked snapshot id"
+    );
+}
+
+#[test]
+fn read_service_can_resolve_current_snapshot_from_branch_token() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.resolve_branch(&state.branch.token_hex).unwrap();
+
+    assert_eq!(snapshot.snapshot_id, commit.snapshot_id);
+}
+
+#[test]
+fn large_files_are_split_into_multiple_chunks() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let mut large_bytes = Vec::with_capacity(9_000_000);
+    for i in 0..9_000_000usize {
+        large_bytes.push((i % 251) as u8);
+    }
+    fs::write(repo_root.join("large.txt"), &large_bytes).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "large-file".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.txt").unwrap();
+
+    assert!(
+        file.chunk_count() > 1,
+        "expected large file to span multiple chunks, got {}",
+        file.chunk_count()
+    );
+
+    let read_back = read_service.read_range(&file, 0, large_bytes.len()).unwrap();
+    assert_eq!(read_back, large_bytes);
+}
+
+#[test]
+fn middle_insertion_only_adds_local_chunks() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let mut original_bytes = Vec::with_capacity(20_000_000);
+    for i in 0..20_000_000usize {
+        original_bytes.push((i % 251) as u8);
+    }
+    fs::write(repo_root.join("large.txt"), &original_bytes).unwrap();
+
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "large-file-v1".to_string(),
+        })
+        .unwrap();
+
+    let middle = original_bytes.len() / 2;
+    let mut updated_bytes = original_bytes[..middle].to_vec();
+    updated_bytes.extend(std::iter::repeat_n(b'Z', 4096));
+    updated_bytes.extend_from_slice(&original_bytes[middle..]);
+    fs::write(repo_root.join("large.txt"), &updated_bytes).unwrap();
+
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "large-file-v2".to_string(),
+        })
+        .unwrap();
+
+    assert!(second.reused_bytes > 0);
+    assert!(
+        second.new_bytes < first.new_bytes,
+        "expected local chunk reuse, first new_bytes={}, second new_bytes={}",
+        first.new_bytes,
+        second.new_bytes
+    );
+    assert!(
+        second.reused_bytes >= 8 * 1024 * 1024,
+        "expected meaningful chunk reuse, reused_bytes={}",
+        second.reused_bytes
+    );
+}
+
+#[test]
+fn verify_snapshot_accepts_a_healthy_local_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify".to_string(),
+        })
+        .unwrap();
+
+    facade.verify_snapshot(&repo_root, &commit.snapshot_id).unwrap();
+}
+
+#[test]
+fn verify_ref_accepts_a_healthy_local_default_ref() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-ref".to_string(),
+        })
+        .unwrap();
+
+    facade.verify_ref(&repo_root).unwrap();
+}
+
+#[test]
+fn verify_ref_rejects_tampered_local_default_ref() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-ref".to_string(),
+        })
+        .unwrap();
+
+    let ref_path = repo_root.join(".e2v").join("refs").join("default.json");
+    let mut bytes = fs::read(&ref_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&ref_path, bytes).unwrap();
+
+    let error = facade.verify_ref(&repo_root).unwrap_err();
+    assert!(
+        error.to_string().contains("authentication")
+            || error.to_string().contains("format")
+            || error.to_string().contains("ref"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn verify_ref_rejects_when_head_snapshot_is_tampered() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-ref-head".to_string(),
+        })
+        .unwrap();
+
+    let snapshot_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", commit.snapshot_id));
+    let mut bytes = fs::read(&snapshot_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&snapshot_path, bytes).unwrap();
+
+    let error = facade.verify_ref(&repo_root).unwrap_err();
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn verify_snapshot_rejects_tampered_reachable_chunk() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{chunk_id}.json"));
+    let mut bytes = fs::read(&chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&chunk_path, bytes).unwrap();
+
+    let error = facade.verify_snapshot(&repo_root, &commit.snapshot_id).unwrap_err();
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn checkout_rejects_tampered_chunk_and_leaves_no_dirty_files() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "checkout-tamper".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{chunk_id}.json"));
+    let mut bytes = fs::read(&chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&chunk_path, bytes).unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+
+    let error = facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+    assert!(!checkout_target.join("hello.txt").exists());
+    let leftover_temps = fs::read_dir(&checkout_target)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("e2v-tmp"))
+        .collect::<Vec<_>>();
+    assert!(
+        leftover_temps.is_empty(),
+        "expected no leftover temp files, found {leftover_temps:?}"
+    );
+}
+
+#[test]
+fn read_range_rejects_tampered_chunk_before_returning_bytes() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "range-tamper".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{chunk_id}.json"));
+    let mut bytes = fs::read(&chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&chunk_path, bytes).unwrap();
+
+    let error = read_service.read_range(&file, 0, 5).unwrap_err();
+
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn traversal_rejects_tampered_tree_objects() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tamper-tree".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let manifest_store = ManifestStore::new(&repo_root);
+    let manifest_snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let root_tree_id = manifest_snapshot.root_tree_id;
+    let tree_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{root_tree_id}.json"));
+    let mut bytes = fs::read(&tree_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&tree_path, bytes).unwrap();
+
+    let error = read_service.read_dir(&snapshot, "").unwrap_err();
+
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn large_directories_are_committed_and_readable_via_tree_sharding() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    for index in 0..4100usize {
+        fs::write(repo_root.join(format!("file-{index:04}.txt")), b"x").unwrap();
+    }
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "sharded-directory".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let entries = read_service.read_dir(&snapshot, "").unwrap();
+    let walked = ManifestStore::new(&repo_root)
+        .walk_tree(&commit.snapshot_id)
+        .unwrap();
+
+    assert!(
+        entries.len() >= 4100,
+        "expected sharded read_dir to expose all directory entries"
+    );
+    assert_eq!(walked.len(), 4100);
+}
+
+#[cfg(windows)]
+#[test]
+fn commit_skips_locked_files_and_reports_warning() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("good.txt"), "good").unwrap();
+    fs::write(repo_root.join("locked.txt"), "locked").unwrap();
+
+    let _locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(repo_root.join("locked.txt"))
+        .unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "skip-locked".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(commit.committed_files, 1);
+    assert_eq!(commit.warnings.len(), 1);
+    assert!(commit.warnings[0].contains("locked.txt"));
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let entries = read_service.read_dir(&snapshot, "").unwrap();
+    assert!(entries.iter().any(|entry| entry.name == "good.txt"));
+    assert!(!entries.iter().any(|entry| entry.name == "locked.txt"));
+}
+
+#[test]
+fn verify_object_accepts_a_healthy_chunk() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-object".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+
+    facade.verify_object(&repo_root, &chunk_id, "chunk").unwrap();
+}
+
+#[test]
+fn verify_object_rejects_tampered_chunk() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-object".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{chunk_id}.json"));
+    let mut bytes = fs::read(&chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&chunk_path, bytes).unwrap();
+
+    let error = facade.verify_object(&repo_root, &chunk_id, "chunk").unwrap_err();
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+}
+
+
+#[test]
+fn manifest_store_walks_nested_tree_entries() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "manifest".to_string(),
+        })
+        .unwrap();
+
+    let store = ManifestStore::new(&repo_root);
+    let entries = store.walk_tree(&commit.snapshot_id).unwrap();
+
+    assert!(entries.iter().any(|entry| entry.path == "nested/hello.txt" && entry.kind == "file"));
+}
+
+#[test]
+fn manifest_store_can_fetch_snapshot_tree_and_file_manifests() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "manifest".to_string(),
+        })
+        .unwrap();
+
+    let store = ManifestStore::new(&repo_root);
+    let snapshot = store.get_snapshot(&commit.snapshot_id).unwrap();
+    let tree = store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let file_entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "nested" && entry.kind == "tree")
+        .unwrap();
+    let nested_tree = store.get_tree_node(&file_entry.object_id).unwrap();
+    let nested_file_entry = nested_tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "hello.txt" && entry.kind == "file")
+        .unwrap();
+    let file = store.get_file(&nested_file_entry.object_id).unwrap();
+
+    assert_eq!(snapshot.message, "manifest");
+    assert_eq!(file.entry_name, "hello.txt");
+    assert_eq!(file.chunker_id, "fastcdc");
+    assert_eq!(file.chunker_config_id, "fastcdc-64k-1m-8m");
+}
+
+#[test]
+fn manifest_store_get_many_fetches_multiple_manifest_types() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "manifest-many".to_string(),
+        })
+        .unwrap();
+
+    let store = ManifestStore::new(&repo_root);
+    let snapshot = store.get_snapshot(&commit.snapshot_id).unwrap();
+    let objects = store
+        .get_many(&[
+            (&commit.snapshot_id, "snapshot"),
+            (&snapshot.root_tree_id, "tree"),
+        ])
+        .unwrap();
+
+    assert_eq!(objects.len(), 2);
+    assert!(matches!(objects[0], ManifestObject::Snapshot(_)));
+    assert!(matches!(objects[1], ManifestObject::Tree(_)));
+}
+
+#[test]
+fn manifest_store_trait_object_supports_snapshot_lookup() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "trait-store".to_string(),
+        })
+        .unwrap();
+
+    let store = ManifestStore::new(&repo_root);
+    let trait_store: &dyn ManifestStoreApi = &store;
+    let snapshot = trait_store.get_snapshot(&commit.snapshot_id).unwrap();
+
+    assert_eq!(snapshot.message, "trait-store");
+}
+
+#[test]
+fn manifest_store_exposes_iterator_style_tree_walk() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "manifest-iter".to_string(),
+        })
+        .unwrap();
+
+    let store = ManifestStore::new(&repo_root);
+    let entries = store
+        .walk_tree_streaming_for_test(&commit.snapshot_id)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(entries.iter().any(|entry| entry.path == "nested/hello.txt"));
+}
+
+#[test]
+fn manifest_store_streaming_tree_walk_defers_deep_file_validation_until_iteration() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("a-first.txt"), "first").unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("z-second.txt"), "second").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "manifest-stream".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let nested_file = read_service
+        .open_file(&snapshot, "nested/z-second.txt")
+        .unwrap();
+    let file_object_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", nested_file.file_object_id));
+    let mut bytes = fs::read(&file_object_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&file_object_path, bytes).unwrap();
+
+    let store = ManifestStore::new(&repo_root);
+    let mut entries = store
+        .walk_tree_streaming_for_test(&commit.snapshot_id)
+        .unwrap();
+
+    let first = entries.next().unwrap().unwrap();
+    assert_eq!(first.path, "a-first.txt");
+
+    let error = entries.next().unwrap().unwrap_err();
+    assert!(
+        error.to_string().contains("authentication"),
+        "unexpected error: {error:#}"
+    );
+}

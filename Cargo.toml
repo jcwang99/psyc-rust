@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/e2v-core",
+    "crates/e2v-store",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+argon2 = "0.5"
+blake3 = "1.8"
+chacha20poly1305 = "0.10"
+fastcdc = "3.1"
+getrandom = "0.3"
+hex = "0.4"
+postcard = { version = "1.1", features = ["use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
