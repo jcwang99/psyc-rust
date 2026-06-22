@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::bundle::{load_remote_bundle_locations, read_bundled_object};
 use e2v_store::{RefToken, RemoteBackend};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,11 +33,26 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             downloaded_objects += 1;
         }
     }
+    let bundle_locations = load_remote_bundle_locations(remote)?;
+    for object_id in bundle_locations.keys() {
+        let target_path = objects_dir.join(format!("{object_id}.json"));
+        if target_path.exists() {
+            continue;
+        }
+        if let Some(bytes) = read_bundled_object(remote, &bundle_locations, object_id)? {
+            std::fs::write(&target_path, bytes)?;
+            downloaded_objects += 1;
+        }
+    }
 
     let ref_token = RefToken::new(options.branch_token);
     if let Some(stored_ref) = remote.read_ref(&ref_token)? {
         std::fs::write(
-            options.repo_root.join(".e2v").join("refs").join("default.json"),
+            options
+                .repo_root
+                .join(".e2v")
+                .join("refs")
+                .join("default.json"),
             stored_ref.value.bytes,
         )?;
     }

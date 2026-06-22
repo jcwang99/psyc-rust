@@ -39,7 +39,11 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
         journal: OperationJournal,
         remote_backend: R,
     ) -> Self {
-        Self { capability, journal, remote_backend }
+        Self {
+            capability,
+            journal,
+            remote_backend,
+        }
     }
 
     pub fn remote_backend(&self) -> &R {
@@ -57,7 +61,10 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
         let lease_path = if writer_mode == e2v_store::WriterMode::SingleWriter {
             let lease_path = format!("leases/{}.lock", plan.target_branch_token);
             if self.remote_backend.exists_physical(&lease_path) {
-                anyhow::bail!("writer lease acquisition failed for {}", plan.target_branch_token);
+                anyhow::bail!(
+                    "writer lease acquisition failed for {}",
+                    plan.target_branch_token
+                );
             }
             self.remote_backend.put_physical(
                 &lease_path,
@@ -112,7 +119,8 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
                 "layout root publish failed: generation changed before publish"
             );
             if let Some(bytes) = &session.next_layout_root_bytes {
-                self.remote_backend.put_physical("layout_root.json", bytes)?;
+                self.remote_backend
+                    .put_physical("layout_root.json", bytes)?;
             }
             Ok(next_layout_root.generation)
         } else {
@@ -121,21 +129,23 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     }
 
     fn pre_commit_verify(&self, session: &PublishSession) -> Result<()> {
-        let bytes = self.remote_backend.get_physical(&session.active_intent_path)?;
+        let bytes = self
+            .remote_backend
+            .get_physical(&session.active_intent_path)?;
         anyhow::ensure!(
             !bytes.is_empty(),
             "pre-commit verify failed: active intent missing or empty"
         );
-        let intent: RemoteOwnershipMarker =
-            serde_json::from_slice(&bytes).context("pre-commit verify failed: invalid active intent marker")?;
+        let intent: RemoteOwnershipMarker = serde_json::from_slice(&bytes)
+            .context("pre-commit verify failed: invalid active intent marker")?;
         anyhow::ensure!(
             intent.operation_id == session.operation_id.value,
             "pre-commit verify failed: active intent belongs to another operation"
         );
         if let Some(expected_ref_version) = session.expected_ref_version {
-            let current = self
-                .remote_backend
-                .read_ref(&e2v_store::RefToken::new(session.target_branch_token.clone()))?;
+            let current = self.remote_backend.read_ref(&e2v_store::RefToken::new(
+                session.target_branch_token.clone(),
+            ))?;
             let current_version = current
                 .as_ref()
                 .map(|stored_ref| stored_ref.version.value)
@@ -151,8 +161,8 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
                 !lease.is_empty(),
                 "pre-commit verify failed: writer lease missing or empty"
             );
-            let lease_marker: RemoteOwnershipMarker =
-                serde_json::from_slice(&lease).context("pre-commit verify failed: invalid writer lease marker")?;
+            let lease_marker: RemoteOwnershipMarker = serde_json::from_slice(&lease)
+                .context("pre-commit verify failed: invalid writer lease marker")?;
             anyhow::ensure!(
                 lease_marker.operation_id == session.operation_id.value,
                 "pre-commit verify failed: writer lease belongs to another operation"
@@ -172,7 +182,8 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     }
 
     fn complete(&self, session: PublishSession) -> Result<()> {
-        self.remote_backend.delete_physical(&session.active_intent_path)?;
+        self.remote_backend
+            .delete_physical(&session.active_intent_path)?;
         if let Some(lease_path) = session.lease_path {
             self.remote_backend.delete_physical(&lease_path)?;
         }
@@ -180,13 +191,19 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     }
 
     fn recover(&self, operation_id: &OperationId) -> Result<RecoveryAction> {
-        let pending = self
-            .journal
-            .pending_objects(operation_id)?
-            .into_iter()
-            .filter(|record| record.state == ObjectUploadState::Uploaded)
-            .map(|record| record.object_id)
-            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        let mut cursor = Some(0usize);
+        while let Some(start) = cursor {
+            let batch = self
+                .journal
+                .pending_object_batch(operation_id, start, 128)?;
+            for record in batch.records {
+                if record.state == ObjectUploadState::Uploaded {
+                    pending.push(record.object_id);
+                }
+            }
+            cursor = batch.next_cursor;
+        }
         if pending.is_empty() {
             Ok(RecoveryAction::NothingToDo)
         } else {
@@ -525,17 +542,10 @@ mod tests {
         let remote = e2v_store::MemoryBackend::new();
         let token = e2v_store::RefToken::new("branch-token".to_string());
         remote
-            .compare_and_swap_ref(
-                &token,
-                None,
-                e2v_store::EncryptedRef::new(vec![1, 2, 3]),
-            )
+            .compare_and_swap_ref(&token, None, e2v_store::EncryptedRef::new(vec![1, 2, 3]))
             .unwrap();
-        let publisher = SimpleTransactionPublisher::new(
-            remote.capability().clone(),
-            journal,
-            remote.clone(),
-        );
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
         let session = publisher
             .begin(PublishPlan {
                 operation_id: OperationId::new("op-stale-precommit".to_string()),
@@ -564,17 +574,10 @@ mod tests {
         let remote = e2v_store::MemoryBackend::new();
         let token = e2v_store::RefToken::new("branch-token".to_string());
         remote
-            .compare_and_swap_ref(
-                &token,
-                None,
-                e2v_store::EncryptedRef::new(vec![1, 2, 3]),
-            )
+            .compare_and_swap_ref(&token, None, e2v_store::EncryptedRef::new(vec![1, 2, 3]))
             .unwrap();
-        let publisher = SimpleTransactionPublisher::new(
-            remote.capability().clone(),
-            journal,
-            remote.clone(),
-        );
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
         let session = publisher
             .begin(PublishPlan {
                 operation_id: OperationId::new("op-publish-ref".to_string()),
@@ -601,11 +604,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
         let remote = e2v_store::MemoryBackend::new();
-        let publisher = SimpleTransactionPublisher::new(
-            remote.capability().clone(),
-            journal,
-            remote.clone(),
-        );
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
         let session = publisher
             .begin(PublishPlan {
                 operation_id: OperationId::new("op-complete-intent".to_string()),
@@ -668,4 +668,3 @@ mod tests {
         assert_eq!(lease_marker["operation_id"], "op-complete-lease-2");
     }
 }
-

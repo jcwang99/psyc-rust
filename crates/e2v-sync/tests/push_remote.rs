@@ -481,6 +481,47 @@ fn push_ignores_unreachable_local_object_files() {
 }
 
 #[test]
+fn push_batches_small_objects_into_remote_bundles_when_threshold_is_reached() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "bundle-small-objects".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "bundle-small-objects-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(pushed.uploaded_objects > 0);
+    assert!(!remote.list_physical("bundles/index/").unwrap().is_empty());
+    assert!(!remote.list_physical("bundles/data/").unwrap().is_empty());
+    assert!(remote.list_physical("objects/").unwrap().len() < pushed.uploaded_objects);
+}
+
+#[test]
 fn resume_skips_uploaded_objects_and_republishes_missing_ref() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -549,12 +590,10 @@ fn resume_skips_uploaded_objects_and_republishes_missing_ref() {
 
     assert!(resumed.skipped_uploaded_objects > 0);
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
-    assert!(
-        rebuilt
-            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-            .unwrap()
-            .is_some()
-    );
+    assert!(rebuilt
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -602,14 +641,15 @@ fn resume_reuploads_missing_remote_objects_from_journal() {
         .join(".e2v")
         .join("journal")
         .join("sync")
-        .join("resume-missing-object-op.wal");
+        .join("operations.sqlite");
     assert!(removed_path.exists());
 
-    let object_bytes = std::fs::read(repo_root.join(".e2v").join("objects").join(
-        first_remote_object
-            .strip_prefix("objects/")
-            .unwrap(),
-    ))
+    let object_bytes = std::fs::read(
+        repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(first_remote_object.strip_prefix("objects/").unwrap()),
+    )
     .unwrap();
     let physical = first_remote_object.clone();
     let remote_shadow = remote
@@ -732,6 +772,81 @@ fn resume_uploads_objects_missing_after_interrupted_push() {
             "missing resumed object {object_id}"
         );
     }
+}
+
+#[test]
+fn resume_counts_skipped_uploaded_objects_across_multiple_journal_batches() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-batched-count".to_string(),
+        })
+        .unwrap();
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+    assert!(reachable_object_ids.len() > 2);
+
+    let remote = MemoryBackend::new();
+    for object_id in reachable_object_ids.iter().skip(2) {
+        let object_name = format!("{object_id}.json");
+        let relative_path = format!("objects/{object_name}");
+        let bytes =
+            std::fs::read(repo_root.join(".e2v").join("objects").join(&object_name)).unwrap();
+        remote.put_physical(&relative_path, &bytes).unwrap();
+    }
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id = e2v_sync::OperationId::new("resume-batched-count-op".to_string());
+    journal
+        .begin_operation(
+            &operation_id,
+            e2v_sync::OperationMetadata::push(state.branch.token_hex.clone(), None),
+        )
+        .unwrap();
+    for object_id in &reachable_object_ids {
+        journal
+            .plan_object(&operation_id, object_id, "object")
+            .unwrap();
+    }
+    for object_id in reachable_object_ids.iter().skip(2) {
+        journal
+            .record_uploaded(&operation_id, object_id, "object")
+            .unwrap();
+    }
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        resumed.skipped_uploaded_objects,
+        reachable_object_ids.len() - 2
+    );
 }
 
 #[test]
@@ -988,12 +1103,10 @@ fn push_rejects_missing_remote_parent_chain() {
     .unwrap_err();
 
     assert!(error.to_string().contains("ancestor"));
-    assert!(
-        remote
-            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-            .unwrap()
-            .is_none()
-    );
+    assert!(remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .is_none());
     assert!(second.snapshot_id.len() > 10);
 }
 
@@ -1033,6 +1146,81 @@ fn push_marks_needs_rebase_when_ref_publish_cas_loses_race() {
     .unwrap_err();
 
     assert!(error.to_string().contains("needs-rebase"));
+}
+
+#[test]
+fn push_rejects_ref_publish_when_reachable_remote_object_disappears() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-remote-before-ref".to_string(),
+        })
+        .unwrap();
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id = e2v_sync::OperationId::new("verify-remote-before-ref-op".to_string());
+    journal
+        .begin_operation(
+            &operation_id,
+            e2v_sync::OperationMetadata::push(state.branch.token_hex.clone(), None),
+        )
+        .unwrap();
+    for object_id in &reachable_object_ids {
+        journal
+            .plan_object(&operation_id, object_id, "object")
+            .unwrap();
+    }
+    for object_id in &reachable_object_ids[..reachable_object_ids.len() - 1] {
+        let object_name = format!("{object_id}.json");
+        remote
+            .put_physical(
+                &format!("objects/{object_name}"),
+                &std::fs::read(repo_root.join(".e2v").join("objects").join(&object_name)).unwrap(),
+            )
+            .unwrap();
+        journal
+            .record_verified(&operation_id, object_id, "object")
+            .unwrap();
+    }
+
+    let error = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(error.published_snapshot_id, commit.snapshot_id);
+    for object_id in &reachable_object_ids {
+        assert!(
+            remote.exists_physical(&format!("objects/{object_id}.json"))
+                || !remote.list_physical("bundles/index/").unwrap().is_empty()
+        );
+    }
 }
 
 #[test]
@@ -1081,7 +1269,10 @@ fn push_allows_fast_forward_when_remote_head_matches_local_parent() {
         },
     )
     .unwrap();
-    assert_eq!(cloned.head_snapshot_id.as_deref(), Some(first.snapshot_id.as_str()));
+    assert_eq!(
+        cloned.head_snapshot_id.as_deref(),
+        Some(first.snapshot_id.as_str())
+    );
 
     fs::write(clone_repo_root.join("hello.txt"), b"second").unwrap();
     let clone_facade = RepositoryFacade::new();
@@ -1110,4 +1301,80 @@ fn push_allows_fast_forward_when_remote_head_matches_local_parent() {
         .unwrap();
     assert!(!stored_ref.value.bytes.is_empty());
     assert!(stored_ref.version.value >= 2);
+}
+
+#[test]
+fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+    let source = RepositoryFacade::new();
+    let source_state = source
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"first").unwrap();
+    let first = source
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let first_push = push_head(
+        &source,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "bundle-ff-push-1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first_push.published_snapshot_id, first.snapshot_id);
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+
+    let clone_repo_root = temp.path().join("clone");
+    let cloned = e2v_sync::clone_remote(
+        &remote,
+        e2v_sync::CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: source_state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cloned.head_snapshot_id.as_deref(),
+        Some(first.snapshot_id.as_str())
+    );
+
+    fs::write(clone_repo_root.join("hello.txt"), b"second").unwrap();
+    let clone_facade = RepositoryFacade::new();
+    let second = clone_facade
+        .commit(CommitOptions {
+            repo_root: clone_repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let second_push = push_head(
+        &clone_facade,
+        &remote,
+        PushOptions {
+            repo_root: clone_repo_root.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "bundle-ff-push-2".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second_push.published_snapshot_id, second.snapshot_id);
 }

@@ -80,7 +80,15 @@ fn fetch_downloads_remote_ref_and_missing_objects_without_touching_worktree() {
         fs::read(target_repo_root.join("local-only.txt")).unwrap(),
         b"leave me alone"
     );
-    assert!(target_repo_root.join(".e2v").join("objects").read_dir().unwrap().count() > 0);
+    assert!(
+        target_repo_root
+            .join(".e2v")
+            .join("objects")
+            .read_dir()
+            .unwrap()
+            .count()
+            > 0
+    );
 }
 
 #[test]
@@ -102,13 +110,14 @@ fn clone_bootstraps_local_repository_from_remote_head() {
     assert!(cloned.head_snapshot_id.is_some());
     assert!(clone_repo_root.join(".e2v").join("objects").is_dir());
     assert!(remote.read_layout_root().unwrap().generation >= 1);
+    assert!(remote
+        .read_ref(&RefToken::new(cloned.branch_token.clone()))
+        .unwrap()
+        .is_some());
     assert!(
-        remote
-            .read_ref(&RefToken::new(cloned.branch_token.clone()))
-            .unwrap()
-            .is_some()
+        !remote.list_physical("objects/").unwrap().is_empty()
+            || !remote.list_physical("bundles/index/").unwrap().is_empty()
     );
-    assert!(remote.list_physical("objects/").unwrap().len() > 0);
 }
 
 #[test]
@@ -224,7 +233,9 @@ fn sync_flows_work_with_opendal_memory_backend_adapter() {
             (format!("objects/{file_name}"), bytes)
         })
     {
-        remote.put_physical(&relative_path.0, &relative_path.1).unwrap();
+        remote
+            .put_physical(&relative_path.0, &relative_path.1)
+            .unwrap();
     }
     remote
         .put_physical(
@@ -248,9 +259,10 @@ fn sync_flows_work_with_opendal_memory_backend_adapter() {
             .unwrap();
     }
     let layout_root = remote.read_layout_root().unwrap();
-    let next_layout_root: e2v_store::LayoutRoot =
-        serde_json::from_slice(&e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap())
-            .unwrap();
+    let next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
+        &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),
+    )
+    .unwrap();
     remote
         .compare_and_swap_layout_root(layout_root.generation, next_layout_root)
         .unwrap();
@@ -296,4 +308,84 @@ fn sync_flows_work_with_opendal_memory_backend_adapter() {
     )
     .unwrap();
     assert!(cloned.head_snapshot_id.is_some());
+}
+
+#[test]
+fn fetch_and_clone_restore_objects_from_remote_bundles() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    let committed = facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "bundled-sync".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "bundled-sync-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+    assert!(!remote.list_physical("bundles/index/").unwrap().is_empty());
+
+    let fetch_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&fetch_repo_root).unwrap();
+    let local = RepositoryFacade::new();
+    local
+        .init(InitOptions {
+            repo_root: fetch_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            repo_root: fetch_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert!(fetched.downloaded_objects > 0);
+    assert!(fetch_repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", committed.snapshot_id))
+        .is_file());
+
+    let clone_repo_root = temp.path().join("clone-target");
+    let cloned = clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cloned.head_snapshot_id.as_deref(),
+        Some(committed.snapshot_id.as_str())
+    );
 }
