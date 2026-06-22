@@ -12,7 +12,7 @@ pub use local_backend::{BlobStore, LocalFolderBackend, ObjectStat};
 pub use layout::LayoutRoot;
 pub use layout_root_store::{LayoutRootStore, LayoutRootVersion};
 pub use memory_backend::MemoryBackend;
-pub use opendal_backend::{RemoteBackend, S3CompatibleMockBackend};
+pub use opendal_backend::{OpendalMemoryBackend, RemoteBackend, S3CompatibleMockBackend};
 pub use logical_object_store::{
     DirectLayoutObjectStore, LogicalObjectStore, PhysicalObjectRef, RepoSecrets,
 };

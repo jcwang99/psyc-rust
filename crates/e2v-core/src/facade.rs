@@ -159,7 +159,7 @@ struct RepoConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RefRecord {
+pub(crate) struct RefRecord {
     pub branch_name: String,
     pub ref_token_hex: String,
     pub head_snapshot_id: Option<String>,
@@ -792,6 +792,12 @@ fn read_default_ref(control_dir: &Path, secrets: &RepoSecrets) -> Result<RefReco
     let path = control_dir.join(DEFAULT_REF_FILE);
     let bytes = std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let plaintext = decrypt_control_record(secrets, DEFAULT_REF_TOKEN, "ref", &bytes)?;
+    postcard_from_bytes(&plaintext).context("failed to decode ref record")
+}
+
+pub(crate) fn decode_default_ref_bytes(control_dir: &Path, bytes: &[u8]) -> Result<RefRecord> {
+    let secrets = open_repo_secrets(control_dir)?;
+    let plaintext = decrypt_control_record(&secrets, DEFAULT_REF_TOKEN, "ref", bytes)?;
     postcard_from_bytes(&plaintext).context("failed to decode ref record")
 }
 
