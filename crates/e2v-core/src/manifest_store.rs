@@ -62,6 +62,7 @@ pub trait ManifestStoreApi {
     fn get_many(&self, ids: &[(&str, &str)]) -> Result<Vec<ManifestObject>>;
     fn walk_tree(&self, snapshot_id: &str) -> Result<Vec<TreeWalkEntry>>;
     fn walk_tree_iter(&self, snapshot_id: &str) -> Result<TreeWalkIter>;
+    fn collect_reachable_object_ids(&self, snapshot_id: &str) -> Result<Vec<String>>;
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +137,16 @@ impl ManifestStoreApi for ManifestStore {
         let object_store = Arc::new(open_object_store(&control_dir)?);
         let snapshot = read_snapshot_object(object_store.as_ref(), snapshot_id)?;
         TreeWalkIter::new(object_store, snapshot.root_tree_id)
+    }
+
+    fn collect_reachable_object_ids(&self, snapshot_id: &str) -> Result<Vec<String>> {
+        let control_dir = self.repo_root.join(CONTROL_DIR);
+        let object_store = open_object_store(&control_dir)?;
+        let mut reachable = std::collections::BTreeSet::new();
+        let snapshot = read_snapshot_object(&object_store, snapshot_id)?;
+        reachable.insert(snapshot_id.to_string());
+        collect_tree_object_ids(&object_store, &snapshot.root_tree_id, &mut reachable)?;
+        Ok(reachable.into_iter().collect())
     }
 }
 
@@ -329,6 +340,58 @@ fn read_tree_shard_object(object_store: &dyn LogicalObjectStore, object_id: &str
     let tree_shard: TreeShardObject = read_stored_object(object_store, object_id, "tree_shard")?;
     validate_manifest_schema_version("tree_shard", tree_shard.schema_version)?;
     Ok(tree_shard)
+}
+
+fn collect_tree_object_ids(
+    object_store: &dyn LogicalObjectStore,
+    tree_id: &str,
+    reachable: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if !reachable.insert(tree_id.to_string()) {
+        return Ok(());
+    }
+
+    match read_tree_object(object_store, tree_id) {
+        Ok(tree) => collect_tree_entries(object_store, tree.entries, reachable),
+        Err(error) => {
+            if !error.to_string().contains("object type mismatch") {
+                return Err(error);
+            }
+            let directory_root = read_directory_root_object(object_store, tree_id)?;
+            for shard_id in directory_root.shards {
+                if !reachable.insert(shard_id.clone()) {
+                    continue;
+                }
+                let shard = read_tree_shard_object(object_store, &shard_id)?;
+                collect_tree_entries(object_store, shard.entries, reachable)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_tree_entries(
+    object_store: &dyn LogicalObjectStore,
+    entries: Vec<TreeEntry>,
+    reachable: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    for entry in entries {
+        match entry.kind.as_str() {
+            "tree" => collect_tree_object_ids(object_store, &entry.object_id, reachable)?,
+            "file" => {
+                if reachable.insert(entry.object_id.clone()) {
+                    let file = read_file_object(object_store, &entry.object_id)?;
+                    for chunk_id in file.chunks {
+                        reachable.insert(chunk_id);
+                    }
+                }
+            }
+            other => {
+                anyhow::bail!("manifest store encountered unknown tree entry kind {other}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_stored_object<T: for<'de> Deserialize<'de>>(

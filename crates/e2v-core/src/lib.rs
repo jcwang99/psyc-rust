@@ -142,6 +142,14 @@ pub mod sync_support {
         )?)
     }
 
+    pub fn decode_ref_head_snapshot_id(
+        repo_root: impl AsRef<Path>,
+        encrypted_ref_bytes: &[u8],
+    ) -> Result<Option<String>> {
+        let control_dir = repo_root.as_ref().join(".e2v");
+        Ok(super::facade::decode_default_ref_bytes(&control_dir, encrypted_ref_bytes)?.head_snapshot_id)
+    }
+
     pub fn list_keyring_files(repo_root: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let keyring_dir = repo_root.as_ref().join(".e2v").join("keyring");
         let mut files = std::fs::read_dir(&keyring_dir)?

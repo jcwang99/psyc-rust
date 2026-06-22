@@ -119,6 +119,11 @@ impl BlobStore for MemoryBackend {
         Ok(bytes[offset..end].to_vec())
     }
 
+    fn delete_physical(&self, relative_path: &str) -> Result<()> {
+        self.physical.lock().unwrap().remove(relative_path);
+        Ok(())
+    }
+
     fn exists_physical(&self, relative_path: &str) -> bool {
         self.physical.lock().unwrap().contains_key(relative_path)
     }
@@ -223,5 +228,15 @@ mod tests {
         let backend = MemoryBackend::new();
 
         assert_eq!(backend.capability().writer_mode(), WriterMode::MultiWriter);
+    }
+
+    #[test]
+    fn delete_physical_removes_existing_object() {
+        let backend = MemoryBackend::new();
+        backend.put_physical("objects/sample.bin", b"hello world").unwrap();
+
+        backend.delete_physical("objects/sample.bin").unwrap();
+
+        assert!(!backend.exists_physical("objects/sample.bin"));
     }
 }

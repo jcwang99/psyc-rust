@@ -26,13 +26,15 @@ pub enum OperationType {
 pub struct OperationMetadata {
     pub operation_type: OperationType,
     pub target_branch_token: String,
+    pub expected_ref_version: Option<u64>,
 }
 
 impl OperationMetadata {
-    pub fn push(target_branch_token: impl Into<String>) -> Self {
+    pub fn push(target_branch_token: impl Into<String>, expected_ref_version: Option<u64>) -> Self {
         Self {
             operation_type: OperationType::Push,
             target_branch_token: target_branch_token.into(),
+            expected_ref_version,
         }
     }
 }
@@ -142,6 +144,18 @@ impl OperationJournal {
         Ok(latest.into_values().collect())
     }
 
+    pub fn operation_metadata(&self, operation_id: &OperationId) -> Result<Option<OperationMetadata>> {
+        let path = self.metadata_path(operation_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read operation metadata {}", path.display()))?;
+        Ok(Some(
+            serde_json::from_slice(&bytes).context("failed to decode operation metadata")?,
+        ))
+    }
+
     fn append_record(&self, operation_id: &OperationId, record: ObjectUploadRecord) -> Result<()> {
         let path = self.wal_path(operation_id);
         let mut existing = if path.exists() {
@@ -179,7 +193,7 @@ mod tests {
         let operation_id = OperationId::new("op-1".to_string());
 
         journal
-            .begin_operation(&operation_id, OperationMetadata::push("branch-token"))
+            .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
             .unwrap();
         journal.plan_object(&operation_id, "chunk-1", "chunk").unwrap();
         journal.record_uploaded(&operation_id, "chunk-1", "chunk").unwrap();

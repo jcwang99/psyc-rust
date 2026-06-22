@@ -1,10 +1,12 @@
 use std::fs;
+use std::io::Write;
 
 use anyhow::Result;
 use e2v_core::{CheckoutOptions, CommitOptions, InitOptions, ManifestObject, ManifestStore, ManifestStoreApi, RepositoryFacade, TreeWalkEntry};
 use e2v_core::testing::{with_snapshot_reader_and_policy_for_test, with_snapshot_reader_for_test, with_stable_read_policy_for_test, StableReadPolicy, TestSnapshotReader};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 fn init_options(repo_root: &std::path::Path) -> InitOptions {
@@ -415,16 +417,41 @@ fn commit_honors_custom_volatile_retry_budget_on_real_unstable_file() {
     let file_path = repo_root.join("large.txt");
     fs::write(&file_path, vec![b'A'; 9 * 1024 * 1024]).unwrap();
     let keep_writing = Arc::new(AtomicBool::new(true));
+    let writer_started = Arc::new(AtomicBool::new(false));
     let writer_flag = Arc::clone(&keep_writing);
+    let started_flag = Arc::clone(&writer_started);
     let writer_path = file_path.clone();
     let writer = std::thread::spawn(move || {
         let mut toggle = false;
         while writer_flag.load(Ordering::SeqCst) {
             let fill = if toggle { b'B' } else { b'C' };
-            let _ = fs::write(&writer_path, vec![fill; 9 * 1024 * 1024]);
+            if let Ok(mut file) = fs::File::create(&writer_path) {
+                let chunk = vec![fill; 256 * 1024];
+                for _ in 0..36 {
+                    if file.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    if file.flush().is_err() {
+                        break;
+                    }
+                    started_flag.store(true, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    if !writer_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
             toggle = !toggle;
         }
     });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !writer_started.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        writer_started.load(Ordering::SeqCst),
+        "background writer never started mutating the file"
+    );
 
     let commit = facade
         .commit(CommitOptions {

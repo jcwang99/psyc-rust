@@ -7,6 +7,7 @@ pub trait BlobStore {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()>;
     fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>>;
     fn get_physical_range(&self, relative_path: &str, offset: usize, length: usize) -> Result<Vec<u8>>;
+    fn delete_physical(&self, relative_path: &str) -> Result<()>;
     fn exists_physical(&self, relative_path: &str) -> bool;
     fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat>;
     fn list_physical(&self, prefix: &str) -> Result<Vec<String>>;
@@ -69,6 +70,15 @@ impl BlobStore for LocalFolderBackend {
         anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
         let end = offset.saturating_add(length).min(bytes.len());
         Ok(bytes[offset..end].to_vec())
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> Result<()> {
+        let full_path = self.repo_root.join(relative_path);
+        if !full_path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(&full_path)
+            .with_context(|| format!("failed to delete object {}", full_path.display()))
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {
@@ -155,6 +165,18 @@ mod tests {
         let stat = blob_store.stat_physical("objects/sample.bin").unwrap();
 
         assert_eq!(stat.length, 11);
+    }
+
+    #[test]
+    fn blob_store_delete_removes_existing_object() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let blob_store: &dyn BlobStore = &backend;
+        blob_store.put_physical("objects/sample.bin", b"hello world").unwrap();
+
+        blob_store.delete_physical("objects/sample.bin").unwrap();
+
+        assert!(!blob_store.exists_physical("objects/sample.bin"));
     }
 
     #[test]
