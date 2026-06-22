@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +14,7 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
 ];
 const LOCAL_CHECKOUT_MAPPING_FILE: &str = ".e2v-checkout-mapping.json";
 const LARGE_FILE_SNAPSHOT_PREFERENCE_BYTES: u64 = 8 * 1024 * 1024;
+const VOLATILE_REREAD_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkingTreeEntry {
@@ -38,7 +39,10 @@ impl WorkingTree {
         Self::new_with_policy(repo_root, StableReadPolicy::default())
     }
 
-    pub fn new_with_policy(repo_root: impl AsRef<Path>, stable_read_policy: StableReadPolicy) -> Self {
+    pub fn new_with_policy(
+        repo_root: impl AsRef<Path>,
+        stable_read_policy: StableReadPolicy,
+    ) -> Self {
         Self {
             repo_root: repo_root.as_ref().to_path_buf(),
             stable_read_policy,
@@ -114,6 +118,7 @@ impl WorkingTree {
                         format!("failed to read working tree file {}", path.display())
                     })?;
                     let after_first = self.capture_metadata(path)?;
+                    std::thread::sleep(VOLATILE_REREAD_DELAY);
                     let second = fs::read(path).with_context(|| {
                         format!("failed to read working tree file {}", path.display())
                     })?;
@@ -128,8 +133,9 @@ impl WorkingTree {
         read_with_metadata_retry(
             || {
                 let before = self.capture_metadata(path)?;
-                let bytes = fs::read(path)
-                    .with_context(|| format!("failed to read working tree file {}", path.display()))?;
+                let bytes = fs::read(path).with_context(|| {
+                    format!("failed to read working tree file {}", path.display())
+                })?;
                 let after = self.capture_metadata(path)?;
                 Ok((before, bytes, after))
             },
@@ -161,7 +167,10 @@ impl WorkingTree {
         }
 
         for component in normalized.split('/') {
-            ensure!(component != "." && component != "..", "path policy violation: checkout path escapes target root");
+            ensure!(
+                component != "." && component != "..",
+                "path policy violation: checkout path escapes target root"
+            );
             self.validate_path_component(component)?;
         }
 
@@ -285,15 +294,20 @@ impl WorkingTree {
         self.ensure_checkout_target_is_clear(final_path)?;
 
         let temp_path = final_path.with_extension("e2v-tmp");
-        fs::write(&temp_path, bytes)
-            .with_context(|| format!("failed to write checkout temp file {}", temp_path.display()))?;
+        fs::write(&temp_path, bytes).with_context(|| {
+            format!("failed to write checkout temp file {}", temp_path.display())
+        })?;
         Ok(temp_path)
     }
 
     pub fn publish_checkout_temp(&self, temp_path: &Path, final_path: &Path) -> Result<()> {
         if final_path.exists() {
-            fs::remove_file(final_path)
-                .with_context(|| format!("failed to replace existing checkout file {}", final_path.display()))?;
+            fs::remove_file(final_path).with_context(|| {
+                format!(
+                    "failed to replace existing checkout file {}",
+                    final_path.display()
+                )
+            })?;
         }
 
         fs::rename(temp_path, final_path)
@@ -301,7 +315,11 @@ impl WorkingTree {
         Ok(())
     }
 
-    pub fn validate_checkout_read_back(&self, expected_name: &str, observed_name: &str) -> Result<()> {
+    pub fn validate_checkout_read_back(
+        &self,
+        expected_name: &str,
+        observed_name: &str,
+    ) -> Result<()> {
         let expected = self.normalize_path_component(expected_name).to_lowercase();
         let observed = self.normalize_path_component(observed_name).to_lowercase();
         ensure!(
@@ -318,7 +336,9 @@ impl WorkingTree {
         let expected_name = final_path
             .file_name()
             .and_then(|name| name.to_str())
-            .with_context(|| format!("checkout target has no file name: {}", final_path.display()))?;
+            .with_context(|| {
+                format!("checkout target has no file name: {}", final_path.display())
+            })?;
         let mut observed_names = Vec::new();
         for entry in fs::read_dir(parent)
             .with_context(|| format!("failed to read checkout parent {}", parent.display()))?
@@ -344,11 +364,16 @@ impl WorkingTree {
             .with_context(|| format!("file not found after publish: {expected_name}"))
     }
 
-    pub fn record_platform_name_mapping(&self, snapshot_path: &str, final_path: &Path) -> Result<()> {
+    pub fn record_platform_name_mapping(
+        &self,
+        snapshot_path: &str,
+        final_path: &Path,
+    ) -> Result<()> {
         let mapping_path = self.repo_root.join(".e2v-checkout-mapping.json");
         let mut mappings: Vec<CheckoutPathMapping> = if mapping_path.is_file() {
-            let bytes = fs::read(&mapping_path)
-                .with_context(|| format!("failed to read checkout mapping {}", mapping_path.display()))?;
+            let bytes = fs::read(&mapping_path).with_context(|| {
+                format!("failed to read checkout mapping {}", mapping_path.display())
+            })?;
             serde_json::from_slice(&bytes).context("failed to decode checkout mapping")?
         } else {
             Vec::new()
@@ -359,13 +384,22 @@ impl WorkingTree {
             local_path: final_path.to_string_lossy().to_string(),
         });
 
-        let bytes = serde_json::to_vec_pretty(&mappings).context("failed to encode checkout mapping")?;
-        fs::write(&mapping_path, bytes)
-            .with_context(|| format!("failed to write checkout mapping {}", mapping_path.display()))?;
+        let bytes =
+            serde_json::to_vec_pretty(&mappings).context("failed to encode checkout mapping")?;
+        fs::write(&mapping_path, bytes).with_context(|| {
+            format!(
+                "failed to write checkout mapping {}",
+                mapping_path.display()
+            )
+        })?;
         Ok(())
     }
 
-    fn nearest_existing_checkout_directory(&self, target_dir: &Path, final_path: &Path) -> Result<PathBuf> {
+    fn nearest_existing_checkout_directory(
+        &self,
+        target_dir: &Path,
+        final_path: &Path,
+    ) -> Result<PathBuf> {
         let mut current = final_path
             .parent()
             .map(Path::to_path_buf)
@@ -410,9 +444,18 @@ impl WorkingTree {
     }
 
     fn validate_path_component(&self, name: &str) -> Result<()> {
-        ensure!(!name.is_empty(), "path policy violation: empty path component");
-        ensure!(!name.contains('/'), "path policy violation: '/' is not allowed");
-        ensure!(!name.contains('\0'), "path policy violation: '\\0' is not allowed");
+        ensure!(
+            !name.is_empty(),
+            "path policy violation: empty path component"
+        );
+        ensure!(
+            !name.contains('/'),
+            "path policy violation: '/' is not allowed"
+        );
+        ensure!(
+            !name.contains('\0'),
+            "path policy violation: '\\0' is not allowed"
+        );
         ensure!(
             !name.contains('<')
                 && !name.contains('>')
@@ -484,7 +527,11 @@ struct CheckoutPathMapping {
     local_path: String,
 }
 
-fn validate_stable_metadata(before: &FileMetadata, after: &FileMetadata, path: &Path) -> Result<()> {
+fn validate_stable_metadata(
+    before: &FileMetadata,
+    after: &FileMetadata,
+    path: &Path,
+) -> Result<()> {
     ensure!(
         before == after,
         "stable read violation: file metadata changed during read for {}",
@@ -493,7 +540,11 @@ fn validate_stable_metadata(before: &FileMetadata, after: &FileMetadata, path: &
     Ok(())
 }
 
-fn read_with_metadata_retry<F>(mut read_once: F, max_attempts: usize, path: &Path) -> Result<Vec<u8>>
+fn read_with_metadata_retry<F>(
+    mut read_once: F,
+    max_attempts: usize,
+    path: &Path,
+) -> Result<Vec<u8>>
 where
     F: FnMut() -> Result<(FileMetadata, Vec<u8>, FileMetadata)>,
 {
@@ -522,7 +573,11 @@ fn should_prefer_snapshot(metadata: &FileMetadata, now: std::time::SystemTime) -
     metadata.len >= LARGE_FILE_SNAPSHOT_PREFERENCE_BYTES || is_volatile_source(metadata, now)
 }
 
-fn read_volatile_with_retry<F>(mut read_once: F, max_attempts: usize, path: &Path) -> Result<Vec<u8>>
+fn read_volatile_with_retry<F>(
+    mut read_once: F,
+    max_attempts: usize,
+    path: &Path,
+) -> Result<Vec<u8>>
 where
     F: FnMut() -> Result<(FileMetadata, Vec<u8>, FileMetadata, Vec<u8>, FileMetadata)>,
 {
@@ -558,10 +613,18 @@ fn probe_directory_writable(path: &Path) -> Result<()> {
             .as_nanos()
     );
     let probe_path = path.join(probe_name);
-    fs::write(&probe_path, [])
-        .with_context(|| format!("checkout preflight failed: target directory is not writable: {}", path.display()))?;
-    fs::remove_file(&probe_path)
-        .with_context(|| format!("checkout preflight failed: failed to remove write probe {}", probe_path.display()))?;
+    fs::write(&probe_path, []).with_context(|| {
+        format!(
+            "checkout preflight failed: target directory is not writable: {}",
+            path.display()
+        )
+    })?;
+    fs::remove_file(&probe_path).with_context(|| {
+        format!(
+            "checkout preflight failed: failed to remove write probe {}",
+            probe_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -592,8 +655,12 @@ fn available_space_for_path(path: &Path) -> Result<u64> {
         )
     };
     if result == 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("checkout preflight failed: could not query disk space for {}", path.display()));
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "checkout preflight failed: could not query disk space for {}",
+                path.display()
+            )
+        });
     }
 
     Ok(available)
@@ -604,13 +671,21 @@ fn available_space_for_path(path: &Path) -> Result<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("checkout preflight failed: invalid path for disk space query: {}", path.display()))?;
+    let c_path = CString::new(path.as_os_str().as_bytes()).with_context(|| {
+        format!(
+            "checkout preflight failed: invalid path for disk space query: {}",
+            path.display()
+        )
+    })?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     let result = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("checkout preflight failed: could not query disk space for {}", path.display()));
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "checkout preflight failed: could not query disk space for {}",
+                path.display()
+            )
+        });
     }
     let stats = unsafe { stats.assume_init() };
     Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
@@ -632,9 +707,7 @@ mod tests {
     impl super::SnapshotReader for RecordingSnapshotReader {
         fn read(&self, path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
             self.calls.lock().unwrap().push(path.to_path_buf());
-            self.result
-                .clone()
-                .map_err(anyhow::Error::msg)
+            self.result.clone().map_err(anyhow::Error::msg)
         }
     }
 
@@ -642,7 +715,13 @@ mod tests {
     fn rejects_invalid_portable_strict_names() {
         let working_tree = WorkingTree::new("D:\\dummy");
 
-        let invalid = ["bad:name.txt", "trailing. ", "NUL.txt", "bad?.txt", "bad\\name"];
+        let invalid = [
+            "bad:name.txt",
+            "trailing. ",
+            "NUL.txt",
+            "bad?.txt",
+            "bad\\name",
+        ];
         for name in invalid {
             let error = working_tree.validate_path_component(name).unwrap_err();
             assert!(
@@ -665,7 +744,9 @@ mod tests {
     fn rejects_checkout_escape_components() {
         let working_tree = WorkingTree::new("D:\\dummy");
 
-        let error = working_tree.path_jail_validate("../escape.txt").unwrap_err();
+        let error = working_tree
+            .path_jail_validate("../escape.txt")
+            .unwrap_err();
         assert!(
             error.to_string().contains("path policy"),
             "unexpected error: {error:#}"
@@ -718,10 +799,7 @@ mod tests {
         let working_tree = WorkingTree::new(&root);
 
         let error = working_tree
-            .preflight_checkout_paths(
-                &root,
-                &["nested/hello.txt".to_string()],
-            )
+            .preflight_checkout_paths(&root, &["nested/hello.txt".to_string()])
             .unwrap_err();
 
         assert!(
@@ -767,9 +845,7 @@ mod tests {
                 &["nested/hello.txt".to_string()],
                 0,
                 |_path| Ok(u64::MAX),
-                |path| {
-                    anyhow::bail!("target directory is not writable: {}", path.display())
-                },
+                |path| anyhow::bail!("target directory is not writable: {}", path.display()),
             )
             .unwrap_err();
 
@@ -787,10 +863,7 @@ mod tests {
         let working_tree = WorkingTree::new(&root);
 
         let error = working_tree
-            .preflight_checkout_paths(
-                &root,
-                &["Readme".to_string(), "README".to_string()],
-            )
+            .preflight_checkout_paths(&root, &["Readme".to_string(), "README".to_string()])
             .unwrap_err();
 
         assert!(
@@ -880,8 +953,9 @@ mod tests {
             modified: std::time::UNIX_EPOCH,
             created: None,
         };
-        let error = super::validate_stable_metadata(&before, &after, std::path::Path::new("demo.txt"))
-            .unwrap_err();
+        let error =
+            super::validate_stable_metadata(&before, &after, std::path::Path::new("demo.txt"))
+                .unwrap_err();
         assert!(error.to_string().contains("stable read violation"));
     }
 
@@ -898,8 +972,9 @@ mod tests {
             created: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
         };
 
-        let error = super::validate_stable_metadata(&before, &after, std::path::Path::new("demo.txt"))
-            .unwrap_err();
+        let error =
+            super::validate_stable_metadata(&before, &after, std::path::Path::new("demo.txt"))
+                .unwrap_err();
 
         assert!(error.to_string().contains("stable read violation"));
     }
@@ -966,7 +1041,10 @@ mod tests {
             created: None,
         };
 
-        assert!(super::is_volatile_source(&metadata, std::time::SystemTime::now()));
+        assert!(super::is_volatile_source(
+            &metadata,
+            std::time::SystemTime::now()
+        ));
     }
 
     #[test]
@@ -977,7 +1055,10 @@ mod tests {
             created: None,
         };
 
-        assert!(!super::is_volatile_source(&metadata, std::time::SystemTime::now()));
+        assert!(!super::is_volatile_source(
+            &metadata,
+            std::time::SystemTime::now()
+        ));
     }
 
     #[test]
@@ -993,7 +1074,6 @@ mod tests {
             std::time::SystemTime::now()
         ));
     }
-
 
     #[test]
     fn stable_read_policy_exposes_default_retry_budget() {
@@ -1078,7 +1158,6 @@ mod tests {
         assert_eq!(bytes, b"disk-bytes");
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
-
 
     #[test]
     fn volatile_retry_succeeds_after_later_stable_attempt() {
@@ -1186,6 +1265,49 @@ mod tests {
             error.to_string().contains("unstable input"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn volatile_retry_rejects_bytes_when_follow_up_observation_changes() {
+        let stable = super::FileMetadata {
+            len: 5,
+            modified: std::time::SystemTime::now(),
+            created: None,
+        };
+        let changed = super::FileMetadata {
+            len: 6,
+            modified: std::time::SystemTime::now(),
+            created: None,
+        };
+        let mut calls = 0usize;
+
+        let error = super::read_volatile_with_retry(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok((
+                        stable.clone(),
+                        b"stable".to_vec(),
+                        stable.clone(),
+                        b"stable".to_vec(),
+                        changed.clone(),
+                    ))
+                } else {
+                    Ok((
+                        stable.clone(),
+                        b"stable".to_vec(),
+                        stable.clone(),
+                        b"stable".to_vec(),
+                        changed.clone(),
+                    ))
+                }
+            },
+            1,
+            std::path::Path::new("demo.txt"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unstable input"));
     }
 
     #[test]

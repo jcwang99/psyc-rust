@@ -203,6 +203,16 @@ pub fn push_head<R: RemoteBackend + Clone>(
 ) -> Result<PushResult> {
     let (_state, snapshot) = sync_support::export_head_snapshot(facade, &options.repo_root)?;
     let remote_bundle_locations = load_remote_bundle_locations(remote)?;
+    if let Some(stored_ref) = remote.read_ref(&RefToken::new(options.branch_token.clone()))? {
+        let remote_head_snapshot_id =
+            sync_support::decode_ref_head_snapshot_id(&options.repo_root, &stored_ref.value.bytes)?;
+        if remote_head_snapshot_id.as_deref() == Some(snapshot.snapshot_id.as_str()) {
+            return Ok(PushResult {
+                published_snapshot_id: snapshot.snapshot_id,
+                uploaded_objects: 0,
+            });
+        }
+    }
     let expected_ref_version =
         match remote.read_ref(&RefToken::new(options.branch_token.clone()))? {
             Some(stored_ref) => {

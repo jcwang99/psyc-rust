@@ -490,6 +490,51 @@ async fn snapshot_file_api_rejects_malformed_multi_range_requests() {
 }
 
 #[tokio::test]
+async fn tampered_snapshot_tree_api_returns_internal_server_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("hello.txt"), b"hello web").unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tampered-snapshot".to_string(),
+        })
+        .unwrap();
+
+    let snapshot_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", commit.snapshot_id));
+    let mut bytes = std::fs::read(&snapshot_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    std::fs::write(&snapshot_path, bytes).unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/snapshots/{}/tree?path=", commit.snapshot_id))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
 async fn branch_file_api_honors_single_byte_range_requests() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

@@ -1378,3 +1378,52 @@ fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
 
     assert_eq!(second_push.published_snapshot_id, second.snapshot_id);
 }
+
+#[test]
+fn push_is_idempotent_when_remote_ref_already_points_at_local_head() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "idempotent-push".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let first = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "idempotent-push-1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first.published_snapshot_id, commit.snapshot_id);
+
+    let second = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "idempotent-push-2".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second.published_snapshot_id, commit.snapshot_id);
+}

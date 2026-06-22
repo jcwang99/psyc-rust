@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf};
 
+use anyhow::Error;
 use axum::{
     Json, Router,
     body::Body,
@@ -8,6 +9,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
+use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
@@ -165,11 +167,11 @@ async fn snapshot_page(
         .map_err(|_| PageError::internal("Failed to open repository read service"))?;
     let snapshot = read_service
         .open_snapshot(&snapshot_id)
-        .map_err(|_| PageError::not_found("Snapshot not found"))?;
+        .map_err(|error| map_page_snapshot_error(error, "Snapshot not found"))?;
     let path = query.path.unwrap_or_default();
     let entries = read_service
         .read_dir(&snapshot, &path)
-        .map_err(|_| PageError::not_found("Directory not found"))?;
+        .map_err(|error| map_page_read_error(error, "Directory not found"))?;
 
     let mut html = format!(
         "<html><body><h1>Snapshot {snapshot_id}</h1><ul>",
@@ -185,14 +187,14 @@ async fn snapshot_page(
             html.push_str(&format!(
                 "<li><a href=\"/api/snapshots/{snapshot_id}/file?path={entry_path}\">{name}</a></li>",
                 snapshot_id = escape_html(&snapshot_id),
-                entry_path = escape_html(&entry_path),
+                entry_path = escape_html(&encode_query_path(&entry_path)),
                 name = escape_html(&entry.name)
             ));
         } else {
             html.push_str(&format!(
                 "<li><a href=\"/snapshots/{snapshot_id}?path={entry_path}\">{name}</a></li>",
                 snapshot_id = escape_html(&snapshot_id),
-                entry_path = escape_html(&entry_path),
+                entry_path = escape_html(&encode_query_path(&entry_path)),
                 name = escape_html(&entry.name)
             ));
         }
@@ -213,11 +215,11 @@ async fn branch_page(
         .map_err(|_| PageError::internal("Failed to open repository read service"))?;
     let snapshot = read_service
         .resolve_branch(&branch_token)
-        .map_err(|_| PageError::not_found("Branch not found"))?;
+        .map_err(|error| map_page_branch_error(error, "Branch not found"))?;
     let path = query.path.unwrap_or_default();
     let entries = read_service
         .read_dir(&snapshot, &path)
-        .map_err(|_| PageError::not_found("Directory not found"))?;
+        .map_err(|error| map_page_read_error(error, "Directory not found"))?;
 
     let mut html = format!(
         "<html><body><h1>Branch {branch_token}</h1><ul>",
@@ -233,14 +235,14 @@ async fn branch_page(
             html.push_str(&format!(
                 "<li><a href=\"/api/branches/{branch_token}/file?path={entry_path}\">{name}</a></li>",
                 branch_token = escape_html(&branch_token),
-                entry_path = escape_html(&entry_path),
+                entry_path = escape_html(&encode_query_path(&entry_path)),
                 name = escape_html(&entry.name)
             ));
         } else {
             html.push_str(&format!(
                 "<li><a href=\"/branches/{branch_token}?path={entry_path}\">{name}</a></li>",
                 branch_token = escape_html(&branch_token),
-                entry_path = escape_html(&entry_path),
+                entry_path = escape_html(&encode_query_path(&entry_path)),
                 name = escape_html(&entry.name)
             ));
         }
@@ -280,11 +282,11 @@ async fn snapshot_tree(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let snapshot = read_service
         .open_snapshot(&snapshot_id)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_snapshot_error)?;
     let path = query.path.unwrap_or_default();
     let entries = read_service
         .read_dir(&snapshot, &path)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_read_error)?;
 
     Ok(Json(DirectoryListingResponse {
         snapshot_id,
@@ -310,11 +312,11 @@ async fn branch_tree(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let snapshot = read_service
         .resolve_branch(&branch_token)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_branch_error)?;
     let path = query.path.unwrap_or_default();
     let entries = read_service
         .read_dir(&snapshot, &path)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_read_error)?;
 
     Ok(Json(DirectoryListingResponse {
         snapshot_id: snapshot.snapshot_id,
@@ -341,10 +343,10 @@ async fn snapshot_file(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let snapshot = read_service
         .open_snapshot(&snapshot_id)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_snapshot_error)?;
     let file = read_service
         .open_file(&snapshot, &query.path)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_read_error)?;
     build_file_response(&read_service, &file, &headers)
 }
 
@@ -360,10 +362,10 @@ async fn branch_file(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let snapshot = read_service
         .resolve_branch(&branch_token)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_branch_error)?;
     let file = read_service
         .open_file(&snapshot, &query.path)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .map_err(map_api_read_error)?;
     build_file_response(&read_service, &file, &headers)
 }
 
@@ -445,4 +447,108 @@ fn escape_html(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn encode_query_path(path: &str) -> String {
+    #[derive(Serialize)]
+    struct EncodedPath<'a> {
+        path: &'a str,
+    }
+
+    serde_urlencoded::to_string(EncodedPath { path })
+        .unwrap_or_else(|_| format!("path={path}"))
+        .trim_start_matches("path=")
+        .to_string()
+}
+
+fn map_api_snapshot_error(error: Error) -> StatusCode {
+    map_api_error_with_not_found(error, &["failed to read object "])
+}
+
+fn map_api_branch_error(error: Error) -> StatusCode {
+    map_api_error_with_not_found(
+        error,
+        &[
+            "branch ref not found for token",
+            "branch ref does not point to a snapshot",
+        ],
+    )
+}
+
+fn map_api_read_error(error: Error) -> StatusCode {
+    map_api_error_with_not_found(
+        error,
+        &[
+            "directory not found in snapshot",
+            "file not found in snapshot",
+            "snapshot path must not be empty",
+            "invalid snapshot path",
+            "failed to read object plaintext",
+        ],
+    )
+}
+
+fn map_page_snapshot_error(error: Error, not_found_message: &str) -> PageError {
+    map_page_error_with_not_found(
+        error,
+        not_found_message,
+        "Failed to read snapshot",
+        &["failed to read object "],
+    )
+}
+
+fn map_page_branch_error(error: Error, not_found_message: &str) -> PageError {
+    map_page_error_with_not_found(
+        error,
+        not_found_message,
+        "Failed to resolve branch",
+        &[
+            "branch ref not found for token",
+            "branch ref does not point to a snapshot",
+        ],
+    )
+}
+
+fn map_page_read_error(error: Error, not_found_message: &str) -> PageError {
+    map_page_error_with_not_found(
+        error,
+        not_found_message,
+        "Failed to read repository content",
+        &[
+            "directory not found in snapshot",
+            "file not found in snapshot",
+            "snapshot path must not be empty",
+            "invalid snapshot path",
+            "failed to read object plaintext",
+        ],
+    )
+}
+
+fn map_api_error_with_not_found(error: Error, not_found_needles: &[&str]) -> StatusCode {
+    if error_chain_contains_any(&error, not_found_needles) {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn map_page_error_with_not_found(
+    error: Error,
+    not_found_message: &str,
+    internal_message: &str,
+    not_found_needles: &[&str],
+) -> PageError {
+    if error_chain_contains_any(&error, not_found_needles) {
+        PageError::not_found(not_found_message)
+    } else {
+        PageError::internal(internal_message)
+    }
+}
+
+fn error_chain_contains_any(error: &Error, needles: &[&str]) -> bool {
+    error.chain().any(|cause| {
+        needles
+            .iter()
+            .any(|needle| cause.to_string().contains(needle))
+    })
 }

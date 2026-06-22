@@ -2,10 +2,16 @@ use std::fs;
 use std::io::Write;
 
 use anyhow::Result;
-use e2v_core::{CheckoutOptions, CommitOptions, InitOptions, ManifestObject, ManifestStore, ManifestStoreApi, RepositoryFacade, TreeWalkEntry};
-use e2v_core::testing::{with_snapshot_reader_and_policy_for_test, with_snapshot_reader_for_test, with_stable_read_policy_for_test, StableReadPolicy, TestSnapshotReader};
-use std::sync::{Arc, Mutex};
+use e2v_core::testing::{
+    StableReadPolicy, TestSnapshotReader, with_snapshot_reader_and_policy_for_test,
+    with_snapshot_reader_for_test, with_stable_read_policy_for_test,
+};
+use e2v_core::{
+    CheckoutOptions, CommitOptions, InitOptions, ManifestObject, ManifestStore, ManifestStoreApi,
+    RepositoryFacade, TreeWalkEntry,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -48,13 +54,34 @@ fn init_creates_control_plane_files_for_local_direct_layout() {
 
     let e2v_dir = repo_root.join(".e2v");
     assert!(e2v_dir.exists(), "expected control directory to exist");
-    assert!(e2v_dir.join("objects").is_dir(), "expected objects directory");
-    assert!(e2v_dir.join("journal").is_dir(), "expected journal directory");
-    assert!(e2v_dir.join("config.json").is_file(), "expected config file");
-    assert!(e2v_dir.join("layout_root.json").is_file(), "expected layout root file");
-    assert!(e2v_dir.join("refs").join("default.json").is_file(), "expected default ref file");
-    assert!(e2v_dir.join("keyring").join("keyring.current").is_file(), "expected current keyring pointer");
-    assert!(e2v_dir.join("keyring").join("keyring.1").is_file(), "expected first keyring generation");
+    assert!(
+        e2v_dir.join("objects").is_dir(),
+        "expected objects directory"
+    );
+    assert!(
+        e2v_dir.join("journal").is_dir(),
+        "expected journal directory"
+    );
+    assert!(
+        e2v_dir.join("config.json").is_file(),
+        "expected config file"
+    );
+    assert!(
+        e2v_dir.join("layout_root.json").is_file(),
+        "expected layout root file"
+    );
+    assert!(
+        e2v_dir.join("refs").join("default.json").is_file(),
+        "expected default ref file"
+    );
+    assert!(
+        e2v_dir.join("keyring").join("keyring.current").is_file(),
+        "expected current keyring pointer"
+    );
+    assert!(
+        e2v_dir.join("keyring").join("keyring.1").is_file(),
+        "expected first keyring generation"
+    );
     let leftover_temps = fs::read_dir(e2v_dir.join("keyring"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
@@ -117,10 +144,7 @@ fn wrong_password_cannot_unlock_keyring() {
     facade.init(init_options(&repo_root)).unwrap();
 
     let error = facade
-        .unlock(
-            &repo_root,
-            "totally wrong password",
-        )
+        .unlock(&repo_root, "totally wrong password")
         .unwrap_err();
 
     assert!(
@@ -197,8 +221,20 @@ fn change_password_rejects_wrong_old_password_without_side_effects() {
             || error.to_string().contains("keyring"),
         "unexpected error: {error:#}"
     );
-    assert!(!repo_root.join(".e2v").join("keyring").join("keyring.2").exists());
-    assert!(!repo_root.join(".e2v").join("journal").join("keyring-update.json").exists());
+    assert!(
+        !repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.2")
+            .exists()
+    );
+    assert!(
+        !repo_root
+            .join(".e2v")
+            .join("journal")
+            .join("keyring-update.json")
+            .exists()
+    );
 }
 
 #[test]
@@ -210,8 +246,14 @@ fn unlock_recovers_interrupted_keyring_pointer_publish() {
     let facade = RepositoryFacade::new();
     facade.init(init_options(&repo_root)).unwrap();
 
-    let keyring_current = repo_root.join(".e2v").join("keyring").join("keyring.current");
-    let journal_path = repo_root.join(".e2v").join("journal").join("keyring-update.json");
+    let keyring_current = repo_root
+        .join(".e2v")
+        .join("keyring")
+        .join("keyring.current");
+    let journal_path = repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("keyring-update.json");
     let pointer_one: serde_json::Value =
         serde_json::from_slice(&fs::read(&keyring_current).unwrap()).unwrap();
     assert_eq!(pointer_one["current"].as_str(), Some("keyring.1"));
@@ -265,8 +307,14 @@ fn unlock_recovers_when_generation_exists_but_journal_is_still_writing_generatio
     let facade = RepositoryFacade::new();
     facade.init(init_options(&repo_root)).unwrap();
 
-    let keyring_current = repo_root.join(".e2v").join("keyring").join("keyring.current");
-    let journal_path = repo_root.join(".e2v").join("journal").join("keyring-update.json");
+    let keyring_current = repo_root
+        .join(".e2v")
+        .join("keyring")
+        .join("keyring.current");
+    let journal_path = repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("keyring-update.json");
     let pointer_one: serde_json::Value =
         serde_json::from_slice(&fs::read(&keyring_current).unwrap()).unwrap();
     assert_eq!(pointer_one["current"].as_str(), Some("keyring.1"));
@@ -363,7 +411,9 @@ fn commit_prefers_snapshot_reader_for_large_file_input() {
     let read_service = facade.read_service(&repo_root).unwrap();
     let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
     let file = read_service.open_file(&snapshot, "large.txt").unwrap();
-    let content = read_service.read_range(&file, 0, snapshot_bytes.len()).unwrap();
+    let content = read_service
+        .read_range(&file, 0, snapshot_bytes.len())
+        .unwrap();
 
     assert_eq!(content, snapshot_bytes);
     assert_eq!(calls.lock().unwrap().len(), 1);
@@ -505,7 +555,9 @@ fn commit_can_use_snapshot_reader_and_custom_stable_read_policy_together() {
     let read_service = facade.read_service(&repo_root).unwrap();
     let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
     let file = read_service.open_file(&snapshot, "large.txt").unwrap();
-    let content = read_service.read_range(&file, 0, snapshot_bytes.len()).unwrap();
+    let content = read_service
+        .read_range(&file, 0, snapshot_bytes.len())
+        .unwrap();
 
     assert_eq!(content, snapshot_bytes);
     assert_eq!(calls.lock().unwrap().len(), 1);
@@ -663,7 +715,10 @@ fn second_commit_links_to_previous_snapshot_as_parent() {
     let snapshots = facade.snapshots(&repo_root).unwrap();
 
     assert_eq!(snapshots[0].snapshot_id, second.snapshot_id);
-    assert_eq!(snapshots[0].parent_snapshot_id.as_deref(), Some(first.snapshot_id.as_str()));
+    assert_eq!(
+        snapshots[0].parent_snapshot_id.as_deref(),
+        Some(first.snapshot_id.as_str())
+    );
 }
 
 #[test]
@@ -819,7 +874,9 @@ fn read_service_can_browse_nested_directories_and_files() {
     assert_eq!(nested_entries[0].name, "hello.txt");
     assert_eq!(nested_entries[0].kind, "file");
 
-    let file = read_service.open_file(&snapshot, "nested/hello.txt").unwrap();
+    let file = read_service
+        .open_file(&snapshot, "nested/hello.txt")
+        .unwrap();
     let content = read_service.read_range(&file, 0, 99).unwrap();
     assert_eq!(String::from_utf8(content).unwrap(), "hello nested");
 }
@@ -883,7 +940,8 @@ fn unicode_name_scan_checkout_scan_is_idempotent() {
         .filter_map(|entry| {
             let entry = entry.unwrap();
             let path = entry.path();
-            if path.file_name().and_then(|name| name.to_str()) == Some(".e2v-checkout-mapping.json") {
+            if path.file_name().and_then(|name| name.to_str()) == Some(".e2v-checkout-mapping.json")
+            {
                 None
             } else {
                 Some(entry.file_name().to_string_lossy().to_string())
@@ -895,7 +953,10 @@ fn unicode_name_scan_checkout_scan_is_idempotent() {
 
     let working_tree = e2v_core::testing::new_working_tree_for_test(&checkout_target);
     let scanned = working_tree.scan_dir(&checkout_target, true).unwrap();
-    let scanned_names = scanned.into_iter().map(|entry| entry.name).collect::<Vec<_>>();
+    let scanned_names = scanned
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
 
     assert_eq!(scanned_names, vec!["\u{e9}.txt".to_string()]);
 }
@@ -971,7 +1032,11 @@ fn commit_ignores_local_checkout_mapping_artifact() {
     let entries = read_service.read_dir(&snapshot, "").unwrap();
 
     assert!(entries.iter().any(|entry| entry.name == "root.txt"));
-    assert!(!entries.iter().any(|entry| entry.name == ".e2v-checkout-mapping.json"));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.name == ".e2v-checkout-mapping.json")
+    );
 }
 
 #[test]
@@ -1256,13 +1321,22 @@ fn commit_uses_repo_scoped_chunk_ids_for_identical_content() {
 
     let left_read_service = facade.read_service(&repo_a).unwrap();
     let left_snapshot = left_read_service.open_snapshot(&left.snapshot_id).unwrap();
-    let left_file = left_read_service.open_file(&left_snapshot, "hello.txt").unwrap();
+    let left_file = left_read_service
+        .open_file(&left_snapshot, "hello.txt")
+        .unwrap();
 
     let right_read_service = facade.read_service(&repo_b).unwrap();
-    let right_snapshot = right_read_service.open_snapshot(&right.snapshot_id).unwrap();
-    let right_file = right_read_service.open_file(&right_snapshot, "hello.txt").unwrap();
+    let right_snapshot = right_read_service
+        .open_snapshot(&right.snapshot_id)
+        .unwrap();
+    let right_file = right_read_service
+        .open_file(&right_snapshot, "hello.txt")
+        .unwrap();
 
-    assert_ne!(left_file.debug_chunk_ids()[0], right_file.debug_chunk_ids()[0]);
+    assert_ne!(
+        left_file.debug_chunk_ids()[0],
+        right_file.debug_chunk_ids()[0]
+    );
 }
 
 #[test]
@@ -1289,11 +1363,15 @@ fn committed_objects_do_not_store_plaintext_file_or_path_bytes() {
 
     for bytes in object_bytes {
         assert!(
-            !bytes.windows(b"hello world".len()).any(|window| window == b"hello world"),
+            !bytes
+                .windows(b"hello world".len())
+                .any(|window| window == b"hello world"),
             "object bytes leaked file content"
         );
         assert!(
-            !bytes.windows(b"hello.txt".len()).any(|window| window == b"hello.txt"),
+            !bytes
+                .windows(b"hello.txt".len())
+                .any(|window| window == b"hello.txt"),
             "object bytes leaked file name"
         );
     }
@@ -1341,12 +1419,13 @@ fn local_default_ref_does_not_store_plaintext_branch_or_snapshot() {
     fs::create_dir_all(&repo_root).unwrap();
 
     let facade = RepositoryFacade::new();
-    facade.init(InitOptions {
-        repo_root: repo_root.clone(),
-        password: "correct horse battery staple".to_string(),
-        branch_name: "trunk".to_string(),
-    })
-    .unwrap();
+    facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "trunk".to_string(),
+        })
+        .unwrap();
     fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
 
     let commit = facade
@@ -1358,7 +1437,9 @@ fn local_default_ref_does_not_store_plaintext_branch_or_snapshot() {
 
     let ref_bytes = fs::read(repo_root.join(".e2v").join("refs").join("default.json")).unwrap();
     assert!(
-        !ref_bytes.windows(b"trunk".len()).any(|window| window == b"trunk"),
+        !ref_bytes
+            .windows(b"trunk".len())
+            .any(|window| window == b"trunk"),
         "ref bytes leaked branch name"
     );
     assert!(
@@ -1387,7 +1468,9 @@ fn read_service_can_resolve_current_snapshot_from_branch_token() {
         .unwrap();
 
     let read_service = facade.read_service(&repo_root).unwrap();
-    let snapshot = read_service.resolve_branch(&state.branch.token_hex).unwrap();
+    let snapshot = read_service
+        .resolve_branch(&state.branch.token_hex)
+        .unwrap();
 
     assert_eq!(snapshot.snapshot_id, commit.snapshot_id);
 }
@@ -1424,7 +1507,9 @@ fn large_files_are_split_into_multiple_chunks() {
         file.chunk_count()
     );
 
-    let read_back = read_service.read_range(&file, 0, large_bytes.len()).unwrap();
+    let read_back = read_service
+        .read_range(&file, 0, large_bytes.len())
+        .unwrap();
     assert_eq!(read_back, large_bytes);
 }
 
@@ -1494,7 +1579,9 @@ fn verify_snapshot_accepts_a_healthy_local_snapshot() {
         })
         .unwrap();
 
-    facade.verify_snapshot(&repo_root, &commit.snapshot_id).unwrap();
+    facade
+        .verify_snapshot(&repo_root, &commit.snapshot_id)
+        .unwrap();
 }
 
 #[test]
@@ -1612,7 +1699,9 @@ fn verify_snapshot_rejects_tampered_reachable_chunk() {
     bytes[last_index] ^= 0x01;
     fs::write(&chunk_path, bytes).unwrap();
 
-    let error = facade.verify_snapshot(&repo_root, &commit.snapshot_id).unwrap_err();
+    let error = facade
+        .verify_snapshot(&repo_root, &commit.snapshot_id)
+        .unwrap_err();
     assert!(
         error.to_string().contains("authentication"),
         "unexpected error: {error:#}"
@@ -1712,6 +1801,51 @@ fn read_range_rejects_tampered_chunk_before_returning_bytes() {
         error.to_string().contains("authentication"),
         "unexpected error: {error:#}"
     );
+}
+
+#[test]
+fn read_range_only_requires_chunks_covering_the_requested_prefix() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let mut content = Vec::with_capacity(16 * 1024 * 1024);
+    for index in 0..(16 * 1024 * 1024) {
+        content.push((index % 251) as u8);
+    }
+    fs::write(repo_root.join("large.bin"), &content).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "prefix-range".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.bin").unwrap();
+    assert!(
+        file.chunk_count() >= 2,
+        "expected multi-chunk file, got {} chunks",
+        file.chunk_count()
+    );
+
+    let later_chunk_id = file.debug_chunk_ids().last().unwrap().clone();
+    let later_chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{later_chunk_id}.json"));
+    let mut bytes = fs::read(&later_chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&later_chunk_path, bytes).unwrap();
+
+    let prefix = read_service.read_range(&file, 0, 16).unwrap();
+
+    assert_eq!(prefix, content[..16].to_vec());
 }
 
 #[test]
@@ -1848,7 +1982,9 @@ fn verify_object_accepts_a_healthy_chunk() {
     let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
     let chunk_id = file.debug_chunk_ids()[0].clone();
 
-    facade.verify_object(&repo_root, &chunk_id, "chunk").unwrap();
+    facade
+        .verify_object(&repo_root, &chunk_id, "chunk")
+        .unwrap();
 }
 
 #[test]
@@ -1881,13 +2017,14 @@ fn verify_object_rejects_tampered_chunk() {
     bytes[last_index] ^= 0x01;
     fs::write(&chunk_path, bytes).unwrap();
 
-    let error = facade.verify_object(&repo_root, &chunk_id, "chunk").unwrap_err();
+    let error = facade
+        .verify_object(&repo_root, &chunk_id, "chunk")
+        .unwrap_err();
     assert!(
         error.to_string().contains("authentication"),
         "unexpected error: {error:#}"
     );
 }
-
 
 #[test]
 fn manifest_store_walks_nested_tree_entries() {
@@ -1910,7 +2047,11 @@ fn manifest_store_walks_nested_tree_entries() {
     let store = ManifestStore::new(&repo_root);
     let entries = store.walk_tree(&commit.snapshot_id).unwrap();
 
-    assert!(entries.iter().any(|entry| entry.path == "nested/hello.txt" && entry.kind == "file"));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.path == "nested/hello.txt" && entry.kind == "file")
+    );
 }
 
 #[test]

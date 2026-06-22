@@ -93,6 +93,48 @@ async fn snapshot_page_renders_directory_entries_as_links() {
 }
 
 #[tokio::test]
+async fn snapshot_page_url_encodes_file_links_for_special_character_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("report&notes#1+.txt"), b"hello web").unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "special-file".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/snapshots/{}?path=", commit.snapshot_id))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("report&amp;notes#1+.txt"));
+    assert!(text.contains("path=report%26notes%231%2B.txt"));
+}
+
+#[tokio::test]
 async fn branch_page_renders_root_entries_as_links() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -140,6 +182,53 @@ async fn branch_page_renders_root_entries_as_links() {
 }
 
 #[tokio::test]
+async fn branch_page_url_encodes_directory_links_for_special_character_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    let state = facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::create_dir_all(repo_root.join("dir&notes#1+")).unwrap();
+    std::fs::write(
+        repo_root.join("dir&notes#1+").join("child.txt"),
+        b"hello from child",
+    )
+    .unwrap();
+    facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "branch-special-dir".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/branches/{}?path=", state.branch.token_hex))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("dir&amp;notes#1+"));
+    assert!(text.contains("path=dir%26notes%231%2B"));
+}
+
+#[tokio::test]
 async fn missing_snapshot_page_renders_readable_error_html() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -176,4 +265,55 @@ async fn missing_snapshot_page_renders_readable_error_html() {
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("<html"));
     assert!(text.contains("Not Found"));
+}
+
+#[tokio::test]
+async fn tampered_snapshot_page_renders_internal_server_error_html() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("hello.txt"), b"hello web").unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tampered-page".to_string(),
+        })
+        .unwrap();
+
+    let snapshot_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", commit.snapshot_id));
+    let mut bytes = std::fs::read(&snapshot_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    std::fs::write(&snapshot_path, bytes).unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/snapshots/{}?path=", commit.snapshot_id))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("<html"));
+    assert!(text.contains("Internal Server Error"));
 }

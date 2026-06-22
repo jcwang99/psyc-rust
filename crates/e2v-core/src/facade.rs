@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
 use std::fs;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
@@ -15,9 +15,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::chunker::FastCdcChunker;
 use crate::keyring::{
-    cache_unlocked_secrets, open_repo_secrets, seal_repo_secrets, unlock_repo_secrets,
-    unlock_repo_secrets_from_generation_file, unlock_repo_secrets_uncached, KeyringPointer,
-    KeyringState, KEYRING_CURRENT_FILE, KEYRING_DIR,
+    KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_secrets,
+    open_repo_secrets, seal_repo_secrets, unlock_repo_secrets,
+    unlock_repo_secrets_from_generation_file, unlock_repo_secrets_uncached,
 };
 use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreApi};
 use crate::working_tree::{SnapshotReader, StableReadPolicy, WorkingTree, WorkingTreeEntry};
@@ -290,14 +290,30 @@ impl RepositoryFacade {
         );
 
         let control_dir = repo_root.join(CONTROL_DIR);
-        fs::create_dir_all(control_dir.join(OBJECTS_DIR))
-            .with_context(|| format!("failed to create objects directory at {}", control_dir.display()))?;
-        fs::create_dir_all(control_dir.join(JOURNAL_DIR))
-            .with_context(|| format!("failed to create journal directory at {}", control_dir.display()))?;
-        fs::create_dir_all(control_dir.join("refs"))
-            .with_context(|| format!("failed to create refs directory at {}", control_dir.display()))?;
-        fs::create_dir_all(control_dir.join(KEYRING_DIR))
-            .with_context(|| format!("failed to create keyring directory at {}", control_dir.display()))?;
+        fs::create_dir_all(control_dir.join(OBJECTS_DIR)).with_context(|| {
+            format!(
+                "failed to create objects directory at {}",
+                control_dir.display()
+            )
+        })?;
+        fs::create_dir_all(control_dir.join(JOURNAL_DIR)).with_context(|| {
+            format!(
+                "failed to create journal directory at {}",
+                control_dir.display()
+            )
+        })?;
+        fs::create_dir_all(control_dir.join("refs")).with_context(|| {
+            format!(
+                "failed to create refs directory at {}",
+                control_dir.display()
+            )
+        })?;
+        fs::create_dir_all(control_dir.join(KEYRING_DIR)).with_context(|| {
+            format!(
+                "failed to create keyring directory at {}",
+                control_dir.display()
+            )
+        })?;
 
         let branch_name = options.branch_name;
         let repo_id = derive_repo_id(&repo_root);
@@ -346,7 +362,12 @@ impl RepositoryFacade {
 
         atomic_write_json(control_dir.join(CONFIG_FILE), &config)?;
         atomic_write_json(control_dir.join(LAYOUT_ROOT_FILE), &layout_root)?;
-        write_keyring_generation_and_pointer(&control_dir, "keyring.1", &keyring_state, &keyring_pointer)?;
+        write_keyring_generation_and_pointer(
+            &control_dir,
+            "keyring.1",
+            &keyring_state,
+            &keyring_pointer,
+        )?;
         write_default_ref(&control_dir, &repo_secrets, &default_ref)?;
         cache_unlocked_secrets(&control_dir, &repo_secrets);
 
@@ -375,8 +396,11 @@ impl RepositoryFacade {
                         .context("invalid keyring recovery journal generation")?;
                     let generation_path = control_dir.join(KEYRING_DIR).join(current);
                     if generation_path.is_file() {
-                        let secrets =
-                            unlock_repo_secrets_from_generation_file(&control_dir, current, password)?;
+                        let secrets = unlock_repo_secrets_from_generation_file(
+                            &control_dir,
+                            current,
+                            password,
+                        )?;
                         atomic_write_json(
                             control_dir.join(KEYRING_CURRENT_FILE),
                             &KeyringPointer {
@@ -565,9 +589,9 @@ impl RepositoryFacade {
             .iter()
             .map(|(snapshot_path, _)| snapshot_path.clone())
             .collect::<Vec<_>>();
-        let required_bytes = planned_files
-            .iter()
-            .fold(0u64, |total, (_, file)| total.saturating_add(file.file_size()));
+        let required_bytes = planned_files.iter().fold(0u64, |total, (_, file)| {
+            total.saturating_add(file.file_size())
+        });
         let final_paths = working_tree.preflight_checkout_paths_for_bytes(
             &_options.target_dir,
             &relative_paths,
@@ -575,12 +599,15 @@ impl RepositoryFacade {
         )?;
         let mut staged = Vec::with_capacity(planned_files.len());
 
-        for ((_snapshot_path, file), final_path) in planned_files.into_iter().zip(final_paths.into_iter()) {
+        for ((_snapshot_path, file), final_path) in
+            planned_files.into_iter().zip(final_paths.into_iter())
+        {
             let stage_result: Result<()> = (|| {
                 let bytes = read_service.read_range(&file, 0, usize::MAX)?;
                 if let Some(parent) = final_path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create checkout directory {}", parent.display()))?;
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create checkout directory {}", parent.display())
+                    })?;
                 }
                 let temp_path = working_tree.write_checkout_temp(&final_path, &bytes)?;
                 staged.push((_snapshot_path, temp_path, final_path));
@@ -598,10 +625,7 @@ impl RepositoryFacade {
         for (snapshot_path, temp_path, final_path) in staged {
             working_tree.publish_checkout_temp(&temp_path, &final_path)?;
             let observed_name = working_tree.observed_checkout_name(&final_path)?;
-            let expected_name = snapshot_path
-                .split('/')
-                .next_back()
-                .unwrap_or_default();
+            let expected_name = snapshot_path.split('/').next_back().unwrap_or_default();
             working_tree.validate_checkout_read_back(expected_name, &observed_name)?;
             working_tree.record_platform_name_mapping(&snapshot_path, &final_path)?;
         }
@@ -698,9 +722,10 @@ impl ReadService {
         let (parent_path, file_name) = split_parent_and_name(path)?;
         let tree_id = resolve_tree_for_path(&manifest_store, &snapshot.root_tree_id, &parent_path)?;
         let tree = manifest_store.get_tree_node(&tree_id)?;
-        let entry = tree.entries.into_iter().find(|entry| {
-            entry.name == file_name && entry.kind == "file"
-        });
+        let entry = tree
+            .entries
+            .into_iter()
+            .find(|entry| entry.name == file_name && entry.kind == "file");
         let entry = entry.with_context(|| format!("file not found in snapshot: {path}"))?;
         let file = manifest_store.get_file(&entry.object_id)?;
 
@@ -720,15 +745,40 @@ impl ReadService {
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let object_store = open_object_store(&control_dir)?;
         ensure!(!file.chunk_ids.is_empty(), "file has no chunks");
-        let mut bytes = Vec::new();
-        for chunk_id in &file.chunk_ids {
-            let chunk = read_chunk_object(&object_store, chunk_id)?;
-            bytes.extend_from_slice(&chunk.data);
+        let file_size: usize = file
+            .file_size
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("file size does not fit in usize"))?;
+        ensure!(offset <= file_size, "range offset out of bounds");
+        let end = offset.saturating_add(length).min(file_size);
+        if offset == end {
+            return Ok(Vec::new());
         }
 
-        ensure!(offset <= bytes.len(), "range offset out of bounds");
-        let end = offset.saturating_add(length).min(bytes.len());
-        Ok(bytes[offset..end].to_vec())
+        let mut chunk_start = 0usize;
+        let mut output = Vec::with_capacity(end - offset);
+        for chunk_id in &file.chunk_ids {
+            if output.len() >= end - offset {
+                break;
+            }
+
+            let chunk = read_chunk_object(&object_store, chunk_id)?;
+            let chunk_end = chunk_start.saturating_add(chunk.data.len());
+            if chunk_end <= offset {
+                chunk_start = chunk_end;
+                continue;
+            }
+            if chunk_start >= end {
+                break;
+            }
+
+            let slice_start = offset.saturating_sub(chunk_start);
+            let slice_end = (end - chunk_start).min(chunk.data.len());
+            output.extend_from_slice(&chunk.data[slice_start..slice_end]);
+            chunk_start = chunk_end;
+        }
+
+        Ok(output)
     }
 }
 
@@ -768,7 +818,8 @@ fn generate_repo_secrets(repo_id: &str) -> Result<RepoSecrets> {
 
 fn random_key_material() -> Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("failed to obtain repository key material"))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("failed to obtain repository key material"))?;
     Ok(bytes)
 }
 
@@ -777,7 +828,10 @@ fn open_object_store(control_dir: &Path) -> Result<DirectLayoutObjectStore> {
     Ok(open_object_store_with_secrets(control_dir, secrets))
 }
 
-fn open_object_store_with_secrets(control_dir: &Path, secrets: RepoSecrets) -> DirectLayoutObjectStore {
+fn open_object_store_with_secrets(
+    control_dir: &Path,
+    secrets: RepoSecrets,
+) -> DirectLayoutObjectStore {
     DirectLayoutObjectStore::new(control_dir, secrets)
 }
 
@@ -790,7 +844,8 @@ fn write_default_ref(control_dir: &Path, secrets: &RepoSecrets, value: &RefRecor
 
 fn read_default_ref(control_dir: &Path, secrets: &RepoSecrets) -> Result<RefRecord> {
     let path = control_dir.join(DEFAULT_REF_FILE);
-    let bytes = std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let plaintext = decrypt_control_record(secrets, DEFAULT_REF_TOKEN, "ref", &bytes)?;
     postcard_from_bytes(&plaintext).context("failed to decode ref record")
 }
@@ -818,7 +873,11 @@ fn encrypt_control_record(
     let mut ciphertext = plaintext.to_vec();
     let associated_data = control_record_associated_data(secrets, &object_id, object_type);
     let auth_tag = cipher
-        .encrypt_in_place_detached(XNonce::from_slice(&nonce), &associated_data, &mut ciphertext)
+        .encrypt_in_place_detached(
+            XNonce::from_slice(&nonce),
+            &associated_data,
+            &mut ciphertext,
+        )
         .map_err(|_| anyhow::anyhow!("failed to encrypt local ref"))?;
 
     let envelope = EncryptedControlRecord {
@@ -844,12 +903,18 @@ fn decrypt_control_record(
 ) -> Result<Vec<u8>> {
     let envelope: EncryptedControlRecord =
         postcard_from_bytes(bytes).context("failed to decode encrypted ref")?;
-    ensure!(envelope.magic == *CONTROL_REF_MAGIC, "ref authentication failed");
+    ensure!(
+        envelope.magic == *CONTROL_REF_MAGIC,
+        "ref authentication failed"
+    );
     ensure!(
         envelope.format_version == CONTROL_REF_FORMAT_VERSION,
         "unsupported ref format version"
     );
-    ensure!(envelope.object_type == object_type, "ref authentication failed");
+    ensure!(
+        envelope.object_type == object_type,
+        "ref authentication failed"
+    );
     ensure!(
         envelope.crypto_suite == "xchacha20poly1305",
         "unsupported ref crypto suite"
@@ -870,7 +935,8 @@ fn decrypt_control_record(
         )
         .map_err(|_| anyhow::anyhow!("ref authentication failed"))?;
 
-    let expected_object_id = derive_control_object_id(secrets, stable_name, object_type, &plaintext);
+    let expected_object_id =
+        derive_control_object_id(secrets, stable_name, object_type, &plaintext);
     ensure!(
         expected_object_id == envelope.object_id,
         "ref authentication failed"
@@ -1016,23 +1082,23 @@ where
     let chunk_pieces = chunker.split(&file_bytes)?;
     let mut chunk_ids = Vec::with_capacity(chunk_pieces.len());
 
-        for piece in chunk_pieces {
-            let piece_len = piece.bytes.len();
-            let chunk = ChunkObject {
-                plaintext_length: piece_len,
-                data: piece.bytes,
-            };
-            let chunk_bytes = postcard_to_vec(&chunk).context("failed to encode chunk")?;
-            let chunk_id = object_store.preview_object_id("chunk", &chunk_bytes);
-            let already_exists = object_store.exists_object(&chunk_id);
-            let chunk_id = object_store.put_object("chunk", &chunk_bytes)?;
-            if already_exists {
-                *reused_bytes += piece_len as u64;
-            } else {
-                *new_bytes += piece_len as u64;
-            }
-            chunk_ids.push(chunk_id);
+    for piece in chunk_pieces {
+        let piece_len = piece.bytes.len();
+        let chunk = ChunkObject {
+            plaintext_length: piece_len,
+            data: piece.bytes,
+        };
+        let chunk_bytes = postcard_to_vec(&chunk).context("failed to encode chunk")?;
+        let chunk_id = object_store.preview_object_id("chunk", &chunk_bytes);
+        let already_exists = object_store.exists_object(&chunk_id);
+        let chunk_id = object_store.put_object("chunk", &chunk_bytes)?;
+        if already_exists {
+            *reused_bytes += piece_len as u64;
+        } else {
+            *new_bytes += piece_len as u64;
         }
+        chunk_ids.push(chunk_id);
+    }
 
     let file_object = FileObject {
         schema_version: REPO_FORMAT_VERSION,
@@ -1052,7 +1118,11 @@ where
     }))
 }
 
-fn resolve_tree_for_path(manifest_store: &LocalManifestStore, root_tree_id: &str, path: &str) -> Result<String> {
+fn resolve_tree_for_path(
+    manifest_store: &LocalManifestStore,
+    root_tree_id: &str,
+    path: &str,
+) -> Result<String> {
     let normalized = normalize_snapshot_path(path);
     if normalized.is_empty() {
         return Ok(root_tree_id.to_string());
@@ -1096,7 +1166,7 @@ fn collect_checkout_file_paths(
     read_service: &ReadService,
     snapshot: &SnapshotHandle,
     snapshot_path: &str,
-    ) -> Result<Vec<(String, FileHandle)>> {
+) -> Result<Vec<(String, FileHandle)>> {
     let entries = read_service.read_dir(snapshot, snapshot_path)?;
     let mut files = Vec::new();
     let path_validator = WorkingTree::new("D:\\manifest-path-validator");
@@ -1106,7 +1176,11 @@ fn collect_checkout_file_paths(
         path_validator.path_jail_validate(&child_snapshot_path)?;
 
         if entry.kind == "tree" {
-            files.extend(collect_checkout_file_paths(read_service, snapshot, &child_snapshot_path)?);
+            files.extend(collect_checkout_file_paths(
+                read_service,
+                snapshot,
+                &child_snapshot_path,
+            )?);
             continue;
         }
 
@@ -1125,19 +1199,31 @@ fn join_snapshot_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn write_object<T: Serialize>(object_store: &DirectLayoutObjectStore, object_type: &str, plaintext: &T) -> Result<String> {
-    let plaintext_bytes = postcard_to_vec(plaintext).context("failed to encode object plaintext")?;
+fn write_object<T: Serialize>(
+    object_store: &DirectLayoutObjectStore,
+    object_type: &str,
+    plaintext: &T,
+) -> Result<String> {
+    let plaintext_bytes =
+        postcard_to_vec(plaintext).context("failed to encode object plaintext")?;
     object_store.put_object(object_type, &plaintext_bytes)
 }
 
-fn read_stored_object<T: for<'de> Deserialize<'de>>(object_store: &DirectLayoutObjectStore, object_id: &str, expected_type: &str) -> Result<T> {
+fn read_stored_object<T: for<'de> Deserialize<'de>>(
+    object_store: &DirectLayoutObjectStore,
+    object_id: &str,
+    expected_type: &str,
+) -> Result<T> {
     let plaintext = object_store.get_object(object_id, expected_type)?;
     postcard_from_bytes(&plaintext).context("failed to decode object plaintext")
 }
 
 #[allow(dead_code)]
 #[cfg(test)]
-fn read_snapshot_object(object_store: &DirectLayoutObjectStore, object_id: &str) -> Result<SnapshotObject> {
+fn read_snapshot_object(
+    object_store: &DirectLayoutObjectStore,
+    object_id: &str,
+) -> Result<SnapshotObject> {
     let snapshot: SnapshotObject = read_stored_object(object_store, object_id, "snapshot")?;
     validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
     Ok(snapshot)
@@ -1174,7 +1260,10 @@ fn reserved_manifest_types() -> &'static [&'static str] {
     RESERVED_MANIFEST_TYPES
 }
 
-fn read_chunk_object(object_store: &DirectLayoutObjectStore, object_id: &str) -> Result<ChunkObject> {
+fn read_chunk_object(
+    object_store: &DirectLayoutObjectStore,
+    object_id: &str,
+) -> Result<ChunkObject> {
     read_stored_object(object_store, object_id, "chunk")
 }
 
@@ -1276,7 +1365,11 @@ fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
     sync_path(&temp_path)?;
     let read_back = fs::read(&temp_path)
         .with_context(|| format!("failed to read back {}", temp_path.display()))?;
-    ensure!(read_back == bytes, "read-back validation failed for {}", temp_path.display());
+    ensure!(
+        read_back == bytes,
+        "read-back validation failed for {}",
+        temp_path.display()
+    );
     fs::rename(&temp_path, &path)
         .with_context(|| format!("failed to publish {}", path.display()))?;
     sync_path(&path)?;
@@ -1294,7 +1387,9 @@ fn sync_path(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to stat {} for sync", path.display()))?;
         let mut options = std::fs::OpenOptions::new();
         if metadata.is_dir() {
-            options.access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+            options
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
         } else {
             options.read(true).write(true);
         }
@@ -1306,8 +1401,7 @@ fn sync_path(path: &Path) -> Result<()> {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to sync {}", path.display()))
+                    return Err(error).with_context(|| format!("failed to sync {}", path.display()));
                 }
             }
         }
@@ -1344,7 +1438,10 @@ fn write_keyring_generation_and_pointer(
         }),
     )?;
     let result = with_keyring_lock(&control_dir.join(KEYRING_DIR), || {
-        atomic_write_json(control_dir.join(KEYRING_DIR).join(generation_file_name), keyring_state)?;
+        atomic_write_json(
+            control_dir.join(KEYRING_DIR).join(generation_file_name),
+            keyring_state,
+        )?;
         atomic_write_json(
             journal_path.clone(),
             &serde_json::json!({
@@ -1390,8 +1487,7 @@ where
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to decode {}", path.display()))
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {}", path.display()))
 }
 
 #[cfg(test)]
@@ -1563,7 +1659,11 @@ mod facade_tests {
             &mut new_bytes,
             &mut reused_bytes,
             &mut warnings,
-            |_path| Err(anyhow::anyhow!("unstable input: volatile source retry budget exhausted")),
+            |_path| {
+                Err(anyhow::anyhow!(
+                    "unstable input: volatile source retry budget exhausted"
+                ))
+            },
         )
         .unwrap();
 
@@ -1621,14 +1721,16 @@ mod facade_tests {
         };
         let mut keyring_one: KeyringState = read_json(generation_one_path.clone()).unwrap();
         keyring_one.generation = 2;
-        keyring_one.envelopes = vec![seal_repo_secrets(
-            &secrets_two.repo_id,
-            DEFAULT_ACTIVE_EPOCH,
-            "correct horse battery staple",
-            &secrets_two,
-            "len:28".to_string(),
-        )
-        .unwrap()];
+        keyring_one.envelopes = vec![
+            seal_repo_secrets(
+                &secrets_two.repo_id,
+                DEFAULT_ACTIVE_EPOCH,
+                "correct horse battery staple",
+                &secrets_two,
+                "len:28".to_string(),
+            )
+            .unwrap(),
+        ];
         atomic_write_json(generation_two_path, &keyring_one).unwrap();
         atomic_write_json(
             current_pointer_path,
@@ -1638,7 +1740,8 @@ mod facade_tests {
             },
         )
         .unwrap();
-        let secrets = unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
+        let secrets =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
 
         assert_eq!(secrets.repo_ref_key, [9u8; 32]);
     }
@@ -1672,11 +1775,11 @@ mod facade_tests {
         )
         .unwrap();
 
-        let error = unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap_err();
+        let error =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap_err();
 
         assert!(
-            error.to_string().contains("generation")
-                || error.to_string().contains("mismatch"),
+            error.to_string().contains("generation") || error.to_string().contains("mismatch"),
             "unexpected error: {error:#}"
         );
     }
@@ -1710,14 +1813,16 @@ mod facade_tests {
         };
         let keyring_two = KeyringState {
             generation: 2,
-            envelopes: vec![seal_repo_secrets(
-                &secrets_two.repo_id,
-                DEFAULT_ACTIVE_EPOCH,
-                "correct horse battery staple",
-                &secrets_two,
-                "len:28".to_string(),
-            )
-            .unwrap()],
+            envelopes: vec![
+                seal_repo_secrets(
+                    &secrets_two.repo_id,
+                    DEFAULT_ACTIVE_EPOCH,
+                    "correct horse battery staple",
+                    &secrets_two,
+                    "len:28".to_string(),
+                )
+                .unwrap(),
+            ],
             ..keyring_one.clone()
         };
 
@@ -1857,8 +1962,7 @@ mod facade_tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("failed")
-                || error.to_string().contains("directory"),
+            error.to_string().contains("failed") || error.to_string().contains("directory"),
             "unexpected error: {error:#}"
         );
         assert!(journal_path.exists());
@@ -1909,8 +2013,7 @@ mod facade_tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("failed")
-                || error.to_string().contains("directory"),
+            error.to_string().contains("failed") || error.to_string().contains("directory"),
             "unexpected error: {error:#}"
         );
         assert!(generation_two_path.is_file());
@@ -2062,7 +2165,8 @@ mod facade_tests {
             })
             .unwrap();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let secrets = unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
+        let secrets =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
         let ref_path = control_dir.join(DEFAULT_REF_FILE);
         let bytes = fs::read(&ref_path).unwrap();
         let mut envelope: EncryptedControlRecord = postcard_from_bytes(&bytes).unwrap();
@@ -2092,7 +2196,8 @@ mod facade_tests {
             })
             .unwrap();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let secrets = unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
+        let secrets =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
         let ref_path = control_dir.join(DEFAULT_REF_FILE);
         let bytes = fs::read(&ref_path).unwrap();
         let mut envelope: EncryptedControlRecord = postcard_from_bytes(&bytes).unwrap();
@@ -2122,7 +2227,8 @@ mod facade_tests {
             })
             .unwrap();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let secrets = unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
+        let secrets =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
         let ref_path = control_dir.join(DEFAULT_REF_FILE);
         let mut bytes = fs::read(&ref_path).unwrap();
         bytes.truncate(bytes.len() - 5);
@@ -2156,7 +2262,8 @@ mod facade_tests {
             })
             .unwrap();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let secrets = unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
+        let secrets =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
         let ref_path = control_dir.join(DEFAULT_REF_FILE);
         let bytes = fs::read(&ref_path).unwrap();
         let mut envelope: EncryptedControlRecord = postcard_from_bytes(&bytes).unwrap();
@@ -2185,7 +2292,8 @@ mod facade_tests {
             })
             .unwrap();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let secrets = unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
+        let secrets =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
         let ref_path = control_dir.join(DEFAULT_REF_FILE);
         let bytes = fs::read(&ref_path).unwrap();
         let mut envelope: EncryptedControlRecord = postcard_from_bytes(&bytes).unwrap();
