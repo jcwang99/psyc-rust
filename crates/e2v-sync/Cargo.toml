@@ -9,6 +9,10 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
+axum.workspace = true
+http.workspace = true
+tower.workspace = true
+tokio.workspace = true
 e2v-core = { path = "../e2v-core" }
 e2v-store = { path = "../e2v-store" }
 
