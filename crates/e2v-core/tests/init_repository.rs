@@ -7,7 +7,8 @@ use e2v_core::testing::{
     with_snapshot_reader_for_test, with_stable_read_policy_for_test,
 };
 use e2v_core::{
-    CheckoutOptions, CommitOptions, InitOptions, ManifestObject, ManifestStore, ManifestStoreApi,
+    CheckoutOptions, CommitOptions, InitOptions, ManifestObject,
+    ManifestSnapshotObject, ManifestStore, ManifestStoreApi, ManifestTreeObject,
     RepositoryFacade, TreeWalkEntry,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1503,6 +1504,86 @@ fn read_service_can_resolve_current_snapshot_from_branch_token() {
 }
 
 #[test]
+fn read_service_rejects_snapshot_id_path_traversal() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let error = read_service.open_snapshot("../evil").unwrap_err();
+
+    assert!(
+        error.to_string().contains("snapshot id")
+            || error.to_string().contains("object id")
+            || error.to_string().contains("path traversal"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_service_rejects_parent_dir_segments_in_directory_paths() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "nested".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+
+    let error = read_service.read_dir(&snapshot, "../nested").unwrap_err();
+
+    assert!(
+        error.to_string().contains("invalid snapshot path"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_service_rejects_parent_dir_segments_in_file_paths() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    std::fs::create_dir_all(repo_root.join("nested")).unwrap();
+    std::fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "nested".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+
+    let error = read_service
+        .open_file(&snapshot, "nested/../hello.txt")
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("invalid snapshot path"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn large_files_are_split_into_multiple_chunks() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1897,6 +1978,50 @@ fn verify_snapshot_rejects_tampered_reachable_chunk() {
 }
 
 #[test]
+fn verify_snapshot_rejects_snapshot_with_invalid_parent_snapshot_id() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-parent".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let object_store = e2v_store::DirectLayoutObjectStore::new(&control_dir, secrets);
+    let tampered_snapshot = ManifestSnapshotObject {
+        parent_snapshot_id: Some("..\\evil".to_string()),
+        ..snapshot
+    };
+    let tampered_snapshot_id = object_store
+        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .unwrap();
+
+    let error = facade
+        .verify_snapshot(&repo_root, &tampered_snapshot_id)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("snapshot")
+            || error.to_string().contains("parent")
+            || error.to_string().contains("object id")
+            || error.to_string().contains("path"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn checkout_rejects_tampered_chunk_and_leaves_no_dirty_files() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -2034,6 +2159,256 @@ fn read_range_only_requires_chunks_covering_the_requested_prefix() {
     let prefix = read_service.read_range(&file, 0, 16).unwrap();
 
     assert_eq!(prefix, content[..16].to_vec());
+}
+
+#[test]
+fn read_range_only_requires_chunks_covering_the_requested_suffix() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let mut content = Vec::with_capacity(16 * 1024 * 1024);
+    for index in 0..(16 * 1024 * 1024) {
+        content.push((index % 251) as u8);
+    }
+    fs::write(repo_root.join("large.bin"), &content).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "suffix-range".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.bin").unwrap();
+    assert!(
+        file.chunk_count() >= 2,
+        "expected multi-chunk file, got {} chunks",
+        file.chunk_count()
+    );
+
+    let first_chunk_id = file.debug_chunk_ids().first().unwrap().clone();
+    let first_chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{first_chunk_id}.json"));
+    let mut bytes = fs::read(&first_chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&first_chunk_path, bytes).unwrap();
+
+    let suffix_len = 64usize;
+    let suffix_offset = content.len() - suffix_len;
+    let suffix = read_service
+        .read_range(&file, suffix_offset, suffix_len)
+        .unwrap();
+
+    assert_eq!(suffix, content[suffix_offset..].to_vec());
+}
+
+#[test]
+fn read_range_rejects_authenticated_file_graph_with_incomplete_chunk_coverage() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "incomplete-coverage".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let file_entry = root_tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .clone();
+    let mut file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    file_manifest.file_size += 5;
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let object_store = e2v_store::DirectLayoutObjectStore::new(&control_dir, secrets);
+    let tampered_file_id = object_store
+        .put_object("file", &postcard::to_stdvec(&file_manifest).unwrap())
+        .unwrap();
+
+    let mut tampered_tree: ManifestTreeObject = root_tree.clone();
+    tampered_tree
+        .entries
+        .iter_mut()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .object_id = tampered_file_id;
+    let tampered_tree_id = object_store
+        .put_object("tree", &postcard::to_stdvec(&tampered_tree).unwrap())
+        .unwrap();
+
+    let mut tampered_snapshot: ManifestSnapshotObject = snapshot.clone();
+    tampered_snapshot.root_tree_id = tampered_tree_id;
+    let tampered_snapshot_id = object_store
+        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let tampered_snapshot_handle = read_service.open_snapshot(&tampered_snapshot_id).unwrap();
+    let file = read_service
+        .open_file(&tampered_snapshot_handle, "hello.txt")
+        .unwrap();
+
+    let error = read_service.read_range(&file, 0, usize::MAX).unwrap_err();
+
+    assert!(
+        error.to_string().contains("chunk")
+            || error.to_string().contains("coverage")
+            || error.to_string().contains("truncated"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_range_rejects_file_manifest_with_mismatched_chunk_length_metadata() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "mismatched-chunk-metadata".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let file_entry = root_tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .clone();
+    let mut file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    file_manifest.chunk_lengths.clear();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let object_store = e2v_store::DirectLayoutObjectStore::new(&control_dir, secrets);
+    let tampered_file_id = object_store
+        .put_object("file", &postcard::to_stdvec(&file_manifest).unwrap())
+        .unwrap();
+
+    let mut tampered_tree: ManifestTreeObject = root_tree.clone();
+    tampered_tree
+        .entries
+        .iter_mut()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .object_id = tampered_file_id;
+    let tampered_tree_id = object_store
+        .put_object("tree", &postcard::to_stdvec(&tampered_tree).unwrap())
+        .unwrap();
+
+    let mut tampered_snapshot: ManifestSnapshotObject = snapshot.clone();
+    tampered_snapshot.root_tree_id = tampered_tree_id;
+    let tampered_snapshot_id = object_store
+        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let tampered_snapshot_handle = read_service.open_snapshot(&tampered_snapshot_id).unwrap();
+    let file = read_service
+        .open_file(&tampered_snapshot_handle, "hello.txt")
+        .unwrap();
+
+    let error = read_service.read_range(&file, 0, usize::MAX).unwrap_err();
+
+    assert!(
+        error.to_string().contains("metadata") || error.to_string().contains("chunk"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn manifest_store_rejects_authenticated_snapshot_graph_with_path_traversal_chunk_id() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tampered-chunk-id".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let file_entry = root_tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .clone();
+    let mut file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    file_manifest.chunks = vec!["..\\evil".to_string()];
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let object_store = e2v_store::DirectLayoutObjectStore::new(&control_dir, secrets);
+    let tampered_file_id = object_store
+        .put_object("file", &postcard::to_stdvec(&file_manifest).unwrap())
+        .unwrap();
+
+    let mut tampered_tree: ManifestTreeObject = root_tree.clone();
+    tampered_tree
+        .entries
+        .iter_mut()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .object_id = tampered_file_id;
+    let tampered_tree_id = object_store
+        .put_object("tree", &postcard::to_stdvec(&tampered_tree).unwrap())
+        .unwrap();
+
+    let mut tampered_snapshot: ManifestSnapshotObject = snapshot.clone();
+    tampered_snapshot.root_tree_id = tampered_tree_id;
+    let tampered_snapshot_id = object_store
+        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .unwrap();
+
+    let error = manifest_store
+        .collect_reachable_object_ids(&tampered_snapshot_id)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("chunk")
+            || error.to_string().contains("object id")
+            || error.to_string().contains("path"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]
@@ -2278,8 +2653,70 @@ fn manifest_store_can_fetch_snapshot_tree_and_file_manifests() {
 
     assert_eq!(snapshot.message, "manifest");
     assert_eq!(file.entry_name, "hello.txt");
+    assert_eq!(file.file_size, "hello nested".len() as u64);
     assert_eq!(file.chunker_id, "fastcdc");
     assert_eq!(file.chunker_config_id, "fastcdc-64k-1m-8m");
+    assert_eq!(file.chunk_lengths, vec!["hello nested".len() as u64]);
+}
+
+#[test]
+fn collect_reachable_object_ids_preserves_graph_traversal_order() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let store = ManifestStore::new(&repo_root);
+
+    let mut found_mismatch = false;
+    for iteration in 0..64usize {
+        fs::write(
+            repo_root.join("alpha.txt"),
+            format!("alpha-payload-{iteration:02}"),
+        )
+        .unwrap();
+        fs::write(
+            repo_root.join("omega.txt"),
+            format!("omega-payload-{:02}-tail", 63 - iteration),
+        )
+        .unwrap();
+
+        let commit = facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: format!("reachable-order-{iteration:02}"),
+            })
+            .unwrap();
+
+        let snapshot = store.get_snapshot(&commit.snapshot_id).unwrap();
+        let root_tree = store.get_tree_node(&snapshot.root_tree_id).unwrap();
+
+        let mut expected = vec![commit.snapshot_id.clone(), snapshot.root_tree_id.clone()];
+        for entry in &root_tree.entries {
+            assert_eq!(entry.kind, "file");
+            expected.push(entry.object_id.clone());
+            let file = store.get_file(&entry.object_id).unwrap();
+            expected.extend(file.chunks);
+        }
+
+        let mut sorted = expected.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted == expected {
+            continue;
+        }
+
+        let collected = store.collect_reachable_object_ids(&commit.snapshot_id).unwrap();
+        assert_eq!(collected, expected);
+        found_mismatch = true;
+        break;
+    }
+
+    assert!(
+        found_mismatch,
+        "failed to find a snapshot whose traversal order differs from lexical object-id order"
+    );
 }
 
 #[test]

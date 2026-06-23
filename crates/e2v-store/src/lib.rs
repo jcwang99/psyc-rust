@@ -13,7 +13,11 @@ pub use layout_root_store::{LayoutRootStore, LayoutRootVersion};
 pub use local_backend::{BlobStore, LocalFolderBackend, ObjectStat};
 pub use logical_object_store::{
     DirectLayoutObjectStore, LogicalObjectStore, PhysicalObjectRef, RepoSecrets,
+    validate_object_id_value,
 };
 pub use memory_backend::MemoryBackend;
 pub use opendal_backend::{OpendalMemoryBackend, RemoteBackend, S3CompatibleMockBackend};
-pub use ref_store::{CasResult, EncryptedRef, RefStore, RefToken, RefVersion, StoredRef};
+pub use ref_store::{
+    CasResult, EncryptedRef, RefStore, RefToken, RefVersion, StoredRef,
+    validate_ref_token_value,
+};

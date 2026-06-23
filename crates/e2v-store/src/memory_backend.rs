@@ -56,6 +56,7 @@ impl MemoryBackend {
 
 impl RefStore for MemoryBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+        token.validate()?;
         Ok(self.refs.lock().unwrap().get(&token.value).cloned())
     }
 
@@ -65,6 +66,7 @@ impl RefStore for MemoryBackend {
         expected: Option<RefVersion>,
         next: EncryptedRef,
     ) -> Result<CasResult> {
+        token.validate()?;
         let mut refs = self.refs.lock().unwrap();
         let current = refs.get(&token.value).cloned();
         let matches = match (&current, expected) {
@@ -246,5 +248,47 @@ mod tests {
         backend.delete_physical("objects/sample.bin").unwrap();
 
         assert!(!backend.exists_physical("objects/sample.bin"));
+    }
+
+    #[test]
+    fn compare_and_swap_ref_rejects_path_traversal_token() {
+        let backend = MemoryBackend::new();
+        let error = backend
+            .compare_and_swap_ref(
+                &RefToken::new("../evil".to_string()),
+                None,
+                EncryptedRef::new(vec![1, 2, 3]),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("path"));
+        assert!(
+            backend
+                .read_ref(&RefToken::new("../evil".to_string()))
+                .unwrap_err()
+                .to_string()
+                .contains("path")
+        );
+    }
+
+    #[test]
+    fn compare_and_swap_ref_rejects_backslash_traversal_token() {
+        let backend = MemoryBackend::new();
+        let error = backend
+            .compare_and_swap_ref(
+                &RefToken::new("..\\evil".to_string()),
+                None,
+                EncryptedRef::new(vec![1, 2, 3]),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("path"));
+        assert!(
+            backend
+                .read_ref(&RefToken::new("..\\evil".to_string()))
+                .unwrap_err()
+                .to_string()
+                .contains("path")
+        );
     }
 }

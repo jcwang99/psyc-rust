@@ -483,9 +483,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "e2v-core",
  "e2v-store",
+ "futures-util",
  "http",
+ "http-body",
+ "postcard",
  "rusqlite",
  "serde",
  "serde_json",

@@ -344,6 +344,41 @@ async fn missing_snapshot_page_renders_readable_error_html() {
 }
 
 #[tokio::test]
+async fn invalid_snapshot_page_returns_bad_request_html_instead_of_internal_server_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/snapshots/%2E%2E?path=")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Bad Request"));
+    assert!(text.contains("Invalid snapshot id"));
+}
+
+#[tokio::test]
 async fn tampered_snapshot_page_renders_internal_server_error_html() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -440,4 +475,39 @@ async fn tampered_branch_page_renders_internal_server_error_html() {
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("<html"));
     assert!(text.contains("Internal Server Error"));
+}
+
+#[tokio::test]
+async fn invalid_branch_page_returns_bad_request_html_instead_of_internal_server_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/branches/%2E%2E?path=")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("Bad Request"));
+    assert!(text.contains("Invalid branch token"));
 }

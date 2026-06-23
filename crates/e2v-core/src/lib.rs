@@ -69,7 +69,7 @@ pub mod sync_support {
     use std::path::{Path, PathBuf};
 
     use anyhow::{Result, ensure};
-    use e2v_store::RepoSecrets;
+    use e2v_store::{RepoSecrets, validate_object_id_value};
     use serde::{Deserialize, Serialize};
 
     use crate::facade::{RepositoryState, SnapshotSummary};
@@ -151,6 +151,7 @@ pub mod sync_support {
         repo_root: impl AsRef<Path>,
         object_id: &str,
     ) -> Result<Vec<u8>> {
+        validate_object_id_value(object_id)?;
         Ok(std::fs::read(
             repo_root
                 .as_ref()
@@ -164,6 +165,24 @@ pub mod sync_support {
         repo_root: impl AsRef<Path>,
         object_id: &str,
     ) -> Result<bool> {
+        parse_local_object_envelope_header(repo_root, object_id).map(|_| true)
+    }
+
+    pub fn read_local_object_type_hint(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+    ) -> Result<String> {
+        Ok(parse_local_object_envelope_header(repo_root, object_id)?.object_type)
+    }
+
+    struct LocalObjectEnvelopeHeader {
+        object_type: String,
+    }
+
+    fn parse_local_object_envelope_header(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+    ) -> Result<LocalObjectEnvelopeHeader> {
         const ENVELOPE_MAGIC: &[u8; 4] = b"E2V0";
         const ENVELOPE_FORMAT_VERSION: u32 = 1;
         const CRYPTO_SUITE: &str = "xchacha20poly1305";
@@ -222,7 +241,7 @@ pub mod sync_support {
         ensure!(auth_tag.len() == TAG_SIZE, "object authentication failed");
         ensure!(cursor == bytes.len(), "object authentication failed");
 
-        Ok(true)
+        Ok(LocalObjectEnvelopeHeader { object_type })
     }
 
     fn take_exact<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {

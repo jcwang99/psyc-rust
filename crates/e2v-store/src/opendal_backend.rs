@@ -192,6 +192,7 @@ impl BlobStore for OpendalMemoryBackend {
 
 impl RefStore for S3CompatibleMockBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+        token.validate()?;
         self.inner.read_ref(token)
     }
 
@@ -201,12 +202,14 @@ impl RefStore for S3CompatibleMockBackend {
         expected: Option<RefVersion>,
         next: EncryptedRef,
     ) -> Result<CasResult> {
+        token.validate()?;
         self.inner.compare_and_swap_ref(token, expected, next)
     }
 }
 
 impl RefStore for OpendalMemoryBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+        token.validate()?;
         let path = Self::ref_path(token);
         if !self.exists_physical(&path) {
             return Ok(None);
@@ -220,6 +223,7 @@ impl RefStore for OpendalMemoryBackend {
         expected: Option<RefVersion>,
         next: EncryptedRef,
     ) -> Result<CasResult> {
+        token.validate()?;
         let current = self.read_ref(token)?;
         let matches = match (&current, expected) {
             (None, None) => true,
@@ -447,6 +451,27 @@ mod tests {
                 .cloned()
                 .unwrap(),
             next_layout
+        );
+    }
+
+    #[test]
+    fn opendal_memory_backend_rejects_path_traversal_ref_token() {
+        let backend = OpendalMemoryBackend::new().unwrap();
+        let error = backend
+            .compare_and_swap_ref(
+                &RefToken::new("../evil".to_string()),
+                None,
+                EncryptedRef::new(vec![1, 2, 3]),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("path"));
+        assert!(
+            backend
+                .read_ref(&RefToken::new("../evil".to_string()))
+                .unwrap_err()
+                .to_string()
+                .contains("path")
         );
     }
 }

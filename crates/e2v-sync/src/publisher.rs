@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use e2v_store::{BackendCapability, CasResult, EncryptedRef, LayoutRootVersion, RemoteBackend};
 
-use crate::journal::{ObjectUploadState, OperationId, OperationJournal};
+use crate::journal::{ObjectUploadState, OperationId, OperationJournal, validate_sync_identifier};
 use crate::transaction::{PublishPlan, PublishSession, PublishedObject};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,7 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
 
 impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     fn begin(&self, plan: PublishPlan) -> Result<PublishSession> {
+        validate_sync_identifier("branch token", &plan.target_branch_token)?;
         let writer_mode = self.capability.writer_mode();
         anyhow::ensure!(
             writer_mode != e2v_store::WriterMode::ReadOnly,
@@ -143,6 +144,7 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             "pre-commit verify failed: active intent belongs to another operation"
         );
         if let Some(expected_ref_version) = session.expected_ref_version {
+            validate_sync_identifier("branch token", &session.target_branch_token)?;
             let current = self.remote_backend.read_ref(&e2v_store::RefToken::new(
                 session.target_branch_token.clone(),
             ))?;
@@ -172,6 +174,7 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     }
 
     fn publish_ref(&self, session: &PublishSession, next: EncryptedRef) -> Result<CasResult> {
+        validate_sync_identifier("branch token", &session.target_branch_token)?;
         self.remote_backend.compare_and_swap_ref(
             &e2v_store::RefToken::new(session.target_branch_token.clone()),
             session
@@ -244,7 +247,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-1".to_string()),
+                operation_id: OperationId::new("op-1".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -278,7 +281,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-intent".to_string()),
+                operation_id: OperationId::new("op-intent".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -317,7 +320,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-precommit".to_string()),
+                operation_id: OperationId::new("op-precommit".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -357,7 +360,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-intent-owner".to_string()),
+                operation_id: OperationId::new("op-intent-owner".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -405,7 +408,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-single-writer".to_string()),
+                operation_id: OperationId::new("op-single-writer".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -443,7 +446,7 @@ mod tests {
 
         let error = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-single-writer-fail".to_string()),
+                operation_id: OperationId::new("op-single-writer-fail".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -477,7 +480,7 @@ mod tests {
 
         let error = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-read-only".to_string()),
+                operation_id: OperationId::new("op-read-only".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -511,7 +514,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-lease-owner".to_string()),
+                operation_id: OperationId::new("op-lease-owner".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -548,7 +551,7 @@ mod tests {
             SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-stale-precommit".to_string()),
+                operation_id: OperationId::new("op-stale-precommit".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: Some(1),
                 writer_mode: WriterMode::ReadOnly,
@@ -580,7 +583,7 @@ mod tests {
             SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-publish-ref".to_string()),
+                operation_id: OperationId::new("op-publish-ref".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: Some(1),
                 writer_mode: WriterMode::ReadOnly,
@@ -608,7 +611,7 @@ mod tests {
             SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-complete-intent".to_string()),
+                operation_id: OperationId::new("op-complete-intent".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -644,7 +647,7 @@ mod tests {
         );
         let first = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-complete-lease-1".to_string()),
+                operation_id: OperationId::new("op-complete-lease-1".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -655,7 +658,7 @@ mod tests {
 
         let second = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-complete-lease-2".to_string()),
+                operation_id: OperationId::new("op-complete-lease-2".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 writer_mode: WriterMode::ReadOnly,
@@ -666,5 +669,52 @@ mod tests {
 
         assert_eq!(second.writer_mode, WriterMode::SingleWriter);
         assert_eq!(lease_marker["operation_id"], "op-complete-lease-2");
+    }
+
+    #[test]
+    fn begin_rejects_branch_token_with_path_traversal_before_writing_markers() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = e2v_store::MemoryBackend::new();
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
+
+        let error = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-invalid-branch".to_string()).unwrap(),
+                target_branch_token: "../evil".to_string(),
+                expected_ref_version: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("branch"));
+        assert!(!remote.exists_physical("transactions/active/op-invalid-branch.intent"));
+        assert!(!remote.exists_physical("leases/../evil.lock"));
+    }
+
+    #[test]
+    fn publish_ref_rejects_branch_token_with_path_traversal_in_session() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = e2v_store::MemoryBackend::new();
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote);
+        let session = PublishSession {
+            operation_id: OperationId::new("op-invalid-session".to_string()).unwrap(),
+            target_branch_token: "../evil".to_string(),
+            expected_ref_version: None,
+            writer_mode: WriterMode::ReadOnly,
+            next_layout_root: None,
+            next_layout_root_bytes: None,
+            active_intent_path: "transactions/active/op-invalid-session.intent".to_string(),
+            lease_path: None,
+        };
+
+        let error = publisher
+            .publish_ref(&session, EncryptedRef::new(vec![1, 2, 3]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("branch"));
     }
 }

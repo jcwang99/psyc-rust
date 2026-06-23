@@ -3,7 +3,7 @@ use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use getrandom::fill as getrandom_fill;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::local_backend::LocalFolderBackend;
 
@@ -45,6 +45,22 @@ pub trait LogicalObjectStore {
     ) -> Result<Vec<u8>>;
     fn exists_object(&self, object_id: &str) -> bool;
     fn resolve_object(&self, object_id: &str) -> Result<PhysicalObjectRef>;
+}
+
+pub fn validate_object_id_value(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    ensure!(!value.trim().is_empty(), "object id must not be empty");
+    ensure!(!path.is_absolute(), "object id must be relative");
+    ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "object id path traversal is not allowed"
+    );
+    ensure!(
+        path.components().count() == 1,
+        "object id must be a single path segment"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +115,7 @@ impl DirectLayoutObjectStore {
     }
 
     pub fn get_object(&self, object_id: &str, expected_type: &str) -> Result<Vec<u8>> {
+        validate_object_id_value(object_id)?;
         let bytes = self
             .backend
             .get_object(&self.relative_object_path(object_id))
@@ -145,6 +162,9 @@ impl DirectLayoutObjectStore {
     }
 
     pub fn exists_object(&self, object_id: &str) -> bool {
+        if validate_object_id_value(object_id).is_err() {
+            return false;
+        }
         self.backend
             .exists_object(&self.relative_object_path(object_id))
     }
@@ -156,6 +176,7 @@ impl DirectLayoutObjectStore {
     }
 
     pub fn resolve_object(&self, object_id: &str) -> Result<PhysicalObjectRef> {
+        validate_object_id_value(object_id)?;
         let relative_path = self.relative_object_path(object_id);
         let bytes = self.backend.get_object(&relative_path)?;
         Ok(PhysicalObjectRef {
@@ -761,5 +782,36 @@ mod tests {
 
         assert_eq!(object_id, same_object_id);
         assert_ne!(first_envelope.nonce, second_envelope.nonce);
+    }
+
+    #[test]
+    fn get_object_rejects_path_traversal_object_id_before_touching_backend() {
+        let temp = tempdir().unwrap();
+        let store = DirectLayoutObjectStore::new(temp.path(), secrets("repo-a"));
+
+        let error = store.get_object("../evil", "chunk").unwrap_err();
+
+        assert!(
+            error.to_string().contains("object id"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("path traversal")
+                || error.to_string().contains("relative"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn get_object_rejects_backslash_traversal_object_id() {
+        let temp = tempdir().unwrap();
+        let store = DirectLayoutObjectStore::new(temp.path(), secrets("repo-a"));
+
+        let error = store.get_object("..\\evil", "chunk").unwrap_err();
+
+        assert!(
+            error.to_string().contains("object id"),
+            "unexpected error: {error:#}"
+        );
     }
 }

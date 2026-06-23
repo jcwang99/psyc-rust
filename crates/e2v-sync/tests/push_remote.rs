@@ -229,6 +229,254 @@ impl RemoteBackend for LayoutPublisherOnlyBackend {
 }
 
 #[derive(Debug, Clone)]
+struct ExistsCountingBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    exists_calls: Arc<Mutex<usize>>,
+    list_calls: Arc<Mutex<usize>>,
+    object_put_calls: Arc<Mutex<usize>>,
+    range_read_paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl ExistsCountingBackend {
+    fn new() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: true,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            exists_calls: Arc::new(Mutex::new(0)),
+            list_calls: Arc::new(Mutex::new(0)),
+            object_put_calls: Arc::new(Mutex::new(0)),
+            range_read_paths: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn exists_call_count(&self) -> usize {
+        *self.exists_calls.lock().unwrap()
+    }
+
+    fn list_call_count(&self) -> usize {
+        *self.list_calls.lock().unwrap()
+    }
+
+    fn reset_counts(&self) {
+        *self.exists_calls.lock().unwrap() = 0;
+        *self.list_calls.lock().unwrap() = 0;
+        *self.object_put_calls.lock().unwrap() = 0;
+        self.range_read_paths.lock().unwrap().clear();
+    }
+
+    fn object_put_call_count(&self) -> usize {
+        *self.object_put_calls.lock().unwrap()
+    }
+
+    fn range_read_paths(&self) -> Vec<String> {
+        self.range_read_paths.lock().unwrap().clone()
+    }
+}
+
+impl BlobStore for ExistsCountingBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        if relative_path.starts_with("objects/")
+            || relative_path.starts_with("bundles/data/")
+            || relative_path.starts_with("bundles/index/")
+        {
+            *self.object_put_calls.lock().unwrap() += 1;
+        }
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.range_read_paths
+            .lock()
+            .unwrap()
+            .push(relative_path.to_string());
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        *self.exists_calls.lock().unwrap() += 1;
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        *self.list_calls.lock().unwrap() += 1;
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for ExistsCountingBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for ExistsCountingBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for ExistsCountingBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InventoryListingForbiddenBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+}
+
+impl InventoryListingForbiddenBackend {
+    fn new(inner: MemoryBackend) -> Self {
+        Self {
+            inner,
+            capability: BackendCapability {
+                supports_conditional_put: true,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+        }
+    }
+}
+
+impl BlobStore for InventoryListingForbiddenBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        if prefix == "objects/" || prefix == "bundles/index/" {
+            anyhow::bail!("remote inventory listing is not allowed during resume for {prefix}");
+        }
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for InventoryListingForbiddenBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for InventoryListingForbiddenBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for InventoryListingForbiddenBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
 struct InterruptingObjectUploadBackend {
     inner: MemoryBackend,
     capability: BackendCapability,
@@ -536,6 +784,420 @@ fn push_publishes_layout_root_through_transaction_publisher() {
 }
 
 #[test]
+fn push_avoids_per_object_remote_exists_checks_for_missing_objects() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..32usize {
+        fs::write(
+            repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "exists-check-scaling".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+
+    let result = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "exists-check-scaling-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(result.uploaded_objects > 0);
+    assert!(
+        remote.list_call_count() >= 1,
+        "expected push to inspect remote object listings"
+    );
+    assert!(
+        remote.exists_call_count() <= 8,
+        "expected push to avoid per-object remote exists checks, saw {} exists calls",
+        remote.exists_call_count()
+    );
+}
+
+#[test]
+fn push_avoids_per_object_remote_exists_checks_when_validating_remote_ancestor_graph() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..32usize {
+        fs::write(
+            repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-v1-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "ancestor-exists-v1".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "ancestor-exists-v1-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    fs::write(repo_root.join("file-00.txt"), "payload-v2-00").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "ancestor-exists-v2".to_string(),
+        })
+        .unwrap();
+
+    remote.reset_counts();
+
+    let result = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "ancestor-exists-v2-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(result.uploaded_objects > 0);
+    assert!(
+        remote.list_call_count() >= 1,
+        "expected push to inspect remote inventory for ancestor validation"
+    );
+    assert!(
+        remote.exists_call_count() <= 8,
+        "expected push to avoid per-object remote exists checks while validating ancestors, saw {} exists calls",
+        remote.exists_call_count()
+    );
+}
+
+#[test]
+fn resume_avoids_per_object_remote_exists_checks_for_pending_objects() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..32usize {
+        fs::write(
+            repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-exists-scaling".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id =
+        e2v_sync::OperationId::new("resume-exists-scaling-op".to_string()).unwrap();
+    journal
+        .begin_operation(
+            &operation_id,
+            e2v_sync::OperationMetadata::push(state.branch.token_hex.clone(), None),
+        )
+        .unwrap();
+    for object_id in &reachable_object_ids {
+        journal
+            .plan_object(&operation_id, object_id, "object")
+            .unwrap();
+    }
+
+    let remote = ExistsCountingBackend::new();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert!(
+        remote.exists_call_count() <= 8,
+        "expected resume to avoid per-object remote exists checks, saw {} exists calls",
+        remote.exists_call_count()
+    );
+    assert_eq!(
+        remote.list_call_count(),
+        0,
+        "expected resume to avoid loading remote object inventory while replaying journal batches"
+    );
+}
+
+#[test]
+fn resume_reuses_journal_recorded_bundle_locations_without_loading_remote_inventory() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..8usize {
+        fs::write(
+            repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-bundled-journal-locations".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-bundled-journal-locations-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id =
+        e2v_sync::OperationId::new("resume-bundled-journal-locations-op".to_string()).unwrap();
+    for object_id in &reachable_object_ids {
+        journal
+            .record_uploaded(&operation_id, object_id, "object")
+            .unwrap();
+    }
+
+    let guarded_remote = InventoryListingForbiddenBackend::new(remote.clone());
+    let resumed = resume_push(
+        &facade,
+        &guarded_remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert!(resumed.skipped_uploaded_objects > 0);
+}
+
+#[test]
+fn resume_skips_object_reupload_when_remote_state_is_already_complete() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..16usize {
+        fs::write(
+            repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-complete-remote".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-complete-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote.reset_counts();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-complete-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.object_put_call_count(),
+        0,
+        "expected resume to skip object reupload when remote is already complete"
+    );
+}
+
+#[test]
+fn resume_reuploads_only_missing_remote_objects_without_journal() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..16usize {
+        fs::write(
+            repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-single-missing-remote-object".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-single-missing-remote-object-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let missing_remote_object = remote
+        .list_physical("objects/")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let local_object_bytes = std::fs::read(
+        repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(missing_remote_object.strip_prefix("objects/").unwrap()),
+    )
+    .unwrap();
+    remote.delete_physical(&missing_remote_object).unwrap();
+    remote.reset_counts();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-single-missing-remote-object-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.object_put_call_count(),
+        1,
+        "expected resume to upload only the missing remote object when no journal records exist"
+    );
+    assert_eq!(
+        remote.get_physical(&missing_remote_object).unwrap(),
+        local_object_bytes
+    );
+}
+
+#[test]
 fn push_ignores_unreachable_local_object_files() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -579,6 +1241,79 @@ fn push_ignores_unreachable_local_object_files() {
 
     assert!(result.uploaded_objects > 0);
     assert!(!remote.exists_physical(&format!("objects/{stray_object_id}.json")));
+}
+
+#[test]
+fn manifest_store_reachable_set_rejects_tampered_chunk_id_before_push_can_upload_it() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    let outside = temp.path().join("outside.json");
+    fs::write(&outside, b"outside").unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tampered-chunk-id".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let file_entry = root_tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .clone();
+    let mut file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    file_manifest.chunks = vec!["..\\evil".to_string()];
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let object_store = e2v_store::DirectLayoutObjectStore::new(&control_dir, secrets);
+    let tampered_file_id = object_store
+        .put_object("file", &postcard::to_stdvec(&file_manifest).unwrap())
+        .unwrap();
+
+    let mut tampered_tree = root_tree.clone();
+    tampered_tree
+        .entries
+        .iter_mut()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .object_id = tampered_file_id;
+    let tampered_tree_id = object_store
+        .put_object("tree", &postcard::to_stdvec(&tampered_tree).unwrap())
+        .unwrap();
+
+    let mut tampered_snapshot = snapshot.clone();
+    tampered_snapshot.root_tree_id = tampered_tree_id;
+    let tampered_snapshot_id = object_store
+        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .unwrap();
+
+    let error = manifest_store
+        .collect_reachable_object_ids(&tampered_snapshot_id)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("chunk")
+            || error.to_string().contains("object id")
+            || error.to_string().contains("path"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
 }
 
 #[test]
@@ -876,7 +1611,8 @@ fn resume_repairs_corrupted_existing_remote_object_instead_of_marking_it_verifie
     let journal =
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
-    let operation_id = e2v_sync::OperationId::new("resume-corrupted-remote-object-op".to_string());
+    let operation_id =
+        e2v_sync::OperationId::new("resume-corrupted-remote-object-op".to_string()).unwrap();
     journal
         .begin_operation(
             &operation_id,
@@ -1009,7 +1745,8 @@ fn resume_counts_skipped_uploaded_objects_across_multiple_journal_batches() {
     let journal =
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
-    let operation_id = e2v_sync::OperationId::new("resume-batched-count-op".to_string());
+    let operation_id =
+        e2v_sync::OperationId::new("resume-batched-count-op".to_string()).unwrap();
     journal
         .begin_operation(
             &operation_id,
@@ -1822,7 +2559,8 @@ fn resume_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
     let journal =
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
-    let operation_id = e2v_sync::OperationId::new("resume-password-rotation-op".to_string());
+    let operation_id =
+        e2v_sync::OperationId::new("resume-password-rotation-op".to_string()).unwrap();
     journal
         .begin_operation(
             &operation_id,
@@ -1998,6 +2736,107 @@ fn push_rejects_missing_remote_parent_chain() {
             .is_none()
     );
     assert!(second.snapshot_id.len() > 10);
+}
+
+#[test]
+fn push_rejects_operation_id_with_path_traversal_before_mutating_remote_state() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "invalid-operation-id".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "../evil".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("operation")
+            || error.to_string().contains("path traversal")
+            || error.to_string().contains("invalid"),
+        "unexpected error: {error:#}"
+    );
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+    assert!(remote.list_physical("bundles/index/").unwrap().is_empty());
+    assert!(remote.list_physical("bundles/data/").unwrap().is_empty());
+    assert!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!remote.exists_physical("transactions/active/../evil.intent"));
+}
+
+#[test]
+fn push_rejects_branch_token_with_path_traversal_before_mutating_remote_state() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "invalid-branch-token".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: "../evil".to_string(),
+            operation_id: "invalid-branch-token-op".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("branch")
+            || error.to_string().contains("path traversal")
+            || error.to_string().contains("invalid"),
+        "unexpected error: {error:#}"
+    );
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+    assert!(remote.list_physical("bundles/index/").unwrap().is_empty());
+    assert!(remote.list_physical("bundles/data/").unwrap().is_empty());
+    assert!(!remote.exists_physical("leases/../evil.lock"));
+    assert!(!remote.exists_physical("transactions/active/invalid-branch-token-op.intent"));
 }
 
 #[test]
@@ -2379,7 +3218,8 @@ fn push_rejects_ref_publish_when_reachable_remote_object_disappears() {
     let journal =
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
-    let operation_id = e2v_sync::OperationId::new("verify-remote-before-ref-op".to_string());
+    let operation_id =
+        e2v_sync::OperationId::new("verify-remote-before-ref-op".to_string()).unwrap();
     journal
         .begin_operation(
             &operation_id,
@@ -2581,6 +3421,212 @@ fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
 }
 
 #[test]
+fn push_fast_forward_bundle_ancestor_validation_avoids_repeating_bundle_range_reads() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+    let source = RepositoryFacade::new();
+    let source_state = source
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-v1-{index:02}"),
+        )
+        .unwrap();
+    }
+    source
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "bundle-ancestor-v1".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    push_head(
+        &source,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "bundle-ancestor-v1-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+
+    let clone_repo_root = temp.path().join("clone");
+    e2v_sync::clone_remote(
+        &remote,
+        e2v_sync::CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: source_state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    for index in 0..24usize {
+        fs::write(
+            clone_repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-v2-{index:02}"),
+        )
+        .unwrap();
+    }
+    let clone_facade = RepositoryFacade::new();
+    clone_facade
+        .commit(CommitOptions {
+            repo_root: clone_repo_root.clone(),
+            message: "bundle-ancestor-v2".to_string(),
+        })
+        .unwrap();
+
+    remote.reset_counts();
+
+    let second_push = push_head(
+        &clone_facade,
+        &remote,
+        PushOptions {
+            repo_root: clone_repo_root.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "bundle-ancestor-v2-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(second_push.uploaded_objects > 0);
+    let range_read_paths = remote.range_read_paths();
+    let distinct_bundle_paths = range_read_paths
+        .iter()
+        .filter(|path| path.starts_with("bundles/data/"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        range_read_paths.len() <= distinct_bundle_paths.len() + 2,
+        "expected ancestor validation to avoid repeated bundle range reads, saw {:?}",
+        range_read_paths
+    );
+}
+
+#[test]
+fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_across_snapshots() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+    let source = RepositoryFacade::new();
+    let source_state = source
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-v1-{index:02}"),
+        )
+        .unwrap();
+    }
+    source
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "deep-bundle-ancestor-v1".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    push_head(
+        &source,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "deep-bundle-ancestor-v1-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+
+    let clone_repo_root = temp.path().join("clone");
+    e2v_sync::clone_remote(
+        &remote,
+        e2v_sync::CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: source_state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let clone_facade = RepositoryFacade::new();
+    for version in 2..=5usize {
+        fs::write(clone_repo_root.join("rolling.txt"), format!("rolling-{version}")).unwrap();
+        clone_facade
+            .commit(CommitOptions {
+                repo_root: clone_repo_root.clone(),
+                message: format!("deep-bundle-ancestor-v{version}"),
+            })
+            .unwrap();
+        push_head(
+            &clone_facade,
+            &remote,
+            PushOptions {
+                repo_root: clone_repo_root.clone(),
+                branch_token: source_state.branch.token_hex.clone(),
+                operation_id: format!("deep-bundle-ancestor-v{version}-op"),
+            },
+        )
+        .unwrap();
+    }
+
+    fs::write(clone_repo_root.join("rolling.txt"), "rolling-6").unwrap();
+    clone_facade
+        .commit(CommitOptions {
+            repo_root: clone_repo_root.clone(),
+            message: "deep-bundle-ancestor-v6".to_string(),
+        })
+        .unwrap();
+
+    remote.reset_counts();
+
+    let pushed = push_head(
+        &clone_facade,
+        &remote,
+        PushOptions {
+            repo_root: clone_repo_root.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "deep-bundle-ancestor-v6-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(pushed.uploaded_objects > 0);
+    let range_read_paths = remote.range_read_paths();
+    let distinct_bundle_paths = range_read_paths
+        .iter()
+        .filter(|path| path.starts_with("bundles/data/"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        range_read_paths.len() <= distinct_bundle_paths.len() + 6,
+        "expected deep ancestor validation to reuse bundle reads across snapshots, saw {:?}",
+        range_read_paths
+    );
+}
+
+#[test]
 fn push_is_idempotent_when_remote_ref_already_points_at_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -2627,6 +3673,126 @@ fn push_is_idempotent_when_remote_ref_already_points_at_local_head() {
     .unwrap();
 
     assert_eq!(second.published_snapshot_id, commit.snapshot_id);
+}
+
+#[test]
+fn push_idempotent_noop_avoids_remote_inventory_listing_when_ref_already_matches_head() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "idempotent-noop".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    let first = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "idempotent-noop-1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first.published_snapshot_id, commit.snapshot_id);
+
+    remote.reset_counts();
+
+    let second = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "idempotent-noop-2".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(remote.object_put_call_count(), 0);
+    assert_eq!(
+        remote.list_call_count(),
+        0,
+        "idempotent noop push should not scan remote object inventory"
+    );
+}
+
+#[test]
+fn push_password_rotation_still_republishes_control_plane_even_when_head_is_unchanged() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "idempotent-password-rotation".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    let first = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "idempotent-password-rotation-1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first.published_snapshot_id, commit.snapshot_id);
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    remote.reset_counts();
+
+    let second = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "idempotent-password-rotation-2".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(second.uploaded_objects, 0);
+    assert!(
+        remote.exists_physical("control/keyring/keyring.2"),
+        "password rotation should still publish the next keyring generation"
+    );
 }
 
 #[test]

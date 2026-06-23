@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -10,9 +10,23 @@ pub struct OperationId {
 }
 
 impl OperationId {
-    pub fn new(value: String) -> Self {
-        Self { value }
+    pub fn new(value: String) -> Result<Self> {
+        validate_sync_identifier("operation id", &value)?;
+        Ok(Self { value })
     }
+}
+
+pub(crate) fn validate_sync_identifier(label: &str, value: &str) -> Result<()> {
+    ensure!(!value.trim().is_empty(), "{label} must not be empty");
+    ensure!(
+        !value.contains('/') && !value.contains('\\'),
+        "{label} must not contain path separators"
+    );
+    ensure!(
+        value != "." && value != "..",
+        "{label} must not contain path traversal"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,7 +433,7 @@ mod tests {
     fn journal_replays_pending_uploaded_objects_in_order() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
-        let operation_id = OperationId::new("op-1".to_string());
+        let operation_id = OperationId::new("op-1".to_string()).unwrap();
 
         journal
             .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
@@ -440,7 +454,7 @@ mod tests {
     fn journal_reads_latest_object_states_in_bounded_batches() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
-        let operation_id = OperationId::new("op-batch".to_string());
+        let operation_id = OperationId::new("op-batch".to_string()).unwrap();
 
         journal
             .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
@@ -500,7 +514,7 @@ mod tests {
     fn journal_pages_only_non_verified_states_for_resume() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
-        let operation_id = OperationId::new("op-resume-batch".to_string());
+        let operation_id = OperationId::new("op-resume-batch".to_string()).unwrap();
 
         journal
             .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
@@ -545,7 +559,7 @@ mod tests {
     fn journal_counts_latest_states_by_kind() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
-        let operation_id = OperationId::new("op-count".to_string());
+        let operation_id = OperationId::new("op-count".to_string()).unwrap();
 
         journal
             .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
@@ -580,7 +594,7 @@ mod tests {
     fn journal_persists_object_states_in_sqlite_index() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
-        let operation_id = OperationId::new("op-sqlite".to_string());
+        let operation_id = OperationId::new("op-sqlite".to_string()).unwrap();
 
         journal
             .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
@@ -590,5 +604,19 @@ mod tests {
             .unwrap();
 
         assert!(temp.path().join("operations.sqlite").is_file());
+    }
+
+    #[test]
+    fn sync_identifier_rejects_path_separators_and_traversal_segments() {
+        let separator_error = validate_sync_identifier("operation id", "../evil").unwrap_err();
+        let traversal_error = validate_sync_identifier("operation id", "..").unwrap_err();
+
+        assert!(separator_error.to_string().contains("path separators"));
+        assert!(traversal_error.to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn sync_identifier_allows_non_path_traversal_dots_inside_names() {
+        validate_sync_identifier("operation id", "resume..batch").unwrap();
     }
 }

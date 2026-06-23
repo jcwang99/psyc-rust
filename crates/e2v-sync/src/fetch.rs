@@ -1,14 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use postcard::from_bytes as postcard_from_bytes;
 use serde::Deserialize;
 
 use crate::bundle::{BundledObjectLocation, load_remote_bundle_locations, read_bundled_object};
-use e2v_core::{clear_unlocked_keyring_cache, validate_layout_root_value};
-use e2v_store::{RefToken, RemoteBackend};
+use crate::journal::validate_sync_identifier;
+use crate::object_type::candidate_object_types;
+use e2v_core::{RepositoryFacade, clear_unlocked_keyring_cache, validate_layout_root_value};
+use e2v_store::{DirectLayoutObjectStore, RefToken, RemoteBackend, RepoSecrets, validate_object_id_value};
 
 const KEYRING_LOCK_FILE: &str = "keyring.lock";
+const REPO_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct KeyringPointer {
@@ -56,6 +60,82 @@ struct RemoteControlPlane {
     default_ref_bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RemoteSnapshotObject {
+    schema_version: u32,
+    message: String,
+    root_tree_id: String,
+    parent_snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RemoteTreeEntry {
+    name: String,
+    kind: String,
+    object_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RemoteTreeObject {
+    schema_version: u32,
+    entries: Vec<RemoteTreeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RemoteDirectoryRootObject {
+    schema_version: u32,
+    fanout: u32,
+    shards: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RemoteTreeShardObject {
+    schema_version: u32,
+    range_start: String,
+    range_end: String,
+    entries: Vec<RemoteTreeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RemoteFileObject {
+    schema_version: u32,
+    entry_name: String,
+    file_size: u64,
+    chunker_id: String,
+    chunker_config_id: String,
+    chunks: Vec<String>,
+    chunk_lengths: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct RemoteValidationRoot {
+    path: PathBuf,
+}
+
+impl RemoteValidationRoot {
+    fn control_dir(&self) -> PathBuf {
+        self.path.join(".e2v")
+    }
+
+    fn object_path(&self, object_id: &str) -> PathBuf {
+        self.control_dir()
+            .join("objects")
+            .join(format!("{object_id}.json"))
+    }
+}
+
+impl Drop for RemoteValidationRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[derive(Debug)]
+struct RemoteFetchPlan {
+    validation_root: RemoteValidationRoot,
+    reachable_object_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchOptions {
     pub repo_root: PathBuf,
@@ -69,6 +149,7 @@ pub struct FetchResult {
 }
 
 pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Result<FetchResult> {
+    validate_sync_identifier("branch token", &options.branch_token)?;
     let control_dir = options.repo_root.join(".e2v");
     let objects_dir = options.repo_root.join(".e2v").join("objects");
     std::fs::create_dir_all(control_dir.join("keyring"))?;
@@ -91,20 +172,8 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
 
     let listed = remote.list_physical("objects/")?;
     let bundle_locations = load_remote_bundle_locations(remote)?;
-    if matches!(
-        sync_mode,
-        RepositorySyncMode::SameRepositoryPointerUnchanged
-            | RepositorySyncMode::SameRepositoryPointerChanged
-    ) {
-        validate_remote_ref_consistency_if_locally_unlocked(
-            remote,
-            &options.repo_root,
-            &requested_branch_token,
-            &stored_ref_bytes,
-            &bundle_locations,
-        )?;
-    }
     let mut validated_remote_objects = Vec::with_capacity(listed.len());
+    let mut remote_loose_object_ids = BTreeSet::new();
     for relative_path in listed {
         let file_name = relative_path
             .strip_prefix("objects/")
@@ -113,67 +182,156 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             anyhow::anyhow!("invalid remote object path {relative_path}: {error}")
         })?;
         let file_name = file_name.to_string();
-        validated_remote_objects.push((relative_path, file_name));
-    }
-    let mut downloaded_objects = 0usize;
-    for (relative_path, file_name) in validated_remote_objects {
         let object_id = file_name
             .strip_suffix(".json")
             .unwrap_or(&file_name)
             .to_string();
-        let target_path = objects_dir.join(file_name);
-        if !target_path.exists() {
-            let bytes = remote.get_physical(&relative_path)?;
-            std::fs::write(&target_path, bytes)?;
-            downloaded_objects += 1;
-            continue;
-        }
-
-        match classify_local_object_health(&options.repo_root, &object_id) {
-            LocalObjectHealth::Verified => {}
-            LocalObjectHealth::LockedByteComparable => {
-                let bytes = remote.get_physical(&relative_path)?;
-                if !local_object_matches_bytes(&options.repo_root, &object_id, &bytes) {
-                    anyhow::bail!(
-                        "cannot replace locked local object {object_id} with unverified remote bytes; unlock repository first"
-                    );
-                }
-            }
-            LocalObjectHealth::LockedEnvelopeInvalid => {
-                let bytes = remote.get_physical(&relative_path)?;
-                std::fs::write(&target_path, bytes)?;
-                downloaded_objects += 1;
-            }
-            LocalObjectHealth::Unhealthy => {
-                let bytes = remote.get_physical(&relative_path)?;
-                std::fs::write(&target_path, bytes)?;
-                downloaded_objects += 1;
-            }
-        }
+        validate_object_id_value(&object_id).map_err(|error| {
+            anyhow::anyhow!("invalid remote object path {relative_path}: {error}")
+        })?;
+        remote_loose_object_ids.insert(object_id);
+        validated_remote_objects.push((relative_path, file_name));
     }
-    for object_id in bundle_locations.keys() {
-        let target_path = objects_dir.join(format!("{object_id}.json"));
-        if target_path.exists() {
+
+    let remote_fetch_plan = if options.password.is_some()
+        && matches!(
+            sync_mode,
+            RepositorySyncMode::ReplaceLocalState | RepositorySyncMode::SameRepositoryPointerUnchanged
+        )
+    {
+        Some(prepare_remote_fetch_plan(
+            remote,
+            &options.repo_root,
+            &control_plane,
+            options.password.as_deref(),
+            &stored_ref_bytes,
+            &remote_loose_object_ids,
+            &bundle_locations,
+        )?)
+    } else {
+        None
+    };
+    if remote_fetch_plan.is_none()
+        && matches!(
+            sync_mode,
+            RepositorySyncMode::SameRepositoryPointerUnchanged
+                | RepositorySyncMode::SameRepositoryPointerChanged
+        )
+    {
+        validate_remote_ref_consistency_if_locally_unlocked(
+            remote,
+            &options.repo_root,
+            &requested_branch_token,
+            &stored_ref_bytes,
+            &bundle_locations,
+        )?;
+    }
+    if matches!(sync_mode, RepositorySyncMode::SameRepositoryPointerUnchanged)
+        && local_control_plane_matches_remote(&control_dir, &control_plane)?
+        && RepositoryFacade::new().verify_ref(&options.repo_root).is_ok()
+    {
+        return Ok(FetchResult {
+            downloaded_objects: 0,
+        });
+    }
+    let mut downloaded_objects = 0usize;
+    if let Some(remote_fetch_plan) = &remote_fetch_plan {
+        for object_id in &remote_fetch_plan.reachable_object_ids {
+            let target_path = objects_dir.join(format!("{object_id}.json"));
+            let bytes = std::fs::read(remote_fetch_plan.validation_root.object_path(object_id))?;
+            if !target_path.exists() {
+                std::fs::write(&target_path, bytes)?;
+                downloaded_objects += 1;
+                continue;
+            }
+
             match classify_local_object_health(&options.repo_root, object_id) {
-                LocalObjectHealth::Verified => continue,
+                LocalObjectHealth::Verified => {}
                 LocalObjectHealth::LockedByteComparable => {
-                    if let Some(bytes) = read_bundled_object(remote, &bundle_locations, object_id)?
-                    {
-                        if !local_object_matches_bytes(&options.repo_root, object_id, &bytes) {
-                            anyhow::bail!(
-                                "cannot replace locked local object {object_id} with unverified remote bytes; unlock repository first"
-                            );
-                        }
+                    if !local_object_matches_bytes(&options.repo_root, object_id, &bytes) {
+                        anyhow::bail!(
+                            "cannot replace locked local object {object_id} with unverified remote bytes; unlock repository first"
+                        );
                     }
-                    continue;
                 }
-                LocalObjectHealth::LockedEnvelopeInvalid => {}
-                LocalObjectHealth::Unhealthy => {}
+                LocalObjectHealth::LockedEnvelopeInvalid | LocalObjectHealth::Unhealthy => {
+                    std::fs::write(&target_path, bytes)?;
+                    downloaded_objects += 1;
+                }
             }
         }
-        if let Some(bytes) = read_bundled_object(remote, &bundle_locations, object_id)? {
-            std::fs::write(&target_path, bytes)?;
-            downloaded_objects += 1;
+    } else {
+        let mut bundle_cache = BTreeMap::new();
+        for (relative_path, file_name) in validated_remote_objects {
+            let object_id = file_name
+                .strip_suffix(".json")
+                .unwrap_or(&file_name)
+                .to_string();
+            let target_path = objects_dir.join(file_name);
+            if !target_path.exists() {
+                let bytes = remote.get_physical(&relative_path)?;
+                std::fs::write(&target_path, bytes)?;
+                downloaded_objects += 1;
+                continue;
+            }
+
+            match classify_local_object_health(&options.repo_root, &object_id) {
+                LocalObjectHealth::Verified => {}
+                LocalObjectHealth::LockedByteComparable => {
+                    let bytes = remote.get_physical(&relative_path)?;
+                    if !local_object_matches_bytes(&options.repo_root, &object_id, &bytes) {
+                        anyhow::bail!(
+                            "cannot replace locked local object {object_id} with unverified remote bytes; unlock repository first"
+                        );
+                    }
+                }
+                LocalObjectHealth::LockedEnvelopeInvalid => {
+                    let bytes = remote.get_physical(&relative_path)?;
+                    std::fs::write(&target_path, bytes)?;
+                    downloaded_objects += 1;
+                }
+                LocalObjectHealth::Unhealthy => {
+                    let bytes = remote.get_physical(&relative_path)?;
+                    std::fs::write(&target_path, bytes)?;
+                    downloaded_objects += 1;
+                }
+            }
+        }
+        for object_id in bundle_locations.keys() {
+            let target_path = objects_dir.join(format!("{object_id}.json"));
+            if target_path.exists() {
+                match classify_local_object_health(&options.repo_root, object_id) {
+                    LocalObjectHealth::Verified => continue,
+                    LocalObjectHealth::LockedByteComparable => {
+                        if let Some(bytes) = remote_object_bytes_with_bundle_cache(
+                            remote,
+                            &remote_loose_object_ids,
+                            &bundle_locations,
+                            &mut bundle_cache,
+                            object_id,
+                        )? {
+                            if !local_object_matches_bytes(&options.repo_root, object_id, &bytes) {
+                                anyhow::bail!(
+                                    "cannot replace locked local object {object_id} with unverified remote bytes; unlock repository first"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    LocalObjectHealth::LockedEnvelopeInvalid => {}
+                    LocalObjectHealth::Unhealthy => {}
+                }
+            }
+            if let Some(bytes) = remote_object_bytes_with_bundle_cache(
+                remote,
+                &remote_loose_object_ids,
+                &bundle_locations,
+                &mut bundle_cache,
+                object_id,
+            )? {
+                std::fs::write(&target_path, bytes)?;
+                downloaded_objects += 1;
+            }
         }
     }
     if matches!(sync_mode, RepositorySyncMode::ReplaceLocalState) {
@@ -209,6 +367,57 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
     }
 
     Ok(FetchResult { downloaded_objects })
+}
+
+fn prepare_remote_fetch_plan<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+    control_plane: &RemoteControlPlane,
+    password: Option<&str>,
+    default_ref_bytes: &[u8],
+    remote_loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+) -> Result<RemoteFetchPlan> {
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(repo_root)?,
+    };
+    write_remote_control_plane_to_validation_root(&validation_root, control_plane)?;
+    let validation_secrets = load_remote_validation_secrets(&validation_root, password)?;
+    let mut bundle_cache = BTreeMap::new();
+    let (_, head_snapshot_id) =
+        e2v_core::sync_support::decode_default_ref_record(&validation_root.path, default_ref_bytes)?;
+    let reachable_object_ids = match head_snapshot_id.as_deref() {
+        Some(head_snapshot_id) => {
+            let reachable_object_ids = collect_remote_reachable_object_ids(
+                remote,
+                remote_loose_object_ids,
+                bundle_locations,
+                &validation_root,
+                &validation_secrets,
+                &mut bundle_cache,
+                head_snapshot_id,
+            )?;
+            materialize_remote_objects_into_validation_root(
+                remote,
+                remote_loose_object_ids,
+                bundle_locations,
+                &validation_root,
+                &mut bundle_cache,
+                &reachable_object_ids,
+            )?;
+            e2v_core::sync_support::verify_snapshot_with_secrets_for_sync(
+                &validation_root.path,
+                validation_secrets,
+                head_snapshot_id,
+            )?;
+            reachable_object_ids
+        }
+        None => Vec::new(),
+    };
+    Ok(RemoteFetchPlan {
+        validation_root,
+        reachable_object_ids,
+    })
 }
 
 fn classify_repository_sync_mode<R: RemoteBackend>(
@@ -292,6 +501,23 @@ fn local_objects_dir_has_entries(control_dir: &std::path::Path) -> Result<bool> 
         .is_some())
 }
 
+fn local_control_plane_matches_remote(
+    control_dir: &Path,
+    control_plane: &RemoteControlPlane,
+) -> Result<bool> {
+    Ok(read_if_exists(control_dir.join("config.json")) == Some(control_plane.config_bytes.clone())
+        && read_if_exists(control_dir.join("layout_root.json"))
+            == Some(control_plane.layout_root_bytes.clone())
+        && read_if_exists(control_dir.join("refs").join("default.json"))
+            == Some(control_plane.default_ref_bytes.clone())
+        && read_if_exists(control_dir.join("keyring").join("keyring.current"))
+            == Some(control_plane.keyring_pointer_bytes.clone()))
+}
+
+fn read_if_exists(path: PathBuf) -> Option<Vec<u8>> {
+    std::fs::read(path).ok()
+}
+
 fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
     let temp_path = path.with_extension(format!(
         "{}.tmp",
@@ -309,14 +535,8 @@ fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
 fn classify_local_object_health(repo_root: &Path, object_id: &str) -> LocalObjectHealth {
     let facade = e2v_core::RepositoryFacade::new();
     let mut saw_locked_error = false;
-    for object_type in [
-        "chunk",
-        "snapshot",
-        "tree",
-        "file",
-        "directory_root",
-        "tree_shard",
-    ] {
+    let hint = e2v_core::sync_support::read_local_object_type_hint(repo_root, object_id).ok();
+    for object_type in candidate_object_types(hint.as_deref()) {
         match facade.verify_object(repo_root, object_id, object_type) {
             Ok(()) => return LocalObjectHealth::Verified,
             Err(error) => {
@@ -350,10 +570,11 @@ fn local_object_matches_bytes(repo_root: &Path, object_id: &str, expected_bytes:
 
 fn remote_object_bytes<R: RemoteBackend>(
     remote: &R,
+    loose_object_ids: &BTreeSet<String>,
     bundle_locations: &BTreeMap<String, BundledObjectLocation>,
     object_id: &str,
 ) -> Result<Option<Vec<u8>>> {
-    if remote.exists_physical(&format!("objects/{object_id}.json")) {
+    if loose_object_ids.contains(object_id) {
         return Ok(Some(
             remote.get_physical(&format!("objects/{object_id}.json"))?,
         ));
@@ -361,197 +582,161 @@ fn remote_object_bytes<R: RemoteBackend>(
     read_bundled_object(remote, bundle_locations, object_id)
 }
 
+fn remote_object_bytes_with_bundle_cache<R: RemoteBackend>(
+    remote: &R,
+    loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    object_id: &str,
+) -> Result<Option<Vec<u8>>> {
+    if loose_object_ids.contains(object_id) {
+        return Ok(Some(
+            remote.get_physical(&format!("objects/{object_id}.json"))?,
+        ));
+    }
+
+    let Some(location) = bundle_locations.get(object_id) else {
+        return Ok(None);
+    };
+    if !bundle_cache.contains_key(&location.data_path) {
+        let bundle_len: usize = remote
+            .stat_physical(&location.data_path)?
+            .length
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("bundle is too large to read on this platform"))?;
+        let bundle_bytes = remote.get_physical_range(&location.data_path, 0, bundle_len)?;
+        bundle_cache.insert(location.data_path.clone(), bundle_bytes);
+    }
+    let bundle_bytes = bundle_cache.get(&location.data_path).unwrap();
+    let end = location.offset.saturating_add(location.length);
+    ensure!(
+        end <= bundle_bytes.len(),
+        "bundled object range out of bounds for {object_id}"
+    );
+    Ok(Some(bundle_bytes[location.offset..end].to_vec()))
+}
+
 fn remote_object_authenticates_for_repo<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
+    loose_object_ids: &BTreeSet<String>,
     bundle_locations: &BTreeMap<String, BundledObjectLocation>,
     object_id: &str,
     expected_type: &str,
-) -> bool {
+) -> Result<()> {
     let control_dir = repo_root.join(".e2v");
-    let secrets = match e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir) {
-        Ok(secrets) => secrets,
-        Err(_) => return false,
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(repo_root)?,
     };
-    let validation_root = match next_validation_root(repo_root) {
-        Ok(path) => path,
-        Err(_) => return false,
-    };
-    let validation_control = validation_root.join(".e2v");
-    if std::fs::create_dir_all(validation_control.join("objects")).is_err() {
-        return false;
-    }
-    if std::fs::create_dir_all(validation_control.join("keyring")).is_err() {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    if std::fs::create_dir_all(validation_control.join("refs")).is_err() {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    let _ = std::fs::copy(
-        control_dir.join("config.json"),
-        validation_control.join("config.json"),
-    );
-    let _ = std::fs::copy(
-        control_dir.join("layout_root.json"),
-        validation_control.join("layout_root.json"),
-    );
-    let _ = std::fs::copy(
-        control_dir.join("refs").join("default.json"),
-        validation_control.join("refs").join("default.json"),
-    );
-    if let Ok(pointer_bytes) = std::fs::read(control_dir.join("keyring").join("keyring.current")) {
-        let _ = std::fs::write(
+    let validation_control = validation_root.control_dir();
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(validation_control.join("objects"))?;
+        std::fs::create_dir_all(validation_control.join("keyring"))?;
+        std::fs::create_dir_all(validation_control.join("refs"))?;
+        std::fs::copy(
+            control_dir.join("config.json"),
+            validation_control.join("config.json"),
+        )?;
+        std::fs::copy(
+            control_dir.join("layout_root.json"),
+            validation_control.join("layout_root.json"),
+        )?;
+        std::fs::copy(
+            control_dir.join("refs").join("default.json"),
+            validation_control.join("refs").join("default.json"),
+        )?;
+        let pointer_bytes =
+            std::fs::read(control_dir.join("keyring").join("keyring.current"))?;
+        std::fs::write(
             validation_control.join("keyring").join("keyring.current"),
             pointer_bytes,
-        );
-    }
-    let store = e2v_store::DirectLayoutObjectStore::new(&validation_control, secrets);
-    let bytes = match remote_object_bytes(remote, bundle_locations, object_id) {
-        Ok(Some(bytes)) => bytes,
-        _ => return false,
-    };
-    let target_path = validation_root
-        .join(".e2v")
-        .join("objects")
-        .join(format!("{object_id}.json"));
-    if std::fs::write(&target_path, &bytes).is_err() {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    let verified = store.get_object(object_id, expected_type).is_ok();
-    let _ = std::fs::remove_dir_all(&validation_root);
-    verified
+        )?;
+
+        let store = e2v_store::DirectLayoutObjectStore::new(&validation_control, secrets);
+        let bytes = remote_object_bytes(remote, loose_object_ids, bundle_locations, object_id)?
+            .with_context(|| format!("missing remote object {object_id}"))?;
+        let object_file_name = validation_object_file_name(object_id)?;
+        let target_path = validation_control.join("objects").join(object_file_name);
+        std::fs::write(&target_path, &bytes)?;
+        let _ = store.get_object(object_id, expected_type)?;
+        Ok(())
+    })();
+    result
 }
 
 fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
+    loose_object_ids: &BTreeSet<String>,
     bundle_locations: &BTreeMap<String, BundledObjectLocation>,
     snapshot_id: &str,
-) -> bool {
-    if !remote_object_authenticates_for_repo(
+) -> Result<()> {
+    remote_object_authenticates_for_repo(
         repo_root,
         remote,
+        loose_object_ids,
         bundle_locations,
         snapshot_id,
         "snapshot",
-    ) {
-        return false;
-    }
+    )
+    .context("failed to authenticate remote head snapshot object")?;
 
     let control_dir = repo_root.join(".e2v");
-    let secrets = match e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir) {
-        Ok(secrets) => secrets,
-        Err(_) => return false,
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(repo_root)?,
     };
-    let validation_root = match next_validation_root(repo_root) {
-        Ok(path) => path,
-        Err(_) => return false,
-    };
-    let validation_control = validation_root.join(".e2v");
-    if std::fs::create_dir_all(validation_control.join("objects")).is_err() {
-        return false;
-    }
-    if std::fs::create_dir_all(validation_control.join("keyring")).is_err() {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    if std::fs::create_dir_all(validation_control.join("refs")).is_err() {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    if std::fs::copy(
-        control_dir.join("config.json"),
-        validation_control.join("config.json"),
-    )
-    .is_err()
-    {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    if std::fs::copy(
-        control_dir.join("layout_root.json"),
-        validation_control.join("layout_root.json"),
-    )
-    .is_err()
-    {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    if std::fs::copy(
-        control_dir.join("refs").join("default.json"),
-        validation_control.join("refs").join("default.json"),
-    )
-    .is_err()
-    {
-        let _ = std::fs::remove_dir_all(&validation_root);
-        return false;
-    }
-    if let Ok(pointer_bytes) = std::fs::read(control_dir.join("keyring").join("keyring.current")) {
-        if std::fs::write(
+    let validation_control = validation_root.control_dir();
+    let mut bundle_cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(validation_control.join("objects"))?;
+        std::fs::create_dir_all(validation_control.join("keyring"))?;
+        std::fs::create_dir_all(validation_control.join("refs"))?;
+        std::fs::copy(
+            control_dir.join("config.json"),
+            validation_control.join("config.json"),
+        )?;
+        std::fs::copy(
+            control_dir.join("layout_root.json"),
+            validation_control.join("layout_root.json"),
+        )?;
+        std::fs::copy(
+            control_dir.join("refs").join("default.json"),
+            validation_control.join("refs").join("default.json"),
+        )?;
+        let pointer_bytes =
+            std::fs::read(control_dir.join("keyring").join("keyring.current"))?;
+        std::fs::write(
             validation_control.join("keyring").join("keyring.current"),
             pointer_bytes,
-        )
-        .is_err()
-        {
-            let _ = std::fs::remove_dir_all(&validation_root);
-            return false;
-        }
-    }
-    let listed = match remote.list_physical("objects/") {
-        Ok(listed) => listed,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&validation_root);
-            return false;
-        }
-    };
-    for (relative_path, file_name) in listed.into_iter().filter_map(|relative_path| {
-        let file_name = relative_path.strip_prefix("objects/")?.to_string();
-        Some((relative_path, file_name))
-    }) {
-        let target_path = validation_control.join("objects").join(file_name);
-        let bytes = match remote.get_physical(&relative_path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                let _ = std::fs::remove_dir_all(&validation_root);
-                return false;
-            }
-        };
-        if std::fs::write(target_path, bytes).is_err() {
-            let _ = std::fs::remove_dir_all(&validation_root);
-            return false;
-        }
-    }
-    for object_id in bundle_locations.keys() {
-        let bytes = match read_bundled_object(remote, bundle_locations, object_id) {
-            Ok(Some(bytes)) => bytes,
-            _ => {
-                let _ = std::fs::remove_dir_all(&validation_root);
-                return false;
-            }
-        };
-        if std::fs::write(
-            validation_control
-                .join("objects")
-                .join(format!("{object_id}.json")),
-            bytes,
-        )
-        .is_err()
-        {
-            let _ = std::fs::remove_dir_all(&validation_root);
-            return false;
-        }
-    }
-    let verified = e2v_core::sync_support::verify_snapshot_with_secrets_for_sync(
-        &validation_root,
-        secrets,
-        snapshot_id,
-    )
-    .is_ok();
-    let _ = std::fs::remove_dir_all(&validation_root);
-    verified
+        )?;
+
+        let reachable_object_ids = collect_remote_reachable_object_ids(
+            remote,
+            loose_object_ids,
+            bundle_locations,
+            &validation_root,
+            &secrets,
+            &mut bundle_cache,
+            snapshot_id,
+        )?;
+        materialize_remote_objects_into_validation_root(
+            remote,
+            loose_object_ids,
+            bundle_locations,
+            &validation_root,
+            &mut bundle_cache,
+            &reachable_object_ids,
+        )?;
+        e2v_core::sync_support::verify_snapshot_with_secrets_for_sync(
+            &validation_root.path,
+            secrets,
+            snapshot_id,
+        )?;
+        Ok(())
+    })();
+    result
 }
 
 fn read_remote_control_plane<R: RemoteBackend>(
@@ -625,6 +810,7 @@ pub(crate) fn validate_remote_branch_control_plane<R: RemoteBackend>(
     remote: &R,
     branch_token: &str,
 ) -> Result<()> {
+    validate_sync_identifier("branch token", branch_token)?;
     let stored_ref = remote
         .read_ref(&RefToken::new(branch_token.to_string()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found"))?;
@@ -642,6 +828,22 @@ fn validate_remote_relative_name(value: &str) -> Result<()> {
         "path traversal is not allowed"
     );
     Ok(())
+}
+
+fn validate_remote_object_file_name(value: &str) -> Result<()> {
+    validate_remote_relative_name(value)?;
+    ensure!(
+        Path::new(value).components().count() == 1,
+        "nested remote object paths are not allowed"
+    );
+    ensure!(value.ends_with(".json"), "remote object path must end with .json");
+    Ok(())
+}
+
+fn validation_object_file_name(object_id: &str) -> Result<String> {
+    let file_name = format!("{object_id}.json");
+    validate_remote_object_file_name(&file_name)?;
+    Ok(file_name)
 }
 
 fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
@@ -670,20 +872,32 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
     );
 
     if let Some(head_snapshot_id) = head_snapshot_id {
+        let listed = _remote.list_physical("objects/")?;
+        let mut loose_object_ids = BTreeSet::new();
+        for relative_path in listed {
+            let Some(object_id) = relative_path
+                .strip_prefix("objects/")
+                .and_then(|value| value.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if validate_object_id_value(object_id).is_ok() {
+                loose_object_ids.insert(object_id.to_string());
+            }
+        }
         ensure!(
-            _remote.exists_physical(&format!("objects/{head_snapshot_id}.json"))
+            loose_object_ids.contains(&head_snapshot_id)
                 || bundle_locations.contains_key(&head_snapshot_id),
             "remote ref points to missing head snapshot {head_snapshot_id}"
         );
-        ensure!(
-            remote_snapshot_graph_authenticates_for_repo(
-                repo_root,
-                _remote,
-                bundle_locations,
-                &head_snapshot_id,
-            ),
-            "remote ref points to unreadable head snapshot graph {head_snapshot_id}"
-        );
+        remote_snapshot_graph_authenticates_for_repo(
+            repo_root,
+            _remote,
+            &loose_object_ids,
+            bundle_locations,
+            &head_snapshot_id,
+        )
+        .with_context(|| format!("remote ref points to unreadable head snapshot graph {head_snapshot_id}"))?;
     }
 
     Ok(())
@@ -751,4 +965,324 @@ fn next_validation_root(repo_root: &Path) -> Result<PathBuf> {
         }
     }
     anyhow::bail!("failed to allocate temporary fetch validation directory")
+}
+
+fn write_remote_control_plane_to_validation_root(
+    validation_root: &RemoteValidationRoot,
+    control_plane: &RemoteControlPlane,
+) -> Result<()> {
+    let validation_control = validation_root.control_dir();
+    std::fs::create_dir_all(validation_control.join("objects"))?;
+    std::fs::create_dir_all(validation_control.join("keyring"))?;
+    std::fs::create_dir_all(validation_control.join("refs"))?;
+    std::fs::write(
+        validation_control.join("config.json"),
+        &control_plane.config_bytes,
+    )?;
+    std::fs::write(
+        validation_control.join("layout_root.json"),
+        &control_plane.layout_root_bytes,
+    )?;
+    std::fs::write(
+        validation_control.join("refs").join("default.json"),
+        &control_plane.default_ref_bytes,
+    )?;
+    std::fs::write(
+        validation_control.join("keyring").join("keyring.current"),
+        &control_plane.keyring_pointer_bytes,
+    )?;
+    for (file_name, bytes) in &control_plane.keyring_files {
+        std::fs::write(validation_control.join("keyring").join(file_name), bytes)?;
+    }
+    Ok(())
+}
+
+fn load_remote_validation_secrets(
+    validation_root: &RemoteValidationRoot,
+    password: Option<&str>,
+) -> Result<RepoSecrets> {
+    let password = password.context("fetch requires password-based remote validation")?;
+    RepositoryFacade::new().unlock(&validation_root.path, password)?;
+    e2v_core::sync_support::open_repo_secrets_for_sync(validation_root.control_dir())
+}
+
+fn collect_remote_reachable_object_ids<R: RemoteBackend>(
+    remote: &R,
+    remote_loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    validation_secrets: &RepoSecrets,
+    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    head_snapshot_id: &str,
+) -> Result<Vec<String>> {
+    let object_store = DirectLayoutObjectStore::new(validation_root.control_dir(), validation_secrets.clone());
+    let mut reachable_object_ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending_snapshots = vec![head_snapshot_id.to_string()];
+
+    while let Some(snapshot_id) = pending_snapshots.pop() {
+        fetch_remote_object_into_validation_root(
+            remote,
+            remote_loose_object_ids,
+            bundle_locations,
+            validation_root,
+            bundle_cache,
+            &snapshot_id,
+        )?;
+        if !push_reachable_id(&mut reachable_object_ids, &mut seen, snapshot_id.clone()) {
+            continue;
+        }
+        let snapshot: RemoteSnapshotObject =
+            read_remote_validation_object(&object_store, &snapshot_id, "snapshot")?;
+        validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
+        collect_remote_tree_object_ids(
+            remote,
+            remote_loose_object_ids,
+            bundle_locations,
+            validation_root,
+            &object_store,
+            bundle_cache,
+            &snapshot.root_tree_id,
+            &mut reachable_object_ids,
+            &mut seen,
+        )?;
+        if let Some(parent_snapshot_id) = snapshot.parent_snapshot_id {
+            validate_object_id_value(&parent_snapshot_id)
+                .with_context(|| format!("invalid parent snapshot id in snapshot {snapshot_id}"))?;
+            pending_snapshots.push(parent_snapshot_id);
+        }
+    }
+
+    Ok(reachable_object_ids)
+}
+
+fn collect_remote_tree_object_ids<R: RemoteBackend>(
+    remote: &R,
+    remote_loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    object_store: &DirectLayoutObjectStore,
+    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    tree_id: &str,
+    reachable_object_ids: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Result<()> {
+    fetch_remote_object_into_validation_root(
+        remote,
+        remote_loose_object_ids,
+        bundle_locations,
+        validation_root,
+        bundle_cache,
+        tree_id,
+    )?;
+    if !push_reachable_id(reachable_object_ids, seen, tree_id.to_string()) {
+        return Ok(());
+    }
+
+    match read_remote_validation_object::<RemoteTreeObject>(object_store, tree_id, "tree") {
+        Ok(tree) => {
+            validate_manifest_schema_version("tree", tree.schema_version)?;
+            collect_remote_tree_entries(
+                remote,
+                remote_loose_object_ids,
+                bundle_locations,
+                validation_root,
+                object_store,
+                bundle_cache,
+                tree.entries,
+                reachable_object_ids,
+                seen,
+            )
+        }
+        Err(error) => {
+            if !error.to_string().contains("object type mismatch") {
+                return Err(error);
+            }
+            let directory_root: RemoteDirectoryRootObject =
+                read_remote_validation_object(object_store, tree_id, "directory_root")?;
+            validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
+            for shard_id in directory_root.shards {
+                validate_object_id_value(&shard_id)
+                    .with_context(|| format!("invalid shard id in directory root {tree_id}"))?;
+                fetch_remote_object_into_validation_root(
+                    remote,
+                    remote_loose_object_ids,
+                    bundle_locations,
+                    validation_root,
+                    bundle_cache,
+                    &shard_id,
+                )?;
+                if !push_reachable_id(reachable_object_ids, seen, shard_id.clone()) {
+                    continue;
+                }
+                let shard: RemoteTreeShardObject =
+                    read_remote_validation_object(object_store, &shard_id, "tree_shard")?;
+                validate_manifest_schema_version("tree_shard", shard.schema_version)?;
+                collect_remote_tree_entries(
+                    remote,
+                    remote_loose_object_ids,
+                    bundle_locations,
+                    validation_root,
+                    object_store,
+                    bundle_cache,
+                    shard.entries,
+                    reachable_object_ids,
+                    seen,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_remote_tree_entries<R: RemoteBackend>(
+    remote: &R,
+    remote_loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    object_store: &DirectLayoutObjectStore,
+    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    entries: Vec<RemoteTreeEntry>,
+    reachable_object_ids: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Result<()> {
+    for entry in entries {
+        validate_object_id_value(&entry.object_id)
+            .with_context(|| format!("invalid {} object id in tree entry {}", entry.kind, entry.name))?;
+        match entry.kind.as_str() {
+            "tree" => collect_remote_tree_object_ids(
+                remote,
+                remote_loose_object_ids,
+                bundle_locations,
+                validation_root,
+                object_store,
+                bundle_cache,
+                &entry.object_id,
+                reachable_object_ids,
+                seen,
+            )?,
+            "file" => collect_remote_file_object_ids(
+                remote,
+                remote_loose_object_ids,
+                bundle_locations,
+                validation_root,
+                object_store,
+                bundle_cache,
+                &entry.object_id,
+                reachable_object_ids,
+                seen,
+            )?,
+            other => anyhow::bail!("unknown remote tree entry kind {other}"),
+        }
+    }
+    Ok(())
+}
+
+fn collect_remote_file_object_ids<R: RemoteBackend>(
+    remote: &R,
+    remote_loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    object_store: &DirectLayoutObjectStore,
+    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    file_id: &str,
+    reachable_object_ids: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Result<()> {
+    fetch_remote_object_into_validation_root(
+        remote,
+        remote_loose_object_ids,
+        bundle_locations,
+        validation_root,
+        bundle_cache,
+        file_id,
+    )?;
+    if !push_reachable_id(reachable_object_ids, seen, file_id.to_string()) {
+        return Ok(());
+    }
+
+    let file: RemoteFileObject = read_remote_validation_object(object_store, file_id, "file")?;
+    validate_manifest_schema_version("file", file.schema_version)?;
+    for chunk_id in file.chunks {
+        validate_object_id_value(&chunk_id)
+            .with_context(|| format!("invalid chunk id in file {file_id}"))?;
+        push_reachable_id(reachable_object_ids, seen, chunk_id);
+    }
+    Ok(())
+}
+
+fn materialize_remote_objects_into_validation_root<R: RemoteBackend>(
+    remote: &R,
+    remote_loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    reachable_object_ids: &[String],
+) -> Result<()> {
+    for object_id in reachable_object_ids {
+        fetch_remote_object_into_validation_root(
+            remote,
+            remote_loose_object_ids,
+            bundle_locations,
+            validation_root,
+            bundle_cache,
+            object_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn fetch_remote_object_into_validation_root<R: RemoteBackend>(
+    remote: &R,
+    remote_loose_object_ids: &BTreeSet<String>,
+    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    object_id: &str,
+) -> Result<()> {
+    validate_object_id_value(object_id)?;
+    let target_path = validation_root.object_path(object_id);
+    if target_path.exists() {
+        return Ok(());
+    }
+    let bytes = remote_object_bytes_with_bundle_cache(
+        remote,
+        remote_loose_object_ids,
+        bundle_locations,
+        bundle_cache,
+        object_id,
+    )?
+    .with_context(|| format!("missing remote object {object_id}"))?;
+    std::fs::write(target_path, bytes)?;
+    Ok(())
+}
+
+fn read_remote_validation_object<T: for<'de> Deserialize<'de>>(
+    object_store: &DirectLayoutObjectStore,
+    object_id: &str,
+    expected_type: &str,
+) -> Result<T> {
+    let plaintext = object_store.get_object(object_id, expected_type)?;
+    postcard_from_bytes(&plaintext).context("failed to decode remote object plaintext")
+}
+
+fn push_reachable_id(
+    reachable_object_ids: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    object_id: String,
+) -> bool {
+    if seen.insert(object_id.clone()) {
+        reachable_object_ids.push(object_id);
+        true
+    } else {
+        false
+    }
+}
+
+fn validate_manifest_schema_version(object_type: &str, schema_version: u32) -> Result<()> {
+    ensure!(
+        schema_version == REPO_FORMAT_VERSION,
+        "unsupported {object_type} schema version {schema_version}"
+    );
+    Ok(())
 }

@@ -2,6 +2,7 @@ mod bundle;
 pub mod clone;
 pub mod fetch;
 pub mod journal;
+mod object_type;
 pub mod publisher;
 pub mod push;
 pub mod transaction;

@@ -1,4 +1,10 @@
+use std::pin::Pin;
+
+use axum::body::Body;
 use e2v_sync::{ServeOptions, build_local_web_router, serve_local_web};
+use e2v_core::ManifestStoreApi;
+use futures_util::future::poll_fn;
+use axum::body::HttpBody as _;
 use tower::util::ServiceExt;
 
 #[test]
@@ -199,6 +205,65 @@ async fn snapshot_file_api_downloads_full_file() {
         .await
         .unwrap();
     assert_eq!(body.as_ref(), b"hello from child");
+}
+
+#[tokio::test]
+async fn snapshot_file_api_streams_large_full_downloads_in_multiple_frames() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let large_bytes = vec![b'x'; (1024 * 1024) + 257];
+    std::fs::write(repo_root.join("large.bin"), &large_bytes).unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "large-file".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=large.bin",
+                    commit.snapshot_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let mut body = response.into_body();
+    let mut frames = 0usize;
+    let mut rebuilt = Vec::new();
+    while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+        .await
+        .transpose()
+        .unwrap()
+    {
+        if let Ok(bytes) = frame.into_data() {
+            frames += 1;
+            rebuilt.extend_from_slice(&bytes);
+        }
+    }
+
+    assert_eq!(rebuilt, large_bytes);
+    assert!(
+        frames >= 2,
+        "expected large full download to stream in multiple frames, saw {frames}"
+    );
 }
 
 #[tokio::test]
@@ -735,6 +800,64 @@ async fn missing_snapshot_tree_api_returns_not_found() {
 }
 
 #[tokio::test]
+async fn snapshot_tree_api_returns_bad_request_for_invalid_snapshot_id_path_traversal() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/snapshots/%2E%2E/tree?path=")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn snapshot_file_api_returns_bad_request_for_invalid_snapshot_id_path_traversal() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/snapshots/%2E%2E/file?path=hello.txt")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn snapshot_file_api_rejects_malformed_multi_range_requests() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -879,6 +1002,80 @@ async fn tampered_snapshot_file_api_returns_internal_server_error_instead_of_not
 }
 
 #[tokio::test]
+async fn snapshot_file_api_returns_internal_server_error_for_authenticated_file_with_empty_chunks() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("hello.txt"), b"hello web").unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "empty-chunks".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = e2v_core::ManifestStore::new(&repo_root);
+    let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let file_entry = root_tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .clone();
+    let mut file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    file_manifest.chunks.clear();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let object_store = e2v_store::DirectLayoutObjectStore::new(&control_dir, secrets);
+    let tampered_file_id = object_store
+        .put_object("file", &postcard::to_stdvec(&file_manifest).unwrap())
+        .unwrap();
+
+    let mut tampered_tree = root_tree.clone();
+    tampered_tree
+        .entries
+        .iter_mut()
+        .find(|entry| entry.name == "hello.txt")
+        .unwrap()
+        .object_id = tampered_file_id;
+    let tampered_tree_id = object_store
+        .put_object("tree", &postcard::to_stdvec(&tampered_tree).unwrap())
+        .unwrap();
+
+    let mut tampered_snapshot = snapshot.clone();
+    tampered_snapshot.root_tree_id = tampered_tree_id;
+    let tampered_snapshot_id = object_store
+        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{tampered_snapshot_id}/file?path=hello.txt"
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
 async fn tampered_branch_tree_api_returns_internal_server_error_instead_of_not_found() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1010,4 +1207,62 @@ async fn branch_file_api_honors_single_byte_range_requests() {
         .await
         .unwrap();
     assert_eq!(body.as_ref(), b"from");
+}
+
+#[tokio::test]
+async fn branch_tree_api_returns_bad_request_for_invalid_branch_token_path_traversal() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/branches/%2E%2E/tree?path=")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn branch_file_api_returns_bad_request_for_invalid_branch_token_path_traversal() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/branches/%2E%2E/file?path=hello.txt")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
 }

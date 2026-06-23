@@ -8,14 +8,19 @@ version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+postcard.workspace = true
 rusqlite.workspace = true
 axum.workspace = true
 http.workspace = true
 tower.workspace = true
 tokio.workspace = true
 serde_urlencoded.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
 e2v-core = { path = "../e2v-core" }
 e2v-store = { path = "../e2v-store" }
 
 [dev-dependencies]
+http-body = "1.0"
+postcard.workspace = true
 tempfile.workspace = true

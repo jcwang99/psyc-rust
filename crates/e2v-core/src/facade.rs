@@ -8,7 +8,10 @@ use anyhow::{Context, Result, ensure};
 use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
-use e2v_store::{DirectLayoutObjectStore, LayoutRoot, RepoSecrets};
+use e2v_store::{
+    DirectLayoutObjectStore, LayoutRoot, RepoSecrets, validate_object_id_value,
+    validate_ref_token_value,
+};
 use postcard::{from_bytes as postcard_from_bytes, to_stdvec as postcard_to_vec};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -39,6 +42,7 @@ const CONTROL_REF_FORMAT_VERSION: u32 = 1;
 #[allow(dead_code)]
 const RESERVED_MANIFEST_TYPES: &[&str] = &["directory_root", "tree_shard"];
 const MAX_TREE_ENTRIES_PER_OBJECT: usize = 4096;
+const CHECKOUT_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitOptions {
@@ -95,6 +99,7 @@ pub struct FileHandle {
     pub file_object_id: String,
     file_size: u64,
     chunk_ids: Vec<String>,
+    chunk_lengths: Vec<u64>,
     layout_generation: u64,
     crypto_suite: String,
     key_epoch: u32,
@@ -128,6 +133,10 @@ impl FileHandle {
 
     pub fn debug_chunk_ids(&self) -> &[String] {
         &self.chunk_ids
+    }
+
+    pub fn debug_chunk_lengths(&self) -> &[u64] {
+        &self.chunk_lengths
     }
 }
 
@@ -192,6 +201,7 @@ struct FileObject {
     pub chunker_id: String,
     pub chunker_config_id: String,
     pub chunks: Vec<String>,
+    pub chunk_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,13 +613,9 @@ impl RepositoryFacade {
             planned_files.into_iter().zip(final_paths.into_iter())
         {
             let stage_result: Result<()> = (|| {
-                let bytes = read_service.read_range(&file, 0, usize::MAX)?;
-                if let Some(parent) = final_path.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("failed to create checkout directory {}", parent.display())
-                    })?;
-                }
-                let temp_path = working_tree.write_checkout_temp(&final_path, &bytes)?;
+                let temp_path = checkout_file_to_temp(&working_tree, &file, &final_path, |offset, length| {
+                    read_service.read_range(&file, offset, length)
+                })?;
                 staged.push((_snapshot_path, temp_path, final_path));
                 Ok(())
             })();
@@ -672,6 +678,7 @@ impl RepositoryFacade {
 
 impl ReadService {
     pub fn open_snapshot(&self, snapshot_id: &str) -> Result<SnapshotHandle> {
+        validate_object_id_value(snapshot_id).context("invalid snapshot id")?;
         let repo_state = RepositoryFacade::new().open(&self.repo_root)?;
         let manifest_store = LocalManifestStore::new(&self.repo_root);
         let snapshot = manifest_store.get_snapshot(snapshot_id)?;
@@ -684,6 +691,7 @@ impl ReadService {
     }
 
     pub fn resolve_branch(&self, ref_token_hex: &str) -> Result<SnapshotHandle> {
+        validate_ref_token_value(ref_token_hex)?;
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let repo_state = RepositoryFacade::new().open(&self.repo_root)?;
         let default_ref = read_current_ref(&control_dir)?;
@@ -736,6 +744,7 @@ impl ReadService {
             file_object_id: entry.object_id,
             file_size: file.file_size,
             chunk_ids: file.chunks,
+            chunk_lengths: file.chunk_lengths,
             layout_generation: snapshot.layout_generation,
             crypto_suite: "xchacha20poly1305".to_string(),
             key_epoch: DEFAULT_ACTIVE_EPOCH,
@@ -756,16 +765,22 @@ impl ReadService {
             return Ok(Vec::new());
         }
         ensure!(!file.chunk_ids.is_empty(), "file has no chunks");
+        ensure!(
+            file.chunk_ids.len() == file.chunk_lengths.len(),
+            "file chunk metadata is inconsistent"
+        );
 
-        let mut chunk_start = 0usize;
         let mut output = Vec::with_capacity(end - offset);
-        for chunk_id in &file.chunk_ids {
+        let mut chunk_start = 0usize;
+        for (chunk_id, chunk_length) in file.chunk_ids.iter().zip(file.chunk_lengths.iter()) {
             if output.len() >= end - offset {
                 break;
             }
 
-            let chunk = read_chunk_object(&object_store, chunk_id)?;
-            let chunk_end = chunk_start.saturating_add(chunk.data.len());
+            let chunk_len: usize = (*chunk_length)
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("chunk length does not fit in usize"))?;
+            let chunk_end = chunk_start.saturating_add(chunk_len);
             if chunk_end <= offset {
                 chunk_start = chunk_end;
                 continue;
@@ -774,14 +789,72 @@ impl ReadService {
                 break;
             }
 
+            let chunk = read_chunk_object(&object_store, chunk_id)?;
+            ensure!(
+                chunk.data.len() == chunk_len,
+                "file chunk metadata does not match chunk payload length"
+            );
             let slice_start = offset.saturating_sub(chunk_start);
-            let slice_end = (end - chunk_start).min(chunk.data.len());
+            let slice_end = (end - chunk_start).min(chunk_len);
             output.extend_from_slice(&chunk.data[slice_start..slice_end]);
             chunk_start = chunk_end;
         }
 
+        ensure!(
+            output.len() == end - offset,
+            "file chunk coverage incomplete for requested range"
+        );
+
         Ok(output)
     }
+}
+
+fn checkout_file_to_temp<F>(
+    working_tree: &WorkingTree,
+    file: &FileHandle,
+    final_path: &Path,
+    mut read_range: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(usize, usize) -> Result<Vec<u8>>,
+{
+    let parent = final_path
+        .parent()
+        .with_context(|| format!("checkout target has no parent: {}", final_path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create checkout directory {}", parent.display()))?;
+    working_tree.ensure_checkout_target_is_clear(final_path)?;
+
+    let temp_path = final_path.with_extension("e2v-tmp");
+    let result = (|| -> Result<()> {
+        let mut temp_file = fs::File::create(&temp_path).with_context(|| {
+            format!("failed to write checkout temp file {}", temp_path.display())
+        })?;
+        let file_size: usize = file
+            .file_size()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("file size does not fit in usize"))?;
+        let mut offset = 0usize;
+        while offset < file_size {
+            let chunk_len = (file_size - offset).min(CHECKOUT_STREAM_CHUNK_BYTES);
+            let bytes = read_range(offset, chunk_len)?;
+            ensure!(
+                bytes.len() == chunk_len,
+                "checkout read returned truncated data"
+            );
+            use std::io::Write as _;
+            temp_file.write_all(&bytes).with_context(|| {
+                format!("failed to write checkout temp file {}", temp_path.display())
+            })?;
+            offset += chunk_len;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(temp_path)
 }
 
 fn directory_is_empty(path: &Path) -> Result<bool> {
@@ -1128,14 +1201,16 @@ where
             return Ok(None);
         }
     };
-    let chunk_pieces = chunker.split(&file_bytes)?;
-    let mut chunk_ids = Vec::with_capacity(chunk_pieces.len());
+    let chunk_spans = chunker.split_spans(&file_bytes)?;
+    let mut chunk_ids = Vec::with_capacity(chunk_spans.len());
+    let mut chunk_lengths = Vec::with_capacity(chunk_spans.len());
 
-    for piece in chunk_pieces {
-        let piece_len = piece.bytes.len();
+    for span in chunk_spans {
+        let piece_bytes = file_bytes[span.offset..span.end()].to_vec();
+        let piece_len = piece_bytes.len();
         let chunk = ChunkObject {
             plaintext_length: piece_len,
-            data: piece.bytes,
+            data: piece_bytes,
         };
         let chunk_bytes = postcard_to_vec(&chunk).context("failed to encode chunk")?;
         let chunk_id = object_store.preview_object_id("chunk", &chunk_bytes);
@@ -1147,6 +1222,7 @@ where
             *new_bytes += piece_len as u64;
         }
         chunk_ids.push(chunk_id);
+        chunk_lengths.push(piece_len as u64);
     }
 
     let file_object = FileObject {
@@ -1156,6 +1232,7 @@ where
         chunker_id: chunker.id().to_string(),
         chunker_config_id: chunker.config_fingerprint().to_string(),
         chunks: chunk_ids,
+        chunk_lengths,
     };
     let file_id = write_object(object_store, "file", &file_object)?;
     *committed_files += 1;
@@ -1180,6 +1257,10 @@ fn resolve_tree_for_path(
     let mut current_tree_id = root_tree_id.to_string();
     for segment in normalized.split('/') {
         ensure!(!segment.is_empty(), "invalid snapshot path: {path}");
+        ensure!(
+            segment != "." && segment != "..",
+            "invalid snapshot path: {path}"
+        );
         let tree = manifest_store.get_tree_node(&current_tree_id)?;
         let next = tree
             .entries
@@ -1205,7 +1286,6 @@ fn split_parent_and_name(path: &str) -> Result<(String, String)> {
 fn normalize_snapshot_path(path: &str) -> String {
     path.trim_matches('/')
         .split('/')
-        .filter(|component| !component.is_empty())
         .map(|component| component.nfc().collect::<String>())
         .collect::<Vec<_>>()
         .join("/")
@@ -1321,8 +1401,18 @@ fn verify_snapshot_graph(
     object_store: &DirectLayoutObjectStore,
     snapshot_id: &str,
 ) -> Result<()> {
-    let snapshot = manifest_store.get_snapshot(snapshot_id)?;
-    verify_tree_graph(manifest_store, object_store, &snapshot.root_tree_id)
+    let mut visited_snapshots = std::collections::BTreeSet::new();
+    let mut next_snapshot_id = Some(snapshot_id.to_string());
+    while let Some(current_snapshot_id) = next_snapshot_id {
+        ensure!(
+            visited_snapshots.insert(current_snapshot_id.clone()),
+            "verify snapshot failed: snapshot parent cycle detected at {current_snapshot_id}"
+        );
+        let snapshot = manifest_store.get_snapshot(&current_snapshot_id)?;
+        verify_tree_graph(manifest_store, object_store, &snapshot.root_tree_id)?;
+        next_snapshot_id = snapshot.parent_snapshot_id;
+    }
+    Ok(())
 }
 
 fn verify_tree_graph(
@@ -1543,6 +1633,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
 #[cfg(test)]
 mod facade_tests {
     use super::*;
+    use std::cell::RefCell;
     use crate::keyring::unlock_repo_secrets_uncached;
     use crate::working_tree::WorkingTreeEntry;
     use tempfile::tempdir;
@@ -1577,6 +1668,7 @@ mod facade_tests {
                 chunker_id: "fastcdc".to_string(),
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
                 chunks: vec![],
+                chunk_lengths: vec![],
             },
         )
         .unwrap();
@@ -2156,6 +2248,7 @@ mod facade_tests {
                 chunker_id: "fastcdc".to_string(),
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
                 chunks: vec![chunk_id],
+                chunk_lengths: vec![5],
             },
         )
         .unwrap();
@@ -2404,5 +2497,47 @@ mod facade_tests {
         let temp = tempdir().unwrap();
 
         sync_path(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn checkout_file_to_temp_requests_bounded_read_ranges() {
+        let requested_lengths = RefCell::new(Vec::new());
+        let file_size = (CHECKOUT_STREAM_CHUNK_BYTES as u64) * 2 + 17;
+        let read_service = |offset: usize, length: usize| -> Result<Vec<u8>> {
+            requested_lengths.borrow_mut().push((offset, length));
+            ensure!(
+                length <= CHECKOUT_STREAM_CHUNK_BYTES,
+                "requested oversized checkout read: {length}"
+            );
+            let remaining = (file_size as usize).saturating_sub(offset);
+            Ok(vec![b'x'; remaining.min(length)])
+        };
+        let temp = tempdir().unwrap();
+        let final_path = temp.path().join("large.bin");
+        let file = FileHandle {
+            snapshot_id: "snapshot".to_string(),
+            file_object_id: "file".to_string(),
+            file_size,
+            chunk_ids: Vec::new(),
+            chunk_lengths: Vec::new(),
+            layout_generation: 1,
+            crypto_suite: "xchacha20poly1305".to_string(),
+            key_epoch: DEFAULT_ACTIVE_EPOCH,
+            chunker_id: "fastcdc".to_string(),
+        };
+
+        let temp_path =
+            checkout_file_to_temp(&WorkingTree::new(temp.path()), &file, &final_path, read_service)
+                .unwrap();
+
+        assert_eq!(
+            requested_lengths.borrow().as_slice(),
+            &[
+                (0, CHECKOUT_STREAM_CHUNK_BYTES),
+                (CHECKOUT_STREAM_CHUNK_BYTES, CHECKOUT_STREAM_CHUNK_BYTES),
+                (CHECKOUT_STREAM_CHUNK_BYTES * 2, 17),
+            ]
+        );
+        assert_eq!(fs::read(temp_path).unwrap().len(), file_size as usize);
     }
 }

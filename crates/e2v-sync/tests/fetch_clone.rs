@@ -1,11 +1,12 @@
 use std::fs;
+use std::sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use e2v_core::{CommitOptions, InitOptions, ManifestStoreApi, RepositoryFacade};
 use e2v_store::{
-    BlobStore, LayoutRootStore, MemoryBackend, OpendalMemoryBackend, RefStore, RefToken,
-    RemoteBackend, S3CompatibleMockBackend, StoredRef,
+    BlobStore, DirectLayoutObjectStore, LayoutRootStore, MemoryBackend, OpendalMemoryBackend,
+    RefStore, RefToken, RemoteBackend, S3CompatibleMockBackend, StoredRef,
 };
 use tempfile::tempdir;
 
@@ -246,6 +247,135 @@ impl RemoteBackend for KeyringPointerHiddenFromListRemote {
     }
 }
 
+#[derive(Clone, Debug)]
+struct GetTrackingBackend {
+    inner: MemoryBackend,
+    fetched_paths: Arc<Mutex<Vec<String>>>,
+    range_read_paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl GetTrackingBackend {
+    fn new(inner: MemoryBackend) -> Self {
+        Self {
+            inner,
+            fetched_paths: Arc::new(Mutex::new(Vec::new())),
+            range_read_paths: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn reset_gets(&self) {
+        self.fetched_paths.lock().unwrap().clear();
+        self.range_read_paths.lock().unwrap().clear();
+    }
+
+    fn fetched_paths(&self) -> Vec<String> {
+        self.fetched_paths.lock().unwrap().clone()
+    }
+
+    fn range_read_paths(&self) -> Vec<String> {
+        self.range_read_paths.lock().unwrap().clone()
+    }
+}
+
+impl BlobStore for GetTrackingBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.fetched_paths
+            .lock()
+            .unwrap()
+            .push(relative_path.to_string());
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.range_read_paths
+            .lock()
+            .unwrap()
+            .push(relative_path.to_string());
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for GetTrackingBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: e2v_store::EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for GetTrackingBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for GetTrackingBackend {
+    fn capability(&self) -> &e2v_store::BackendCapability {
+        self.inner.capability()
+    }
+}
+
+fn add_unreachable_remote_chunk_object(remote: &MemoryBackend, repo_root: &std::path::Path) -> String {
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let object_store = DirectLayoutObjectStore::new(&control_dir, secrets);
+    let stray_object_id = object_store.put_object("chunk", b"unreachable remote object").unwrap();
+    let stray_bytes = fs::read(
+        control_dir
+            .join("objects")
+            .join(format!("{stray_object_id}.json")),
+    )
+    .unwrap();
+    remote
+        .put_physical(&format!("objects/{stray_object_id}.json"), &stray_bytes)
+        .unwrap();
+    stray_object_id
+}
+
 #[test]
 fn fetch_downloads_remote_ref_and_missing_objects_without_touching_worktree() {
     let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
@@ -285,6 +415,310 @@ fn fetch_downloads_remote_ref_and_missing_objects_without_touching_worktree() {
             .count()
             > 0
     );
+}
+
+#[test]
+fn fetch_does_not_download_unreachable_remote_loose_objects_on_initial_sync() {
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
+    let stray_object_id = add_unreachable_remote_chunk_object(&remote, &source_repo_root);
+    let tracked_remote = GetTrackingBackend::new(remote);
+    let target_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&target_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let fetched = fetch_remote(
+        &tracked_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token,
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    assert!(
+        !target_repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{stray_object_id}.json"))
+            .is_file(),
+        "fetch should not materialize unreachable remote objects locally"
+    );
+    assert!(
+        !tracked_remote
+            .fetched_paths()
+            .iter()
+            .any(|path| path == &format!("objects/{stray_object_id}.json")),
+        "fetch should not read unreachable remote objects from the backend"
+    );
+}
+
+#[test]
+fn fetch_does_not_read_unreachable_remote_loose_objects_when_repo_is_already_unlocked() {
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
+    let tracked_remote = GetTrackingBackend::new(remote);
+    let clone_repo_root = temp.path().join("clone-target");
+
+    clone_remote(
+        &tracked_remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: branch_token.clone(),
+        },
+    )
+    .unwrap();
+
+    let stray_object_id = add_unreachable_remote_chunk_object(&tracked_remote.inner, &source_repo_root);
+    tracked_remote.reset_gets();
+
+    let fetched = fetch_remote(
+        &tracked_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: clone_repo_root.clone(),
+            branch_token,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fetched.downloaded_objects, 0);
+    assert!(
+        !tracked_remote
+            .fetched_paths()
+            .iter()
+            .any(|path| path == &format!("objects/{stray_object_id}.json")),
+        "fetch should not re-read unreachable remote objects while validating an unlocked repository"
+    );
+    assert!(
+        !clone_repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{stray_object_id}.json"))
+            .is_file(),
+        "fetch should not import unreachable remote objects into an unlocked repository"
+    );
+}
+
+#[test]
+fn fetch_restores_bundled_objects_without_repeating_bundle_range_reads_per_object() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("file-{index:02}.txt")),
+            format!("payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "bundled-fetch-range-scaling".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "bundled-fetch-range-scaling-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+
+    let tracked_remote = GetTrackingBackend::new(remote);
+    let target_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&target_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let fetched = fetch_remote(
+        &tracked_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    let range_read_paths = tracked_remote.range_read_paths();
+    assert!(
+        !range_read_paths.is_empty(),
+        "expected bundled fetch to use bundle range reads"
+    );
+    let distinct_bundle_paths = range_read_paths
+        .iter()
+        .filter(|path| path.starts_with("bundles/data/"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        range_read_paths.len() <= distinct_bundle_paths.len() + 2,
+        "expected fetch to avoid repeated per-object bundle reads, saw {:?}",
+        range_read_paths
+    );
+}
+
+#[test]
+fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer_changes() {
+    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("base-{index:02}.txt")),
+            format!("base-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "bundled-base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "bundled-pointer-change-base".to_string(),
+        },
+    )
+    .unwrap();
+
+    let clone_repo_root = temp.path().join("clone-target");
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .change_password(
+            &source_repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("next-{index:02}.txt")),
+            format!("next-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    let committed = facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "bundled-pointer-change-next".to_string(),
+        })
+        .unwrap();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "bundled-pointer-change-next".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+
+    let tracked_remote = GetTrackingBackend::new(remote);
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&clone_repo_root.join(".e2v"));
+    tracked_remote.reset_gets();
+
+    let fetched = fetch_remote(
+        &tracked_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: clone_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    assert!(
+        clone_repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{}.json", committed.snapshot_id))
+            .is_file()
+    );
+    let bundle_range_read_paths = tracked_remote
+        .range_read_paths()
+        .into_iter()
+        .filter(|path| path.starts_with("bundles/data/"))
+        .collect::<Vec<_>>();
+    assert!(
+        !bundle_range_read_paths.is_empty(),
+        "expected fetch to read bundled object data after the remote keyring pointer changed"
+    );
+    let distinct_bundle_paths = bundle_range_read_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        bundle_range_read_paths.len() <= distinct_bundle_paths.len() + 1,
+        "expected fetch to reuse bundle reads after the remote keyring pointer changed, saw {:?}",
+        bundle_range_read_paths
+    );
+
+    RepositoryFacade::new()
+        .unlock(&clone_repo_root, "new horse battery staple")
+        .unwrap();
 }
 
 #[test]
@@ -1252,7 +1686,10 @@ fn fetch_rejects_remote_object_paths_that_escape_the_objects_directory() {
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("invalid remote object path")
+        error
+            .to_string()
+            .contains("remote ref points to unreadable head snapshot graph")
+            || error.to_string().contains("invalid remote object path")
             || error.to_string().contains("path escapes")
             || error.to_string().contains("path traversal"),
         "unexpected error: {error:#}"
@@ -1270,6 +1707,49 @@ fn fetch_rejects_remote_object_paths_that_escape_the_objects_directory() {
             .count(),
         0
     );
+}
+
+#[test]
+fn fetch_does_not_allow_unlocked_head_validation_to_write_outside_validation_root() {
+    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let target_repo_root = temp.path().join("fetch-target");
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: branch_token.clone(),
+        },
+    )
+    .unwrap();
+
+    fs::write(target_repo_root.join("keep.txt"), b"safe").unwrap();
+    remote
+        .put_physical("objects/../../../keep.txt", b"malicious overwrite")
+        .unwrap();
+
+    let error = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("remote ref points to unreadable head snapshot graph")
+            || error.to_string().contains("invalid remote object path")
+            || error.to_string().contains("path escapes")
+            || error.to_string().contains("path traversal"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(fs::read(target_repo_root.join("keep.txt")).unwrap(), b"safe");
 }
 
 #[test]

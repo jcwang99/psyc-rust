@@ -9,7 +9,11 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
+use bytes::Bytes;
+use futures_util::{stream, StreamExt};
 use serde::Serialize;
+
+const STREAMING_FILE_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
@@ -409,15 +413,52 @@ fn build_file_response(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let bytes = read_service
-        .read_range(&file, 0, file_size)
+    if file_size == 0 {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::ACCEPT_RANGES, "bytes")
+            .header(axum::http::header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let first_chunk_len = file_size.min(STREAMING_FILE_CHUNK_BYTES);
+    let first_chunk = read_service
+        .read_range(file, 0, first_chunk_len)
+        .map(Bytes::from)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let body = if file_size <= STREAMING_FILE_CHUNK_BYTES {
+        Body::from(first_chunk)
+    } else {
+        let read_service = read_service.clone();
+        let file = file.clone();
+        let remaining_chunks = stream::iter((1..file_size.div_ceil(STREAMING_FILE_CHUNK_BYTES)).map(
+            move |chunk_index| {
+                let offset = chunk_index * STREAMING_FILE_CHUNK_BYTES;
+                let remaining = file_size.saturating_sub(offset);
+                let chunk_len = remaining.min(STREAMING_FILE_CHUNK_BYTES);
+                read_service
+                    .read_range(&file, offset, chunk_len)
+                    .map(Bytes::from)
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to stream repository file: {error}"
+                        ))
+                    })
+            },
+        ));
+        let first_chunk_stream = stream::iter(std::iter::once(Ok::<Bytes, std::io::Error>(
+            first_chunk,
+        )));
+        Body::from_stream(first_chunk_stream.chain(remaining_chunks))
+    };
 
     Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::ACCEPT_RANGES, "bytes")
-        .header(axum::http::header::CONTENT_LENGTH, bytes.len().to_string())
-        .body(Body::from(bytes))
+        .header(axum::http::header::CONTENT_LENGTH, file_size.to_string())
+        .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -475,10 +516,32 @@ fn encode_query_path(path: &str) -> String {
 }
 
 fn map_api_snapshot_error(error: Error) -> StatusCode {
+    if error_chain_contains_any(
+        &error,
+        &[
+            "invalid snapshot id",
+            "object id must not be empty",
+            "object id must be relative",
+            "object id path traversal is not allowed",
+            "object id must be a single path segment",
+        ],
+    ) {
+        return StatusCode::BAD_REQUEST;
+    }
     map_api_error_with_not_found(error, &["failed to read object "])
 }
 
 fn map_api_branch_error(error: Error) -> StatusCode {
+    if error_chain_contains_any(
+        &error,
+        &[
+            "ref token must not be empty",
+            "ref token must be relative",
+            "ref token path traversal is not allowed",
+        ],
+    ) {
+        return StatusCode::BAD_REQUEST;
+    }
     map_api_error_with_not_found(
         error,
         &[
@@ -506,6 +569,21 @@ fn map_api_read_error(error: Error) -> StatusCode {
 }
 
 fn map_page_snapshot_error(error: Error, not_found_message: &str) -> PageError {
+    if error_chain_contains_any(
+        &error,
+        &[
+            "invalid snapshot id",
+            "object id must not be empty",
+            "object id must be relative",
+            "object id path traversal is not allowed",
+            "object id must be a single path segment",
+        ],
+    ) {
+        return PageError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid snapshot id".to_string(),
+        };
+    }
     map_page_error_with_not_found(
         error,
         not_found_message,
@@ -515,6 +593,19 @@ fn map_page_snapshot_error(error: Error, not_found_message: &str) -> PageError {
 }
 
 fn map_page_branch_error(error: Error, not_found_message: &str) -> PageError {
+    if error_chain_contains_any(
+        &error,
+        &[
+            "ref token must not be empty",
+            "ref token must be relative",
+            "ref token path traversal is not allowed",
+        ],
+    ) {
+        return PageError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid branch token".to_string(),
+        };
+    }
     map_page_error_with_not_found(
         error,
         not_found_message,

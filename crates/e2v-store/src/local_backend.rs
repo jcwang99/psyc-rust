@@ -1,7 +1,7 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 pub trait BlobStore {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()>;
@@ -39,8 +39,20 @@ impl LocalFolderBackend {
         &self.repo_root
     }
 
+    fn resolve_relative_path(&self, relative_path: &str) -> Result<PathBuf> {
+        let path = Path::new(relative_path);
+        ensure!(!relative_path.is_empty(), "path must not be empty");
+        ensure!(!path.is_absolute(), "path must be relative to repo root");
+        ensure!(
+            path.components()
+                .all(|component| matches!(component, Component::Normal(_))),
+            "path traversal outside repo root is not allowed"
+        );
+        Ok(self.repo_root.join(path))
+    }
+
     pub fn put_object(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
-        let full_path = self.repo_root.join(relative_path);
+        let full_path = self.resolve_relative_path(relative_path)?;
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create object parent {}", parent.display()))?;
@@ -51,13 +63,15 @@ impl LocalFolderBackend {
     }
 
     pub fn get_object(&self, relative_path: &str) -> Result<Vec<u8>> {
-        let full_path = self.repo_root.join(relative_path);
+        let full_path = self.resolve_relative_path(relative_path)?;
         fs::read(&full_path)
             .with_context(|| format!("failed to read object {}", full_path.display()))
     }
 
     pub fn exists_object(&self, relative_path: &str) -> bool {
-        self.repo_root.join(relative_path).is_file()
+        self.resolve_relative_path(relative_path)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
     }
 }
 
@@ -83,7 +97,7 @@ impl BlobStore for LocalFolderBackend {
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
-        let full_path = self.repo_root.join(relative_path);
+        let full_path = self.resolve_relative_path(relative_path)?;
         if !full_path.exists() {
             return Ok(());
         }
@@ -96,7 +110,7 @@ impl BlobStore for LocalFolderBackend {
     }
 
     fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
-        let full_path = self.repo_root.join(relative_path);
+        let full_path = self.resolve_relative_path(relative_path)?;
         let metadata = fs::metadata(&full_path)
             .with_context(|| format!("failed to stat object {}", full_path.display()))?;
         Ok(ObjectStat {
@@ -105,7 +119,7 @@ impl BlobStore for LocalFolderBackend {
     }
 
     fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
-        let base = self.repo_root.join(prefix);
+        let base = self.resolve_relative_path(prefix)?;
         let mut listed = Vec::new();
         if !base.exists() {
             return Ok(listed);
@@ -127,6 +141,8 @@ impl BlobStore for LocalFolderBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::{BlobStore, LocalFolderBackend};
@@ -213,5 +229,59 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert!(listed.iter().any(|path| path == "objects/a.bin"));
         assert!(listed.iter().any(|path| path == "objects/b.bin"));
+    }
+
+    #[test]
+    fn put_object_rejects_parent_dir_traversal_outside_repo_root() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        let outside = temp.path().join("keep.txt");
+        fs::write(&outside, b"keep").unwrap();
+        let backend = LocalFolderBackend::new(&repo_root);
+
+        let error = backend.put_object("../keep.txt", b"overwrite").unwrap_err();
+
+        assert!(
+            error.to_string().contains("path traversal")
+                || error.to_string().contains("repo root")
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn put_object_rejects_absolute_paths_outside_repo_root() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        let outside = temp.path().join("keep.txt");
+        fs::write(&outside, b"keep").unwrap();
+        let backend = LocalFolderBackend::new(&repo_root);
+
+        let error = backend
+            .put_object(outside.to_str().unwrap(), b"overwrite")
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("relative")
+                || error.to_string().contains("repo root")
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn put_object_rejects_backslash_traversal_segments() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        let backend = LocalFolderBackend::new(&repo_root);
+
+        let error = backend.put_object("objects\\..\\keep.txt", b"overwrite").unwrap_err();
+
+        assert!(
+            error.to_string().contains("path traversal")
+                || error.to_string().contains("separator"),
+            "unexpected error: {error:#}"
+        );
     }
 }

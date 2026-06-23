@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
-use e2v_store::{DirectLayoutObjectStore, LogicalObjectStore};
+use e2v_store::{DirectLayoutObjectStore, LogicalObjectStore, validate_object_id_value};
 use postcard::from_bytes as postcard_from_bytes;
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,7 @@ pub struct ManifestFileObject {
     pub chunker_id: String,
     pub chunker_config_id: String,
     pub chunks: Vec<String>,
+    pub chunk_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +113,7 @@ impl ManifestStoreApi for ManifestStore {
             chunker_id: file.chunker_id,
             chunker_config_id: file.chunker_config_id,
             chunks: file.chunks,
+            chunk_lengths: file.chunk_lengths,
         })
     }
 
@@ -142,11 +145,12 @@ impl ManifestStoreApi for ManifestStore {
     fn collect_reachable_object_ids(&self, snapshot_id: &str) -> Result<Vec<String>> {
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let object_store = open_object_store(&control_dir)?;
-        let mut reachable = std::collections::BTreeSet::new();
+        let mut reachable = Vec::new();
+        let mut seen = HashSet::new();
         let snapshot = read_snapshot_object(&object_store, snapshot_id)?;
-        reachable.insert(snapshot_id.to_string());
-        collect_tree_object_ids(&object_store, &snapshot.root_tree_id, &mut reachable)?;
-        Ok(reachable.into_iter().collect())
+        push_reachable_id(&mut reachable, &mut seen, snapshot_id.to_string());
+        collect_tree_object_ids(&object_store, &snapshot.root_tree_id, &mut reachable, &mut seen)?;
+        Ok(reachable)
     }
 }
 
@@ -166,6 +170,7 @@ struct FileObject {
     pub chunker_id: String,
     pub chunker_config_id: String,
     pub chunks: Vec<String>,
+    pub chunk_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,25 +361,26 @@ fn read_tree_shard_object(
 fn collect_tree_object_ids(
     object_store: &dyn LogicalObjectStore,
     tree_id: &str,
-    reachable: &mut std::collections::BTreeSet<String>,
+    reachable: &mut Vec<String>,
+    seen: &mut HashSet<String>,
 ) -> Result<()> {
-    if !reachable.insert(tree_id.to_string()) {
+    if !push_reachable_id(reachable, seen, tree_id.to_string()) {
         return Ok(());
     }
 
     match read_tree_object(object_store, tree_id) {
-        Ok(tree) => collect_tree_entries(object_store, tree.entries, reachable),
+        Ok(tree) => collect_tree_entries(object_store, tree.entries, reachable, seen),
         Err(error) => {
             if !error.to_string().contains("object type mismatch") {
                 return Err(error);
             }
             let directory_root = read_directory_root_object(object_store, tree_id)?;
             for shard_id in directory_root.shards {
-                if !reachable.insert(shard_id.clone()) {
+                if !push_reachable_id(reachable, seen, shard_id.clone()) {
                     continue;
                 }
                 let shard = read_tree_shard_object(object_store, &shard_id)?;
-                collect_tree_entries(object_store, shard.entries, reachable)?;
+                collect_tree_entries(object_store, shard.entries, reachable, seen)?;
             }
             Ok(())
         }
@@ -384,16 +390,19 @@ fn collect_tree_object_ids(
 fn collect_tree_entries(
     object_store: &dyn LogicalObjectStore,
     entries: Vec<TreeEntry>,
-    reachable: &mut std::collections::BTreeSet<String>,
+    reachable: &mut Vec<String>,
+    seen: &mut HashSet<String>,
 ) -> Result<()> {
     for entry in entries {
         match entry.kind.as_str() {
-            "tree" => collect_tree_object_ids(object_store, &entry.object_id, reachable)?,
+            "tree" => collect_tree_object_ids(object_store, &entry.object_id, reachable, seen)?,
             "file" => {
-                if reachable.insert(entry.object_id.clone()) {
+                if push_reachable_id(reachable, seen, entry.object_id.clone()) {
                     let file = read_file_object(object_store, &entry.object_id)?;
                     for chunk_id in file.chunks {
-                        reachable.insert(chunk_id);
+                        validate_object_id_value(&chunk_id)
+                            .with_context(|| format!("invalid chunk id in file {}", entry.object_id))?;
+                        push_reachable_id(reachable, seen, chunk_id);
                     }
                 }
             }
@@ -403,6 +412,15 @@ fn collect_tree_entries(
         }
     }
     Ok(())
+}
+
+fn push_reachable_id(reachable: &mut Vec<String>, seen: &mut HashSet<String>, object_id: String) -> bool {
+    if seen.insert(object_id.clone()) {
+        reachable.push(object_id);
+        true
+    } else {
+        false
+    }
 }
 
 fn read_stored_object<T: for<'de> Deserialize<'de>>(
