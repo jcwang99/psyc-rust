@@ -23,6 +23,7 @@ pub struct RepoSecrets {
     pub repo_ref_key: [u8; 32],
     pub repo_manifest_enc_key: [u8; 32],
     pub repo_nonce_key: [u8; 32],
+    pub repo_path_index_key: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,6 +495,7 @@ mod tests {
             repo_ref_key: [4u8; 32],
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
+            repo_path_index_key: [5u8; 32],
         }
     }
 

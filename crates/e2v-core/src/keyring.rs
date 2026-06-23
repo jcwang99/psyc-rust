@@ -51,6 +51,7 @@ pub struct SealedRepoSecrets {
     pub repo_ref_key_hex: String,
     pub repo_manifest_enc_key_hex: String,
     pub repo_nonce_key_hex: String,
+    pub repo_path_index_key_hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +115,7 @@ fn unlock_repo_secrets_from_state(keyring: &KeyringState, password: &str) -> Res
         repo_ref_key: decode_hex_key(&sealed.repo_ref_key_hex)?,
         repo_manifest_enc_key: decode_hex_key(&sealed.repo_manifest_enc_key_hex)?,
         repo_nonce_key: decode_hex_key(&sealed.repo_nonce_key_hex)?,
+        repo_path_index_key: decode_hex_key(&sealed.repo_path_index_key_hex)?,
     };
     Ok(secrets)
 }
@@ -141,6 +143,7 @@ pub fn seal_repo_secrets(
         repo_ref_key_hex: hex::encode(secrets.repo_ref_key),
         repo_manifest_enc_key_hex: hex::encode(secrets.repo_manifest_enc_key),
         repo_nonce_key_hex: hex::encode(secrets.repo_nonce_key),
+        repo_path_index_key_hex: hex::encode(secrets.repo_path_index_key),
     };
     let plaintext = postcard::to_stdvec(&sealed).context("failed to encode sealed repo secrets")?;
     let mut nonce = [0u8; 24];

@@ -22,6 +22,7 @@ use crate::keyring::{
     open_repo_secrets, seal_repo_secrets, unlock_repo_secrets,
     unlock_repo_secrets_from_generation_file, unlock_repo_secrets_uncached,
 };
+use crate::local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
 use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreApi};
 use crate::working_tree::{SnapshotReader, StableReadPolicy, WorkingTree, WorkingTreeEntry};
 
@@ -29,6 +30,7 @@ const CONTROL_DIR: &str = ".e2v";
 const CONFIG_FILE: &str = "config.json";
 const LAYOUT_ROOT_FILE: &str = "layout_root.json";
 const DEFAULT_REF_FILE: &str = "refs/default.json";
+const BRANCH_REFS_DIR: &str = "refs/branches";
 const OBJECTS_DIR: &str = "objects";
 const JOURNAL_DIR: &str = "journal";
 const DIRECT_LAYOUT_ID: &str = "direct";
@@ -159,6 +161,14 @@ pub struct BranchState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchSummary {
+    pub name: String,
+    pub token_hex: String,
+    pub head_snapshot_id: Option<String>,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RepoConfig {
     pub repo_format_version: u32,
     pub min_client_version: String,
@@ -198,6 +208,7 @@ struct FileObject {
     pub schema_version: u32,
     pub entry_name: String,
     pub file_size: u64,
+    pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
     pub chunks: Vec<String>,
@@ -318,6 +329,12 @@ impl RepositoryFacade {
                 control_dir.display()
             )
         })?;
+        fs::create_dir_all(control_dir.join(BRANCH_REFS_DIR)).with_context(|| {
+            format!(
+                "failed to create branch refs directory at {}",
+                control_dir.display()
+            )
+        })?;
         fs::create_dir_all(control_dir.join(KEYRING_DIR)).with_context(|| {
             format!(
                 "failed to create keyring directory at {}",
@@ -379,6 +396,7 @@ impl RepositoryFacade {
             &keyring_pointer,
         )?;
         write_default_ref(&control_dir, &repo_secrets, &default_ref)?;
+        write_branch_ref(&control_dir, &repo_secrets, &default_ref)?;
         cache_unlocked_secrets(&control_dir, &repo_secrets);
 
         Ok(RepositoryState {
@@ -509,7 +527,7 @@ impl RepositoryFacade {
         );
 
         let repo_secrets = open_repo_secrets(&control_dir)?;
-        let mut default_ref = read_default_ref(&control_dir, &repo_secrets)?;
+        let mut default_ref = read_current_ref(&control_dir)?;
         let mut committed_files = 0usize;
         let mut new_bytes = 0u64;
         let mut reused_bytes = 0u64;
@@ -545,6 +563,7 @@ impl RepositoryFacade {
 
         default_ref.head_snapshot_id = Some(snapshot_id.clone());
         write_default_ref(&control_dir, &repo_secrets, &default_ref)?;
+        write_branch_ref(&control_dir, &repo_secrets, &default_ref)?;
 
         Ok(CommitResult {
             snapshot_id,
@@ -558,8 +577,7 @@ impl RepositoryFacade {
     pub fn snapshots(&self, repo_root: impl AsRef<Path>) -> Result<Vec<SnapshotSummary>> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let repo_secrets = open_repo_secrets(&control_dir)?;
-        let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
+        let default_ref = read_current_ref(&control_dir)?;
         let manifest_store = LocalManifestStore::new(&repo_root);
         let mut next_snapshot_id = default_ref.head_snapshot_id;
         let mut snapshots = Vec::new();
@@ -581,6 +599,141 @@ impl RepositoryFacade {
         Ok(ReadService {
             repo_root: repo_root.as_ref().to_path_buf(),
         })
+    }
+
+    pub fn search_metadata(
+        &self,
+        repo_root: impl AsRef<Path>,
+        query: MetadataSearchQuery,
+    ) -> Result<Vec<MetadataSearchResult>> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let current_ref = read_current_ref(&control_dir)?;
+        crate::local_index::search_metadata(
+            &repo_root,
+            &current_ref.ref_token_hex,
+            current_ref.head_snapshot_id.as_deref(),
+            &query,
+        )
+    }
+
+    pub fn search_filenames(
+        &self,
+        repo_root: impl AsRef<Path>,
+        query_text: &str,
+    ) -> Result<Vec<FilenameSearchResult>> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let current_ref = read_current_ref(&control_dir)?;
+        crate::local_index::search_filenames(
+            &repo_root,
+            &current_ref.ref_token_hex,
+            current_ref.head_snapshot_id.as_deref(),
+            query_text,
+        )
+    }
+
+    pub fn create_branch(
+        &self,
+        repo_root: impl AsRef<Path>,
+        branch_name: &str,
+    ) -> Result<BranchState> {
+        ensure!(
+            !branch_name.trim().is_empty(),
+            "branch name must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let current_ref = read_current_ref(&control_dir)?;
+        let token_hex = derive_branch_token(&repo_secrets.repo_ref_key, branch_name);
+        if current_ref.ref_token_hex == token_hex {
+            anyhow::bail!("branch already exists: {branch_name}");
+        }
+        if read_branch_ref_if_exists(&control_dir, &repo_secrets, &token_hex)?.is_some() {
+            anyhow::bail!("branch already exists: {branch_name}");
+        }
+
+        let branch_ref = RefRecord {
+            branch_name: branch_name.to_string(),
+            ref_token_hex: token_hex.clone(),
+            head_snapshot_id: current_ref.head_snapshot_id,
+        };
+        write_branch_ref(&control_dir, &repo_secrets, &branch_ref)?;
+
+        Ok(BranchState {
+            name: branch_name.to_string(),
+            token_hex,
+        })
+    }
+
+    pub fn list_branches(&self, repo_root: impl AsRef<Path>) -> Result<Vec<BranchSummary>> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let current_ref = read_current_ref(&control_dir)?;
+        let mut branches = read_all_branch_refs(&control_dir, &repo_secrets)?;
+        if !branches
+            .iter()
+            .any(|branch| branch.ref_token_hex == current_ref.ref_token_hex)
+        {
+            branches.push(current_ref.clone());
+        }
+        branches.sort_by(|left, right| left.branch_name.cmp(&right.branch_name));
+
+        Ok(branches
+            .into_iter()
+            .map(|branch| BranchSummary {
+                name: branch.branch_name,
+                token_hex: branch.ref_token_hex.clone(),
+                head_snapshot_id: branch.head_snapshot_id,
+                is_current: branch.ref_token_hex == current_ref.ref_token_hex,
+            })
+            .collect())
+    }
+
+    pub fn delete_branch(&self, repo_root: impl AsRef<Path>, branch_name: &str) -> Result<()> {
+        ensure!(
+            !branch_name.trim().is_empty(),
+            "branch name must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let current_ref = read_current_ref(&control_dir)?;
+        let token_hex = derive_branch_token(&repo_secrets.repo_ref_key, branch_name);
+        if current_ref.ref_token_hex == token_hex {
+            anyhow::bail!("cannot delete the current branch");
+        }
+        let path = branch_ref_path(&control_dir, &token_hex)?;
+        ensure!(path.is_file(), "branch not found: {branch_name}");
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to delete branch ref {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn checkout_branch(
+        &self,
+        repo_root: impl AsRef<Path>,
+        branch_name: &str,
+    ) -> Result<RepositoryState> {
+        ensure!(
+            !branch_name.trim().is_empty(),
+            "branch name must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let current_ref = read_current_ref(&control_dir)?;
+        let token_hex = derive_branch_token(&repo_secrets.repo_ref_key, branch_name);
+        let target_ref = if current_ref.ref_token_hex == token_hex {
+            current_ref
+        } else {
+            read_branch_ref_if_exists(&control_dir, &repo_secrets, &token_hex)?
+                .with_context(|| format!("branch not found: {branch_name}"))?
+        };
+        write_default_ref(&control_dir, &repo_secrets, &target_ref)?;
+        self.open(&repo_root)
     }
 
     pub fn checkout(&self, _options: CheckoutOptions) -> Result<()> {
@@ -694,12 +847,15 @@ impl ReadService {
         validate_ref_token_value(ref_token_hex)?;
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let repo_state = RepositoryFacade::new().open(&self.repo_root)?;
-        let default_ref = read_current_ref(&control_dir)?;
-        ensure!(
-            default_ref.ref_token_hex == ref_token_hex,
-            "branch ref not found for token"
-        );
-        let snapshot_id = default_ref
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let current_ref = read_current_ref(&control_dir)?;
+        let branch_ref = if current_ref.ref_token_hex == ref_token_hex {
+            current_ref
+        } else {
+            read_branch_ref_if_exists(&control_dir, &repo_secrets, ref_token_hex)?
+                .context("branch ref not found for token")?
+        };
+        let snapshot_id = branch_ref
             .head_snapshot_id
             .context("branch ref does not point to a snapshot")?;
         let manifest_store = LocalManifestStore::new(&self.repo_root);
@@ -888,6 +1044,7 @@ fn generate_repo_secrets(repo_id: &str) -> Result<RepoSecrets> {
         repo_ref_key: random_key_material()?,
         repo_manifest_enc_key: random_key_material()?,
         repo_nonce_key: random_key_material()?,
+        repo_path_index_key: random_key_material()?,
     })
 }
 
@@ -943,6 +1100,20 @@ fn write_default_ref(control_dir: &Path, secrets: &RepoSecrets, value: &RefRecor
     atomic_write_bytes(path, &bytes)
 }
 
+fn write_branch_ref(control_dir: &Path, secrets: &RepoSecrets, value: &RefRecord) -> Result<()> {
+    fs::create_dir_all(control_dir.join(BRANCH_REFS_DIR)).with_context(|| {
+        format!(
+            "failed to create branch refs directory at {}",
+            control_dir.join(BRANCH_REFS_DIR).display()
+        )
+    })?;
+    let plaintext = postcard_to_vec(value).context("failed to encode ref record")?;
+    let stable_name = branch_ref_stable_name(&value.ref_token_hex);
+    let bytes = encrypt_control_record(secrets, &stable_name, "ref", &plaintext)?;
+    let path = branch_ref_path(control_dir, &value.ref_token_hex)?;
+    atomic_write_bytes(path, &bytes)
+}
+
 fn read_default_ref(control_dir: &Path, secrets: &RepoSecrets) -> Result<RefRecord> {
     let path = control_dir.join(DEFAULT_REF_FILE);
     let bytes =
@@ -981,6 +1152,70 @@ pub(crate) fn verify_snapshot_with_secrets_for_sync(
 fn read_current_ref(control_dir: &Path) -> Result<RefRecord> {
     let secrets = open_repo_secrets(control_dir)?;
     read_default_ref(control_dir, &secrets)
+}
+
+fn read_branch_ref_if_exists(
+    control_dir: &Path,
+    secrets: &RepoSecrets,
+    ref_token_hex: &str,
+) -> Result<Option<RefRecord>> {
+    let path = branch_ref_path(control_dir, ref_token_hex)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let plaintext = decrypt_control_record(
+        secrets,
+        &branch_ref_stable_name(ref_token_hex),
+        "ref",
+        &bytes,
+    )?;
+    let record: RefRecord =
+        postcard_from_bytes(&plaintext).context("failed to decode branch ref record")?;
+    ensure!(
+        record.ref_token_hex == ref_token_hex,
+        "branch ref token mismatch"
+    );
+    Ok(Some(record))
+}
+
+fn read_all_branch_refs(control_dir: &Path, secrets: &RepoSecrets) -> Result<Vec<RefRecord>> {
+    let refs_dir = control_dir.join(BRANCH_REFS_DIR);
+    if !refs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut refs = Vec::new();
+    for entry in fs::read_dir(&refs_dir)
+        .with_context(|| format!("failed to read branch refs directory {}", refs_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(token_hex) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(branch_ref) = read_branch_ref_if_exists(control_dir, secrets, token_hex)? {
+            refs.push(branch_ref);
+        }
+    }
+    Ok(refs)
+}
+
+fn branch_ref_path(control_dir: &Path, ref_token_hex: &str) -> Result<PathBuf> {
+    validate_ref_token_value(ref_token_hex)?;
+    ensure!(
+        Path::new(ref_token_hex).components().count() == 1,
+        "branch token must be a single path segment"
+    );
+    Ok(control_dir
+        .join(BRANCH_REFS_DIR)
+        .join(format!("{ref_token_hex}.json")))
+}
+
+fn branch_ref_stable_name(ref_token_hex: &str) -> String {
+    format!("branch-ref:{ref_token_hex}")
 }
 
 fn encrypt_control_record(
@@ -1146,7 +1381,22 @@ fn build_tree_object(
                 new_bytes,
                 reused_bytes,
                 warnings,
-                |path| working_tree.open_stable_file(path),
+                |path| {
+                    let bytes = working_tree.open_stable_file(path)?;
+                    let modified_unix_ms = std::fs::metadata(path)
+                        .with_context(|| {
+                            format!("failed to stat working tree file {}", path.display())
+                        })?
+                        .modified()
+                        .with_context(|| {
+                            format!("failed to read modified time for {}", path.display())
+                        })?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    Ok((bytes, modified_unix_ms))
+                },
             )?;
             if let Some(tree_entry) = maybe_tree_entry {
                 tree_entries.push(tree_entry);
@@ -1179,11 +1429,11 @@ fn build_file_tree_entry_with<F>(
     mut read_file: F,
 ) -> Result<Option<TreeEntry>>
 where
-    F: FnMut(&PathBuf) -> Result<Vec<u8>>,
+    F: FnMut(&PathBuf) -> Result<(Vec<u8>, u64)>,
 {
     let chunker = FastCdcChunker;
-    let file_bytes = match read_file(&entry.path) {
-        Ok(bytes) => bytes,
+    let (file_bytes, modified_unix_ms) = match read_file(&entry.path) {
+        Ok(values) => values,
         Err(error) => {
             if error.to_string().contains("unstable input") {
                 warnings.push(format!(
@@ -1229,6 +1479,7 @@ where
         schema_version: REPO_FORMAT_VERSION,
         entry_name: entry.name.clone(),
         file_size: file_bytes.len() as u64,
+        modified_unix_ms,
         chunker_id: chunker.id().to_string(),
         chunker_config_id: chunker.config_fingerprint().to_string(),
         chunks: chunk_ids,
@@ -1665,6 +1916,7 @@ mod facade_tests {
                 schema_version: REPO_FORMAT_VERSION + 1,
                 entry_name: "hello.txt".to_string(),
                 file_size: 5,
+                modified_unix_ms: 1,
                 chunker_id: "fastcdc".to_string(),
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
                 chunks: vec![],
@@ -1754,7 +2006,7 @@ mod facade_tests {
                 if path == &failing_path {
                     Err(anyhow::anyhow!("simulated read failure"))
                 } else {
-                    Ok(b"good".to_vec())
+                    Ok((b"good".to_vec(), 1))
                 }
             },
         )
@@ -1768,7 +2020,7 @@ mod facade_tests {
             &mut new_bytes,
             &mut reused_bytes,
             &mut warnings,
-            |_path| Ok(b"good".to_vec()),
+            |_path| Ok((b"good".to_vec(), 1)),
         )
         .unwrap();
 
@@ -1892,6 +2144,7 @@ mod facade_tests {
             repo_ref_key: [9u8; 32],
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
+            repo_path_index_key: [4u8; 32],
         };
         let mut keyring_one: KeyringState = read_json(generation_one_path.clone()).unwrap();
         keyring_one.generation = 2;
@@ -1984,6 +2237,7 @@ mod facade_tests {
             repo_ref_key: [9u8; 32],
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
+            repo_path_index_key: [4u8; 32],
         };
         let keyring_two = KeyringState {
             generation: 2,
@@ -2245,6 +2499,7 @@ mod facade_tests {
                 schema_version: REPO_FORMAT_VERSION,
                 entry_name: "../escape.txt".to_string(),
                 file_size: 5,
+                modified_unix_ms: 1,
                 chunker_id: "fastcdc".to_string(),
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
                 chunks: vec![chunk_id],

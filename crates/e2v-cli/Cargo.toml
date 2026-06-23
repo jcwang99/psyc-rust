@@ -1,0 +1,14 @@
+[package]
+name = "e2v-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+e2v-core = { path = "../e2v-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

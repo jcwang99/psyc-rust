@@ -36,6 +36,7 @@ pub struct ManifestFileObject {
     pub schema_version: u32,
     pub entry_name: String,
     pub file_size: u64,
+    pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
     pub chunks: Vec<String>,
@@ -110,6 +111,7 @@ impl ManifestStoreApi for ManifestStore {
             schema_version: file.schema_version,
             entry_name: file.entry_name,
             file_size: file.file_size,
+            modified_unix_ms: file.modified_unix_ms,
             chunker_id: file.chunker_id,
             chunker_config_id: file.chunker_config_id,
             chunks: file.chunks,
@@ -167,6 +169,7 @@ struct FileObject {
     pub schema_version: u32,
     pub entry_name: String,
     pub file_size: u64,
+    pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
     pub chunks: Vec<String>,
@@ -465,6 +468,7 @@ mod tests {
             repo_ref_key: [4u8; 32],
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
+            repo_path_index_key: [5u8; 32],
         };
         DirectLayoutObjectStore::new(control_dir, secrets)
     }
@@ -551,6 +555,7 @@ mod tests {
             repo_ref_key: [4u8; 32],
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
+            repo_path_index_key: [5u8; 32],
         };
         let secrets_two = RepoSecrets {
             repo_id: "repo".to_string(),
@@ -559,6 +564,7 @@ mod tests {
             repo_ref_key: [4u8; 32],
             repo_manifest_enc_key: [8u8; 32],
             repo_nonce_key: [3u8; 32],
+            repo_path_index_key: [5u8; 32],
         };
         let keyring_one = KeyringState {
             format_version: REPO_FORMAT_VERSION,
@@ -618,6 +624,7 @@ mod tests {
             repo_ref_key: [4u8; 32],
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
+            repo_path_index_key: [5u8; 32],
         };
         let keyring = KeyringState {
             format_version: REPO_FORMAT_VERSION,

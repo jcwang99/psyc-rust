@@ -101,6 +101,7 @@ struct RemoteFileObject {
     schema_version: u32,
     entry_name: String,
     file_size: u64,
+    modified_unix_ms: u64,
     chunker_id: String,
     chunker_config_id: String,
     chunks: Vec<String>,

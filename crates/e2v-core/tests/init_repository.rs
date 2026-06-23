@@ -133,6 +133,7 @@ fn keyring_generation_does_not_store_plaintext_repo_keys() {
     assert!(!keyring_text.contains("repo_ref_key_hex"));
     assert!(!keyring_text.contains("repo_manifest_enc_key_hex"));
     assert!(!keyring_text.contains("repo_nonce_key_hex"));
+    assert!(!keyring_text.contains("repo_path_index_key_hex"));
 }
 
 #[test]
@@ -197,6 +198,39 @@ fn change_password_rotates_keyring_generation_and_requires_new_password() {
 
     assert_eq!(reopened.repo_root, created.repo_root);
     assert_eq!(reopened.branch.name, created.branch.name);
+}
+
+#[test]
+fn repo_path_index_key_survives_keyring_round_trip() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let original =
+        e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    assert_ne!(original.repo_path_index_key, [0u8; 32]);
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&control_dir);
+    let reopened = facade
+        .unlock(&repo_root, "new horse battery staple")
+        .unwrap();
+    let reopened_secrets =
+        e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+
+    assert_eq!(reopened.branch.name, "main");
+    assert_eq!(reopened_secrets.repo_path_index_key, original.repo_path_index_key);
 }
 
 #[test]
@@ -782,6 +816,116 @@ fn snapshots_lists_latest_commit_first() {
     assert_eq!(snapshots[0].snapshot_id, second.snapshot_id);
     assert_eq!(snapshots[0].message, "second");
     assert_eq!(snapshots[1].message, "first");
+}
+
+#[test]
+fn branch_create_and_list_tracks_current_and_existing_heads() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "base").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let before_objects = fs::read_dir(repo_root.join(".e2v").join("objects"))
+        .unwrap()
+        .count();
+
+    let feature = facade
+        .create_branch(&repo_root, "feature")
+        .unwrap();
+    let branches = facade.list_branches(&repo_root).unwrap();
+    let after_objects = fs::read_dir(repo_root.join(".e2v").join("objects"))
+        .unwrap()
+        .count();
+
+    assert_eq!(before_objects, after_objects);
+    assert_eq!(created.branch.name, "main");
+    assert_eq!(feature.name, "feature");
+    assert_ne!(feature.token_hex, created.branch.token_hex);
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0].name, "feature");
+    assert_eq!(branches[0].head_snapshot_id.as_deref(), Some(first.snapshot_id.as_str()));
+    assert!(!branches[0].is_current);
+    assert_eq!(branches[1].name, "main");
+    assert_eq!(branches[1].head_snapshot_id.as_deref(), Some(first.snapshot_id.as_str()));
+    assert!(branches[1].is_current);
+}
+
+#[test]
+fn branch_checkout_switches_active_branch_and_commit_only_advances_that_branch() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let main = facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "base").unwrap();
+    let base = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+    let feature = facade
+        .create_branch(&repo_root, "feature")
+        .unwrap();
+
+    let reopened = facade.checkout_branch(&repo_root, "feature").unwrap();
+    assert_eq!(reopened.branch.name, "feature");
+    assert_eq!(fs::read_to_string(repo_root.join("tracked.txt")).unwrap(), "base");
+
+    fs::write(repo_root.join("tracked.txt"), "feature-v2").unwrap();
+    let feature_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let feature_snapshot = read_service
+        .resolve_branch(&feature.token_hex)
+        .unwrap();
+    let main_snapshot = read_service
+        .resolve_branch(&main.branch.token_hex)
+        .unwrap();
+    let current_snapshots = facade.snapshots(&repo_root).unwrap();
+
+    assert_eq!(feature_snapshot.snapshot_id, feature_commit.snapshot_id);
+    assert_eq!(main_snapshot.snapshot_id, base.snapshot_id);
+    assert_eq!(current_snapshots[0].snapshot_id, feature_commit.snapshot_id);
+}
+
+#[test]
+fn branch_delete_rejects_current_branch_and_allows_non_current_branch() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    facade.create_branch(&repo_root, "feature").unwrap();
+
+    let current_error = facade.delete_branch(&repo_root, "main").unwrap_err();
+    assert!(
+        current_error.to_string().contains("current")
+            || current_error.to_string().contains("active"),
+        "unexpected error: {current_error:#}"
+    );
+
+    facade.delete_branch(&repo_root, "feature").unwrap();
+    let branches = facade.list_branches(&repo_root).unwrap();
+
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].name, "main");
 }
 
 #[test]
@@ -2657,6 +2801,207 @@ fn manifest_store_can_fetch_snapshot_tree_and_file_manifests() {
     assert_eq!(file.chunker_id, "fastcdc");
     assert_eq!(file.chunker_config_id, "fastcdc-64k-1m-8m");
     assert_eq!(file.chunk_lengths, vec!["hello nested".len() as u64]);
+}
+
+#[test]
+fn file_manifest_records_modified_time() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "manifest".to_string(),
+        })
+        .unwrap();
+
+    let store = ManifestStore::new(&repo_root);
+    let snapshot = store.get_snapshot(&commit.snapshot_id).unwrap();
+    let tree = store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let dir_entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "nested" && entry.kind == "tree")
+        .unwrap();
+    let nested_tree = store.get_tree_node(&dir_entry.object_id).unwrap();
+    let file_entry = nested_tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "hello.txt" && entry.kind == "file")
+        .unwrap();
+    let file = store.get_file(&file_entry.object_id).unwrap();
+
+    assert!(file.modified_unix_ms > 0);
+}
+
+#[test]
+fn metadata_search_filters_by_extension_and_path_prefix() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("docs")).unwrap();
+    fs::create_dir_all(repo_root.join("src")).unwrap();
+    fs::write(repo_root.join("docs").join("guide.md"), "guide").unwrap();
+    fs::write(repo_root.join("docs").join("notes.txt"), "notes").unwrap();
+    fs::write(repo_root.join("src").join("guide.md"), "source guide").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let results = facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: Some("md".to_string()),
+                path_prefix: Some("docs".to_string()),
+                min_size: None,
+                max_size: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, "docs/guide.md");
+    assert_eq!(results[0].extension.as_deref(), Some("md"));
+}
+
+#[test]
+fn metadata_search_filters_by_size_bounds() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tiny.txt"), "a").unwrap();
+    fs::write(repo_root.join("mid.txt"), "abcd").unwrap();
+    fs::write(repo_root.join("large.txt"), "abcdefghij").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let results = facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: None,
+                path_prefix: None,
+                min_size: Some(2),
+                max_size: Some(6),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, "mid.txt");
+    assert_eq!(results[0].size_bytes, 4);
+    assert!(results[0].modified_unix_ms > 0);
+    assert!(!results[0].file_object_id.is_empty());
+}
+
+#[test]
+fn filename_search_finds_visible_files_and_refreshes_after_commit_and_branch_checkout() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("alpha-notes.txt"), "alpha").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+    facade.create_branch(&repo_root, "feature").unwrap();
+
+    let base_results = facade
+        .search_filenames(&repo_root, "notes")
+        .unwrap();
+    assert_eq!(base_results.len(), 1);
+    assert_eq!(base_results[0].path, "alpha-notes.txt");
+
+    fs::write(repo_root.join("notes-fresh.txt"), "fresh").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "main-update".to_string(),
+        })
+        .unwrap();
+    let main_results = facade
+        .search_filenames(&repo_root, "notes")
+        .unwrap();
+    assert_eq!(main_results.len(), 2);
+
+    facade.checkout_branch(&repo_root, "feature").unwrap();
+    let feature_results = facade
+        .search_filenames(&repo_root, "notes")
+        .unwrap();
+    assert_eq!(feature_results.len(), 1);
+    assert_eq!(feature_results[0].path, "alpha-notes.txt");
+}
+
+#[test]
+fn metadata_and_filename_search_return_empty_results_for_uncommitted_repository() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let metadata = facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: None,
+                path_prefix: None,
+                min_size: None,
+                max_size: None,
+            },
+        )
+        .unwrap();
+    let filenames = facade.search_filenames(&repo_root, "anything").unwrap();
+
+    assert!(metadata.is_empty());
+    assert!(filenames.is_empty());
+}
+
+#[test]
+fn branch_list_includes_current_branch_when_only_default_ref_exists() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let branch_ref_dir = repo_root.join(".e2v").join("refs").join("branches");
+    if branch_ref_dir.exists() {
+        fs::remove_dir_all(&branch_ref_dir).unwrap();
+    }
+
+    let branches = facade.list_branches(&repo_root).unwrap();
+
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].name, "main");
+    assert!(branches[0].is_current);
 }
 
 #[test]

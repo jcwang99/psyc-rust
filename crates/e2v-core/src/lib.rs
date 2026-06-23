@@ -1,6 +1,7 @@
 mod chunker;
 pub mod facade;
 mod keyring;
+mod local_index;
 mod manifest_store;
 mod working_tree;
 
@@ -54,11 +55,14 @@ pub mod testing {
 }
 
 pub use facade::{
-    BranchState, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
+    BranchState, BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
     InitOptions, ReadService, RepositoryFacade, RepositoryState, SnapshotSummary,
     validate_layout_root_value,
 };
 pub use keyring::clear_unlocked_keyring_cache;
+pub use local_index::{
+    FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult,
+};
 pub use manifest_store::{
     ManifestFileObject, ManifestObject, ManifestSnapshotObject, ManifestStore, ManifestStoreApi,
     ManifestTreeEntry, ManifestTreeObject, TreeWalkEntry,
