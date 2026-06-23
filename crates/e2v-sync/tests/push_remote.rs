@@ -8,7 +8,7 @@ use e2v_store::{
 };
 use tempfile::tempdir;
 
-use e2v_sync::{clone_remote, push_head, resume_push, CloneOptions, PushOptions, ResumeOptions};
+use e2v_sync::{CloneOptions, PushOptions, ResumeOptions, clone_remote, push_head, resume_push};
 
 #[derive(Debug, Clone)]
 struct RefConflictBackend {
@@ -343,6 +343,107 @@ impl RemoteBackend for InterruptingObjectUploadBackend {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SingleWriterMemoryBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+}
+
+impl SingleWriterMemoryBackend {
+    fn new() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+        }
+    }
+}
+
+impl BlobStore for SingleWriterMemoryBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for SingleWriterMemoryBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for SingleWriterMemoryBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for SingleWriterMemoryBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
 #[test]
 fn push_uploads_reachable_objects_and_publishes_remote_ref() {
     let temp = tempdir().unwrap();
@@ -590,10 +691,12 @@ fn resume_skips_uploaded_objects_and_republishes_missing_ref() {
 
     assert!(resumed.skipped_uploaded_objects > 0);
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
-    assert!(rebuilt
-        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-        .unwrap()
-        .is_some());
+    assert!(
+        rebuilt
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -713,6 +816,97 @@ fn resume_reuploads_missing_remote_objects_from_journal() {
 }
 
 #[test]
+fn resume_repairs_corrupted_existing_remote_object_instead_of_marking_it_verified() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-corrupted-remote-object".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-corrupted-remote-object-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+    let object_id = reachable_object_ids
+        .iter()
+        .find(|id| **id != commit.snapshot_id)
+        .unwrap()
+        .clone();
+    let remote_object_path = format!("objects/{object_id}.json");
+    let local_object_bytes = std::fs::read(
+        repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{object_id}.json")),
+    )
+    .unwrap();
+    let mut corrupted_bytes = remote.get_physical(&remote_object_path).unwrap();
+    let flip_index = corrupted_bytes.len() / 2;
+    corrupted_bytes[flip_index] ^= 0x01;
+    remote
+        .put_physical(&remote_object_path, &corrupted_bytes)
+        .unwrap();
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id = e2v_sync::OperationId::new("resume-corrupted-remote-object-op".to_string());
+    journal
+        .begin_operation(
+            &operation_id,
+            e2v_sync::OperationMetadata::push(state.branch.token_hex.clone(), None),
+        )
+        .unwrap();
+    journal
+        .plan_object(&operation_id, &object_id, "object")
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.get_physical(&remote_object_path).unwrap(),
+        local_object_bytes,
+        "resume should heal a corrupted remote object rather than marking it verified as-is"
+    );
+}
+
+#[test]
 fn resume_uploads_objects_missing_after_interrupted_push() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -750,9 +944,11 @@ fn resume_uploads_objects_missing_after_interrupted_push() {
         },
     )
     .unwrap_err();
-    assert!(push_error
-        .to_string()
-        .contains("simulated object upload interruption"));
+    assert!(
+        push_error
+            .to_string()
+            .contains("simulated object upload interruption")
+    );
 
     let resumed = resume_push(
         &facade,
@@ -915,6 +1111,613 @@ fn resume_restores_missing_control_plane_files_before_republishing_ref() {
 }
 
 #[test]
+fn resume_restores_control_ref_mirror_even_when_remote_ref_already_matches_local_head() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-control-ref-mirror".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-control-ref-mirror-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote.delete_physical("control/refs/default.json").unwrap();
+    remote
+        .put_physical(
+            "transactions/active/resume-control-ref-mirror-op.intent",
+            br#"{"operation_id":"resume-control-ref-mirror-op","target_branch_token":"main"}"#,
+        )
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-control-ref-mirror-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.get_physical("control/refs/default.json").unwrap(),
+        e2v_core::sync_support::read_default_ref_bytes(&repo_root).unwrap()
+    );
+    assert!(
+        !remote.exists_physical("transactions/active/resume-control-ref-mirror-op.intent"),
+        "resume should clean up the active intent once the control-plane mirror is restored"
+    );
+}
+
+#[test]
+fn resume_restores_missing_config_when_remote_ref_and_control_ref_mirror_match() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-missing-config".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-config-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote.delete_physical("control/config.json").unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-config-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.get_physical("control/config.json").unwrap(),
+        e2v_core::sync_support::read_config_bytes(&repo_root).unwrap()
+    );
+}
+
+#[test]
+fn resume_repairs_stale_config_when_remote_ref_and_control_ref_mirror_match() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-stale-config".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-stale-config-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .put_physical("control/config.json", br#"{"stale":true}"#)
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-stale-config-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.get_physical("control/config.json").unwrap(),
+        e2v_core::sync_support::read_config_bytes(&repo_root).unwrap()
+    );
+}
+
+#[test]
+fn resume_restores_missing_layout_root_when_remote_ref_and_control_ref_mirror_match() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-missing-layout-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-layout-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote.delete_physical("layout_root.json").unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-layout-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.get_physical("layout_root.json").unwrap(),
+        e2v_core::sync_support::read_layout_root_bytes(&repo_root).unwrap()
+    );
+}
+
+#[test]
+fn resume_repairs_stale_layout_root_when_remote_ref_and_control_ref_mirror_match() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-stale-layout-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-stale-layout-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .put_physical("layout_root.json", br#"{"stale":true}"#)
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-stale-layout-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.get_physical("layout_root.json").unwrap(),
+        e2v_core::sync_support::read_layout_root_bytes(&repo_root).unwrap()
+    );
+}
+
+#[test]
+fn resume_restores_missing_keyring_pointer_when_remote_ref_and_control_ref_mirror_match() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-missing-keyring-pointer".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-keyring-pointer-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .delete_physical("control/keyring/keyring.current")
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-keyring-pointer-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap(),
+        std::fs::read(
+            repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn resume_repairs_stale_keyring_pointer_when_remote_ref_and_control_ref_mirror_match() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-stale-keyring-pointer".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-stale-keyring-pointer-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .put_physical(
+            "control/keyring/keyring.current",
+            br#"{"generation":"stale"}"#,
+        )
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-stale-keyring-pointer-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap(),
+        std::fs::read(
+            repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn resume_restores_missing_keyring_generation_when_remote_ref_and_control_ref_mirror_match() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-missing-keyring-generation".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-keyring-generation-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pointer_bytes = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let current = pointer["current"].as_str().unwrap();
+    remote
+        .delete_physical(&format!("control/keyring/{current}"))
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-missing-keyring-generation-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote
+            .get_physical(&format!("control/keyring/{current}"))
+            .unwrap(),
+        std::fs::read(repo_root.join(".e2v").join("keyring").join(current)).unwrap()
+    );
+}
+
+#[test]
+fn resume_cleans_up_stale_active_intent_when_remote_state_is_already_complete() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-cleanup-only".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-cleanup-only-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .put_physical(
+            "transactions/active/resume-cleanup-only-op.intent",
+            br#"{"operation_id":"resume-cleanup-only-op","target_branch_token":"main"}"#,
+        )
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-cleanup-only-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert!(
+        !remote.exists_physical("transactions/active/resume-cleanup-only-op.intent"),
+        "resume should clean up a stale active intent even when no control-plane repair is needed"
+    );
+}
+
+#[test]
+fn resume_cleans_up_stale_single_writer_lease_when_remote_state_is_already_complete() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-cleanup-single-writer".to_string(),
+        })
+        .unwrap();
+
+    let remote = SingleWriterMemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-cleanup-single-writer-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .put_physical(
+            &format!(
+                "transactions/active/{}.intent",
+                "resume-cleanup-single-writer-op"
+            ),
+            br#"{"operation_id":"resume-cleanup-single-writer-op","target_branch_token":"main"}"#,
+        )
+        .unwrap();
+    remote
+        .put_physical(
+            &format!("leases/{}.lock", state.branch.token_hex),
+            format!(
+                r#"{{"operation_id":"{}","target_branch_token":"{}"}}"#,
+                "resume-cleanup-single-writer-op", state.branch.token_hex
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-cleanup-single-writer-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert!(!remote.exists_physical("transactions/active/resume-cleanup-single-writer-op.intent"));
+    assert!(!remote.exists_physical(&format!("leases/{}.lock", state.branch.token_hex)));
+}
+
+#[test]
 fn resume_rejects_stale_remote_ref_and_requires_rebase_recovery() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -969,6 +1772,91 @@ fn resume_rejects_stale_remote_ref_and_requires_rebase_recovery() {
     .unwrap_err();
 
     assert!(error.to_string().contains("needs-rebase"));
+}
+
+#[test]
+fn resume_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-password-rotation".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-password-rotation-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+    let original_keyring_pointer = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id = e2v_sync::OperationId::new("resume-password-rotation-op".to_string());
+    journal
+        .begin_operation(
+            &operation_id,
+            e2v_sync::OperationMetadata::push(state.branch.token_hex.clone(), None),
+        )
+        .unwrap();
+
+    remote
+        .compare_and_swap_ref(
+            &RefToken::new(state.branch.token_hex.clone()),
+            Some(e2v_store::RefVersion { value: 1 }),
+            e2v_store::EncryptedRef::new(vec![9, 9, 9]),
+        )
+        .unwrap();
+
+    let error = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("needs-rebase"));
+    assert_eq!(
+        remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap(),
+        original_keyring_pointer,
+        "resume must not publish a new keyring pointer before ref CAS succeeds"
+    );
 }
 
 #[test]
@@ -1103,11 +1991,216 @@ fn push_rejects_missing_remote_parent_chain() {
     .unwrap_err();
 
     assert!(error.to_string().contains("ancestor"));
-    assert!(remote
-        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-        .unwrap()
-        .is_none());
+    assert!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_none()
+    );
     assert!(second.snapshot_id.len() > 10);
+}
+
+#[test]
+fn push_rejects_corrupted_remote_parent_snapshot_even_when_object_path_exists() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"first").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "corrupted-parent-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"second").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let remote_parent_path = format!("objects/{}.json", first.snapshot_id);
+    let mut corrupted_parent_bytes = remote.get_physical(&remote_parent_path).unwrap();
+    let flip_index = corrupted_parent_bytes.len() / 2;
+    corrupted_parent_bytes[flip_index] ^= 0x01;
+    remote
+        .put_physical(&remote_parent_path, &corrupted_parent_bytes)
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "corrupted-parent-op".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("ancestor")
+            || error.to_string().contains("authentication")
+            || error.to_string().contains("remote"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn push_accepts_healthy_remote_parent_snapshot_when_object_verifies() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"first").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "healthy-parent-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"second").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "healthy-parent-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(pushed.published_snapshot_id, second.snapshot_id);
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+}
+
+#[test]
+fn push_rejects_remote_parent_snapshot_when_reachable_chunk_is_corrupted() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"first").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "corrupted-parent-chunk-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_ids = manifest_store
+        .collect_reachable_object_ids(&first.snapshot_id)
+        .unwrap();
+    let chunk_id = reachable_ids
+        .into_iter()
+        .find(|object_id| facade.verify_object(&repo_root, object_id, "chunk").is_ok())
+        .unwrap();
+    let remote_chunk_path = format!("objects/{chunk_id}.json");
+    let mut bytes = remote.get_physical(&remote_chunk_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    remote.put_physical(&remote_chunk_path, &bytes).unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"second").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "corrupted-parent-chunk-op".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("ancestor")
+            || error.to_string().contains("verification")
+            || error.to_string().contains("failed"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]
@@ -1146,6 +2239,114 @@ fn push_marks_needs_rebase_when_ref_publish_cas_loses_race() {
     .unwrap_err();
 
     assert!(error.to_string().contains("needs-rebase"));
+}
+
+#[test]
+fn push_does_not_publish_control_ref_mirror_before_ref_cas_succeeds() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "cas-race".to_string(),
+        })
+        .unwrap();
+
+    let remote = RefConflictBackend::new();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "cas-race-op".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("needs-rebase"));
+    assert!(
+        !remote.exists_physical("control/refs/default.json"),
+        "control ref mirror must not be published before ref CAS succeeds"
+    );
+}
+
+#[test]
+fn push_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed-password-rotation".to_string(),
+        })
+        .unwrap();
+
+    let remote = RefConflictBackend::new();
+    push_head(
+        &facade,
+        &remote.inner,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "seed-password-rotation-op".to_string(),
+        },
+    )
+    .unwrap();
+    let original_keyring_pointer = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "cas-race-password-rotation-op".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("needs-rebase"));
+    assert_eq!(
+        remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap(),
+        original_keyring_pointer,
+        "keyring pointer must not be published before ref CAS succeeds"
+    );
 }
 
 #[test]
@@ -1426,4 +2627,117 @@ fn push_is_idempotent_when_remote_ref_already_points_at_local_head() {
     .unwrap();
 
     assert_eq!(second.published_snapshot_id, commit.snapshot_id);
+}
+
+#[test]
+fn push_republishes_control_plane_when_password_rotates_without_new_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "password-rotation".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let first = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "password-rotation-push-1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first.published_snapshot_id, commit.snapshot_id);
+
+    let original_keyring_pointer = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    let second = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "password-rotation-push-2".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second.published_snapshot_id, commit.snapshot_id);
+    assert!(remote.exists_physical("control/keyring/keyring.2"));
+    assert_ne!(
+        remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap(),
+        original_keyring_pointer
+    );
+}
+
+#[test]
+fn push_does_not_upload_local_keyring_lock_file_to_remote_control_plane() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "ignore-keyring-lock".to_string(),
+        })
+        .unwrap();
+    fs::write(
+        repo_root.join(".e2v").join("keyring").join("keyring.lock"),
+        b"locked",
+    )
+    .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-ignore-keyring-lock".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.lock"),
+        "push should not upload local keyring lock files"
+    );
 }

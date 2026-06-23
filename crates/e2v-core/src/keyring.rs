@@ -70,10 +70,14 @@ pub fn cache_unlocked_secrets(control_dir: &Path, secrets: &RepoSecrets) {
     cache.insert(control_dir.to_path_buf(), secrets.clone());
 }
 
-pub fn clear_unlocked_keyring_cache_for_test(control_dir: &Path) {
+pub fn clear_unlocked_keyring_cache(control_dir: &Path) {
     if let Some(cache) = UNLOCKED_KEYRINGS.get() {
         cache.lock().unwrap().remove(control_dir);
     }
+}
+
+pub fn clear_unlocked_keyring_cache_for_test(control_dir: &Path) {
+    clear_unlocked_keyring_cache(control_dir);
 }
 
 pub fn unlock_repo_secrets(control_dir: &Path, password: &str) -> Result<RepoSecrets> {
@@ -145,7 +149,11 @@ pub fn seal_repo_secrets(
     let mut ciphertext = plaintext.clone();
     let associated_data = password_envelope_associated_data(repo_id, active_epoch);
     let auth_tag = cipher
-        .encrypt_in_place_detached(XNonce::from_slice(&nonce), &associated_data, &mut ciphertext)
+        .encrypt_in_place_detached(
+            XNonce::from_slice(&nonce),
+            &associated_data,
+            &mut ciphertext,
+        )
         .map_err(|_| anyhow::anyhow!("failed to encrypt keyring envelope"))?;
     let record = PasswordEnvelopeRecord {
         magic: *KEYRING_PASSWORD_MAGIC,
@@ -186,11 +194,14 @@ fn decrypt_password_envelope(
 ) -> Result<SealedRepoSecrets> {
     let salt = hex::decode(&envelope.salt_hex).context("invalid keyring password envelope salt")?;
     let key = derive_password_key(password, &salt)?;
-    let record_bytes =
-        hex::decode(&envelope.ciphertext_hex).context("invalid keyring password envelope ciphertext")?;
-    let record: PasswordEnvelopeRecord =
-        postcard::from_bytes(&record_bytes).context("failed to decode keyring password envelope")?;
-    ensure!(record.magic == *KEYRING_PASSWORD_MAGIC, "keyring unlock failed");
+    let record_bytes = hex::decode(&envelope.ciphertext_hex)
+        .context("invalid keyring password envelope ciphertext")?;
+    let record: PasswordEnvelopeRecord = postcard::from_bytes(&record_bytes)
+        .context("failed to decode keyring password envelope")?;
+    ensure!(
+        record.magic == *KEYRING_PASSWORD_MAGIC,
+        "keyring unlock failed"
+    );
     ensure!(
         record.format_version == KEYRING_PASSWORD_FORMAT_VERSION,
         "unsupported keyring password envelope version"
@@ -257,6 +268,7 @@ pub fn decode_hex_key(value: &str) -> Result<[u8; 32]> {
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
-    let bytes = std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {}", path.display()))
 }

@@ -819,6 +819,33 @@ fn read_service_reads_directory_and_file_content_from_snapshot() {
 }
 
 #[test]
+fn read_service_reads_empty_files_from_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("empty.txt"), []).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "empty".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "empty.txt").unwrap();
+    let content = read_service.read_range(&file, 0, 0).unwrap();
+
+    assert!(content.is_empty());
+    assert_eq!(file.file_size(), 0);
+    assert_eq!(file.chunk_count(), 0);
+}
+
+#[test]
 fn read_service_clamps_ranges_that_extend_past_end_of_file() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1585,6 +1612,103 @@ fn verify_snapshot_accepts_a_healthy_local_snapshot() {
 }
 
 #[test]
+fn open_rejects_unsupported_layout_root_schema_version() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let layout_root_path = repo_root.join(".e2v").join("layout_root.json");
+    let mut layout_root: serde_json::Value =
+        serde_json::from_slice(&fs::read(&layout_root_path).unwrap()).unwrap();
+    layout_root["schema_version"] = serde_json::Value::from(99u64);
+    fs::write(
+        &layout_root_path,
+        serde_json::to_vec_pretty(&layout_root).unwrap(),
+    )
+    .unwrap();
+
+    let error = facade.open(&repo_root).unwrap_err();
+
+    assert!(
+        error.to_string().contains("schema")
+            || error.to_string().contains("layout")
+            || error.to_string().contains("unsupported"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn verify_snapshot_requires_layout_root_view_to_be_present() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-layout".to_string(),
+        })
+        .unwrap();
+
+    fs::remove_file(repo_root.join(".e2v").join("layout_root.json")).unwrap();
+
+    let error = facade
+        .verify_snapshot(&repo_root, &commit.snapshot_id)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("layout_root.json") || error.to_string().contains("layout root"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn verify_snapshot_rejects_unsupported_layout_root_schema_version() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-layout-schema".to_string(),
+        })
+        .unwrap();
+
+    let layout_root_path = repo_root.join(".e2v").join("layout_root.json");
+    let mut layout_root: serde_json::Value =
+        serde_json::from_slice(&fs::read(&layout_root_path).unwrap()).unwrap();
+    layout_root["schema_version"] = serde_json::Value::from(99u64);
+    fs::write(
+        &layout_root_path,
+        serde_json::to_vec_pretty(&layout_root).unwrap(),
+    )
+    .unwrap();
+
+    let error = facade
+        .verify_snapshot(&repo_root, &commit.snapshot_id)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("schema")
+            || error.to_string().contains("layout")
+            || error.to_string().contains("unsupported"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn verify_ref_accepts_a_healthy_local_default_ref() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1602,6 +1726,70 @@ fn verify_ref_accepts_a_healthy_local_default_ref() {
         .unwrap();
 
     facade.verify_ref(&repo_root).unwrap();
+}
+
+#[test]
+fn verify_ref_requires_layout_root_view_to_be_present() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-layout".to_string(),
+        })
+        .unwrap();
+
+    fs::remove_file(repo_root.join(".e2v").join("layout_root.json")).unwrap();
+
+    let error = facade.verify_ref(&repo_root).unwrap_err();
+
+    assert!(
+        error.to_string().contains("layout_root.json") || error.to_string().contains("layout root"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn verify_ref_rejects_unsupported_layout_root_schema_version() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "verify-ref-layout-schema".to_string(),
+        })
+        .unwrap();
+
+    let layout_root_path = repo_root.join(".e2v").join("layout_root.json");
+    let mut layout_root: serde_json::Value =
+        serde_json::from_slice(&fs::read(&layout_root_path).unwrap()).unwrap();
+    layout_root["schema_version"] = serde_json::Value::from(99u64);
+    fs::write(
+        &layout_root_path,
+        serde_json::to_vec_pretty(&layout_root).unwrap(),
+    )
+    .unwrap();
+
+    let error = facade.verify_ref(&repo_root).unwrap_err();
+
+    assert!(
+        error.to_string().contains("schema")
+            || error.to_string().contains("layout")
+            || error.to_string().contains("unsupported"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]

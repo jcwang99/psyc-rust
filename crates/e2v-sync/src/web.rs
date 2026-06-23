@@ -429,6 +429,18 @@ fn parse_single_range(header: &str, file_size: usize) -> Result<(usize, usize), 
         return Err(RangeError::BadRequest);
     }
     let (start, end) = bytes.split_once('-').ok_or(RangeError::BadRequest)?;
+    if start.is_empty() {
+        let suffix_len: usize = end.parse().map_err(|_| RangeError::BadRequest)?;
+        if suffix_len == 0 {
+            return Err(RangeError::Unsatisfiable);
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        let end = file_size.saturating_sub(1);
+        if file_size == 0 {
+            return Err(RangeError::Unsatisfiable);
+        }
+        return Ok((start, end));
+    }
     let start: usize = start.parse().map_err(|_| RangeError::BadRequest)?;
     let end = if end.is_empty() {
         file_size.saturating_sub(1)
@@ -447,6 +459,7 @@ fn escape_html(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn encode_query_path(path: &str) -> String {
@@ -476,13 +489,17 @@ fn map_api_branch_error(error: Error) -> StatusCode {
 }
 
 fn map_api_read_error(error: Error) -> StatusCode {
+    if error_chain_contains_any(
+        &error,
+        &["snapshot path must not be empty", "invalid snapshot path"],
+    ) {
+        return StatusCode::BAD_REQUEST;
+    }
     map_api_error_with_not_found(
         error,
         &[
             "directory not found in snapshot",
             "file not found in snapshot",
-            "snapshot path must not be empty",
-            "invalid snapshot path",
             "failed to read object plaintext",
         ],
     )
@@ -510,6 +527,15 @@ fn map_page_branch_error(error: Error, not_found_message: &str) -> PageError {
 }
 
 fn map_page_read_error(error: Error, not_found_message: &str) -> PageError {
+    if error_chain_contains_any(
+        &error,
+        &["snapshot path must not be empty", "invalid snapshot path"],
+    ) {
+        return PageError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid repository path".to_string(),
+        };
+    }
     map_page_error_with_not_found(
         error,
         not_found_message,
@@ -517,8 +543,6 @@ fn map_page_read_error(error: Error, not_found_message: &str) -> PageError {
         &[
             "directory not found in snapshot",
             "file not found in snapshot",
-            "snapshot path must not be empty",
-            "invalid snapshot path",
             "failed to read object plaintext",
         ],
     )

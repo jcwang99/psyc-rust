@@ -6,7 +6,12 @@ use anyhow::{Context, Result};
 pub trait BlobStore {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()>;
     fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>>;
-    fn get_physical_range(&self, relative_path: &str, offset: usize, length: usize) -> Result<Vec<u8>>;
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>>;
     fn delete_physical(&self, relative_path: &str) -> Result<()>;
     fn exists_physical(&self, relative_path: &str) -> bool;
     fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat>;
@@ -65,7 +70,12 @@ impl BlobStore for LocalFolderBackend {
         self.get_object(relative_path)
     }
 
-    fn get_physical_range(&self, relative_path: &str, offset: usize, length: usize) -> Result<Vec<u8>> {
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         let bytes = self.get_object(relative_path)?;
         anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
         let end = offset.saturating_add(length).min(bytes.len());
@@ -106,11 +116,7 @@ impl BlobStore for LocalFolderBackend {
         {
             let entry = entry?;
             if entry.file_type()?.is_file() {
-                let relative = format!(
-                    "{}{}",
-                    prefix,
-                    entry.file_name().to_string_lossy()
-                );
+                let relative = format!("{}{}", prefix, entry.file_name().to_string_lossy());
                 listed.push(relative);
             }
         }
@@ -149,10 +155,20 @@ mod tests {
         let backend = LocalFolderBackend::new(temp.path());
         let blob_store: &dyn BlobStore = &backend;
 
-        blob_store.put_physical("objects/sample.bin", b"hello world").unwrap();
+        blob_store
+            .put_physical("objects/sample.bin", b"hello world")
+            .unwrap();
         assert!(blob_store.exists_physical("objects/sample.bin"));
-        assert_eq!(blob_store.get_physical("objects/sample.bin").unwrap(), b"hello world");
-        assert_eq!(blob_store.get_physical_range("objects/sample.bin", 6, 5).unwrap(), b"world");
+        assert_eq!(
+            blob_store.get_physical("objects/sample.bin").unwrap(),
+            b"hello world"
+        );
+        assert_eq!(
+            blob_store
+                .get_physical_range("objects/sample.bin", 6, 5)
+                .unwrap(),
+            b"world"
+        );
     }
 
     #[test]
@@ -160,7 +176,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let backend = LocalFolderBackend::new(temp.path());
         let blob_store: &dyn BlobStore = &backend;
-        blob_store.put_physical("objects/sample.bin", b"hello world").unwrap();
+        blob_store
+            .put_physical("objects/sample.bin", b"hello world")
+            .unwrap();
 
         let stat = blob_store.stat_physical("objects/sample.bin").unwrap();
 
@@ -172,7 +190,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let backend = LocalFolderBackend::new(temp.path());
         let blob_store: &dyn BlobStore = &backend;
-        blob_store.put_physical("objects/sample.bin", b"hello world").unwrap();
+        blob_store
+            .put_physical("objects/sample.bin", b"hello world")
+            .unwrap();
 
         blob_store.delete_physical("objects/sample.bin").unwrap();
 

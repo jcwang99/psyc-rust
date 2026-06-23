@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use e2v_store::BlobStore;
 use serde::{Deserialize, Serialize};
 
@@ -72,15 +73,67 @@ pub fn load_remote_bundle_locations<B: BlobStore>(
     let mut locations = BTreeMap::new();
     for index_path in remote.list_physical(REMOTE_BUNDLE_INDEX_PREFIX)? {
         let index: ObjectBundleIndex = serde_json::from_slice(&remote.get_physical(&index_path)?)?;
+        ensure!(
+            index.schema_version == BUNDLE_SCHEMA_VERSION,
+            "unsupported bundle index schema version {}",
+            index.schema_version
+        );
+        ensure!(
+            index.data_path.starts_with(REMOTE_BUNDLE_DATA_PREFIX),
+            "invalid bundle data path {}",
+            index.data_path
+        );
+        validate_bundle_relative_path(
+            index
+                .data_path
+                .strip_prefix(REMOTE_BUNDLE_DATA_PREFIX)
+                .unwrap_or_default(),
+        )?;
+        let bundle_len = remote.stat_physical(&index.data_path)?.length;
+        let mut previous_end = 0u64;
         for entry in index.entries {
+            ensure!(
+                !entry.object_id.is_empty()
+                    && entry
+                        .object_id
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit()),
+                "invalid bundled object id {}",
+                entry.object_id
+            );
+            let entry_end = entry.offset.checked_add(entry.length).ok_or_else(|| {
+                anyhow::anyhow!("invalid bundle entry range for {}", entry.object_id)
+            })?;
+            ensure!(
+                entry.length > 0,
+                "invalid bundle entry range for {}",
+                entry.object_id
+            );
+            ensure!(
+                entry.offset >= previous_end,
+                "bundle entry overlap detected for {}",
+                entry.object_id
+            );
+            ensure!(
+                entry_end <= bundle_len,
+                "bundle entry range out of bounds for {}",
+                entry.object_id
+            );
+            let object_id = entry.object_id;
+            ensure!(
+                !locations.contains_key(&object_id),
+                "duplicate bundled object id {}",
+                object_id
+            );
             locations.insert(
-                entry.object_id,
+                object_id,
                 BundledObjectLocation {
                     data_path: index.data_path.clone(),
                     offset: entry.offset as usize,
                     length: entry.length as usize,
                 },
             );
+            previous_end = entry_end;
         }
     }
     Ok(locations)
@@ -99,6 +152,21 @@ pub fn read_bundled_object<B: BlobStore>(
         location.offset,
         location.length,
     )?))
+}
+
+fn validate_bundle_relative_path(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    ensure!(!value.is_empty(), "empty bundle data path");
+    ensure!(
+        !path.is_absolute(),
+        "bundle data path escapes target directory"
+    );
+    ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "bundle data path traversal is not allowed"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

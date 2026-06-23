@@ -466,7 +466,7 @@ impl RepositoryFacade {
         let control_dir = repo_root.join(CONTROL_DIR);
 
         let config: RepoConfig = read_json(control_dir.join(CONFIG_FILE))?;
-        let layout_root: LayoutRoot = read_json(control_dir.join(LAYOUT_ROOT_FILE))?;
+        let layout_root = validate_layout_root(&control_dir)?;
         let repo_secrets = open_repo_secrets(&control_dir)?;
         let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
 
@@ -636,6 +636,7 @@ impl RepositoryFacade {
     pub fn verify_snapshot(&self, _repo_root: impl AsRef<Path>, _snapshot_id: &str) -> Result<()> {
         let repo_root = _repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
+        let _repo_state = self.open(&repo_root)?;
         let object_store = open_object_store(&control_dir)?;
         let manifest_store = LocalManifestStore::new(&repo_root);
         verify_snapshot_graph(&manifest_store, &object_store, _snapshot_id)
@@ -657,6 +658,7 @@ impl RepositoryFacade {
     pub fn verify_ref(&self, _repo_root: impl AsRef<Path>) -> Result<()> {
         let repo_root = _repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
+        let _repo_state = self.open(&repo_root)?;
         let repo_secrets = open_repo_secrets(&control_dir)?;
         let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
         if let Some(snapshot_id) = default_ref.head_snapshot_id.as_deref() {
@@ -744,7 +746,6 @@ impl ReadService {
     pub fn read_range(&self, file: &FileHandle, offset: usize, length: usize) -> Result<Vec<u8>> {
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let object_store = open_object_store(&control_dir)?;
-        ensure!(!file.chunk_ids.is_empty(), "file has no chunks");
         let file_size: usize = file
             .file_size
             .try_into()
@@ -754,6 +755,7 @@ impl ReadService {
         if offset == end {
             return Ok(Vec::new());
         }
+        ensure!(!file.chunk_ids.is_empty(), "file has no chunks");
 
         let mut chunk_start = 0usize;
         let mut output = Vec::with_capacity(end - offset);
@@ -824,6 +826,7 @@ fn random_key_material() -> Result<[u8; 32]> {
 }
 
 fn open_object_store(control_dir: &Path) -> Result<DirectLayoutObjectStore> {
+    validate_layout_root(control_dir)?;
     let secrets = open_repo_secrets(control_dir)?;
     Ok(open_object_store_with_secrets(control_dir, secrets))
 }
@@ -833,6 +836,31 @@ fn open_object_store_with_secrets(
     secrets: RepoSecrets,
 ) -> DirectLayoutObjectStore {
     DirectLayoutObjectStore::new(control_dir, secrets)
+}
+
+fn validate_layout_root(control_dir: &Path) -> Result<LayoutRoot> {
+    let layout_root: LayoutRoot = read_json(control_dir.join(LAYOUT_ROOT_FILE))?;
+    validate_layout_root_value(&layout_root)?;
+    Ok(layout_root)
+}
+
+pub fn validate_layout_root_value(layout_root: &LayoutRoot) -> Result<()> {
+    ensure!(
+        layout_root.schema_version == REPO_FORMAT_VERSION,
+        "unsupported layout root schema version {}",
+        layout_root.schema_version
+    );
+    ensure!(
+        layout_root.layout_id == DIRECT_LAYOUT_ID,
+        "unsupported layout id {}",
+        layout_root.layout_id
+    );
+    ensure!(
+        layout_root.mapping_policy == DIRECT_MAPPING_POLICY,
+        "unsupported layout mapping policy {}",
+        layout_root.mapping_policy
+    );
+    Ok(())
 }
 
 fn write_default_ref(control_dir: &Path, secrets: &RepoSecrets, value: &RefRecord) -> Result<()> {
@@ -854,6 +882,27 @@ pub(crate) fn decode_default_ref_bytes(control_dir: &Path, bytes: &[u8]) -> Resu
     let secrets = open_repo_secrets(control_dir)?;
     let plaintext = decrypt_control_record(&secrets, DEFAULT_REF_TOKEN, "ref", bytes)?;
     postcard_from_bytes(&plaintext).context("failed to decode ref record")
+}
+
+pub(crate) fn verify_snapshot_with_secrets_for_sync(
+    repo_root: impl AsRef<Path>,
+    secrets: RepoSecrets,
+    snapshot_id: &str,
+) -> Result<()> {
+    let repo_root = repo_root.as_ref().to_path_buf();
+    let control_dir = repo_root.join(CONTROL_DIR);
+    let _layout_root = validate_layout_root(&control_dir)?;
+    let secrets_were_cached = open_repo_secrets(&control_dir).is_ok();
+    if !secrets_were_cached {
+        cache_unlocked_secrets(&control_dir, &secrets);
+    }
+    let object_store = open_object_store_with_secrets(&control_dir, secrets);
+    let manifest_store = LocalManifestStore::new(&repo_root);
+    let result = verify_snapshot_graph(&manifest_store, &object_store, snapshot_id);
+    if !secrets_were_cached {
+        crate::keyring::clear_unlocked_keyring_cache(&control_dir);
+    }
+    result
 }
 
 fn read_current_ref(control_dir: &Path) -> Result<RefRecord> {
@@ -1401,7 +1450,8 @@ fn sync_path(path: &Path) -> Result<()> {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
                 Err(error) => {
-                    return Err(error).with_context(|| format!("failed to sync {}", path.display()));
+                    return Err(error)
+                        .with_context(|| format!("failed to sync {}", path.display()));
                 }
             }
         }
@@ -1680,6 +1730,38 @@ mod facade_tests {
             "unexpected warning: {}",
             warnings[0]
         );
+    }
+
+    #[test]
+    fn verify_snapshot_with_explicit_secrets_does_not_require_cached_unlock_state() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello").unwrap();
+        let commit = facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let control_dir = repo_root.join(CONTROL_DIR);
+        crate::keyring::clear_unlocked_keyring_cache(&control_dir);
+        let secrets =
+            unlock_repo_secrets_uncached(&control_dir, "correct horse battery staple").unwrap();
+        crate::keyring::clear_unlocked_keyring_cache(&control_dir);
+
+        verify_snapshot_with_secrets_for_sync(&repo_root, secrets, &commit.snapshot_id).unwrap();
+        assert!(open_repo_secrets(&control_dir).is_err());
     }
 
     #[test]

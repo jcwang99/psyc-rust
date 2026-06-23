@@ -1,5 +1,5 @@
-pub mod facade;
 mod chunker;
+pub mod facade;
 mod keyring;
 mod manifest_store;
 mod working_tree;
@@ -11,14 +11,12 @@ pub mod testing {
 
     use anyhow::Result;
 
-    pub use crate::keyring::clear_unlocked_keyring_cache_for_test;
-    pub use crate::working_tree::{SnapshotReader, StableReadPolicy};
-    pub use crate::working_tree::WorkingTree as TestWorkingTree;
     pub use crate::facade::RepositoryFacade;
+    pub use crate::keyring::clear_unlocked_keyring_cache_for_test;
+    pub use crate::working_tree::WorkingTree as TestWorkingTree;
+    pub use crate::working_tree::{SnapshotReader, StableReadPolicy};
 
-    pub fn new_working_tree_for_test(
-        repo_root: impl AsRef<std::path::Path>,
-    ) -> TestWorkingTree {
+    pub fn new_working_tree_for_test(repo_root: impl AsRef<std::path::Path>) -> TestWorkingTree {
         TestWorkingTree::new(repo_root)
     }
 
@@ -58,7 +56,9 @@ pub mod testing {
 pub use facade::{
     BranchState, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
     InitOptions, ReadService, RepositoryFacade, RepositoryState, SnapshotSummary,
+    validate_layout_root_value,
 };
+pub use keyring::clear_unlocked_keyring_cache;
 pub use manifest_store::{
     ManifestFileObject, ManifestObject, ManifestSnapshotObject, ManifestStore, ManifestStoreApi,
     ManifestTreeEntry, ManifestTreeObject, TreeWalkEntry,
@@ -68,7 +68,8 @@ pub use working_tree::{SnapshotReader, StableReadPolicy};
 pub mod sync_support {
     use std::path::{Path, PathBuf};
 
-    use anyhow::Result;
+    use anyhow::{Result, ensure};
+    use e2v_store::RepoSecrets;
     use serde::{Deserialize, Serialize};
 
     use crate::facade::{RepositoryState, SnapshotSummary};
@@ -138,8 +139,122 @@ pub mod sync_support {
 
     pub fn read_default_ref_bytes(repo_root: impl AsRef<Path>) -> Result<Vec<u8>> {
         Ok(std::fs::read(
-            repo_root.as_ref().join(".e2v").join("refs").join("default.json"),
+            repo_root
+                .as_ref()
+                .join(".e2v")
+                .join("refs")
+                .join("default.json"),
         )?)
+    }
+
+    pub fn read_local_object_bytes(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+    ) -> Result<Vec<u8>> {
+        Ok(std::fs::read(
+            repo_root
+                .as_ref()
+                .join(".e2v")
+                .join("objects")
+                .join(format!("{object_id}.json")),
+        )?)
+    }
+
+    pub fn local_object_envelope_looks_valid(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+    ) -> Result<bool> {
+        const ENVELOPE_MAGIC: &[u8; 4] = b"E2V0";
+        const ENVELOPE_FORMAT_VERSION: u32 = 1;
+        const CRYPTO_SUITE: &str = "xchacha20poly1305";
+        const NONCE_SIZE: usize = 24;
+        const TAG_SIZE: usize = 16;
+
+        let bytes = read_local_object_bytes(repo_root, object_id)?;
+        ensure!(
+            bytes.len() >= ENVELOPE_MAGIC.len(),
+            "object authentication failed"
+        );
+
+        let mut cursor = 0usize;
+        let magic = take_exact(&bytes, &mut cursor, ENVELOPE_MAGIC.len())?;
+        ensure!(magic == ENVELOPE_MAGIC, "object authentication failed");
+
+        let format_version = read_u32(&bytes, &mut cursor)?;
+        ensure!(
+            format_version == ENVELOPE_FORMAT_VERSION,
+            "object authentication failed"
+        );
+
+        let object_type = read_string(&bytes, &mut cursor)?;
+        ensure!(
+            !object_type.trim().is_empty(),
+            "object authentication failed"
+        );
+
+        let crypto_suite = read_string(&bytes, &mut cursor)?;
+        ensure!(crypto_suite == CRYPTO_SUITE, "object authentication failed");
+
+        let key_epoch = read_u32(&bytes, &mut cursor)?;
+        ensure!(key_epoch > 0, "object authentication failed");
+
+        let padding_policy = read_string(&bytes, &mut cursor)?;
+        ensure!(
+            !padding_policy.trim().is_empty(),
+            "object authentication failed"
+        );
+
+        let stored_object_id = read_string(&bytes, &mut cursor)?;
+        ensure!(
+            stored_object_id == object_id,
+            "object authentication failed"
+        );
+
+        let nonce_len = take_exact(&bytes, &mut cursor, 1)?[0] as usize;
+        ensure!(nonce_len == NONCE_SIZE, "object authentication failed");
+        let _nonce = take_exact(&bytes, &mut cursor, nonce_len)?;
+
+        let ciphertext_len = read_u64(&bytes, &mut cursor)? as usize;
+        ensure!(ciphertext_len > 0, "object authentication failed");
+        let _ciphertext = take_exact(&bytes, &mut cursor, ciphertext_len)?;
+
+        let auth_tag = take_exact(&bytes, &mut cursor, TAG_SIZE)?;
+        ensure!(auth_tag.len() == TAG_SIZE, "object authentication failed");
+        ensure!(cursor == bytes.len(), "object authentication failed");
+
+        Ok(true)
+    }
+
+    fn take_exact<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
+        let end = cursor.saturating_add(len);
+        ensure!(end <= bytes.len(), "object authentication failed");
+        let slice = &bytes[*cursor..end];
+        *cursor = end;
+        Ok(slice)
+    }
+
+    fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8> {
+        Ok(take_exact(bytes, cursor, 1)?[0])
+    }
+
+    fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+        let mut value = [0u8; 4];
+        value.copy_from_slice(take_exact(bytes, cursor, 4)?);
+        Ok(u32::from_le_bytes(value))
+    }
+
+    fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
+        let mut value = [0u8; 8];
+        value.copy_from_slice(take_exact(bytes, cursor, 8)?);
+        Ok(u64::from_le_bytes(value))
+    }
+
+    fn read_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
+        let length = read_u8(bytes, cursor)? as usize;
+        let raw = take_exact(bytes, cursor, length)?;
+        Ok(std::str::from_utf8(raw)
+            .map_err(|_| anyhow::anyhow!("object authentication failed"))?
+            .to_string())
     }
 
     pub fn decode_ref_head_snapshot_id(
@@ -147,7 +262,31 @@ pub mod sync_support {
         encrypted_ref_bytes: &[u8],
     ) -> Result<Option<String>> {
         let control_dir = repo_root.as_ref().join(".e2v");
-        Ok(super::facade::decode_default_ref_bytes(&control_dir, encrypted_ref_bytes)?.head_snapshot_id)
+        Ok(
+            super::facade::decode_default_ref_bytes(&control_dir, encrypted_ref_bytes)?
+                .head_snapshot_id,
+        )
+    }
+
+    pub fn decode_default_ref_record(
+        repo_root: impl AsRef<Path>,
+        encrypted_ref_bytes: &[u8],
+    ) -> Result<(String, Option<String>)> {
+        let control_dir = repo_root.as_ref().join(".e2v");
+        let record = super::facade::decode_default_ref_bytes(&control_dir, encrypted_ref_bytes)?;
+        Ok((record.ref_token_hex, record.head_snapshot_id))
+    }
+
+    pub fn open_repo_secrets_for_sync(control_dir: impl AsRef<Path>) -> Result<RepoSecrets> {
+        super::keyring::open_repo_secrets(control_dir.as_ref())
+    }
+
+    pub fn verify_snapshot_with_secrets_for_sync(
+        repo_root: impl AsRef<Path>,
+        secrets: RepoSecrets,
+        snapshot_id: &str,
+    ) -> Result<()> {
+        super::facade::verify_snapshot_with_secrets_for_sync(repo_root, secrets, snapshot_id)
     }
 
     pub fn list_keyring_files(repo_root: impl AsRef<Path>) -> Result<Vec<PathBuf>> {

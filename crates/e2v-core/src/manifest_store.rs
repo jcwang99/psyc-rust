@@ -252,22 +252,24 @@ impl Iterator for TreeWalkIter {
             };
 
             match entry.kind.as_str() {
-                "tree" => match read_directory_entries(self.object_store.as_ref(), &entry.object_id) {
-                    Ok(entries) => {
-                        self.stack.push(PendingDirectory {
-                            prefix: path,
-                            entries,
-                            next_index: 0,
-                        });
+                "tree" => {
+                    match read_directory_entries(self.object_store.as_ref(), &entry.object_id) {
+                        Ok(entries) => {
+                            self.stack.push(PendingDirectory {
+                                prefix: path,
+                                entries,
+                                next_index: 0,
+                            });
+                        }
+                        Err(error) => return Some(Err(error)),
                     }
-                    Err(error) => return Some(Err(error)),
-                },
+                }
                 "file" => match read_file_object(self.object_store.as_ref(), &entry.object_id) {
                     Ok(_) => {
                         return Some(Ok(TreeWalkEntry {
                             path,
                             kind: "file".to_string(),
-                        }))
+                        }));
                     }
                     Err(error) => return Some(Err(error)),
                 },
@@ -275,7 +277,7 @@ impl Iterator for TreeWalkIter {
                     return Some(Err(anyhow::anyhow!(
                         "manifest store encountered unknown tree entry kind {}",
                         entry.kind
-                    )))
+                    )));
                 }
             }
         }
@@ -287,7 +289,10 @@ fn open_object_store(control_dir: &Path) -> Result<DirectLayoutObjectStore> {
     Ok(DirectLayoutObjectStore::new(control_dir, secrets))
 }
 
-fn read_snapshot_object(object_store: &dyn LogicalObjectStore, object_id: &str) -> Result<SnapshotObject> {
+fn read_snapshot_object(
+    object_store: &dyn LogicalObjectStore,
+    object_id: &str,
+) -> Result<SnapshotObject> {
     let snapshot: SnapshotObject = read_stored_object(object_store, object_id, "snapshot")?;
     validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
     Ok(snapshot)
@@ -309,7 +314,10 @@ fn read_directory_root_object(
     Ok(directory_root)
 }
 
-fn read_directory_entries(object_store: &dyn LogicalObjectStore, object_id: &str) -> Result<Vec<TreeEntry>> {
+fn read_directory_entries(
+    object_store: &dyn LogicalObjectStore,
+    object_id: &str,
+) -> Result<Vec<TreeEntry>> {
     match read_tree_object(object_store, object_id) {
         Ok(tree) => return Ok(tree.entries),
         Err(error) => {
@@ -336,7 +344,10 @@ fn read_file_object(object_store: &dyn LogicalObjectStore, object_id: &str) -> R
     Ok(file)
 }
 
-fn read_tree_shard_object(object_store: &dyn LogicalObjectStore, object_id: &str) -> Result<TreeShardObject> {
+fn read_tree_shard_object(
+    object_store: &dyn LogicalObjectStore,
+    object_id: &str,
+) -> Result<TreeShardObject> {
     let tree_shard: TreeShardObject = read_stored_object(object_store, object_id, "tree_shard")?;
     validate_manifest_schema_version("tree_shard", tree_shard.schema_version)?;
     Ok(tree_shard)
@@ -417,9 +428,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use e2v_store::logical_object_store::LogicalObjectStore;
+    use crate::keyring::{
+        KeyringPointer, KeyringState, seal_repo_secrets, unlock_repo_secrets_uncached,
+    };
     use e2v_store::RepoSecrets;
-    use crate::keyring::{seal_repo_secrets, unlock_repo_secrets_uncached, KeyringPointer, KeyringState};
+    use e2v_store::logical_object_store::LogicalObjectStore;
 
     fn store_for_tests() -> DirectLayoutObjectStore {
         let temp = tempdir().unwrap();
@@ -536,25 +549,16 @@ mod tests {
             active_epoch: 1,
             crypto_suite: "xchacha20poly1305".to_string(),
             kdf: "argon2id".to_string(),
-            envelopes: vec![seal_repo_secrets(
-                "repo",
-                1,
-                "password",
-                &secrets_one,
-                "len:8".to_string(),
-            )
-            .unwrap()],
+            envelopes: vec![
+                seal_repo_secrets("repo", 1, "password", &secrets_one, "len:8".to_string())
+                    .unwrap(),
+            ],
         };
         let mut keyring_two = keyring_one.clone();
         keyring_two.generation = 2;
-        keyring_two.envelopes = vec![seal_repo_secrets(
-            "repo",
-            1,
-            "password",
-            &secrets_two,
-            "len:8".to_string(),
-        )
-        .unwrap()];
+        keyring_two.envelopes = vec![
+            seal_repo_secrets("repo", 1, "password", &secrets_two, "len:8".to_string()).unwrap(),
+        ];
 
         fs::write(
             control_dir.join("keyring").join("keyring.1"),
@@ -604,14 +608,9 @@ mod tests {
             active_epoch: 1,
             crypto_suite: "xchacha20poly1305".to_string(),
             kdf: "argon2id".to_string(),
-            envelopes: vec![seal_repo_secrets(
-                "repo",
-                1,
-                "password",
-                &secrets,
-                "len:8".to_string(),
-            )
-            .unwrap()],
+            envelopes: vec![
+                seal_repo_secrets("repo", 1, "password", &secrets, "len:8".to_string()).unwrap(),
+            ],
         };
 
         fs::write(
@@ -632,8 +631,7 @@ mod tests {
         let error = unlock_repo_secrets_uncached(&control_dir, "password").unwrap_err();
 
         assert!(
-            error.to_string().contains("generation")
-                || error.to_string().contains("mismatch"),
+            error.to_string().contains("generation") || error.to_string().contains("mismatch"),
             "unexpected error: {error:#}"
         );
     }

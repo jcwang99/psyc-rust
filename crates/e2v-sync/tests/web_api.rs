@@ -202,6 +202,56 @@ async fn snapshot_file_api_downloads_full_file() {
 }
 
 #[tokio::test]
+async fn snapshot_file_api_downloads_empty_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("empty.txt"), []).unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "empty-file".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=empty.txt",
+                    commit.snapshot_id
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .unwrap(),
+        "0"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
 async fn snapshot_file_api_honors_single_byte_range_requests() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -252,6 +302,246 @@ async fn snapshot_file_api_honors_single_byte_range_requests() {
         .await
         .unwrap();
     assert_eq!(body.as_ref(), b"hello");
+}
+
+#[tokio::test]
+async fn snapshot_file_api_honors_suffix_byte_range_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::create_dir_all(repo_root.join("nested")).unwrap();
+    std::fs::write(
+        repo_root.join("nested").join("child.txt"),
+        b"hello from child",
+    )
+    .unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "suffix-range".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=nested/child.txt",
+                    commit.snapshot_id
+                ))
+                .header(http::header::RANGE, "bytes=-5")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_RANGE).unwrap(),
+        "bytes 11-15/16"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"child");
+}
+
+#[tokio::test]
+async fn snapshot_file_api_honors_open_ended_byte_range_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::create_dir_all(repo_root.join("nested")).unwrap();
+    std::fs::write(
+        repo_root.join("nested").join("child.txt"),
+        b"hello from child",
+    )
+    .unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "open-ended-range".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=nested/child.txt",
+                    commit.snapshot_id
+                ))
+                .header(http::header::RANGE, "bytes=6-")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_RANGE).unwrap(),
+        "bytes 6-15/16"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"from child");
+}
+
+#[tokio::test]
+async fn snapshot_file_api_returns_416_for_empty_file_range_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("empty.txt"), []).unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "empty-range".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=empty.txt",
+                    commit.snapshot_id
+                ))
+                .header(http::header::RANGE, "bytes=0-0")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_RANGE).unwrap(),
+        "bytes */0"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_file_api_rejects_empty_suffix_range_form() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::create_dir_all(repo_root.join("nested")).unwrap();
+    std::fs::write(
+        repo_root.join("nested").join("child.txt"),
+        b"hello from child",
+    )
+    .unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "bad-empty-suffix-range".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=nested/child.txt",
+                    commit.snapshot_id
+                ))
+                .header(http::header::RANGE, "bytes=-")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn snapshot_file_api_rejects_range_headers_with_internal_whitespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::create_dir_all(repo_root.join("nested")).unwrap();
+    std::fs::write(
+        repo_root.join("nested").join("child.txt"),
+        b"hello from child",
+    )
+    .unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "range-whitespace".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=nested/child.txt",
+                    commit.snapshot_id
+                ))
+                .header(http::header::RANGE, "bytes= 0-4")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -532,6 +822,141 @@ async fn tampered_snapshot_tree_api_returns_internal_server_error() {
         .unwrap();
 
     assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn tampered_snapshot_file_api_returns_internal_server_error_instead_of_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("hello.txt"), b"hello web").unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tampered-file-object".to_string(),
+        })
+        .unwrap();
+
+    let object_ids = e2v_core::sync_support::list_local_object_files(&repo_root).unwrap();
+    let file_object_path = object_ids
+        .into_iter()
+        .find(|path| {
+            let id = path.file_stem().unwrap().to_string_lossy().to_string();
+            e2v_core::RepositoryFacade::new()
+                .verify_object(&repo_root, &id, "file")
+                .is_ok()
+        })
+        .unwrap();
+    let mut bytes = std::fs::read(&file_object_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    std::fs::write(&file_object_path, bytes).unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/snapshots/{}/file?path=hello.txt",
+                    commit.snapshot_id
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn tampered_branch_tree_api_returns_internal_server_error_instead_of_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    let state = facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("hello.txt"), b"hello web").unwrap();
+    facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tampered-branch-ref".to_string(),
+        })
+        .unwrap();
+
+    let ref_path = repo_root.join(".e2v").join("refs").join("default.json");
+    let mut bytes = std::fs::read(&ref_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    std::fs::write(&ref_path, bytes).unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!(
+                    "/api/branches/{}/tree?path=",
+                    state.branch.token_hex
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn snapshot_file_api_returns_bad_request_for_empty_file_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("hello.txt"), b"hello web").unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "invalid-logical-path".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/api/snapshots/{}/file?path=", commit.snapshot_id))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

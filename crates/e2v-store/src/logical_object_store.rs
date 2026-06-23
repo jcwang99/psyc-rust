@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use getrandom::fill as getrandom_fill;
+use std::path::{Path, PathBuf};
 
 use crate::local_backend::LocalFolderBackend;
 
@@ -72,8 +72,13 @@ impl DirectLayoutObjectStore {
         let padding_policy = self.padding_policy_for(object_type);
         let padded_plaintext = self.apply_padding_policy(object_type, plaintext, padding_policy)?;
         let nonce = self.nonce_for(object_type, &object_id, padding_policy)?;
-        let (ciphertext, auth_tag) =
-            self.encrypt_object(&object_id, object_type, padding_policy, &nonce, &padded_plaintext)?;
+        let (ciphertext, auth_tag) = self.encrypt_object(
+            &object_id,
+            object_type,
+            padding_policy,
+            &nonce,
+            &padded_plaintext,
+        )?;
         let envelope = EncryptedObjectEnvelope {
             format_version: ENVELOPE_FORMAT_VERSION,
             object_type: object_type.to_string(),
@@ -140,11 +145,14 @@ impl DirectLayoutObjectStore {
     }
 
     pub fn exists_object(&self, object_id: &str) -> bool {
-        self.backend.exists_object(&self.relative_object_path(object_id))
+        self.backend
+            .exists_object(&self.relative_object_path(object_id))
     }
 
     pub fn object_path(&self, object_id: &str) -> PathBuf {
-        self.control_dir.join("objects").join(format!("{object_id}.json"))
+        self.control_dir
+            .join("objects")
+            .join(format!("{object_id}.json"))
     }
 
     pub fn resolve_object(&self, object_id: &str) -> Result<PhysicalObjectRef> {
@@ -172,7 +180,12 @@ impl DirectLayoutObjectStore {
         hex::encode(hash.as_bytes())
     }
 
-    fn derive_nonce(&self, object_id: &str, object_type: &str, padding_policy: &str) -> [u8; NONCE_SIZE] {
+    fn derive_nonce(
+        &self,
+        object_id: &str,
+        object_type: &str,
+        padding_policy: &str,
+    ) -> [u8; NONCE_SIZE] {
         let mut hasher = Hasher::new_keyed(&self.secrets.repo_nonce_key);
         hasher.update(object_id.as_bytes());
         hasher.update(object_type.as_bytes());
@@ -196,7 +209,8 @@ impl DirectLayoutObjectStore {
         }
 
         let mut nonce = [0u8; NONCE_SIZE];
-        getrandom_fill(&mut nonce).map_err(|_| anyhow::anyhow!("failed to obtain random object nonce"))?;
+        getrandom_fill(&mut nonce)
+            .map_err(|_| anyhow::anyhow!("failed to obtain random object nonce"))?;
         Ok(nonce)
     }
 
@@ -222,8 +236,11 @@ impl DirectLayoutObjectStore {
 
     fn decrypt_object(&self, envelope: &EncryptedObjectEnvelope) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new((&self.secrets.repo_manifest_enc_key).into());
-        let associated_data =
-            self.associated_data(&envelope.object_id, &envelope.object_type, &envelope.padding_policy);
+        let associated_data = self.associated_data(
+            &envelope.object_id,
+            &envelope.object_type,
+            &envelope.padding_policy,
+        );
         let mut buffer = envelope.ciphertext.clone();
 
         cipher
@@ -270,7 +287,8 @@ impl DirectLayoutObjectStore {
         }
 
         let mut seed = [0u8; 1];
-        getrandom_fill(&mut seed).map_err(|_| anyhow::anyhow!("failed to obtain random padding seed"))?;
+        getrandom_fill(&mut seed)
+            .map_err(|_| anyhow::anyhow!("failed to obtain random padding seed"))?;
         let pad_len = (seed[0] as usize % 32) + 1;
         let mut bytes = Vec::with_capacity(4 + plaintext.len() + pad_len);
         bytes.extend_from_slice(&(pad_len as u32).to_le_bytes());
@@ -288,7 +306,10 @@ impl DirectLayoutObjectStore {
         let mut pad_len_bytes = [0u8; 4];
         pad_len_bytes.copy_from_slice(&plaintext[..4]);
         let pad_len = u32::from_le_bytes(pad_len_bytes) as usize;
-        ensure!(plaintext.len() >= 4 + pad_len, "object authentication failed");
+        ensure!(
+            plaintext.len() >= 4 + pad_len,
+            "object authentication failed"
+        );
         let end = plaintext.len() - pad_len;
         Ok(plaintext[4..end].to_vec())
     }
@@ -355,7 +376,10 @@ impl EncryptedObjectEnvelope {
 
     fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cursor = 0usize;
-        ensure!(bytes.len() >= ENVELOPE_MAGIC.len(), "object authentication failed");
+        ensure!(
+            bytes.len() >= ENVELOPE_MAGIC.len(),
+            "object authentication failed"
+        );
 
         let magic = take_exact(bytes, &mut cursor, ENVELOPE_MAGIC.len())?;
         ensure!(magic == ENVELOPE_MAGIC, "object authentication failed");
@@ -416,7 +440,10 @@ fn take_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
 }
 
 fn take_exact<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
-    ensure!(bytes.len().saturating_sub(*cursor) >= len, "object authentication failed");
+    ensure!(
+        bytes.len().saturating_sub(*cursor) >= len,
+        "object authentication failed"
+    );
     let slice = &bytes[*cursor..*cursor + len];
     *cursor += len;
     Ok(slice)
@@ -434,7 +461,9 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    use super::{DirectLayoutObjectStore, EncryptedObjectEnvelope, LogicalObjectStore, RepoSecrets};
+    use super::{
+        DirectLayoutObjectStore, EncryptedObjectEnvelope, LogicalObjectStore, RepoSecrets,
+    };
 
     fn secrets(repo_id: &str) -> RepoSecrets {
         RepoSecrets {
@@ -531,8 +560,7 @@ mod tests {
         let error = store_b.get_object(&object_id, "chunk").unwrap_err();
 
         assert!(
-            error.to_string().contains("authentication")
-                || error.to_string().contains("mismatch"),
+            error.to_string().contains("authentication") || error.to_string().contains("mismatch"),
             "unexpected error: {error:#}"
         );
     }
@@ -657,7 +685,8 @@ mod tests {
 
         let object_type_len = bytes[8] as usize;
         let crypto_suite_len = bytes[9 + object_type_len] as usize;
-        let nonce_len_index = 9 + object_type_len + 1 + crypto_suite_len + 4 + 1 + "none".len() + 1 + 64;
+        let nonce_len_index =
+            9 + object_type_len + 1 + crypto_suite_len + 4 + 1 + "none".len() + 1 + 64;
         bytes[nonce_len_index] = 0;
         fs::write(&object_path, &bytes).unwrap();
 
@@ -712,7 +741,8 @@ mod tests {
         let bytes = fs::read(store.object_path(&object_id)).unwrap();
 
         assert!(
-            bytes.windows("randomized-manifest-padding".len())
+            bytes
+                .windows("randomized-manifest-padding".len())
                 .any(|window| window == b"randomized-manifest-padding")
         );
     }

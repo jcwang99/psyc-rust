@@ -105,7 +105,12 @@ impl BlobStore for S3CompatibleMockBackend {
         self.inner.get_physical(relative_path)
     }
 
-    fn get_physical_range(&self, relative_path: &str, offset: usize, length: usize) -> Result<Vec<u8>> {
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         self.inner.get_physical_range(relative_path, offset, length)
     }
 
@@ -136,7 +141,12 @@ impl BlobStore for OpendalMemoryBackend {
         Ok(self.operator.read(relative_path)?.to_vec())
     }
 
-    fn get_physical_range(&self, relative_path: &str, offset: usize, length: usize) -> Result<Vec<u8>> {
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         let bytes = self.get_physical(relative_path)?;
         anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
         let end = offset.saturating_add(length).min(bytes.len());
@@ -232,10 +242,7 @@ impl RefStore for OpendalMemoryBackend {
             },
             value: next,
         };
-        self.put_physical(
-            &Self::ref_path(token),
-            &serde_json::to_vec_pretty(&stored)?,
-        )?;
+        self.put_physical(&Self::ref_path(token), &serde_json::to_vec_pretty(&stored)?)?;
         Ok(CasResult {
             applied: true,
             current: Some(stored),
@@ -266,7 +273,9 @@ impl LayoutRootStore for OpendalMemoryBackend {
         if !self.exists_physical("layout_root.json") {
             return Ok(Self::default_layout_root());
         }
-        Ok(serde_json::from_slice(&self.get_physical("layout_root.json")?)?)
+        Ok(serde_json::from_slice(
+            &self.get_physical("layout_root.json")?,
+        )?)
     }
 
     fn compare_and_swap_layout_root(
@@ -361,7 +370,10 @@ mod tests {
 
         let listed = backend.list_physical("objects/").unwrap();
 
-        assert_eq!(listed, vec!["objects/a.bin".to_string(), "objects/b.bin".to_string()]);
+        assert_eq!(
+            listed,
+            vec!["objects/a.bin".to_string(), "objects/b.bin".to_string()]
+        );
     }
 
     #[test]
@@ -414,10 +426,7 @@ mod tests {
             .compare_and_swap_ref(&token, None, next_ref.clone())
             .unwrap();
         assert!(ref_result.applied);
-        assert_eq!(
-            reader.read_ref(&token).unwrap().unwrap().value,
-            next_ref
-        );
+        assert_eq!(reader.read_ref(&token).unwrap().unwrap().value, next_ref);
 
         let next_layout = LayoutRoot {
             schema_version: 1,

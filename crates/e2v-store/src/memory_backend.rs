@@ -80,7 +80,10 @@ impl RefStore for MemoryBackend {
         }
 
         let next_version = RefVersion {
-            value: current.as_ref().map(|stored| stored.version.value + 1).unwrap_or(1),
+            value: current
+                .as_ref()
+                .map(|stored| stored.version.value + 1)
+                .unwrap_or(1),
         };
         let stored = StoredRef {
             version: next_version,
@@ -112,7 +115,12 @@ impl BlobStore for MemoryBackend {
             .with_context(|| format!("missing physical object {relative_path}"))
     }
 
-    fn get_physical_range(&self, relative_path: &str, offset: usize, length: usize) -> Result<Vec<u8>> {
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         let bytes = self.get_physical(relative_path)?;
         anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
         let end = offset.saturating_add(length).min(bytes.len());
@@ -197,9 +205,7 @@ mod tests {
             .unwrap();
         assert!(initial.applied);
 
-        let stale = backend
-            .compare_and_swap_ref(&token, None, second)
-            .unwrap();
+        let stale = backend.compare_and_swap_ref(&token, None, second).unwrap();
         assert!(!stale.applied);
         assert_eq!(stale.current.unwrap().value, first);
     }
@@ -233,7 +239,9 @@ mod tests {
     #[test]
     fn delete_physical_removes_existing_object() {
         let backend = MemoryBackend::new();
-        backend.put_physical("objects/sample.bin", b"hello world").unwrap();
+        backend
+            .put_physical("objects/sample.bin", b"hello world")
+            .unwrap();
 
         backend.delete_physical("objects/sample.bin").unwrap();
 

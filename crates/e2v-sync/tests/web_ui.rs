@@ -229,6 +229,82 @@ async fn branch_page_url_encodes_directory_links_for_special_character_names() {
 }
 
 #[tokio::test]
+async fn snapshot_page_escapes_single_quotes_in_visible_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("report'oops.txt"), b"hello web").unwrap();
+    let commit = facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "single-quote-file".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/snapshots/{}?path=", commit.snapshot_id))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("report&#39;oops.txt"));
+    assert!(!text.contains("report'oops.txt"));
+}
+
+#[tokio::test]
+async fn missing_snapshot_page_escapes_single_quotes_in_error_message_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo'root");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/snapshots/does-not-exist?path=")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!text.contains("repo'root"));
+}
+
+#[tokio::test]
 async fn missing_snapshot_page_renders_readable_error_html() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -303,6 +379,54 @@ async fn tampered_snapshot_page_renders_internal_server_error_html() {
         .oneshot(
             http::Request::builder()
                 .uri(format!("/snapshots/{}?path=", commit.snapshot_id))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("<html"));
+    assert!(text.contains("Internal Server Error"));
+}
+
+#[tokio::test]
+async fn tampered_branch_page_renders_internal_server_error_html() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = e2v_core::RepositoryFacade::new();
+    let state = facade
+        .init(e2v_core::InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    std::fs::write(repo_root.join("hello.txt"), b"hello web").unwrap();
+    facade
+        .commit(e2v_core::CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "tampered-branch-page".to_string(),
+        })
+        .unwrap();
+
+    let ref_path = repo_root.join(".e2v").join("refs").join("default.json");
+    let mut bytes = std::fs::read(&ref_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    std::fs::write(&ref_path, bytes).unwrap();
+
+    let app = build_local_web_router(repo_root.clone());
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri(format!("/branches/{}?path=", state.branch.token_hex))
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
