@@ -69,6 +69,71 @@ impl OpendalMemoryBackend {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebdavVerifiedCapabilities {
+    pub supports_reliable_remote_time: bool,
+    pub supports_object_generation_or_etag: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebdavRemoteConfig {
+    pub flavor: WebdavFlavor,
+    pub endpoint: String,
+    pub root: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub token: Option<String>,
+    pub disable_create_dir: bool,
+    pub verified_capabilities: WebdavVerifiedCapabilities,
+}
+
+#[derive(Clone)]
+pub struct OpendalWebdavBackend {
+    operator: opendal::blocking::Operator,
+    capability: BackendCapability,
+    flavor: WebdavFlavor,
+}
+
+impl OpendalWebdavBackend {
+    pub fn new(config: WebdavRemoteConfig) -> Result<Self> {
+        anyhow::ensure!(
+            !config.endpoint.trim().is_empty(),
+            "webdav endpoint must not be empty"
+        );
+        anyhow::ensure!(
+            !config.root.trim().is_empty(),
+            "webdav root must not be empty"
+        );
+
+        let _guard = OPENDAL_RUNTIME.enter();
+        let mut builder = opendal::services::Webdav::default()
+            .endpoint(&config.endpoint)
+            .root(&config.root)
+            .disable_create_dir(config.disable_create_dir);
+        if let Some(username) = &config.username {
+            builder = builder.username(username);
+        }
+        if let Some(password) = &config.password {
+            builder = builder.password(password);
+        }
+        if let Some(token) = &config.token {
+            builder = builder.token(token);
+        }
+
+        let operator = opendal::blocking::Operator::new(opendal::Operator::new(builder)?.finish())?;
+
+        Ok(Self {
+            operator,
+            capability: webdav_capability(&config.verified_capabilities),
+            flavor: config.flavor,
+        })
+    }
+
+    pub fn flavor(&self) -> WebdavFlavor {
+        self.flavor
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct S3CompatibleMockBackend {
     inner: crate::memory_backend::MemoryBackend,
@@ -96,7 +161,101 @@ impl S3CompatibleMockBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebdavFlavor {
+    Webdav,
+    Alist,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebdavAlistMockBackend {
+    inner: crate::memory_backend::MemoryBackend,
+    capability: BackendCapability,
+    flavor: WebdavFlavor,
+}
+
+impl WebdavAlistMockBackend {
+    pub fn webdav() -> Self {
+        Self::with_capability(WebdavFlavor::Webdav, false)
+    }
+
+    pub fn alist() -> Self {
+        Self::with_capability(WebdavFlavor::Alist, false)
+    }
+
+    pub fn verified_single_writer(flavor: WebdavFlavor) -> Self {
+        Self::with_capability(flavor, true)
+    }
+
+    pub fn flavor(&self) -> WebdavFlavor {
+        self.flavor
+    }
+
+    fn with_capability(flavor: WebdavFlavor, verified_single_writer: bool) -> Self {
+        Self {
+            inner: crate::memory_backend::MemoryBackend::new(),
+            capability: webdav_capability(&WebdavVerifiedCapabilities {
+                supports_reliable_remote_time: verified_single_writer,
+                supports_object_generation_or_etag: verified_single_writer,
+            }),
+            flavor,
+        }
+    }
+}
+
+fn webdav_capability(verified_capabilities: &WebdavVerifiedCapabilities) -> BackendCapability {
+    BackendCapability {
+        supports_conditional_put: false,
+        supports_range_read: true,
+        supports_atomic_rename: false,
+        supports_paged_list: false,
+        consistency_class: ConsistencyClass::UnknownOrEventual,
+        supports_remote_lock_or_lease: true,
+        supports_transaction_markers: true,
+        supports_reliable_remote_time: verified_capabilities.supports_reliable_remote_time,
+        supports_object_generation_or_etag: verified_capabilities
+            .supports_object_generation_or_etag,
+        supports_layout_root_cas: false,
+        supports_oblivious_access_schedule: false,
+    }
+}
+
 impl BlobStore for S3CompatibleMockBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl BlobStore for WebdavAlistMockBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
         self.inner.put_physical(relative_path, bytes)
     }
@@ -190,7 +349,83 @@ impl BlobStore for OpendalMemoryBackend {
     }
 }
 
+impl BlobStore for OpendalWebdavBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+        self.operator.write(relative_path, bytes.to_vec())?;
+        Ok(())
+    }
+
+    fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+        Ok(self.operator.read(relative_path)?.to_vec())
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self.get_physical(relative_path)?;
+        anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
+        let end = offset.saturating_add(length).min(bytes.len());
+        Ok(bytes[offset..end].to_vec())
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> Result<()> {
+        if self.exists_physical(relative_path) {
+            self.operator.delete(relative_path)?;
+        }
+        Ok(())
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.operator.exists(relative_path).unwrap_or(false)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+        let metadata = self.operator.stat(relative_path)?;
+        Ok(ObjectStat {
+            length: metadata.content_length(),
+        })
+    }
+
+    fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut listed = self
+            .operator
+            .list(prefix)?
+            .into_iter()
+            .filter_map(|entry: opendal::Entry| {
+                let path = entry.path().to_string();
+                if path == prefix || path.ends_with('/') {
+                    None
+                } else {
+                    Some(path)
+                }
+            })
+            .collect::<Vec<_>>();
+        listed.sort();
+        Ok(listed)
+    }
+}
+
 impl RefStore for S3CompatibleMockBackend {
+    fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+        token.validate()?;
+        self.inner.read_ref(token)
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> Result<CasResult> {
+        token.validate()?;
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl RefStore for WebdavAlistMockBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
         token.validate()?;
         self.inner.read_ref(token)
@@ -254,7 +489,75 @@ impl RefStore for OpendalMemoryBackend {
     }
 }
 
+impl RefStore for OpendalWebdavBackend {
+    fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+        token.validate()?;
+        let path = OpendalMemoryBackend::ref_path(token);
+        if !self.exists_physical(&path) {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&self.get_physical(&path)?)?))
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> Result<CasResult> {
+        token.validate()?;
+        let current = self.read_ref(token)?;
+        let matches = match (&current, expected) {
+            (None, None) => true,
+            (Some(stored), Some(expected_version)) => stored.version == expected_version,
+            _ => false,
+        };
+        if !matches {
+            return Ok(CasResult {
+                applied: false,
+                current,
+            });
+        }
+
+        let stored = StoredRef {
+            version: RefVersion {
+                value: current
+                    .as_ref()
+                    .map(|existing| existing.version.value + 1)
+                    .unwrap_or(1),
+            },
+            value: next,
+        };
+        self.put_physical(
+            &OpendalMemoryBackend::ref_path(token),
+            &serde_json::to_vec_pretty(&stored)?,
+        )?;
+        Ok(CasResult {
+            applied: true,
+            current: Some(stored),
+        })
+    }
+}
+
 impl LayoutRootStore for S3CompatibleMockBackend {
+    fn read_layout_root(&self) -> Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: LayoutRootVersion,
+        next: LayoutRoot,
+    ) -> Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl LayoutRootStore for WebdavAlistMockBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
         self.inner.read_layout_root()
     }
@@ -317,13 +620,73 @@ impl LayoutRootStore for OpendalMemoryBackend {
     }
 }
 
+impl LayoutRootStore for OpendalWebdavBackend {
+    fn read_layout_root(&self) -> Result<LayoutRoot> {
+        if !self.exists_physical("layout_root.json") {
+            return Ok(OpendalMemoryBackend::default_layout_root());
+        }
+        Ok(serde_json::from_slice(
+            &self.get_physical("layout_root.json")?,
+        )?)
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: LayoutRootVersion,
+        next: LayoutRoot,
+    ) -> Result<CasResult> {
+        let current = self.read_layout_root()?;
+        if current.generation != expected {
+            return Ok(CasResult {
+                applied: false,
+                current: None,
+            });
+        }
+
+        let bytes = serde_json::to_vec_pretty(&next)?;
+        self.put_physical("layout_root.json", &bytes)?;
+        self.put_physical(
+            &OpendalMemoryBackend::layout_history_path(next.generation),
+            &bytes,
+        )?;
+        Ok(CasResult {
+            applied: true,
+            current: None,
+        })
+    }
+
+    fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
+        let retained_paths = self.list_physical("control/layout-roots/")?;
+        if retained_paths.is_empty() {
+            return Ok(vec![self.read_layout_root()?]);
+        }
+
+        retained_paths
+            .into_iter()
+            .map(|path| serde_json::from_slice(&self.get_physical(&path)?).map_err(Into::into))
+            .collect()
+    }
+}
+
 impl RemoteBackend for S3CompatibleMockBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }
 }
 
+impl RemoteBackend for WebdavAlistMockBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
 impl RemoteBackend for OpendalMemoryBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+impl RemoteBackend for OpendalWebdavBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }
@@ -338,6 +701,7 @@ impl RemoteBackend for crate::memory_backend::MemoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WriterMode;
 
     #[test]
     fn s3_compatible_backend_defaults_to_unknown_or_eventual_consistency() {
@@ -473,5 +837,79 @@ mod tests {
                 .to_string()
                 .contains("path")
         );
+    }
+
+    #[test]
+    fn webdav_and_alist_backends_default_to_conservative_single_writer_capabilities() {
+        for backend in [
+            WebdavAlistMockBackend::webdav(),
+            WebdavAlistMockBackend::alist(),
+        ] {
+            assert_eq!(
+                backend.capability().consistency_class,
+                ConsistencyClass::UnknownOrEventual
+            );
+            assert!(!backend.capability().supports_conditional_put);
+            assert!(backend.capability().supports_remote_lock_or_lease);
+            assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
+            assert_eq!(backend.capability().push_write_mode(), WriterMode::ReadOnly);
+            assert!(!backend.capability().supports_safe_single_writer_push());
+        }
+    }
+
+    #[test]
+    fn verified_webdav_backend_enables_safe_single_writer_push() {
+        let backend = WebdavAlistMockBackend::verified_single_writer(WebdavFlavor::Webdav);
+
+        assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
+        assert_eq!(
+            backend.capability().push_write_mode(),
+            WriterMode::SingleWriter
+        );
+        assert!(backend.capability().supports_safe_single_writer_push());
+    }
+
+    #[test]
+    fn opendal_webdav_backend_defaults_to_conservative_capabilities() {
+        let backend = OpendalWebdavBackend::new(WebdavRemoteConfig {
+            flavor: WebdavFlavor::Webdav,
+            endpoint: "https://example.com/dav".to_string(),
+            root: "/repo".to_string(),
+            username: Some("alice".to_string()),
+            password: Some("secret".to_string()),
+            token: None,
+            disable_create_dir: false,
+            verified_capabilities: WebdavVerifiedCapabilities::default(),
+        })
+        .unwrap();
+
+        assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
+        assert_eq!(backend.capability().push_write_mode(), WriterMode::ReadOnly);
+        assert!(!backend.capability().supports_safe_single_writer_push());
+    }
+
+    #[test]
+    fn opendal_alist_backend_can_enable_verified_single_writer_profile() {
+        let backend = OpendalWebdavBackend::new(WebdavRemoteConfig {
+            flavor: WebdavFlavor::Alist,
+            endpoint: "https://example.com/alist/dav".to_string(),
+            root: "/repo".to_string(),
+            username: None,
+            password: None,
+            token: Some("bearer-token".to_string()),
+            disable_create_dir: true,
+            verified_capabilities: WebdavVerifiedCapabilities {
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
+        assert_eq!(
+            backend.capability().push_write_mode(),
+            WriterMode::SingleWriter
+        );
+        assert!(backend.capability().supports_safe_single_writer_push());
     }
 }

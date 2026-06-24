@@ -38,4 +38,20 @@ impl BackendCapability {
             WriterMode::ReadOnly
         }
     }
+
+    pub fn supports_safe_single_writer_push(&self) -> bool {
+        self.supports_remote_lock_or_lease
+            && self.supports_transaction_markers
+            && (self.supports_reliable_remote_time || self.supports_object_generation_or_etag)
+    }
+
+    pub fn push_write_mode(&self) -> WriterMode {
+        if self.supports_conditional_put {
+            WriterMode::MultiWriter
+        } else if self.supports_safe_single_writer_push() {
+            WriterMode::SingleWriter
+        } else {
+            WriterMode::ReadOnly
+        }
+    }
 }

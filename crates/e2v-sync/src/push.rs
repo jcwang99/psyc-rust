@@ -11,9 +11,7 @@ use crate::bundle::{
     BundledObjectLocation, ObjectBundleBuilder, bundle_paths, load_remote_bundle_locations,
     load_remote_operation_bundle_locations,
 };
-use crate::journal::{
-    OperationId, OperationJournal, OperationMetadata, validate_sync_identifier,
-};
+use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_sync_identifier};
 use crate::object_type::infer_object_type_from_hint;
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::transaction::{PublishPlan, PublishedObject};
@@ -178,8 +176,7 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
                 },
                 Err(_) => return false,
             };
-            let bundle_bytes = match remote.get_physical_range(&location.data_path, 0, bundle_len)
-            {
+            let bundle_bytes = match remote.get_physical_range(&location.data_path, 0, bundle_len) {
                 Ok(bytes) => bytes,
                 Err(_) => return false,
             };
@@ -297,26 +294,26 @@ fn remote_object_authenticates_for_resume<R: RemoteBackend>(
 
     let (remote_loose_object_ids, remote_bundle_locations) =
         ensure_remote_object_inventory_loaded(remote, fallback_inventory)?;
-    Ok(inventory_has_object(
-        remote_loose_object_ids,
-        remote_bundle_locations,
-        object_id,
-    ) && remote_object_authenticates_for_repo(
-        repo_root,
-        remote,
-        remote_bundle_locations,
-        bundle_cache,
-        object_id,
-        expected_type,
-    ))
+    Ok(
+        inventory_has_object(remote_loose_object_ids, remote_bundle_locations, object_id)
+            && remote_object_authenticates_for_repo(
+                repo_root,
+                remote,
+                remote_bundle_locations,
+                bundle_cache,
+                object_id,
+                expected_type,
+            ),
+    )
 }
 
 fn infer_object_type_for_resume_candidate(repo_root: &Path, object_id: &str) -> &'static str {
     let facade = RepositoryFacade::new();
-    let hint = e2v_core::sync_support::read_local_object_type_hint(repo_root, object_id)
-        .ok();
+    let hint = e2v_core::sync_support::read_local_object_type_hint(repo_root, object_id).ok();
     infer_object_type_from_hint(hint.as_deref(), |object_type| {
-        facade.verify_object(repo_root, object_id, object_type).is_ok()
+        facade
+            .verify_object(repo_root, object_id, object_type)
+            .is_ok()
     })
 }
 
@@ -419,7 +416,8 @@ where
     if let Some(builder) = bundle_builder {
         if !bundled_object_ids.is_empty() {
             let (index, payload) = builder.finish();
-            let (_, data_path, index_path) = bundle_paths(&operation_id.value, *bundle_batch_index)?;
+            let (_, data_path, index_path) =
+                bundle_paths(&operation_id.value, *bundle_batch_index)?;
             remote.put_physical(&data_path, &payload)?;
             remote.put_physical(&index_path, &serde_json::to_vec_pretty(&index)?)?;
             *bundle_batch_index += 1;
@@ -672,7 +670,7 @@ pub fn push_head<R: RemoteBackend + Clone>(
         operation_id: operation_id.clone(),
         target_branch_token: options.branch_token.clone(),
         expected_ref_version,
-        writer_mode: remote.capability().writer_mode(),
+        writer_mode: remote.capability().push_write_mode(),
     })?;
     let session = crate::transaction::PublishSession {
         next_layout_root: Some(layout_root.clone()),
@@ -687,7 +685,11 @@ pub fn push_head<R: RemoteBackend + Clone>(
     let missing_object_ids = reachable_object_ids
         .iter()
         .filter(|object_id| {
-            !inventory_has_object(&remote_loose_object_ids, &remote_bundle_locations, object_id)
+            !inventory_has_object(
+                &remote_loose_object_ids,
+                &remote_bundle_locations,
+                object_id,
+            )
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -824,7 +826,8 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     }
 
     if !saw_journal_objects {
-        let (remote_loose_object_ids, remote_bundle_locations) = load_remote_object_inventory(remote)?;
+        let (remote_loose_object_ids, remote_bundle_locations) =
+            load_remote_object_inventory(remote)?;
         let manifest_store = ManifestStore::new(&options.repo_root);
         let reachable_object_ids =
             manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
@@ -897,7 +900,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         operation_id: operation_id.clone(),
         target_branch_token: branch_token.clone(),
         expected_ref_version,
-        writer_mode: remote.capability().writer_mode(),
+        writer_mode: remote.capability().push_write_mode(),
     })?;
     let session = crate::transaction::PublishSession {
         next_layout_root: Some(layout_root.clone()),
@@ -970,7 +973,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_object_authentication_rejects_path_traversal_object_id_without_writing_outside_repo() {
+    fn remote_object_authentication_rejects_path_traversal_object_id_without_writing_outside_repo()
+    {
         let temp = tempdir().unwrap();
         let repo_root = temp.path().join("repo");
         fs::create_dir_all(&repo_root).unwrap();
@@ -1041,7 +1045,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_snapshot_graph_authentication_rejects_path_traversal_snapshot_id_without_writing_outside_repo() {
+    fn remote_snapshot_graph_authentication_rejects_path_traversal_snapshot_id_without_writing_outside_repo()
+     {
         let temp = tempdir().unwrap();
         let repo_root = temp.path().join("repo");
         fs::create_dir_all(&repo_root).unwrap();

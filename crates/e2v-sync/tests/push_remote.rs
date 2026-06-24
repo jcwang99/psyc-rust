@@ -5,6 +5,7 @@ use e2v_core::{CommitOptions, InitOptions, ManifestStore, ManifestStoreApi, Repo
 use e2v_store::{
     BackendCapability, BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot,
     LayoutRootStore, MemoryBackend, RefStore, RefToken, RefVersion, RemoteBackend, StoredRef,
+    WebdavAlistMockBackend, WebdavFlavor,
 };
 use tempfile::tempdir;
 
@@ -742,6 +743,88 @@ fn push_uploads_reachable_objects_and_publishes_remote_ref() {
 }
 
 #[test]
+fn push_rejects_conservative_webdav_backend_by_default() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello webdav").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "webdav-risky-default".to_string(),
+        })
+        .unwrap();
+
+    let remote = WebdavAlistMockBackend::webdav();
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "webdav-risky-default-op".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("risky"));
+}
+
+#[test]
+fn push_uses_single_writer_lease_fallback_for_verified_webdav_backend() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello verified webdav").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "webdav-single-writer".to_string(),
+        })
+        .unwrap();
+
+    let remote = WebdavAlistMockBackend::verified_single_writer(WebdavFlavor::Webdav);
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "webdav-single-writer-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(pushed.published_snapshot_id, commit.snapshot_id);
+    assert!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_some()
+    );
+    assert!(!remote.exists_physical(&format!("leases/{}.lock", state.branch.token_hex)));
+}
+
+#[test]
 fn push_publishes_layout_root_through_transaction_publisher() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -945,8 +1028,7 @@ fn resume_avoids_per_object_remote_exists_checks_for_pending_objects() {
     let journal =
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
-    let operation_id =
-        e2v_sync::OperationId::new("resume-exists-scaling-op".to_string()).unwrap();
+    let operation_id = e2v_sync::OperationId::new("resume-exists-scaling-op".to_string()).unwrap();
     journal
         .begin_operation(
             &operation_id,
@@ -1269,7 +1351,9 @@ fn manifest_store_reachable_set_rejects_tampered_chunk_id_before_push_can_upload
 
     let manifest_store = ManifestStore::new(&repo_root);
     let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
-    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let root_tree = manifest_store
+        .get_tree_node(&snapshot.root_tree_id)
+        .unwrap();
     let file_entry = root_tree
         .entries
         .iter()
@@ -1300,7 +1384,10 @@ fn manifest_store_reachable_set_rejects_tampered_chunk_id_before_push_can_upload
     let mut tampered_snapshot = snapshot.clone();
     tampered_snapshot.root_tree_id = tampered_tree_id;
     let tampered_snapshot_id = object_store
-        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .put_object(
+            "snapshot",
+            &postcard::to_stdvec(&tampered_snapshot).unwrap(),
+        )
         .unwrap();
 
     let error = manifest_store
@@ -1745,8 +1832,7 @@ fn resume_counts_skipped_uploaded_objects_across_multiple_journal_batches() {
     let journal =
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
-    let operation_id =
-        e2v_sync::OperationId::new("resume-batched-count-op".to_string()).unwrap();
+    let operation_id = e2v_sync::OperationId::new("resume-batched-count-op".to_string()).unwrap();
     journal
         .begin_operation(
             &operation_id,
@@ -3572,7 +3658,11 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
 
     let clone_facade = RepositoryFacade::new();
     for version in 2..=5usize {
-        fs::write(clone_repo_root.join("rolling.txt"), format!("rolling-{version}")).unwrap();
+        fs::write(
+            clone_repo_root.join("rolling.txt"),
+            format!("rolling-{version}"),
+        )
+        .unwrap();
         clone_facade
             .commit(CommitOptions {
                 repo_root: clone_repo_root.clone(),

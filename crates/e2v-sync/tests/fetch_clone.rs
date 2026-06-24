@@ -1,12 +1,12 @@
 use std::fs;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use e2v_core::{CommitOptions, InitOptions, ManifestStoreApi, RepositoryFacade};
 use e2v_store::{
     BlobStore, DirectLayoutObjectStore, LayoutRootStore, MemoryBackend, OpendalMemoryBackend,
-    RefStore, RefToken, RemoteBackend, S3CompatibleMockBackend, StoredRef,
+    RefStore, RefToken, RemoteBackend, S3CompatibleMockBackend, StoredRef, WebdavAlistMockBackend,
 };
 use tempfile::tempdir;
 
@@ -359,11 +359,16 @@ impl RemoteBackend for GetTrackingBackend {
     }
 }
 
-fn add_unreachable_remote_chunk_object(remote: &MemoryBackend, repo_root: &std::path::Path) -> String {
+fn add_unreachable_remote_chunk_object(
+    remote: &MemoryBackend,
+    repo_root: &std::path::Path,
+) -> String {
     let control_dir = repo_root.join(".e2v");
     let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
     let object_store = DirectLayoutObjectStore::new(&control_dir, secrets);
-    let stray_object_id = object_store.put_object("chunk", b"unreachable remote object").unwrap();
+    let stray_object_id = object_store
+        .put_object("chunk", b"unreachable remote object")
+        .unwrap();
     let stray_bytes = fs::read(
         control_dir
             .join("objects")
@@ -477,7 +482,8 @@ fn fetch_does_not_read_unreachable_remote_loose_objects_when_repo_is_already_unl
     )
     .unwrap();
 
-    let stray_object_id = add_unreachable_remote_chunk_object(&tracked_remote.inner, &source_repo_root);
+    let stray_object_id =
+        add_unreachable_remote_chunk_object(&tracked_remote.inner, &source_repo_root);
     tracked_remote.reset_gets();
 
     let fetched = fetch_remote(
@@ -1749,7 +1755,10 @@ fn fetch_does_not_allow_unlocked_head_validation_to_write_outside_validation_roo
             || error.to_string().contains("path traversal"),
         "unexpected error: {error:#}"
     );
-    assert_eq!(fs::read(target_repo_root.join("keep.txt")).unwrap(), b"safe");
+    assert_eq!(
+        fs::read(target_repo_root.join("keep.txt")).unwrap(),
+        b"safe"
+    );
 }
 
 #[test]
@@ -3915,6 +3924,120 @@ fn sync_flows_work_with_opendal_memory_backend_adapter() {
     .unwrap_err();
     assert!(push_error.to_string().contains("read-only"));
 
+    for relative_path in e2v_core::sync_support::list_local_object_files(&source_repo_root)
+        .unwrap()
+        .into_iter()
+        .map(|path| {
+            let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let bytes = fs::read(&path).unwrap();
+            (format!("objects/{file_name}"), bytes)
+        })
+    {
+        remote
+            .put_physical(&relative_path.0, &relative_path.1)
+            .unwrap();
+    }
+    remote
+        .put_physical(
+            "control/config.json",
+            &e2v_core::sync_support::read_config_bytes(&source_repo_root).unwrap(),
+        )
+        .unwrap();
+    remote
+        .put_physical(
+            "control/refs/default.json",
+            &e2v_core::sync_support::read_default_ref_bytes(&source_repo_root).unwrap(),
+        )
+        .unwrap();
+    for keyring_file in e2v_core::sync_support::list_keyring_files(&source_repo_root).unwrap() {
+        let file_name = keyring_file.file_name().unwrap().to_str().unwrap();
+        remote
+            .put_physical(
+                &format!("control/keyring/{file_name}"),
+                &fs::read(&keyring_file).unwrap(),
+            )
+            .unwrap();
+    }
+    let layout_root = remote.read_layout_root().unwrap();
+    let next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
+        &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),
+    )
+    .unwrap();
+    remote
+        .compare_and_swap_layout_root(layout_root.generation, next_layout_root)
+        .unwrap();
+    remote
+        .compare_and_swap_ref(
+            &RefToken::new(state.branch.token_hex.clone()),
+            None,
+            e2v_store::EncryptedRef::new(
+                e2v_core::sync_support::read_default_ref_bytes(&source_repo_root).unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let fetch_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&fetch_repo_root).unwrap();
+    let local = RepositoryFacade::new();
+    local
+        .init(InitOptions {
+            repo_root: fetch_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: fetch_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert!(fetched.downloaded_objects > 0);
+
+    let clone_repo_root = temp.path().join("clone-target");
+    let cloned = clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert!(cloned.head_snapshot_id.is_some());
+}
+
+#[test]
+fn fetch_and_clone_work_with_conservative_webdav_backend_adapter() {
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(
+        source_repo_root.join("hello.txt"),
+        b"hello conservative webdav",
+    )
+    .unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "adapter-webdav".to_string(),
+        })
+        .unwrap();
+
+    let remote = WebdavAlistMockBackend::webdav();
     for relative_path in e2v_core::sync_support::list_local_object_files(&source_repo_root)
         .unwrap()
         .into_iter()

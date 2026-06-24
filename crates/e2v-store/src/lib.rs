@@ -16,8 +16,10 @@ pub use logical_object_store::{
     validate_object_id_value,
 };
 pub use memory_backend::MemoryBackend;
-pub use opendal_backend::{OpendalMemoryBackend, RemoteBackend, S3CompatibleMockBackend};
+pub use opendal_backend::{
+    OpendalMemoryBackend, OpendalWebdavBackend, RemoteBackend, S3CompatibleMockBackend,
+    WebdavAlistMockBackend, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
+};
 pub use ref_store::{
-    CasResult, EncryptedRef, RefStore, RefToken, RefVersion, StoredRef,
-    validate_ref_token_value,
+    CasResult, EncryptedRef, RefStore, RefToken, RefVersion, StoredRef, validate_ref_token_value,
 };

@@ -54,7 +54,13 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
 impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     fn begin(&self, plan: PublishPlan) -> Result<PublishSession> {
         validate_sync_identifier("branch token", &plan.target_branch_token)?;
-        let writer_mode = self.capability.writer_mode();
+        let advertised_writer_mode = self.capability.writer_mode();
+        let writer_mode = self.capability.push_write_mode();
+        if advertised_writer_mode == e2v_store::WriterMode::SingleWriter
+            && writer_mode == e2v_store::WriterMode::ReadOnly
+        {
+            anyhow::bail!("risky single-writer backend capabilities are disabled by default");
+        }
         anyhow::ensure!(
             writer_mode != e2v_store::WriterMode::ReadOnly,
             "read-only backend capabilities cannot publish"
@@ -488,6 +494,40 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn begin_rejects_risky_single_writer_backend_by_default() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: false,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: false,
+                supports_object_generation_or_etag: false,
+                supports_layout_root_cas: false,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            e2v_store::MemoryBackend::new(),
+        );
+
+        let error = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-risky-single-writer".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("risky"));
     }
 
     #[test]
