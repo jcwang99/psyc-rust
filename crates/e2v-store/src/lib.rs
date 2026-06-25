@@ -6,6 +6,7 @@ pub mod logical_object_store;
 pub mod memory_backend;
 pub mod opendal_backend;
 pub mod ref_store;
+pub mod storage_layout;
 
 pub use capability::{BackendCapability, ConsistencyClass, WriterMode};
 pub use layout::LayoutRoot;
@@ -21,5 +22,9 @@ pub use opendal_backend::{
     WebdavAlistMockBackend, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
 };
 pub use ref_store::{
-    CasResult, EncryptedRef, RefStore, RefToken, RefVersion, StoredRef, validate_ref_token_value,
+    CasResult, EncryptedRef, ListedRef, RefStore, RefToken, RefVersion, StoredRef,
+    validate_ref_token_value,
+};
+pub use storage_layout::{
+    DirectStorageLayout, LayoutObjectLocation, PackStorageLayout, StorageLayout,
 };

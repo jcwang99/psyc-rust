@@ -6,9 +6,13 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 e2v-core = { path = "../e2v-core" }
+e2v-sync = { path = "../e2v-sync" }
+e2v-store = { path = "../e2v-store" }
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

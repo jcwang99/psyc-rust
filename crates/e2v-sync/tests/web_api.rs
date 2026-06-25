@@ -1,10 +1,10 @@
 use std::pin::Pin;
 
 use axum::body::Body;
-use e2v_sync::{ServeOptions, build_local_web_router, serve_local_web};
-use e2v_core::ManifestStoreApi;
-use futures_util::future::poll_fn;
 use axum::body::HttpBody as _;
+use e2v_core::ManifestStoreApi;
+use e2v_sync::{ServeOptions, build_local_web_router, serve_local_web};
+use futures_util::future::poll_fn;
 use tower::util::ServiceExt;
 
 #[test]
@@ -1002,7 +1002,8 @@ async fn tampered_snapshot_file_api_returns_internal_server_error_instead_of_not
 }
 
 #[tokio::test]
-async fn snapshot_file_api_returns_internal_server_error_for_authenticated_file_with_empty_chunks() {
+async fn snapshot_file_api_returns_internal_server_error_for_authenticated_file_with_empty_chunks()
+{
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     std::fs::create_dir_all(&repo_root).unwrap();
@@ -1025,7 +1026,9 @@ async fn snapshot_file_api_returns_internal_server_error_for_authenticated_file_
 
     let manifest_store = e2v_core::ManifestStore::new(&repo_root);
     let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
-    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let root_tree = manifest_store
+        .get_tree_node(&snapshot.root_tree_id)
+        .unwrap();
     let file_entry = root_tree
         .entries
         .iter()
@@ -1056,7 +1059,10 @@ async fn snapshot_file_api_returns_internal_server_error_for_authenticated_file_
     let mut tampered_snapshot = snapshot.clone();
     tampered_snapshot.root_tree_id = tampered_tree_id;
     let tampered_snapshot_id = object_store
-        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .put_object(
+            "snapshot",
+            &postcard::to_stdvec(&tampered_snapshot).unwrap(),
+        )
         .unwrap();
 
     let app = build_local_web_router(repo_root.clone());

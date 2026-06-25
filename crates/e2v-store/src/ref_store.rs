@@ -53,6 +53,12 @@ pub struct StoredRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedRef {
+    pub token: RefToken,
+    pub stored: StoredRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasResult {
     pub applied: bool,
     pub current: Option<StoredRef>,
@@ -60,6 +66,7 @@ pub struct CasResult {
 
 pub trait RefStore {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>>;
+    fn list_refs(&self) -> Result<Vec<ListedRef>>;
     fn compare_and_swap_ref(
         &self,
         token: &RefToken,

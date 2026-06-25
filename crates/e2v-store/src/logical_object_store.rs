@@ -6,6 +6,7 @@ use getrandom::fill as getrandom_fill;
 use std::path::{Component, Path, PathBuf};
 
 use crate::local_backend::LocalFolderBackend;
+use crate::storage_layout::{DirectStorageLayout, LayoutObjectLocation, StorageLayout};
 
 const ENVELOPE_MAGIC: &[u8; 4] = b"E2V0";
 const ENVELOPE_FORMAT_VERSION: u32 = 1;
@@ -32,6 +33,17 @@ pub struct PhysicalObjectRef {
     pub container_id: String,
     pub offset: Option<u64>,
     pub length: u64,
+}
+
+impl PhysicalObjectRef {
+    pub fn pack(container_id: String, offset: u64, length: u64) -> Self {
+        Self {
+            layout_id: "pack".to_string(),
+            container_id,
+            offset: Some(offset),
+            length,
+        }
+    }
 }
 
 pub trait LogicalObjectStore {
@@ -180,11 +192,9 @@ impl DirectLayoutObjectStore {
         validate_object_id_value(object_id)?;
         let relative_path = self.relative_object_path(object_id);
         let bytes = self.backend.get_object(&relative_path)?;
-        Ok(PhysicalObjectRef {
-            layout_id: "direct".to_string(),
-            container_id: relative_path,
-            offset: None,
-            length: bytes.len() as u64,
+        DirectStorageLayout.resolve(LayoutObjectLocation::LooseObject {
+            object_id,
+            stored_len: bytes.len() as u64,
         })
     }
 
@@ -484,7 +494,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DirectLayoutObjectStore, EncryptedObjectEnvelope, LogicalObjectStore, RepoSecrets,
+        DirectLayoutObjectStore, EncryptedObjectEnvelope, LogicalObjectStore, PhysicalObjectRef,
+        RepoSecrets,
+    };
+    use crate::storage_layout::{
+        DirectStorageLayout, LayoutObjectLocation, PackStorageLayout, StorageLayout,
     };
 
     fn secrets(repo_id: &str) -> RepoSecrets {
@@ -542,6 +556,51 @@ mod tests {
         assert_eq!(reference.container_id, format!("objects/{object_id}.json"));
         assert_eq!(reference.offset, None);
         assert!(reference.length > 0);
+    }
+
+    #[test]
+    fn pack_physical_reference_records_container_offset_and_length() {
+        let reference = PhysicalObjectRef::pack("packs/data/pack-01.bin".to_string(), 128, 4096);
+
+        assert_eq!(reference.layout_id, "pack");
+        assert_eq!(reference.container_id, "packs/data/pack-01.bin");
+        assert_eq!(reference.offset, Some(128));
+        assert_eq!(reference.length, 4096);
+    }
+
+    #[test]
+    fn direct_storage_layout_resolves_loose_object_path() {
+        let layout = DirectStorageLayout;
+
+        let reference = layout
+            .resolve(LayoutObjectLocation::LooseObject {
+                object_id: "abc123",
+                stored_len: 42,
+            })
+            .unwrap();
+
+        assert_eq!(reference.layout_id, "direct");
+        assert_eq!(reference.container_id, "objects/abc123.json");
+        assert_eq!(reference.offset, None);
+        assert_eq!(reference.length, 42);
+    }
+
+    #[test]
+    fn pack_storage_layout_resolves_pack_container_offset_and_length() {
+        let layout = PackStorageLayout;
+
+        let reference = layout
+            .resolve(LayoutObjectLocation::PackedObject {
+                container_id: "packs/data/pack-01.bin",
+                offset: 128,
+                length: 4096,
+            })
+            .unwrap();
+
+        assert_eq!(reference.layout_id, "pack");
+        assert_eq!(reference.container_id, "packs/data/pack-01.bin");
+        assert_eq!(reference.offset, Some(128));
+        assert_eq!(reference.length, 4096);
     }
 
     #[test]
@@ -798,8 +857,7 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(
-            error.to_string().contains("path traversal")
-                || error.to_string().contains("relative"),
+            error.to_string().contains("path traversal") || error.to_string().contains("relative"),
             "unexpected error: {error:#}"
         );
     }

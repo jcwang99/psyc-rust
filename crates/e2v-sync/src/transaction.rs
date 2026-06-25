@@ -10,6 +10,7 @@ pub struct PublishPlan {
     pub operation_id: OperationId,
     pub target_branch_token: String,
     pub expected_ref_version: Option<u64>,
+    pub planned_snapshot_id: Option<String>,
     pub writer_mode: WriterMode,
 }
 

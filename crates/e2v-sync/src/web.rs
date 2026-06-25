@@ -10,7 +10,7 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use serde::Serialize;
 
 const STREAMING_FILE_CHUNK_BYTES: usize = 256 * 1024;
@@ -433,8 +433,8 @@ fn build_file_response(
     } else {
         let read_service = read_service.clone();
         let file = file.clone();
-        let remaining_chunks = stream::iter((1..file_size.div_ceil(STREAMING_FILE_CHUNK_BYTES)).map(
-            move |chunk_index| {
+        let remaining_chunks = stream::iter(
+            (1..file_size.div_ceil(STREAMING_FILE_CHUNK_BYTES)).map(move |chunk_index| {
                 let offset = chunk_index * STREAMING_FILE_CHUNK_BYTES;
                 let remaining = file_size.saturating_sub(offset);
                 let chunk_len = remaining.min(STREAMING_FILE_CHUNK_BYTES);
@@ -442,15 +442,12 @@ fn build_file_response(
                     .read_range(&file, offset, chunk_len)
                     .map(Bytes::from)
                     .map_err(|error| {
-                        std::io::Error::other(format!(
-                            "failed to stream repository file: {error}"
-                        ))
+                        std::io::Error::other(format!("failed to stream repository file: {error}"))
                     })
-            },
-        ));
-        let first_chunk_stream = stream::iter(std::iter::once(Ok::<Bytes, std::io::Error>(
-            first_chunk,
-        )));
+            }),
+        );
+        let first_chunk_stream =
+            stream::iter(std::iter::once(Ok::<Bytes, std::io::Error>(first_chunk)));
         Body::from_stream(first_chunk_stream.chain(remaining_chunks))
     };
 

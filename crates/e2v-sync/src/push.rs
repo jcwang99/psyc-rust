@@ -7,12 +7,13 @@ use anyhow::{Context, Result};
 use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
 use e2v_store::{EncryptedRef, LayoutRoot, RefToken, RemoteBackend, validate_object_id_value};
 
-use crate::bundle::{
-    BundledObjectLocation, ObjectBundleBuilder, bundle_paths, load_remote_bundle_locations,
-    load_remote_operation_bundle_locations,
-};
 use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_sync_identifier};
 use crate::object_type::infer_object_type_from_hint;
+use crate::pack::{ObjectPackBuilder, PackedObjectLocation, pack_paths};
+use crate::pack_index::{
+    encode_pack_index_segment_bytes_for_sync, load_remote_pack_locations_with_local_cache,
+    next_pack_index_segment_paths, publish_pack_index_root,
+};
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::transaction::{PublishPlan, PublishedObject};
 
@@ -45,43 +46,43 @@ pub struct ResumeResult {
 }
 
 const RESUME_OBJECT_BATCH_SIZE: usize = 128;
-const SMALL_OBJECT_BUNDLE_BATCH_SIZE: usize = 256;
+const SMALL_OBJECT_PACK_BATCH_SIZE: usize = 256;
 const SMALL_OBJECT_MAX_BYTES: usize = 1024 * 1024;
-const DEFAULT_SMALL_OBJECT_BUNDLE_THRESHOLD: usize = 100_000;
+const DEFAULT_SMALL_OBJECT_PACK_THRESHOLD: usize = 100_000;
 thread_local! {
-    static SMALL_OBJECT_BUNDLE_THRESHOLD_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    static SMALL_OBJECT_PACK_THRESHOLD_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-pub fn small_object_bundle_threshold() -> usize {
-    SMALL_OBJECT_BUNDLE_THRESHOLD_OVERRIDE.with(|override_cell| {
+pub fn small_object_pack_threshold() -> usize {
+    SMALL_OBJECT_PACK_THRESHOLD_OVERRIDE.with(|override_cell| {
         override_cell
             .get()
-            .unwrap_or(DEFAULT_SMALL_OBJECT_BUNDLE_THRESHOLD)
+            .unwrap_or(DEFAULT_SMALL_OBJECT_PACK_THRESHOLD)
     })
 }
 
-fn should_bundle_small_objects(object_count: usize) -> bool {
-    object_count >= small_object_bundle_threshold()
+fn should_pack_small_objects(object_count: usize) -> bool {
+    object_count >= small_object_pack_threshold()
 }
 
-pub fn override_small_object_bundle_threshold_for_test(
+pub fn override_small_object_pack_threshold_for_test(
     threshold: usize,
-) -> SmallObjectBundleThresholdGuard {
-    let previous = SMALL_OBJECT_BUNDLE_THRESHOLD_OVERRIDE.with(|override_cell| {
+) -> SmallObjectPackThresholdGuard {
+    let previous = SMALL_OBJECT_PACK_THRESHOLD_OVERRIDE.with(|override_cell| {
         let previous = override_cell.get();
         override_cell.set(Some(threshold));
         previous
     });
-    SmallObjectBundleThresholdGuard { previous }
+    SmallObjectPackThresholdGuard { previous }
 }
 
-pub struct SmallObjectBundleThresholdGuard {
+pub struct SmallObjectPackThresholdGuard {
     previous: Option<usize>,
 }
 
-impl Drop for SmallObjectBundleThresholdGuard {
+impl Drop for SmallObjectPackThresholdGuard {
     fn drop(&mut self) {
-        SMALL_OBJECT_BUNDLE_THRESHOLD_OVERRIDE.with(|override_cell| {
+        SMALL_OBJECT_PACK_THRESHOLD_OVERRIDE.with(|override_cell| {
             override_cell.set(self.previous);
         });
     }
@@ -96,10 +97,10 @@ fn local_object_path(repo_root: &Path, object_id: &str) -> PathBuf {
 
 fn inventory_has_object(
     loose_object_ids: &BTreeSet<String>,
-    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
     object_id: &str,
 ) -> bool {
-    loose_object_ids.contains(object_id) || bundle_locations.contains_key(object_id)
+    loose_object_ids.contains(object_id) || pack_locations.contains_key(object_id)
 }
 
 fn load_remote_loose_object_ids<R: RemoteBackend>(remote: &R) -> Result<BTreeSet<String>> {
@@ -119,26 +120,33 @@ fn load_remote_loose_object_ids<R: RemoteBackend>(remote: &R) -> Result<BTreeSet
 }
 
 fn load_remote_object_inventory<R: RemoteBackend>(
+    control_dir: &Path,
     remote: &R,
-) -> Result<(BTreeSet<String>, BTreeMap<String, BundledObjectLocation>)> {
-    Ok((
-        load_remote_loose_object_ids(remote)?,
-        load_remote_bundle_locations(remote)?,
-    ))
+) -> Result<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
+    let secrets = sync_support::open_repo_secrets_for_sync(control_dir)?;
+    let pack_locations =
+        load_remote_pack_locations_with_local_cache(remote, control_dir, Some(&secrets))?;
+    Ok((load_remote_loose_object_ids(remote)?, pack_locations))
 }
 
-fn load_remote_resume_bundle_locations<R: RemoteBackend>(
+fn load_remote_resume_pack_locations<R: RemoteBackend>(
+    control_dir: &Path,
     remote: &R,
     operation_id: &OperationId,
-) -> Result<BTreeMap<String, BundledObjectLocation>> {
-    load_remote_operation_bundle_locations(remote, &operation_id.value)
+) -> Result<BTreeMap<String, PackedObjectLocation>> {
+    let secrets = sync_support::open_repo_secrets_for_sync(control_dir)?;
+    crate::pack_index::load_remote_operation_pack_locations_with_secrets(
+        remote,
+        &operation_id.value,
+        &secrets,
+    )
 }
 
 fn remote_object_authenticates_for_repo<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
-    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
-    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
     object_id: &str,
     expected_type: &str,
 ) -> bool {
@@ -167,29 +175,39 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
         return verified;
     }
 
-    if let Some(location) = bundle_locations.get(object_id) {
-        if !bundle_cache.contains_key(&location.data_path) {
-            let bundle_len = match remote.stat_physical(&location.data_path) {
+    if let Some(location) = pack_locations.get(object_id) {
+        let physical_ref = location.physical_ref();
+        if !pack_cache.contains_key(&physical_ref.container_id) {
+            let pack_len = match remote.stat_physical(&physical_ref.container_id) {
                 Ok(stat) => match usize::try_from(stat.length) {
                     Ok(length) => length,
                     Err(_) => return false,
                 },
                 Err(_) => return false,
             };
-            let bundle_bytes = match remote.get_physical_range(&location.data_path, 0, bundle_len) {
-                Ok(bytes) => bytes,
-                Err(_) => return false,
-            };
-            bundle_cache.insert(location.data_path.clone(), bundle_bytes);
+            let pack_bytes =
+                match remote.get_physical_range(&physical_ref.container_id, 0, pack_len) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
+            pack_cache.insert(physical_ref.container_id.clone(), pack_bytes);
         }
-        let Some(bundle_bytes) = bundle_cache.get(&location.data_path) else {
+        let Some(pack_bytes) = pack_cache.get(&physical_ref.container_id) else {
             return false;
         };
-        let end = location.offset.saturating_add(location.length);
-        if end > bundle_bytes.len() {
+        let offset = match usize::try_from(physical_ref.offset.unwrap_or(0)) {
+            Ok(offset) => offset,
+            Err(_) => return false,
+        };
+        let length = match usize::try_from(physical_ref.length) {
+            Ok(length) => length,
+            Err(_) => return false,
+        };
+        let end = offset.saturating_add(length);
+        if end > pack_bytes.len() {
             return false;
         }
-        let bytes = bundle_bytes[location.offset..end].to_vec();
+        let bytes = pack_bytes[offset..end].to_vec();
         let target_path = local_object_path(repo_root, object_id);
         let original = std::fs::read(&target_path).ok();
         if std::fs::write(&target_path, &bytes).is_err() {
@@ -214,15 +232,15 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
     loose_object_ids: &BTreeSet<String>,
-    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
-    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
     snapshot_id: &str,
 ) -> bool {
     if !remote_object_authenticates_for_repo(
         repo_root,
         remote,
-        bundle_locations,
-        bundle_cache,
+        pack_locations,
+        pack_cache,
         snapshot_id,
         "snapshot",
     ) {
@@ -240,12 +258,12 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
             continue;
         }
         let object_type = infer_object_type_for_resume_candidate(repo_root, &object_id);
-        if !inventory_has_object(loose_object_ids, bundle_locations, &object_id)
+        if !inventory_has_object(loose_object_ids, pack_locations, &object_id)
             || !remote_object_authenticates_for_repo(
                 repo_root,
                 remote,
-                bundle_locations,
-                bundle_cache,
+                pack_locations,
+                pack_cache,
                 &object_id,
                 object_type,
             )
@@ -258,11 +276,12 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
 }
 
 fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
+    control_dir: &Path,
     remote: &'a R,
-    inventory: &'a mut Option<(BTreeSet<String>, BTreeMap<String, BundledObjectLocation>)>,
-) -> Result<&'a (BTreeSet<String>, BTreeMap<String, BundledObjectLocation>)> {
+    inventory: &'a mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
+) -> Result<&'a (BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
     if inventory.is_none() {
-        *inventory = Some(load_remote_object_inventory(remote)?);
+        *inventory = Some(load_remote_object_inventory(control_dir, remote)?);
     }
     Ok(inventory.as_ref().expect("inventory initialized"))
 }
@@ -270,37 +289,38 @@ fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
 fn remote_object_authenticates_for_resume<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
-    current_operation_bundle_locations: &BTreeMap<String, BundledObjectLocation>,
-    allow_inventory_lookup: bool,
-    fallback_inventory: &mut Option<(BTreeSet<String>, BTreeMap<String, BundledObjectLocation>)>,
-    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    current_operation_pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    allow_full_inventory_lookup: bool,
+    remote_inventory_cache: &mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
     object_id: &str,
     expected_type: &str,
 ) -> Result<bool> {
     if remote_object_authenticates_for_repo(
         repo_root,
         remote,
-        current_operation_bundle_locations,
-        bundle_cache,
+        current_operation_pack_locations,
+        pack_cache,
         object_id,
         expected_type,
     ) {
         return Ok(true);
     }
 
-    if !allow_inventory_lookup {
+    if !allow_full_inventory_lookup {
         return Ok(false);
     }
 
-    let (remote_loose_object_ids, remote_bundle_locations) =
-        ensure_remote_object_inventory_loaded(remote, fallback_inventory)?;
+    let control_dir = repo_root.join(".e2v");
+    let (remote_loose_object_ids, remote_pack_locations) =
+        ensure_remote_object_inventory_loaded(&control_dir, remote, remote_inventory_cache)?;
     Ok(
-        inventory_has_object(remote_loose_object_ids, remote_bundle_locations, object_id)
+        inventory_has_object(remote_loose_object_ids, remote_pack_locations, object_id)
             && remote_object_authenticates_for_repo(
                 repo_root,
                 remote,
-                remote_bundle_locations,
-                bundle_cache,
+                remote_pack_locations,
+                pack_cache,
                 object_id,
                 expected_type,
             ),
@@ -319,12 +339,12 @@ fn infer_object_type_for_resume_candidate(repo_root: &Path, object_id: &str) -> 
 
 fn verify_remote_reachable_objects(
     loose_object_ids: &BTreeSet<String>,
-    bundle_locations: &BTreeMap<String, BundledObjectLocation>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
     object_ids: &[String],
 ) -> Result<()> {
     for object_id in object_ids {
         anyhow::ensure!(
-            inventory_has_object(loose_object_ids, bundle_locations, object_id),
+            inventory_has_object(loose_object_ids, pack_locations, object_id),
             "pre-commit verify failed: reachable object missing from remote: {object_id}"
         );
     }
@@ -334,10 +354,10 @@ fn verify_remote_reachable_objects(
 fn verify_remote_reachable_objects_for_resume<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
-    current_operation_bundle_locations: &BTreeMap<String, BundledObjectLocation>,
-    allow_inventory_lookup: bool,
-    fallback_inventory: &mut Option<(BTreeSet<String>, BTreeMap<String, BundledObjectLocation>)>,
-    bundle_cache: &mut BTreeMap<String, Vec<u8>>,
+    current_operation_pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    allow_full_inventory_lookup: bool,
+    remote_inventory_cache: &mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
     snapshot_id: &str,
     object_ids: &[String],
 ) -> Result<()> {
@@ -351,10 +371,10 @@ fn verify_remote_reachable_objects_for_resume<R: RemoteBackend>(
             remote_object_authenticates_for_resume(
                 repo_root,
                 remote,
-                current_operation_bundle_locations,
-                allow_inventory_lookup,
-                fallback_inventory,
-                bundle_cache,
+                current_operation_pack_locations,
+                allow_full_inventory_lookup,
+                remote_inventory_cache,
+                pack_cache,
                 object_id,
                 expected_type,
             )?,
@@ -364,13 +384,13 @@ fn verify_remote_reachable_objects_for_resume<R: RemoteBackend>(
     Ok(())
 }
 
-fn next_bundle_batch_index<R: RemoteBackend>(
+fn next_pack_batch_index<R: RemoteBackend>(
     remote: &R,
     operation_id: &OperationId,
 ) -> Result<usize> {
-    let prefix = format!("bundles/index/{}-", operation_id.value);
+    let prefix = format!("packs/index/{}-", operation_id.value);
     Ok(remote
-        .list_physical("bundles/index/")?
+        .list_physical("packs/index/")?
         .into_iter()
         .filter(|path| path.starts_with(&prefix))
         .count())
@@ -381,30 +401,30 @@ fn upload_object_batch<R, F>(
     repo_root: &Path,
     operation_id: &OperationId,
     object_ids: &[String],
-    bundle_enabled: bool,
-    bundle_batch_index: &mut usize,
+    pack_enabled: bool,
+    pack_batch_index: &mut usize,
     mut on_uploaded: F,
-) -> Result<()>
+) -> Result<Option<String>>
 where
     R: RemoteBackend,
     F: FnMut(&str) -> Result<()>,
 {
-    let mut bundle_builder = if bundle_enabled {
-        Some(ObjectBundleBuilder::new(
+    let mut pack_builder = if pack_enabled {
+        Some(ObjectPackBuilder::new(
             &operation_id.value,
-            *bundle_batch_index,
+            *pack_batch_index,
         )?)
     } else {
         None
     };
-    let mut bundled_object_ids = Vec::new();
+    let mut packed_object_ids = Vec::new();
     for object_id in object_ids {
         validate_object_id_value(object_id)?;
         let bytes = std::fs::read(local_object_path(repo_root, object_id))?;
-        if let Some(builder) = bundle_builder.as_mut() {
+        if let Some(builder) = pack_builder.as_mut() {
             if bytes.len() <= SMALL_OBJECT_MAX_BYTES {
                 builder.push_object(object_id.clone(), &bytes);
-                bundled_object_ids.push(object_id.clone());
+                packed_object_ids.push(object_id.clone());
                 continue;
             }
         }
@@ -413,21 +433,29 @@ where
         on_uploaded(object_id)?;
     }
 
-    if let Some(builder) = bundle_builder {
-        if !bundled_object_ids.is_empty() {
+    if let Some(builder) = pack_builder {
+        if !packed_object_ids.is_empty() {
             let (index, payload) = builder.finish();
-            let (_, data_path, index_path) =
-                bundle_paths(&operation_id.value, *bundle_batch_index)?;
+            let (_, data_path, index_path) = pack_paths(&operation_id.value, *pack_batch_index)?;
+            let secrets = sync_support::open_repo_secrets_for_sync(repo_root.join(".e2v"))?;
             remote.put_physical(&data_path, &payload)?;
-            remote.put_physical(&index_path, &serde_json::to_vec_pretty(&index)?)?;
-            *bundle_batch_index += 1;
-            for object_id in &bundled_object_ids {
+            remote.put_physical(
+                &index_path,
+                &encode_pack_index_segment_bytes_for_sync(
+                    &secrets,
+                    &index_path,
+                    &serde_json::to_vec_pretty(&index)?,
+                )?,
+            )?;
+            *pack_batch_index += 1;
+            for object_id in &packed_object_ids {
                 on_uploaded(object_id)?;
             }
+            return Ok(Some(index_path));
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn upload_objects_with_policy<R, F>(
@@ -435,44 +463,36 @@ fn upload_objects_with_policy<R, F>(
     repo_root: &Path,
     operation_id: &OperationId,
     object_ids: &[String],
-    bundle_enabled: bool,
+    pack_enabled: bool,
     mut on_uploaded: F,
-) -> Result<()>
+) -> Result<Vec<String>>
 where
     R: RemoteBackend,
     F: FnMut(&str) -> Result<()>,
 {
     if object_ids.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let mut bundle_batch_index = if bundle_enabled {
-        next_bundle_batch_index(remote, operation_id)?
+    let mut pack_batch_index = if pack_enabled {
+        next_pack_batch_index(remote, operation_id)?
     } else {
         0
     };
-    for object_batch in object_ids.chunks(SMALL_OBJECT_BUNDLE_BATCH_SIZE) {
-        upload_object_batch(
+    let mut published_pack_index_segments = Vec::new();
+    for object_batch in object_ids.chunks(SMALL_OBJECT_PACK_BATCH_SIZE) {
+        if let Some(index_path) = upload_object_batch(
             remote,
             repo_root,
             operation_id,
             object_batch,
-            bundle_enabled,
-            &mut bundle_batch_index,
+            pack_enabled,
+            &mut pack_batch_index,
             &mut on_uploaded,
-        )?;
+        )? {
+            published_pack_index_segments.push(index_path);
+        }
     }
-    Ok(())
-}
-
-fn remote_control_ref_mirror_matches<R: RemoteBackend>(
-    remote: &R,
-    expected_default_ref_bytes: &[u8],
-) -> bool {
-    remote_physical_matches(
-        remote,
-        "control/refs/default.json",
-        expected_default_ref_bytes,
-    )
+    Ok(published_pack_index_segments)
 }
 
 fn remote_physical_matches<R: RemoteBackend>(
@@ -486,13 +506,8 @@ fn remote_physical_matches<R: RemoteBackend>(
         .unwrap_or(false)
 }
 
-fn remote_control_plane_matches<R: RemoteBackend>(
-    remote: &R,
-    config_bytes: &[u8],
-    layout_root_bytes: &[u8],
-) -> bool {
-    remote_physical_matches(remote, "control/config.json", config_bytes)
-        && remote_physical_matches(remote, "layout_root.json", layout_root_bytes)
+fn remote_control_plane_matches<R: RemoteBackend>(remote: &R, layout_root_bytes: &[u8]) -> bool {
+    remote_physical_matches(remote, "layout_root.json", layout_root_bytes)
 }
 
 fn remote_keyring_matches<R: RemoteBackend>(remote: &R, keyring_files: &[PathBuf]) -> bool {
@@ -579,7 +594,6 @@ pub fn push_head<R: RemoteBackend + Clone>(
     validate_sync_identifier("operation id", &options.operation_id)?;
     let (_state, snapshot) = sync_support::export_head_snapshot(facade, &options.repo_root)?;
     let layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;
-    let config_bytes = sync_support::read_config_bytes(&options.repo_root)?;
     let keyring_files = sync_support::list_keyring_files(&options.repo_root)?;
     let default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
     let expected_ref_version =
@@ -593,8 +607,7 @@ pub fn push_head<R: RemoteBackend + Clone>(
                     let remote_ref_matches_local =
                         stored_ref.value.bytes.as_slice() == default_ref_bytes.as_slice();
                     if remote_ref_matches_local
-                        && remote_control_ref_mirror_matches(remote, &default_ref_bytes)
-                        && remote_control_plane_matches(remote, &config_bytes, &layout_root_bytes)
+                        && remote_control_plane_matches(remote, &layout_root_bytes)
                         && remote_keyring_matches(remote, &keyring_files)
                     {
                         return Ok(PushResult {
@@ -603,11 +616,9 @@ pub fn push_head<R: RemoteBackend + Clone>(
                         });
                     }
                     if remote_ref_matches_local {
-                        remote.put_physical("control/config.json", &config_bytes)?;
                         upload_remote_keyring_generations(remote, &keyring_files)?;
                         remote.put_physical("layout_root.json", &layout_root_bytes)?;
                         publish_remote_keyring_pointer(remote, &keyring_files)?;
-                        remote.put_physical("control/refs/default.json", &default_ref_bytes)?;
                         return Ok(PushResult {
                             published_snapshot_id: snapshot.snapshot_id,
                             uploaded_objects: 0,
@@ -628,13 +639,15 @@ pub fn push_head<R: RemoteBackend + Clone>(
             }
             None => None,
         };
-    let (mut remote_loose_object_ids, mut remote_bundle_locations) =
-        load_remote_object_inventory(remote)?;
-    let mut remote_bundle_cache = BTreeMap::new();
+    let control_dir = options.repo_root.join(".e2v");
+    let pack_index_secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let (mut remote_loose_object_ids, mut remote_pack_locations) =
+        load_remote_object_inventory(&control_dir, remote)?;
+    let mut remote_pack_cache = BTreeMap::new();
     for ancestor_snapshot_id in &snapshot.ancestor_snapshot_ids {
         if !inventory_has_object(
             &remote_loose_object_ids,
-            &remote_bundle_locations,
+            &remote_pack_locations,
             ancestor_snapshot_id,
         ) {
             anyhow::bail!(
@@ -646,8 +659,8 @@ pub fn push_head<R: RemoteBackend + Clone>(
                 &options.repo_root,
                 remote,
                 &remote_loose_object_ids,
-                &remote_bundle_locations,
-                &mut remote_bundle_cache,
+                &remote_pack_locations,
+                &mut remote_pack_cache,
                 ancestor_snapshot_id,
             ),
             "push rejected: reachable remote snapshot failed verification: {ancestor_snapshot_id}"
@@ -670,6 +683,7 @@ pub fn push_head<R: RemoteBackend + Clone>(
         operation_id: operation_id.clone(),
         target_branch_token: options.branch_token.clone(),
         expected_ref_version,
+        planned_snapshot_id: Some(snapshot.snapshot_id.clone()),
         writer_mode: remote.capability().push_write_mode(),
     })?;
     let session = crate::transaction::PublishSession {
@@ -681,27 +695,23 @@ pub fn push_head<R: RemoteBackend + Clone>(
     let manifest_store = ManifestStore::new(&options.repo_root);
     let reachable_object_ids =
         manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
-    let bundle_enabled = should_bundle_small_objects(reachable_object_ids.len());
+    let pack_enabled = should_pack_small_objects(reachable_object_ids.len());
     let missing_object_ids = reachable_object_ids
         .iter()
         .filter(|object_id| {
-            !inventory_has_object(
-                &remote_loose_object_ids,
-                &remote_bundle_locations,
-                object_id,
-            )
+            !inventory_has_object(&remote_loose_object_ids, &remote_pack_locations, object_id)
         })
         .cloned()
         .collect::<Vec<_>>();
     for object_id in &reachable_object_ids {
         journal.plan_object(&operation_id, object_id, "object")?;
     }
-    upload_objects_with_policy(
+    let published_pack_index_segments = upload_objects_with_policy(
         remote,
         &options.repo_root,
         &operation_id,
         &missing_object_ids,
-        bundle_enabled,
+        pack_enabled,
         |object_id| {
             publisher.record_uploaded(
                 &session,
@@ -710,19 +720,34 @@ pub fn push_head<R: RemoteBackend + Clone>(
                     object_type: "object".to_string(),
                 },
             )?;
+            publisher.heartbeat(&session)?;
             journal.record_verified(&operation_id, object_id, "object")
         },
     )?;
 
-    remote.put_physical("control/config.json", &config_bytes)?;
     upload_remote_keyring_generations(remote, &keyring_files)?;
     publisher.publish_layout_if_needed(&session)?;
+    if !published_pack_index_segments.is_empty() {
+        let segment_paths = next_pack_index_segment_paths(
+            remote,
+            &published_pack_index_segments,
+            Some(&pack_index_secrets),
+        )?;
+        publish_pack_index_root(
+            remote,
+            &pack_index_secrets,
+            &layout_root.layout_id,
+            layout_root.generation,
+            segment_paths,
+        )?;
+    }
     publisher.pre_commit_verify(&session)?;
 
-    (remote_loose_object_ids, remote_bundle_locations) = load_remote_object_inventory(remote)?;
+    (remote_loose_object_ids, remote_pack_locations) =
+        load_remote_object_inventory(&control_dir, remote)?;
     verify_remote_reachable_objects(
         &remote_loose_object_ids,
-        &remote_bundle_locations,
+        &remote_pack_locations,
         &reachable_object_ids,
     )?;
     let publish_result =
@@ -731,7 +756,6 @@ pub fn push_head<R: RemoteBackend + Clone>(
         anyhow::bail!("push requires needs-rebase recovery");
     }
     publish_remote_keyring_pointer(remote, &keyring_files)?;
-    remote.put_physical("control/refs/default.json", &default_ref_bytes)?;
     publisher.complete(session)?;
 
     Ok(PushResult {
@@ -761,7 +785,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             crate::journal::ObjectUploadState::Failed,
         ],
     )?;
-    let bundle_enabled = should_bundle_small_objects(total_tracked_objects);
+    let pack_enabled = should_pack_small_objects(total_tracked_objects);
     let skipped_uploaded_objects = journal.count_objects_in_states(
         &operation_id,
         &[
@@ -769,7 +793,6 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             crate::journal::ObjectUploadState::Verified,
         ],
     )?;
-    let config_bytes = sync_support::read_config_bytes(&options.repo_root)?;
     let keyring_files = sync_support::list_keyring_files(&options.repo_root)?;
     let layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;
     let layout_root: LayoutRoot = serde_json::from_slice(&layout_root_bytes)?;
@@ -783,9 +806,13 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         .map(|stored_ref| stored_ref.value.bytes.as_slice() == default_ref_bytes.as_slice())
         .unwrap_or(false);
     let mut saw_journal_objects = false;
-    let mut remote_bundle_locations = load_remote_resume_bundle_locations(remote, &operation_id)?;
+    let control_dir = options.repo_root.join(".e2v");
+    let pack_index_secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let mut remote_pack_locations =
+        load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
     let mut remote_inventory = None;
-    let mut remote_bundle_cache = BTreeMap::new();
+    let mut remote_pack_cache = BTreeMap::new();
+    let mut published_pack_index_segments = Vec::new();
     let mut pending_cursor = Some(0usize);
     while let Some(cursor) = pending_cursor {
         let batch =
@@ -799,10 +826,10 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             if remote_object_authenticates_for_resume(
                 &options.repo_root,
                 remote,
-                &remote_bundle_locations,
+                &remote_pack_locations,
                 false,
                 &mut remote_inventory,
-                &mut remote_bundle_cache,
+                &mut remote_pack_cache,
                 &record.object_id,
                 infer_object_type_for_resume_candidate(&options.repo_root, &record.object_id),
             )? {
@@ -811,38 +838,39 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             }
             missing_object_ids.push(record.object_id.clone());
         }
-        upload_objects_with_policy(
+        published_pack_index_segments.extend(upload_objects_with_policy(
             remote,
             &options.repo_root,
             &operation_id,
             &missing_object_ids,
-            bundle_enabled,
+            pack_enabled,
             |object_id| journal.record_verified(&operation_id, object_id, "object"),
-        )?;
-        remote_bundle_locations = load_remote_resume_bundle_locations(remote, &operation_id)?;
+        )?);
+        remote_pack_locations =
+            load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
         remote_inventory = None;
-        remote_bundle_cache.clear();
+        remote_pack_cache.clear();
         pending_cursor = batch.next_cursor;
     }
 
     if !saw_journal_objects {
-        let (remote_loose_object_ids, remote_bundle_locations) =
-            load_remote_object_inventory(remote)?;
+        let (remote_loose_object_ids, remote_pack_locations) =
+            load_remote_object_inventory(&control_dir, remote)?;
         let manifest_store = ManifestStore::new(&options.repo_root);
         let reachable_object_ids =
             manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
         let remote_is_already_complete = remote_ref_matches_local
             && inventory_has_object(
                 &remote_loose_object_ids,
-                &remote_bundle_locations,
+                &remote_pack_locations,
                 &snapshot.snapshot_id,
             )
             && remote_snapshot_graph_authenticates_for_repo(
                 &options.repo_root,
                 remote,
                 &remote_loose_object_ids,
-                &remote_bundle_locations,
-                &mut remote_bundle_cache,
+                &remote_pack_locations,
+                &mut remote_pack_cache,
                 &snapshot.snapshot_id,
             );
         if !remote_is_already_complete {
@@ -853,36 +881,33 @@ pub fn resume_push<R: RemoteBackend + Clone>(
                 } else {
                     infer_object_type_for_resume_candidate(&options.repo_root, object_id)
                 };
-                if inventory_has_object(
-                    &remote_loose_object_ids,
-                    &remote_bundle_locations,
-                    object_id,
-                ) && remote_object_authenticates_for_repo(
-                    &options.repo_root,
-                    remote,
-                    &remote_bundle_locations,
-                    &mut remote_bundle_cache,
-                    object_id,
-                    object_type,
-                ) {
+                if inventory_has_object(&remote_loose_object_ids, &remote_pack_locations, object_id)
+                    && remote_object_authenticates_for_repo(
+                        &options.repo_root,
+                        remote,
+                        &remote_pack_locations,
+                        &mut remote_pack_cache,
+                        object_id,
+                        object_type,
+                    )
+                {
                     continue;
                 }
                 missing_object_ids.push(object_id.clone());
             }
-            upload_objects_with_policy(
+            published_pack_index_segments.extend(upload_objects_with_policy(
                 remote,
                 &options.repo_root,
                 &operation_id,
                 &missing_object_ids,
-                reachable_object_ids.len() >= small_object_bundle_threshold(),
+                reachable_object_ids.len() >= small_object_pack_threshold(),
                 |object_id| journal.record_verified(&operation_id, object_id, "object"),
-            )?;
+            )?);
         }
     }
 
     if remote_ref_matches_local
-        && remote_control_ref_mirror_matches(remote, &default_ref_bytes)
-        && remote_control_plane_matches(remote, &config_bytes, &layout_root_bytes)
+        && remote_control_plane_matches(remote, &layout_root_bytes)
         && remote_keyring_matches(remote, &keyring_files)
     {
         cleanup_completed_operation_markers(remote, &operation_id, &branch_token)?;
@@ -900,6 +925,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         operation_id: operation_id.clone(),
         target_branch_token: branch_token.clone(),
         expected_ref_version,
+        planned_snapshot_id: Some(snapshot.snapshot_id.clone()),
         writer_mode: remote.capability().push_write_mode(),
     })?;
     let session = crate::transaction::PublishSession {
@@ -908,20 +934,45 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         ..session
     };
     if remote_ref_matches_local {
-        remote.put_physical("control/config.json", &config_bytes)?;
         upload_remote_keyring_generations(remote, &keyring_files)?;
         publish_remote_keyring_pointer(remote, &keyring_files)?;
         publisher.publish_layout_if_needed(&session)?;
-        remote.put_physical("control/refs/default.json", &default_ref_bytes)?;
+        if !published_pack_index_segments.is_empty() {
+            let segment_paths = next_pack_index_segment_paths(
+                remote,
+                &published_pack_index_segments,
+                Some(&pack_index_secrets),
+            )?;
+            publish_pack_index_root(
+                remote,
+                &pack_index_secrets,
+                &layout_root.layout_id,
+                layout_root.generation,
+                segment_paths,
+            )?;
+        }
         publisher.complete(session)?;
         return Ok(ResumeResult {
             published_snapshot_id: snapshot.snapshot_id,
             skipped_uploaded_objects,
         });
     }
-    remote.put_physical("control/config.json", &config_bytes)?;
     upload_remote_keyring_generations(remote, &keyring_files)?;
     publisher.publish_layout_if_needed(&session)?;
+    if !published_pack_index_segments.is_empty() {
+        let segment_paths = next_pack_index_segment_paths(
+            remote,
+            &published_pack_index_segments,
+            Some(&pack_index_secrets),
+        )?;
+        publish_pack_index_root(
+            remote,
+            &pack_index_secrets,
+            &layout_root.layout_id,
+            layout_root.generation,
+            segment_paths,
+        )?;
+    }
     publisher.pre_commit_verify(&session)?;
     let manifest_store = ManifestStore::new(&options.repo_root);
     let reachable_object_ids =
@@ -929,10 +980,10 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     verify_remote_reachable_objects_for_resume(
         &options.repo_root,
         remote,
-        &remote_bundle_locations,
+        &remote_pack_locations,
         false,
         &mut remote_inventory,
-        &mut remote_bundle_cache,
+        &mut remote_pack_cache,
         &snapshot.snapshot_id,
         &reachable_object_ids,
     )?;
@@ -942,7 +993,6 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         anyhow::bail!("push requires needs-rebase recovery");
     }
     publish_remote_keyring_pointer(remote, &keyring_files)?;
-    remote.put_physical("control/refs/default.json", &default_ref_bytes)?;
     publisher.complete(session)?;
 
     Ok(ResumeResult {
@@ -960,16 +1010,16 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BundledObjectLocation, remote_object_authenticates_for_repo,
-        remote_snapshot_graph_authenticates_for_repo, should_bundle_small_objects,
+        PackedObjectLocation, remote_object_authenticates_for_repo,
+        remote_snapshot_graph_authenticates_for_repo, should_pack_small_objects,
         upload_object_batch,
     };
     use crate::journal::OperationId;
 
     #[test]
-    fn default_small_object_bundling_threshold_starts_at_100k() {
-        assert!(!should_bundle_small_objects(99_999));
-        assert!(should_bundle_small_objects(100_000));
+    fn default_small_object_pack_threshold_starts_at_100k() {
+        assert!(!should_pack_small_objects(99_999));
+        assert!(should_pack_small_objects(100_000));
     }
 
     #[test]
@@ -998,7 +1048,7 @@ mod tests {
         let verified = remote_object_authenticates_for_repo(
             &repo_root,
             &remote,
-            &std::collections::BTreeMap::<String, BundledObjectLocation>::new(),
+            &std::collections::BTreeMap::<String, PackedObjectLocation>::new(),
             &mut std::collections::BTreeMap::<String, Vec<u8>>::new(),
             "..\\..\\..\\outside",
             "snapshot",
@@ -1034,7 +1084,7 @@ mod tests {
         let verified = remote_object_authenticates_for_repo(
             &repo_root,
             &remote,
-            &std::collections::BTreeMap::<String, BundledObjectLocation>::new(),
+            &std::collections::BTreeMap::<String, PackedObjectLocation>::new(),
             &mut std::collections::BTreeMap::<String, Vec<u8>>::new(),
             "../../../outside",
             "snapshot",
@@ -1078,7 +1128,7 @@ mod tests {
             &repo_root,
             &remote,
             &std::collections::BTreeSet::<String>::new(),
-            &std::collections::BTreeMap::<String, BundledObjectLocation>::new(),
+            &std::collections::BTreeMap::<String, PackedObjectLocation>::new(),
             &mut std::collections::BTreeMap::<String, Vec<u8>>::new(),
             "..\\..\\..\\outside",
         );
@@ -1097,7 +1147,7 @@ mod tests {
 
         let remote = MemoryBackend::new();
         let operation_id = OperationId::new("upload-batch-op".to_string()).unwrap();
-        let mut bundle_batch_index = 0usize;
+        let mut pack_batch_index = 0usize;
 
         let error = upload_object_batch(
             &remote,
@@ -1105,7 +1155,7 @@ mod tests {
             &operation_id,
             &["..\\..\\..\\outside".to_string()],
             false,
-            &mut bundle_batch_index,
+            &mut pack_batch_index,
             |_| Ok(()),
         )
         .unwrap_err();

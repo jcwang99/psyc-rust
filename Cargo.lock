@@ -622,8 +622,12 @@ dependencies = [
  "anyhow",
  "clap",
  "e2v-core",
+ "e2v-store",
+ "e2v-sync",
+ "serde",
  "serde_json",
  "tempfile",
+ "url",
 ]
 
 [[package]]
@@ -682,6 +686,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "url",
 ]
 
 [[package]]

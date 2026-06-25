@@ -1,0 +1,995 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use e2v_core::{RepositoryFacade, sync_support};
+use e2v_store::{BackendCapability, RefToken, RemoteBackend, validate_object_id_value};
+use serde::{Deserialize, Serialize};
+
+use crate::fetch::{
+    RemoteValidationRoot, assert_remote_generations_meet_local_floor,
+    collect_remote_reachable_object_ids, next_validation_root, read_remote_control_plane,
+    update_trusted_remote_state_from_control_plane, write_remote_control_plane_to_validation_root,
+};
+use crate::object_type::candidate_object_types;
+use crate::pack::PackedObjectLocation;
+use crate::pack_index::load_remote_pack_locations_with_local_cache;
+use crate::remote_markers::{
+    INTENT_EXPIRY_HOURS, marker_is_fresh_at, observe_remote_now_with_probe,
+};
+use e2v_store::DirectLayoutObjectStore;
+
+const UNPUBLISHED_SNAPSHOT_GRACE_PERIOD_DAYS: u64 = 30;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyRemoteOptions {
+    pub repo_root: PathBuf,
+    pub sample_percent: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairRemoteOptions {
+    pub repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcDryRunOptions {
+    pub repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcExecuteOptions {
+    pub repo_root: PathBuf,
+    pub grace_period_days: u64,
+    pub allow_single_writer_maintenance_window: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyRemoteResult {
+    pub sampled_objects: usize,
+    pub repaired_local_objects: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairRemoteResult {
+    pub repaired_objects: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcDryRunReport {
+    pub unreachable_physical_refs: Vec<String>,
+    pub active_intent_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcExecuteResult {
+    pub deleted_physical_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcExecuteCapabilityStatus {
+    pub supported: bool,
+    pub blockers: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GcDeleteJournal {
+    grace_period_days: u64,
+    fence_state: GcFenceState,
+    pending_paths: Vec<String>,
+}
+
+pub fn force_accept_remote_rollback<R: RemoteBackend>(
+    remote: &R,
+    options: RepairRemoteOptions,
+    password: &str,
+) -> Result<RepairRemoteResult> {
+    anyhow::ensure!(
+        !password.trim().is_empty(),
+        "force-accept-remote-rollback requires repository password"
+    );
+    let control_dir = options.repo_root.join(".e2v");
+    let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
+    let (branch_token, _) =
+        sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
+    let default_ref = remote
+        .read_ref(&RefToken::new(branch_token.clone()))?
+        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
+    let (_, head_snapshot_id) =
+        sync_support::decode_default_ref_record(&options.repo_root, &default_ref.value.bytes)?;
+
+    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
+    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let pack_locations =
+        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+    let mut pack_cache = BTreeMap::new();
+    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(&options.repo_root)?,
+    };
+    write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
+    let reachable_object_ids = match head_snapshot_id.as_deref() {
+        Some(head_snapshot_id) => collect_remote_reachable_object_ids(
+            remote,
+            &remote_loose_object_ids,
+            &pack_locations,
+            &validation_root,
+            &secrets,
+            &mut pack_cache,
+            head_snapshot_id,
+        )?,
+        None => Vec::new(),
+    };
+
+    let mut repaired_objects = 0usize;
+    let objects_dir = control_dir.join("objects");
+    std::fs::create_dir_all(&objects_dir)?;
+    for object_id in &reachable_object_ids {
+        let bytes = remote_object_bytes_with_pack_cache(
+            remote,
+            &remote_loose_object_ids,
+            &pack_locations,
+            &mut pack_cache,
+            object_id,
+        )?
+        .with_context(|| format!("missing remote object {object_id}"))?;
+        let local_path = objects_dir.join(format!("{object_id}.json"));
+        let needs_repair = std::fs::read(&local_path)
+            .map(|existing| existing != bytes)
+            .unwrap_or(true);
+        if needs_repair {
+            std::fs::write(&local_path, &bytes)?;
+            repaired_objects += 1;
+        }
+    }
+
+    rewrite_local_control_plane_from_remote(&control_dir, &control_plane)?;
+    update_trusted_remote_state_from_control_plane(&default_ref, &control_plane)?;
+    RepositoryFacade::new().unlock(&options.repo_root, password)?;
+    RepositoryFacade::new().verify_ref(&options.repo_root)?;
+    Ok(RepairRemoteResult { repaired_objects })
+}
+
+pub fn verify_remote<R: RemoteBackend>(
+    remote: &R,
+    options: VerifyRemoteOptions,
+) -> Result<VerifyRemoteResult> {
+    anyhow::ensure!(
+        (1..=100).contains(&options.sample_percent),
+        "sample percent must be between 1 and 100"
+    );
+
+    let control_dir = options.repo_root.join(".e2v");
+    let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
+    let (branch_token, _) =
+        sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
+    let default_ref = remote
+        .read_ref(&RefToken::new(branch_token.clone()))?
+        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
+    let (_, head_snapshot_id) =
+        sync_support::decode_default_ref_record(&options.repo_root, &default_ref.value.bytes)?;
+    let Some(head_snapshot_id) = head_snapshot_id else {
+        return Ok(VerifyRemoteResult {
+            sampled_objects: 0,
+            repaired_local_objects: 0,
+        });
+    };
+
+    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
+    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let pack_locations =
+        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+    let mut pack_cache = BTreeMap::new();
+    let facade = RepositoryFacade::new();
+    let mut repaired_local_objects = 0usize;
+
+    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(&options.repo_root)?,
+    };
+    write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
+    let reachable_object_ids = collect_remote_reachable_object_ids(
+        remote,
+        &remote_loose_object_ids,
+        &pack_locations,
+        &validation_root,
+        &secrets,
+        &mut pack_cache,
+        &head_snapshot_id,
+    )?;
+    let sampled_object_ids = sample_object_ids(&reachable_object_ids, options.sample_percent);
+    let validation_object_store =
+        DirectLayoutObjectStore::new(validation_root.control_dir(), secrets.clone());
+
+    for object_id in &sampled_object_ids {
+        let bytes = remote_object_bytes_with_pack_cache(
+            remote,
+            &remote_loose_object_ids,
+            &pack_locations,
+            &mut pack_cache,
+            object_id,
+        )?
+        .with_context(|| format!("missing sampled remote object {object_id}"))?;
+        std::fs::write(validation_root.object_path(object_id), &bytes)?;
+        let expected_type = infer_remote_object_type(&validation_object_store, object_id)?;
+
+        let local_path = control_dir
+            .join("objects")
+            .join(format!("{object_id}.json"));
+        let original = std::fs::read(&local_path).ok();
+        std::fs::write(&local_path, &bytes)?;
+        match facade.verify_object(&options.repo_root, object_id, expected_type) {
+            Ok(()) => {
+                if original.as_deref() != Some(bytes.as_slice()) {
+                    repaired_local_objects += 1;
+                }
+            }
+            Err(error) => {
+                if let Some(original_bytes) = original {
+                    std::fs::write(&local_path, original_bytes)?;
+                } else {
+                    let _ = std::fs::remove_file(&local_path);
+                }
+                return Err(error).with_context(|| {
+                    format!("failed to authenticate sampled remote object {object_id}")
+                });
+            }
+        }
+    }
+
+    update_trusted_remote_state_from_control_plane(&default_ref, &control_plane)?;
+    Ok(VerifyRemoteResult {
+        sampled_objects: sampled_object_ids.len(),
+        repaired_local_objects,
+    })
+}
+
+pub fn repair_remote<R: RemoteBackend>(
+    remote: &R,
+    options: RepairRemoteOptions,
+) -> Result<RepairRemoteResult> {
+    let control_dir = options.repo_root.join(".e2v");
+    let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
+    let (branch_token, _) =
+        sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
+    let default_ref = remote
+        .read_ref(&RefToken::new(branch_token.clone()))?
+        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
+    let (_, head_snapshot_id) =
+        sync_support::decode_default_ref_record(&options.repo_root, &default_ref.value.bytes)?;
+    let Some(head_snapshot_id) = head_snapshot_id else {
+        return Ok(RepairRemoteResult {
+            repaired_objects: 0,
+        });
+    };
+
+    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
+    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let pack_locations =
+        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+    let mut pack_cache = BTreeMap::new();
+    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(&options.repo_root)?,
+    };
+    write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
+    let reachable_object_ids = collect_remote_reachable_object_ids(
+        remote,
+        &remote_loose_object_ids,
+        &pack_locations,
+        &validation_root,
+        &secrets,
+        &mut pack_cache,
+        &head_snapshot_id,
+    )?;
+
+    let mut repaired_objects = 0usize;
+    for object_id in &reachable_object_ids {
+        let bytes = remote_object_bytes_with_pack_cache(
+            remote,
+            &remote_loose_object_ids,
+            &pack_locations,
+            &mut pack_cache,
+            object_id,
+        )?
+        .with_context(|| format!("missing remote object {object_id}"))?;
+        let local_path = control_dir
+            .join("objects")
+            .join(format!("{object_id}.json"));
+        let needs_repair = std::fs::read(&local_path)
+            .map(|existing| existing != bytes)
+            .unwrap_or(true);
+        if needs_repair {
+            std::fs::write(&local_path, &bytes)?;
+            repaired_objects += 1;
+        }
+    }
+
+    update_trusted_remote_state_from_control_plane(&default_ref, &control_plane)?;
+    Ok(RepairRemoteResult { repaired_objects })
+}
+
+pub fn gc_dry_run<R: RemoteBackend>(
+    remote: &R,
+    options: GcDryRunOptions,
+) -> Result<GcDryRunReport> {
+    let control_dir = options.repo_root.join(".e2v");
+    let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
+    let (branch_token, _) =
+        sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
+    let default_ref = remote
+        .read_ref(&RefToken::new(branch_token.clone()))?
+        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
+
+    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
+    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let pack_locations =
+        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(&options.repo_root)?,
+    };
+    write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
+    let mut pack_cache = BTreeMap::new();
+    let mut reachable_object_ids = collect_all_remote_reachable_object_ids(
+        remote,
+        &options.repo_root,
+        &remote_loose_object_ids,
+        &pack_locations,
+        &validation_root,
+        &secrets,
+        &mut pack_cache,
+    )?;
+    reachable_object_ids.extend(collect_recent_unpublished_local_reachable_object_ids(
+        remote,
+        &options.repo_root,
+        &remote_loose_object_ids,
+        &pack_locations,
+        &validation_root,
+        &secrets,
+        &mut pack_cache,
+        &reachable_object_ids,
+    )?);
+    let active_intent_paths = list_active_intent_paths(remote)?;
+    let mut unreachable_physical_refs = collect_unreachable_physical_refs(
+        remote,
+        &remote_loose_object_ids,
+        &pack_locations,
+        &reachable_object_ids,
+    )?;
+    unreachable_physical_refs.sort();
+
+    Ok(GcDryRunReport {
+        unreachable_physical_refs,
+        active_intent_paths,
+    })
+}
+
+pub fn gc_execute<R: RemoteBackend>(
+    remote: &R,
+    options: GcExecuteOptions,
+) -> Result<GcExecuteResult> {
+    anyhow::ensure!(
+        options.grace_period_days > 0,
+        "grace period must be greater than zero"
+    );
+    ensure_gc_execute_capability(remote.capability())?;
+    anyhow::ensure!(
+        remote.capability().writer_mode() != e2v_store::WriterMode::SingleWriter
+            || options.allow_single_writer_maintenance_window,
+        "gc execute aborted: single-writer backends require an explicit offline maintenance window confirmation"
+    );
+    let journal_path = gc_delete_journal_path(&options.repo_root);
+    let (before_fence, candidate_paths) = match load_gc_delete_journal(&journal_path)? {
+        Some(journal) => {
+            anyhow::ensure!(
+                journal.grace_period_days == options.grace_period_days,
+                "gc execute aborted: existing delete journal was created with a different grace period"
+            );
+            (journal.fence_state, journal.pending_paths)
+        }
+        None => {
+            let before_fence = capture_gc_fence_state(remote)?;
+            let report = gc_dry_run(
+                remote,
+                GcDryRunOptions {
+                    repo_root: options.repo_root.clone(),
+                },
+            )?;
+            anyhow::ensure!(
+                report.active_intent_paths.is_empty(),
+                "gc execute aborted: active intent exists"
+            );
+            anyhow::ensure!(
+                before_fence.active_lease_paths.is_empty(),
+                "gc execute aborted: writer lease exists"
+            );
+            store_gc_delete_journal(
+                &journal_path,
+                &GcDeleteJournal {
+                    grace_period_days: options.grace_period_days,
+                    fence_state: before_fence.clone(),
+                    pending_paths: report.unreachable_physical_refs.clone(),
+                },
+            )?;
+            (before_fence, report.unreachable_physical_refs)
+        }
+    };
+    let after_fence = capture_gc_fence_state(remote)?;
+    anyhow::ensure!(
+        before_fence == after_fence,
+        "gc execute aborted: remote refs, intents, or layout root changed during execution"
+    );
+    anyhow::ensure!(
+        after_fence.active_lease_paths.is_empty(),
+        "gc execute aborted: writer lease exists"
+    );
+
+    let safe_horizon =
+        observed_remote_safe_horizon(remote, options.grace_period_days, &candidate_paths)?;
+    let mut deleted_physical_refs = Vec::new();
+    for (index, path) in candidate_paths.iter().enumerate() {
+        if !remote.exists_physical(path) {
+            continue;
+        }
+        if !physical_ref_is_older_than_horizon(remote, path, safe_horizon)? {
+            continue;
+        }
+        if let Err(error) = remote.delete_physical(path) {
+            let pending_paths = candidate_paths[index..]
+                .iter()
+                .filter(|pending_path| remote.exists_physical(pending_path))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !pending_paths.is_empty() {
+                store_gc_delete_journal(
+                    &journal_path,
+                    &GcDeleteJournal {
+                        grace_period_days: options.grace_period_days,
+                        fence_state: before_fence.clone(),
+                        pending_paths,
+                    },
+                )?;
+            }
+            return Err(error);
+        }
+        deleted_physical_refs.push(path.clone());
+    }
+    remove_gc_delete_journal(&journal_path)?;
+
+    Ok(GcExecuteResult {
+        deleted_physical_refs,
+    })
+}
+
+pub fn gc_execute_capability_status(capability: &BackendCapability) -> GcExecuteCapabilityStatus {
+    let mut blockers = Vec::new();
+    if !capability.supports_paged_list {
+        blockers.push("requires reliable paged listing");
+    }
+    if !capability.supports_reliable_remote_time {
+        blockers.push("requires reliable remote time");
+    }
+    if !capability.supports_remote_lock_or_lease {
+        blockers.push("requires remote lock or lease");
+    }
+    if !capability.supports_transaction_markers {
+        blockers.push("requires transaction markers");
+    }
+    GcExecuteCapabilityStatus {
+        supported: blockers.is_empty(),
+        blockers,
+    }
+}
+
+fn ensure_gc_execute_capability(capability: &BackendCapability) -> Result<()> {
+    let status = gc_execute_capability_status(capability);
+    anyhow::ensure!(
+        status.supported,
+        "gc execute aborted: backend capability does not satisfy destructive gc safety requirements ({})",
+        status.blockers.join(", ")
+    );
+    Ok(())
+}
+
+fn sample_object_ids(object_ids: &[String], sample_percent: u8) -> Vec<String> {
+    if object_ids.is_empty() {
+        return Vec::new();
+    }
+    let target = ((object_ids.len() * usize::from(sample_percent)).saturating_add(99)) / 100;
+    object_ids
+        .iter()
+        .take(target.max(1))
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn load_remote_loose_object_ids<R: RemoteBackend>(remote: &R) -> Result<BTreeSet<String>> {
+    let mut object_ids = BTreeSet::new();
+    for relative_path in remote.list_physical("objects/")? {
+        let Some(object_id) = relative_path
+            .strip_prefix("objects/")
+            .and_then(|value| value.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if validate_object_id_value(object_id).is_ok() {
+            object_ids.insert(object_id.to_string());
+        }
+    }
+    Ok(object_ids)
+}
+
+fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
+    remote: &R,
+    loose_object_ids: &BTreeSet<String>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    object_id: &str,
+) -> Result<Option<Vec<u8>>> {
+    if loose_object_ids.contains(object_id) {
+        return Ok(Some(
+            remote.get_physical(&format!("objects/{object_id}.json"))?,
+        ));
+    }
+
+    let Some(location) = pack_locations.get(object_id) else {
+        return Ok(None);
+    };
+    let physical_ref = location.physical_ref();
+    if !pack_cache.contains_key(&physical_ref.container_id) {
+        let pack_len: usize = remote
+            .stat_physical(&physical_ref.container_id)?
+            .length
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
+        let pack_bytes = remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
+        pack_cache.insert(physical_ref.container_id.clone(), pack_bytes);
+    }
+    let pack_bytes = pack_cache.get(&physical_ref.container_id).unwrap();
+    let offset = usize::try_from(physical_ref.offset.unwrap_or(0))
+        .map_err(|_| anyhow::anyhow!("pack offset is too large to read on this platform"))?;
+    let length = usize::try_from(physical_ref.length)
+        .map_err(|_| anyhow::anyhow!("pack length is too large to read on this platform"))?;
+    let end = offset.saturating_add(length);
+    anyhow::ensure!(
+        end <= pack_bytes.len(),
+        "packed object range out of bounds for {object_id}"
+    );
+    Ok(Some(pack_bytes[offset..end].to_vec()))
+}
+
+fn infer_remote_object_type(
+    object_store: &DirectLayoutObjectStore,
+    object_id: &str,
+) -> Result<&'static str> {
+    for object_type in candidate_object_types(None) {
+        if object_store.get_object(object_id, object_type).is_ok() {
+            return Ok(object_type);
+        }
+    }
+    anyhow::bail!("failed to infer remote object type for {object_id}")
+}
+
+fn list_active_intent_paths<R: RemoteBackend>(remote: &R) -> Result<Vec<String>> {
+    list_fresh_marker_paths(
+        remote,
+        "transactions/active/",
+        ".intent",
+        INTENT_EXPIRY_HOURS,
+    )
+}
+
+fn list_active_lease_paths<R: RemoteBackend>(remote: &R) -> Result<Vec<String>> {
+    list_fresh_marker_paths(remote, "leases/", ".lock", INTENT_EXPIRY_HOURS)
+}
+
+fn list_fresh_marker_paths<R: RemoteBackend>(
+    remote: &R,
+    prefix: &str,
+    suffix: &str,
+    expiry_hours: u64,
+) -> Result<Vec<String>> {
+    let observed_now = observe_remote_now_with_probe(remote, ".e2v/gc-remote-time.probe")?;
+    let mut intent_paths = remote
+        .list_physical(prefix)?
+        .into_iter()
+        .filter(|path| path.ends_with(suffix))
+        .filter(|path| {
+            marker_is_fresh_at(remote, path, observed_now, expiry_hours).unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    intent_paths.sort();
+    Ok(intent_paths)
+}
+
+fn rewrite_local_control_plane_from_remote(
+    control_dir: &std::path::Path,
+    control_plane: &crate::fetch::RemoteControlPlane,
+) -> Result<()> {
+    std::fs::create_dir_all(control_dir.join("keyring"))?;
+    std::fs::create_dir_all(control_dir.join("refs"))?;
+    std::fs::create_dir_all(control_dir.join("refs").join("branches"))?;
+    for (file_name, bytes) in &control_plane.keyring_files {
+        std::fs::write(control_dir.join("keyring").join(file_name), bytes)?;
+    }
+    std::fs::write(
+        control_dir.join("refs").join("default.json"),
+        &control_plane.default_ref_bytes,
+    )?;
+    let repo_root = control_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("control directory has no repository root"))?;
+    let secrets = sync_support::open_repo_secrets_for_sync(control_dir)?;
+    let (branch_token, _) =
+        sync_support::decode_default_ref_record(repo_root, &control_plane.default_ref_bytes)?;
+    let branch_plaintext = sync_support::decrypt_control_record_for_sync(
+        &secrets,
+        "default",
+        "ref",
+        &control_plane.default_ref_bytes,
+    )?;
+    let branch_ref_bytes = sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        &format!("branch-ref:{branch_token}"),
+        "ref",
+        &branch_plaintext,
+    )?;
+    let branch_ref_path = control_dir
+        .join("refs")
+        .join("branches")
+        .join(format!("{branch_token}.json"));
+    std::fs::write(branch_ref_path, branch_ref_bytes)?;
+    std::fs::write(
+        control_dir.join("layout_root.json"),
+        &control_plane.layout_root_bytes,
+    )?;
+    std::fs::write(
+        control_dir.join("keyring").join("keyring.current"),
+        &control_plane.keyring_pointer_bytes,
+    )?;
+    e2v_core::clear_unlocked_keyring_cache(control_dir);
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GcFenceState {
+    refs: Vec<(String, u64, Vec<u8>)>,
+    active_intent_paths: Vec<String>,
+    active_lease_paths: Vec<String>,
+    layout_root_generation: u64,
+}
+
+fn gc_delete_journal_path(repo_root: &std::path::Path) -> PathBuf {
+    repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("gc")
+        .join("gc-execute.json")
+}
+
+fn load_gc_delete_journal(path: &std::path::Path) -> Result<Option<GcDeleteJournal>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read gc delete journal {}", path.display()))?;
+    let journal = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to decode gc delete journal {}", path.display()))?;
+    Ok(Some(journal))
+}
+
+fn store_gc_delete_journal(path: &std::path::Path, journal: &GcDeleteJournal) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("gc delete journal path has no parent"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create gc journal dir {}", parent.display()))?;
+    std::fs::write(path, serde_json::to_vec_pretty(journal)?)
+        .with_context(|| format!("failed to write gc delete journal {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_gc_delete_journal(path: &std::path::Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove gc delete journal {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &std::path::Path,
+    remote_loose_object_ids: &BTreeSet<String>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    validation_secrets: &e2v_store::RepoSecrets,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<BTreeSet<String>> {
+    let local_default_ref_bytes = sync_support::read_default_ref_bytes(repo_root)?;
+    let (default_branch_token, _) =
+        sync_support::decode_default_ref_record(repo_root, &local_default_ref_bytes)?;
+    let mut reachable = BTreeSet::new();
+    for listed_ref in remote.list_refs()? {
+        let (decoded_branch_token, head_snapshot_id) =
+            sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)
+                .with_context(|| {
+                    format!(
+                        "failed to decode remote branch ref {}",
+                        listed_ref.token.value
+                    )
+                })?;
+        anyhow::ensure!(
+            decoded_branch_token == listed_ref.token.value,
+            "remote ref token mismatch: listed {}, decoded {}",
+            listed_ref.token.value,
+            decoded_branch_token
+        );
+        let Some(head_snapshot_id) = head_snapshot_id else {
+            continue;
+        };
+        let per_ref_reachable = collect_remote_reachable_object_ids(
+            remote,
+            remote_loose_object_ids,
+            pack_locations,
+            validation_root,
+            validation_secrets,
+            pack_cache,
+            &head_snapshot_id,
+        )?;
+        reachable.extend(per_ref_reachable);
+    }
+
+    if reachable.is_empty() {
+        let default_ref = remote
+            .read_ref(&RefToken::new(default_branch_token.clone()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("remote branch ref not found for {default_branch_token}")
+            })?;
+        let (_, head_snapshot_id) =
+            sync_support::decode_default_ref_record(repo_root, &default_ref.value.bytes)?;
+        if let Some(head_snapshot_id) = head_snapshot_id {
+            reachable.extend(collect_remote_reachable_object_ids(
+                remote,
+                remote_loose_object_ids,
+                pack_locations,
+                validation_root,
+                validation_secrets,
+                pack_cache,
+                &head_snapshot_id,
+            )?);
+        }
+    }
+
+    Ok(reachable)
+}
+
+fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &std::path::Path,
+    remote_loose_object_ids: &BTreeSet<String>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    validation_root: &RemoteValidationRoot,
+    validation_secrets: &e2v_store::RepoSecrets,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    remote_reachable_object_ids: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let facade = RepositoryFacade::new();
+    let mut candidate_head_snapshot_ids = facade
+        .list_branches(repo_root)?
+        .into_iter()
+        .filter_map(|branch| branch.head_snapshot_id)
+        .filter(|snapshot_id| !remote_reachable_object_ids.contains(snapshot_id))
+        .collect::<BTreeSet<_>>();
+    if candidate_head_snapshot_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let candidate_paths = candidate_head_snapshot_ids
+        .iter()
+        .filter_map(|snapshot_id| {
+            remote_physical_path_for_object(remote_loose_object_ids, pack_locations, snapshot_id)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if candidate_paths.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let unpublished_safe_horizon = observed_remote_safe_horizon(
+        remote,
+        UNPUBLISHED_SNAPSHOT_GRACE_PERIOD_DAYS,
+        &candidate_paths,
+    )?;
+    candidate_head_snapshot_ids.retain(|snapshot_id| {
+        let Some(path) =
+            remote_physical_path_for_object(remote_loose_object_ids, pack_locations, snapshot_id)
+        else {
+            return false;
+        };
+        !physical_ref_is_older_than_horizon(remote, &path, unpublished_safe_horizon)
+            .unwrap_or(false)
+    });
+    if candidate_head_snapshot_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut protected_object_ids = BTreeSet::new();
+    for snapshot_id in candidate_head_snapshot_ids {
+        let reachable = collect_remote_reachable_object_ids(
+            remote,
+            remote_loose_object_ids,
+            pack_locations,
+            validation_root,
+            validation_secrets,
+            pack_cache,
+            &snapshot_id,
+        )
+        .with_context(|| {
+            format!(
+                "failed to collect remote graph for recent unpublished local snapshot {snapshot_id}"
+            )
+        })?;
+        protected_object_ids.extend(reachable);
+    }
+    Ok(protected_object_ids)
+}
+
+fn collect_unreachable_physical_refs<R: RemoteBackend>(
+    remote: &R,
+    remote_loose_object_ids: &BTreeSet<String>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    reachable_object_ids: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let mut reachable_physical_refs = BTreeSet::new();
+    for object_id in reachable_object_ids {
+        if remote_loose_object_ids.contains(object_id) {
+            reachable_physical_refs.insert(format!("objects/{object_id}.json"));
+            continue;
+        }
+        if let Some(location) = pack_locations.get(object_id) {
+            reachable_physical_refs.insert(location.physical_ref().container_id);
+        }
+    }
+
+    let mut candidates = remote
+        .list_physical("objects/")?
+        .into_iter()
+        .filter(|path| {
+            path.strip_prefix("objects/")
+                .and_then(|value| value.strip_suffix(".json"))
+                .map(|object_id| validate_object_id_value(object_id).is_ok())
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    candidates.extend(remote.list_physical("packs/data/")?);
+
+    Ok(candidates
+        .into_iter()
+        .filter(|path| !reachable_physical_refs.contains(path))
+        .collect())
+}
+
+fn remote_physical_path_for_object(
+    remote_loose_object_ids: &BTreeSet<String>,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    object_id: &str,
+) -> Option<String> {
+    if remote_loose_object_ids.contains(object_id) {
+        return Some(format!("objects/{object_id}.json"));
+    }
+    pack_locations
+        .get(object_id)
+        .map(|location| location.physical_ref().container_id)
+}
+
+fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> {
+    let refs = remote
+        .list_refs()?
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.token.value,
+                entry.stored.version.value,
+                entry.stored.value.bytes,
+            )
+        })
+        .collect::<Vec<_>>();
+    let active_intent_paths = list_active_intent_paths(remote)?;
+    let active_lease_paths = list_active_lease_paths(remote)?;
+    let layout_root_generation = remote.read_layout_root()?.generation;
+    Ok(GcFenceState {
+        refs,
+        active_intent_paths,
+        active_lease_paths,
+        layout_root_generation,
+    })
+}
+
+fn observed_remote_safe_horizon<R: RemoteBackend>(
+    remote: &R,
+    grace_period_days: u64,
+    candidate_paths: &[String],
+) -> Result<std::time::SystemTime> {
+    let observed_now = observed_remote_latest_time(remote, candidate_paths)?;
+    let grace_period =
+        std::time::Duration::from_secs(grace_period_days.saturating_mul(24 * 60 * 60));
+    observed_now
+        .checked_sub(grace_period)
+        .ok_or_else(|| anyhow::anyhow!("gc execute aborted: invalid grace period horizon"))
+}
+
+fn observed_remote_latest_time<R: RemoteBackend>(
+    remote: &R,
+    candidate_paths: &[String],
+) -> Result<std::time::SystemTime> {
+    let mut observed_times = Vec::new();
+    observed_times.push(
+        remote
+            .stat_physical("layout_root.json")?
+            .modified_at
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gc execute aborted: layout root has no reliable remote modification time"
+                )
+            })?,
+    );
+    if remote.exists_physical("pack-index/root.json") {
+        observed_times.push(
+            remote
+                .stat_physical("pack-index/root.json")?
+                .modified_at
+                .ok_or_else(|| anyhow::anyhow!("gc execute aborted: pack index root has no reliable remote modification time"))?,
+        );
+    }
+    for path in remote.list_physical("transactions/active/")? {
+        if !path.ends_with(".intent") {
+            continue;
+        }
+        observed_times.push(remote.stat_physical(&path)?.modified_at.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gc execute aborted: active intent {path} has no reliable remote modification time"
+            )
+        })?);
+    }
+    for path in remote.list_physical("leases/")? {
+        if !path.ends_with(".lock") {
+            continue;
+        }
+        observed_times.push(remote.stat_physical(&path)?.modified_at.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gc execute aborted: writer lease {path} has no reliable remote modification time"
+            )
+        })?);
+    }
+    for path in candidate_paths {
+        observed_times.push(remote.stat_physical(path)?.modified_at.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gc execute aborted: physical ref {path} has no reliable remote modification time"
+            )
+        })?);
+    }
+    let observed_now = observed_times
+        .into_iter()
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("gc execute aborted: failed to observe remote clock"))?;
+    Ok(observed_now)
+}
+
+fn physical_ref_is_older_than_horizon<R: RemoteBackend>(
+    remote: &R,
+    path: &str,
+    safe_horizon: std::time::SystemTime,
+) -> Result<bool> {
+    let modified_at = remote.stat_physical(path)?.modified_at.ok_or_else(|| {
+        anyhow::anyhow!(
+            "gc execute aborted: physical ref {path} has no reliable remote modification time"
+        )
+    })?;
+    Ok(modified_at <= safe_horizon)
+}

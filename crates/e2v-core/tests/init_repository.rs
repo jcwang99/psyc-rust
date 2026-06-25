@@ -7,10 +7,11 @@ use e2v_core::testing::{
     with_snapshot_reader_for_test, with_stable_read_policy_for_test,
 };
 use e2v_core::{
-    CheckoutOptions, CommitOptions, InitOptions, ManifestObject,
-    ManifestSnapshotObject, ManifestStore, ManifestStoreApi, ManifestTreeObject,
-    RepositoryFacade, TreeWalkEntry,
+    CheckoutOptions, CommitOptions, InitOptions, ManifestObject, ManifestSnapshotObject,
+    ManifestStore, ManifestStoreApi, ManifestTreeObject, RepositoryFacade, TreeWalkEntry,
 };
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +23,13 @@ fn init_options(repo_root: &std::path::Path) -> InitOptions {
         password: "correct horse battery staple".to_string(),
         branch_name: "main".to_string(),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RefRecordMirror {
+    branch_name: String,
+    ref_token_hex: String,
+    head_snapshot_id: Option<String>,
 }
 
 trait StreamingTreeWalkTestExt {
@@ -62,10 +70,6 @@ fn init_creates_control_plane_files_for_local_direct_layout() {
     assert!(
         e2v_dir.join("journal").is_dir(),
         "expected journal directory"
-    );
-    assert!(
-        e2v_dir.join("config.json").is_file(),
-        "expected config file"
     );
     assert!(
         e2v_dir.join("layout_root.json").is_file(),
@@ -115,6 +119,78 @@ fn init_persists_openable_repository_state() {
     let opened = facade.open(&repo_root).unwrap();
 
     assert_eq!(opened, created);
+}
+
+#[test]
+fn legacy_config_file_is_absent_after_init() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    assert!(
+        !repo_root.join(".e2v").join("config.json").exists(),
+        "legacy config.json should not be created"
+    );
+}
+
+#[test]
+fn init_does_not_create_redundant_config_file() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    assert!(
+        !repo_root.join(".e2v").join("config.json").exists(),
+        "init should not create redundant config.json once ref/layout/keyring are the only control-plane sources of truth"
+    );
+}
+
+#[test]
+fn open_rejects_default_ref_without_branch_name_instead_of_falling_back_to_config() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let default_ref_path = control_dir.join("refs").join("default.json");
+    let default_ref_bytes = fs::read(&default_ref_path).unwrap();
+    let plaintext = e2v_core::sync_support::decrypt_control_record_for_sync(
+        &secrets,
+        "default",
+        "ref",
+        &default_ref_bytes,
+    )
+    .unwrap();
+    let mut record: RefRecordMirror = postcard::from_bytes(&plaintext).unwrap();
+    record.branch_name.clear();
+    let rewritten_plaintext = postcard::to_stdvec(&record).unwrap();
+    let rewritten_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "default",
+        "ref",
+        &rewritten_plaintext,
+    )
+    .unwrap();
+    fs::write(&default_ref_path, rewritten_bytes).unwrap();
+
+    let error = facade.open(&repo_root).unwrap_err();
+
+    assert!(
+        error.to_string().contains("branch")
+            || error.to_string().contains("default ref")
+            || error.to_string().contains("ref record"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]
@@ -210,8 +286,7 @@ fn repo_path_index_key_survives_keyring_round_trip() {
     facade.init(init_options(&repo_root)).unwrap();
 
     let control_dir = repo_root.join(".e2v");
-    let original =
-        e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let original = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
     assert_ne!(original.repo_path_index_key, [0u8; 32]);
 
     facade
@@ -230,7 +305,10 @@ fn repo_path_index_key_survives_keyring_round_trip() {
         e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
 
     assert_eq!(reopened.branch.name, "main");
-    assert_eq!(reopened_secrets.repo_path_index_key, original.repo_path_index_key);
+    assert_eq!(
+        reopened_secrets.repo_path_index_key,
+        original.repo_path_index_key
+    );
 }
 
 #[test]
@@ -838,9 +916,7 @@ fn branch_create_and_list_tracks_current_and_existing_heads() {
         .unwrap()
         .count();
 
-    let feature = facade
-        .create_branch(&repo_root, "feature")
-        .unwrap();
+    let feature = facade.create_branch(&repo_root, "feature").unwrap();
     let branches = facade.list_branches(&repo_root).unwrap();
     let after_objects = fs::read_dir(repo_root.join(".e2v").join("objects"))
         .unwrap()
@@ -852,10 +928,16 @@ fn branch_create_and_list_tracks_current_and_existing_heads() {
     assert_ne!(feature.token_hex, created.branch.token_hex);
     assert_eq!(branches.len(), 2);
     assert_eq!(branches[0].name, "feature");
-    assert_eq!(branches[0].head_snapshot_id.as_deref(), Some(first.snapshot_id.as_str()));
+    assert_eq!(
+        branches[0].head_snapshot_id.as_deref(),
+        Some(first.snapshot_id.as_str())
+    );
     assert!(!branches[0].is_current);
     assert_eq!(branches[1].name, "main");
-    assert_eq!(branches[1].head_snapshot_id.as_deref(), Some(first.snapshot_id.as_str()));
+    assert_eq!(
+        branches[1].head_snapshot_id.as_deref(),
+        Some(first.snapshot_id.as_str())
+    );
     assert!(branches[1].is_current);
 }
 
@@ -874,13 +956,14 @@ fn branch_checkout_switches_active_branch_and_commit_only_advances_that_branch()
             message: "base".to_string(),
         })
         .unwrap();
-    let feature = facade
-        .create_branch(&repo_root, "feature")
-        .unwrap();
+    let feature = facade.create_branch(&repo_root, "feature").unwrap();
 
     let reopened = facade.checkout_branch(&repo_root, "feature").unwrap();
     assert_eq!(reopened.branch.name, "feature");
-    assert_eq!(fs::read_to_string(repo_root.join("tracked.txt")).unwrap(), "base");
+    assert_eq!(
+        fs::read_to_string(repo_root.join("tracked.txt")).unwrap(),
+        "base"
+    );
 
     fs::write(repo_root.join("tracked.txt"), "feature-v2").unwrap();
     let feature_commit = facade
@@ -891,12 +974,8 @@ fn branch_checkout_switches_active_branch_and_commit_only_advances_that_branch()
         .unwrap();
 
     let read_service = facade.read_service(&repo_root).unwrap();
-    let feature_snapshot = read_service
-        .resolve_branch(&feature.token_hex)
-        .unwrap();
-    let main_snapshot = read_service
-        .resolve_branch(&main.branch.token_hex)
-        .unwrap();
+    let feature_snapshot = read_service.resolve_branch(&feature.token_hex).unwrap();
+    let main_snapshot = read_service.resolve_branch(&main.branch.token_hex).unwrap();
     let current_snapshots = facade.snapshots(&repo_root).unwrap();
 
     assert_eq!(feature_snapshot.snapshot_id, feature_commit.snapshot_id);
@@ -1736,9 +1815,10 @@ fn large_files_are_split_into_multiple_chunks() {
     let facade = RepositoryFacade::new();
     facade.init(init_options(&repo_root)).unwrap();
 
-    let mut large_bytes = Vec::with_capacity(9_000_000);
-    for i in 0..9_000_000usize {
-        large_bytes.push((i % 251) as u8);
+    let mut large_bytes = Vec::with_capacity(24 * 1024 * 1024);
+    for block in 0..24usize {
+        let fill = b'A' + (block as u8 % 26);
+        large_bytes.extend(std::iter::repeat_n(fill, 1024 * 1024));
     }
     fs::write(repo_root.join("large.txt"), &large_bytes).unwrap();
 
@@ -1763,6 +1843,74 @@ fn large_files_are_split_into_multiple_chunks() {
         .read_range(&file, 0, large_bytes.len())
         .unwrap();
     assert_eq!(read_back, large_bytes);
+}
+
+#[test]
+fn oversized_file_chunk_lists_are_sharded_without_breaking_read_service_or_manifest_store() {
+    let _guard = e2v_core::testing::override_max_file_chunks_per_object_for_test(2);
+    let _chunk_guard = e2v_core::testing::override_fixed_span_bytes_for_test(1024 * 1024);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let mut large_bytes = Vec::with_capacity(9_000_000);
+    for i in 0..9_000_000usize {
+        large_bytes.push((i % 251) as u8);
+    }
+    fs::write(repo_root.join("large.txt"), &large_bytes).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "large-file-sharded".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.txt").unwrap();
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot_manifest = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let tree = manifest_store
+        .get_tree_node(&snapshot_manifest.root_tree_id)
+        .unwrap();
+    let file_entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "large.txt" && entry.kind == "file")
+        .unwrap();
+    let file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    let local_object_files = e2v_core::sync_support::list_local_object_files(&repo_root).unwrap();
+    let file_shard_object_count = local_object_files
+        .iter()
+        .filter_map(|path| {
+            let object_id = path.file_stem()?.to_str()?;
+            e2v_core::sync_support::read_local_object_type_hint(&repo_root, object_id).ok()
+        })
+        .filter(|object_type| object_type == "file_shard")
+        .count();
+
+    assert!(
+        file.chunk_count() > 2,
+        "expected large file to span more than the test chunk limit"
+    );
+    assert!(
+        file_shard_object_count > 0,
+        "expected oversized file to publish file_shard objects"
+    );
+    assert!(
+        !file_manifest.chunk_lengths.is_empty(),
+        "expected manifest store to expose chunk lengths"
+    );
+    assert_eq!(
+        read_service
+            .read_range(&file, 0, large_bytes.len())
+            .unwrap(),
+        large_bytes
+    );
 }
 
 #[test]
@@ -2149,7 +2297,10 @@ fn verify_snapshot_rejects_snapshot_with_invalid_parent_snapshot_id() {
         ..snapshot
     };
     let tampered_snapshot_id = object_store
-        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .put_object(
+            "snapshot",
+            &postcard::to_stdvec(&tampered_snapshot).unwrap(),
+        )
         .unwrap();
 
     let error = facade
@@ -2373,7 +2524,9 @@ fn read_range_rejects_authenticated_file_graph_with_incomplete_chunk_coverage() 
 
     let manifest_store = ManifestStore::new(&repo_root);
     let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
-    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let root_tree = manifest_store
+        .get_tree_node(&snapshot.root_tree_id)
+        .unwrap();
     let file_entry = root_tree
         .entries
         .iter()
@@ -2404,7 +2557,10 @@ fn read_range_rejects_authenticated_file_graph_with_incomplete_chunk_coverage() 
     let mut tampered_snapshot: ManifestSnapshotObject = snapshot.clone();
     tampered_snapshot.root_tree_id = tampered_tree_id;
     let tampered_snapshot_id = object_store
-        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .put_object(
+            "snapshot",
+            &postcard::to_stdvec(&tampered_snapshot).unwrap(),
+        )
         .unwrap();
 
     let read_service = facade.read_service(&repo_root).unwrap();
@@ -2442,7 +2598,9 @@ fn read_range_rejects_file_manifest_with_mismatched_chunk_length_metadata() {
 
     let manifest_store = ManifestStore::new(&repo_root);
     let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
-    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let root_tree = manifest_store
+        .get_tree_node(&snapshot.root_tree_id)
+        .unwrap();
     let file_entry = root_tree
         .entries
         .iter()
@@ -2473,7 +2631,10 @@ fn read_range_rejects_file_manifest_with_mismatched_chunk_length_metadata() {
     let mut tampered_snapshot: ManifestSnapshotObject = snapshot.clone();
     tampered_snapshot.root_tree_id = tampered_tree_id;
     let tampered_snapshot_id = object_store
-        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .put_object(
+            "snapshot",
+            &postcard::to_stdvec(&tampered_snapshot).unwrap(),
+        )
         .unwrap();
 
     let read_service = facade.read_service(&repo_root).unwrap();
@@ -2509,7 +2670,9 @@ fn manifest_store_rejects_authenticated_snapshot_graph_with_path_traversal_chunk
 
     let manifest_store = ManifestStore::new(&repo_root);
     let snapshot = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
-    let root_tree = manifest_store.get_tree_node(&snapshot.root_tree_id).unwrap();
+    let root_tree = manifest_store
+        .get_tree_node(&snapshot.root_tree_id)
+        .unwrap();
     let file_entry = root_tree
         .entries
         .iter()
@@ -2540,7 +2703,10 @@ fn manifest_store_rejects_authenticated_snapshot_graph_with_path_traversal_chunk
     let mut tampered_snapshot: ManifestSnapshotObject = snapshot.clone();
     tampered_snapshot.root_tree_id = tampered_tree_id;
     let tampered_snapshot_id = object_store
-        .put_object("snapshot", &postcard::to_stdvec(&tampered_snapshot).unwrap())
+        .put_object(
+            "snapshot",
+            &postcard::to_stdvec(&tampered_snapshot).unwrap(),
+        )
         .unwrap();
 
     let error = manifest_store
@@ -2931,9 +3097,7 @@ fn filename_search_finds_visible_files_and_refreshes_after_commit_and_branch_che
         .unwrap();
     facade.create_branch(&repo_root, "feature").unwrap();
 
-    let base_results = facade
-        .search_filenames(&repo_root, "notes")
-        .unwrap();
+    let base_results = facade.search_filenames(&repo_root, "notes").unwrap();
     assert_eq!(base_results.len(), 1);
     assert_eq!(base_results[0].path, "alpha-notes.txt");
 
@@ -2944,17 +3108,91 @@ fn filename_search_finds_visible_files_and_refreshes_after_commit_and_branch_che
             message: "main-update".to_string(),
         })
         .unwrap();
-    let main_results = facade
-        .search_filenames(&repo_root, "notes")
-        .unwrap();
+    let main_results = facade.search_filenames(&repo_root, "notes").unwrap();
     assert_eq!(main_results.len(), 2);
 
     facade.checkout_branch(&repo_root, "feature").unwrap();
-    let feature_results = facade
-        .search_filenames(&repo_root, "notes")
-        .unwrap();
+    let feature_results = facade.search_filenames(&repo_root, "notes").unwrap();
     assert_eq!(feature_results.len(), 1);
     assert_eq!(feature_results[0].path, "alpha-notes.txt");
+}
+
+#[test]
+fn metadata_search_refresh_preserves_unchanged_index_rows_across_head_updates() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("stable.txt"), "stable").unwrap();
+    fs::write(repo_root.join("base.txt"), "base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: None,
+                path_prefix: None,
+                min_size: None,
+                max_size: None,
+            },
+        )
+        .unwrap();
+
+    let index_db = repo_root.join(".e2v").join("index.sqlite3");
+    let connection = Connection::open(&index_db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE audit_log(kind TEXT NOT NULL, path TEXT NOT NULL);
+             CREATE TRIGGER current_files_delete_audit
+             AFTER DELETE ON current_files
+             BEGIN
+                 INSERT INTO audit_log(kind, path) VALUES('delete', old.path);
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    fs::write(repo_root.join("added.txt"), "added").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "add-file".to_string(),
+        })
+        .unwrap();
+
+    facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: None,
+                path_prefix: None,
+                min_size: None,
+                max_size: None,
+            },
+        )
+        .unwrap();
+
+    let connection = Connection::open(&index_db).unwrap();
+    let deleted_stable: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE kind = 'delete' AND path = 'stable.txt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        deleted_stable, 0,
+        "incremental index refresh should not delete unchanged rows"
+    );
 }
 
 #[test]
@@ -2984,7 +3222,7 @@ fn metadata_and_filename_search_return_empty_results_for_uncommitted_repository(
 }
 
 #[test]
-fn branch_list_includes_current_branch_when_only_default_ref_exists() {
+fn branch_list_rejects_missing_current_branch_ref() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2997,11 +3235,14 @@ fn branch_list_includes_current_branch_when_only_default_ref_exists() {
         fs::remove_dir_all(&branch_ref_dir).unwrap();
     }
 
-    let branches = facade.list_branches(&repo_root).unwrap();
+    let error = facade.list_branches(&repo_root).unwrap_err();
 
-    assert_eq!(branches.len(), 1);
-    assert_eq!(branches[0].name, "main");
-    assert!(branches[0].is_current);
+    assert!(
+        error.to_string().contains("current branch")
+            || error.to_string().contains("missing")
+            || error.to_string().contains("branch ref"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]
@@ -3052,7 +3293,9 @@ fn collect_reachable_object_ids_preserves_graph_traversal_order() {
             continue;
         }
 
-        let collected = store.collect_reachable_object_ids(&commit.snapshot_id).unwrap();
+        let collected = store
+            .collect_reachable_object_ids(&commit.snapshot_id)
+            .unwrap();
         assert_eq!(collected, expected);
         found_mismatch = true;
         break;

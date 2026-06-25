@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -47,12 +48,14 @@ pub fn search_metadata(
     bootstrap(&connection)?;
     rebuild_if_needed(&connection, repo_root, branch_token_hex, head_snapshot_id)?;
 
-    let extension = query.extension.as_ref().map(|value| value.trim().to_lowercase());
-    let path_prefix = query.path_prefix.as_ref().map(|value| {
-        value.trim_matches('/')
-            .replace('\\', "/")
-            .to_string()
-    });
+    let extension = query
+        .extension
+        .as_ref()
+        .map(|value| value.trim().to_lowercase());
+    let path_prefix = query
+        .path_prefix
+        .as_ref()
+        .map(|value| value.trim_matches('/').replace('\\', "/").to_string());
     let min_size = query.min_size.map(i64::try_from).transpose()?;
     let max_size = query.max_size.map(i64::try_from).transpose()?;
 
@@ -65,18 +68,15 @@ pub fn search_metadata(
            AND (?4 IS NULL OR size_bytes <= ?4)
          ORDER BY path ASC",
     )?;
-    let rows = statement.query_map(
-        params![extension, path_prefix, min_size, max_size],
-        |row| {
-            Ok(MetadataSearchResult {
-                path: row.get(0)?,
-                extension: row.get(1)?,
-                size_bytes: row.get::<_, u64>(2)?,
-                modified_unix_ms: row.get::<_, u64>(3)?,
-                file_object_id: row.get(4)?,
-            })
-        },
-    )?;
+    let rows = statement.query_map(params![extension, path_prefix, min_size, max_size], |row| {
+        Ok(MetadataSearchResult {
+            path: row.get(0)?,
+            extension: row.get(1)?,
+            size_bytes: row.get::<_, u64>(2)?,
+            modified_unix_ms: row.get::<_, u64>(3)?,
+            file_object_id: row.get(4)?,
+        })
+    })?;
 
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(anyhow::Error::from)
@@ -172,46 +172,9 @@ fn rebuild_if_needed(
     }
 
     let transaction = connection.unchecked_transaction()?;
-    transaction.execute("DELETE FROM current_files", [])?;
-    transaction.execute("DELETE FROM filename_fts", [])?;
-
-    if let Some(head_snapshot_id) = head_snapshot_id {
-        let store = ManifestStore::new(repo_root);
-        let entries = store.walk_tree(head_snapshot_id)?;
-        let read_service = crate::facade::RepositoryFacade::new().read_service(repo_root)?;
-        let snapshot = read_service.open_snapshot(head_snapshot_id)?;
-        let mut insert = transaction.prepare(
-            "INSERT INTO current_files (
-                 path, file_name, extension, size_bytes, modified_unix_ms, file_object_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        let mut insert_fts = transaction.prepare(
-            "INSERT INTO filename_fts(path, file_name, file_object_id) VALUES (?1, ?2, ?3)",
-        )?;
-        for entry in entries {
-            let path = entry.path;
-            let (_, file_name) = path
-                .rsplit_once('/')
-                .map(|(parent, name)| (Some(parent), name))
-                .unwrap_or((None, path.as_str()));
-            let extension = file_name.rsplit_once('.').map(|(_, ext)| ext.to_lowercase());
-            let file = read_service.open_file(&snapshot, &path)?;
-            let manifest_file = store.get_file(&file.file_object_id)?;
-            insert.execute(params![
-                path,
-                file_name.to_lowercase(),
-                extension,
-                i64::try_from(manifest_file.file_size)?,
-                i64::try_from(manifest_file.modified_unix_ms)?,
-                file.file_object_id
-            ])?;
-            insert_fts.execute(params![
-                path,
-                file_name.to_lowercase(),
-                file.file_object_id
-            ])?;
-        }
-    }
+    let next_entries = load_snapshot_file_rows(repo_root, head_snapshot_id)?;
+    let current_entries = load_indexed_file_rows(&transaction)?;
+    sync_index_rows(&transaction, &current_entries, &next_entries)?;
 
     transaction.execute(
         "INSERT INTO index_meta(key, value) VALUES('branch_token_hex', ?1)
@@ -224,5 +187,129 @@ fn rebuild_if_needed(
         params![requested_head],
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedFileRow {
+    path: String,
+    file_name: String,
+    extension: Option<String>,
+    size_bytes: u64,
+    modified_unix_ms: u64,
+    file_object_id: String,
+}
+
+fn load_snapshot_file_rows(
+    repo_root: &Path,
+    head_snapshot_id: Option<&str>,
+) -> Result<BTreeMap<String, IndexedFileRow>> {
+    let Some(head_snapshot_id) = head_snapshot_id else {
+        return Ok(BTreeMap::new());
+    };
+    let store = ManifestStore::new(repo_root);
+    let entries = store.walk_tree(head_snapshot_id)?;
+    let read_service = crate::facade::RepositoryFacade::new().read_service(repo_root)?;
+    let snapshot = read_service.open_snapshot(head_snapshot_id)?;
+    let mut rows = BTreeMap::new();
+    for entry in entries {
+        let path = entry.path;
+        let (_, file_name) = path
+            .rsplit_once('/')
+            .map(|(parent, name)| (Some(parent), name))
+            .unwrap_or((None, path.as_str()));
+        let file_name = file_name.to_lowercase();
+        let extension = file_name
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_lowercase());
+        let file = read_service.open_file(&snapshot, &path)?;
+        let manifest_file = store.get_file(&file.file_object_id)?;
+        rows.insert(
+            path.clone(),
+            IndexedFileRow {
+                path,
+                file_name,
+                extension,
+                size_bytes: manifest_file.file_size,
+                modified_unix_ms: manifest_file.modified_unix_ms,
+                file_object_id: file.file_object_id,
+            },
+        );
+    }
+    Ok(rows)
+}
+
+fn load_indexed_file_rows(connection: &Connection) -> Result<BTreeMap<String, IndexedFileRow>> {
+    let mut statement = connection.prepare(
+        "SELECT path, file_name, extension, size_bytes, modified_unix_ms, file_object_id
+         FROM current_files
+         ORDER BY path ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(IndexedFileRow {
+            path: row.get(0)?,
+            file_name: row.get(1)?,
+            extension: row.get(2)?,
+            size_bytes: row.get::<_, u64>(3)?,
+            modified_unix_ms: row.get::<_, u64>(4)?,
+            file_object_id: row.get(5)?,
+        })
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.path.clone(), row))
+        .collect::<BTreeMap<_, _>>())
+}
+
+fn sync_index_rows(
+    connection: &Connection,
+    current_entries: &BTreeMap<String, IndexedFileRow>,
+    next_entries: &BTreeMap<String, IndexedFileRow>,
+) -> Result<()> {
+    {
+        let mut delete_current = connection.prepare("DELETE FROM current_files WHERE path = ?1")?;
+        let mut delete_fts = connection.prepare("DELETE FROM filename_fts WHERE path = ?1")?;
+        for path in current_entries.keys() {
+            if !next_entries.contains_key(path) {
+                delete_current.execute([path])?;
+                delete_fts.execute([path])?;
+            }
+        }
+    }
+
+    {
+        let mut upsert_current = connection.prepare(
+            "INSERT INTO current_files (
+                 path, file_name, extension, size_bytes, modified_unix_ms, file_object_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET
+                 file_name = excluded.file_name,
+                 extension = excluded.extension,
+                 size_bytes = excluded.size_bytes,
+                 modified_unix_ms = excluded.modified_unix_ms,
+                 file_object_id = excluded.file_object_id",
+        )?;
+        let mut delete_fts = connection.prepare("DELETE FROM filename_fts WHERE path = ?1")?;
+        let mut insert_fts = connection.prepare(
+            "INSERT INTO filename_fts(path, file_name, file_object_id) VALUES (?1, ?2, ?3)",
+        )?;
+        for (path, next) in next_entries {
+            if current_entries.get(path) == Some(next) {
+                continue;
+            }
+            upsert_current.execute(params![
+                next.path,
+                next.file_name,
+                next.extension,
+                i64::try_from(next.size_bytes)?,
+                i64::try_from(next.modified_unix_ms)?,
+                next.file_object_id
+            ])?;
+            delete_fts.execute([path])?;
+            insert_fts.execute(params![next.path, next.file_name, next.file_object_id])?;
+        }
+    }
+
     Ok(())
 }

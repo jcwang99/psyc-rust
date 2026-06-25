@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -27,7 +28,6 @@ use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreAp
 use crate::working_tree::{SnapshotReader, StableReadPolicy, WorkingTree, WorkingTreeEntry};
 
 const CONTROL_DIR: &str = ".e2v";
-const CONFIG_FILE: &str = "config.json";
 const LAYOUT_ROOT_FILE: &str = "layout_root.json";
 const DEFAULT_REF_FILE: &str = "refs/default.json";
 const BRANCH_REFS_DIR: &str = "refs/branches";
@@ -36,15 +36,46 @@ const JOURNAL_DIR: &str = "journal";
 const DIRECT_LAYOUT_ID: &str = "direct";
 const DIRECT_MAPPING_POLICY: &str = "loose";
 const REPO_FORMAT_VERSION: u32 = 1;
-const MIN_CLIENT_VERSION: &str = "0.1.0";
 const DEFAULT_ACTIVE_EPOCH: u32 = 1;
 const DEFAULT_REF_TOKEN: &str = "default";
 const CONTROL_REF_MAGIC: &[u8; 4] = b"E2RF";
 const CONTROL_REF_FORMAT_VERSION: u32 = 1;
 #[allow(dead_code)]
-const RESERVED_MANIFEST_TYPES: &[&str] = &["directory_root", "tree_shard"];
+const RESERVED_MANIFEST_TYPES: &[&str] = &["directory_root", "tree_shard", "file_shard"];
 const MAX_TREE_ENTRIES_PER_OBJECT: usize = 4096;
 const CHECKOUT_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+const DEFAULT_MAX_FILE_CHUNKS_PER_OBJECT: usize = 8192;
+thread_local! {
+    static MAX_FILE_CHUNKS_PER_OBJECT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub fn override_max_file_chunks_per_object_for_test(
+    max_chunks: usize,
+) -> MaxFileChunksPerObjectGuard {
+    let previous = MAX_FILE_CHUNKS_PER_OBJECT_OVERRIDE.with(|cell| {
+        let previous = cell.get();
+        cell.set(Some(max_chunks));
+        previous
+    });
+    MaxFileChunksPerObjectGuard { previous }
+}
+
+pub struct MaxFileChunksPerObjectGuard {
+    previous: Option<usize>,
+}
+
+impl Drop for MaxFileChunksPerObjectGuard {
+    fn drop(&mut self) {
+        MAX_FILE_CHUNKS_PER_OBJECT_OVERRIDE.with(|cell| {
+            cell.set(self.previous);
+        });
+    }
+}
+
+fn max_file_chunks_per_object() -> usize {
+    MAX_FILE_CHUNKS_PER_OBJECT_OVERRIDE
+        .with(|cell| cell.get().unwrap_or(DEFAULT_MAX_FILE_CHUNKS_PER_OBJECT))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitOptions {
@@ -169,15 +200,6 @@ pub struct BranchSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RepoConfig {
-    pub repo_format_version: u32,
-    pub min_client_version: String,
-    pub active_epoch: u32,
-    pub default_branch: String,
-    pub path_policy: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RefRecord {
     pub branch_name: String,
     pub ref_token_hex: String,
@@ -211,6 +233,14 @@ struct FileObject {
     pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
+    pub chunks: Vec<String>,
+    pub chunk_lengths: Vec<u64>,
+    pub shard_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FileShardObject {
+    pub schema_version: u32,
     pub chunks: Vec<String>,
     pub chunk_lengths: Vec<u64>,
 }
@@ -349,13 +379,6 @@ impl RepositoryFacade {
             name: branch_name.clone(),
             token_hex: derive_branch_token(&repo_secrets.repo_ref_key, &branch_name),
         };
-        let config = RepoConfig {
-            repo_format_version: REPO_FORMAT_VERSION,
-            min_client_version: MIN_CLIENT_VERSION.to_string(),
-            active_epoch: DEFAULT_ACTIVE_EPOCH,
-            default_branch: branch.name.clone(),
-            path_policy: "portable-strict".to_string(),
-        };
         let layout_root = LayoutRoot {
             schema_version: REPO_FORMAT_VERSION,
             layout_id: DIRECT_LAYOUT_ID.to_string(),
@@ -387,7 +410,6 @@ impl RepositoryFacade {
             current: "keyring.1".to_string(),
         };
 
-        atomic_write_json(control_dir.join(CONFIG_FILE), &config)?;
         atomic_write_json(control_dir.join(LAYOUT_ROOT_FILE), &layout_root)?;
         write_keyring_generation_and_pointer(
             &control_dir,
@@ -493,19 +515,18 @@ impl RepositoryFacade {
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
 
-        let config: RepoConfig = read_json(control_dir.join(CONFIG_FILE))?;
         let layout_root = validate_layout_root(&control_dir)?;
         let repo_secrets = open_repo_secrets(&control_dir)?;
         let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
+        ensure!(
+            !default_ref.branch_name.trim().is_empty(),
+            "default ref record is missing branch name"
+        );
 
         Ok(RepositoryState {
             repo_root,
             branch: BranchState {
-                name: if default_ref.branch_name.is_empty() {
-                    config.default_branch
-                } else {
-                    default_ref.branch_name
-                },
+                name: default_ref.branch_name,
                 token_hex: default_ref.ref_token_hex,
             },
             layout_generation: layout_root.generation,
@@ -673,12 +694,12 @@ impl RepositoryFacade {
         let repo_secrets = open_repo_secrets(&control_dir)?;
         let current_ref = read_current_ref(&control_dir)?;
         let mut branches = read_all_branch_refs(&control_dir, &repo_secrets)?;
-        if !branches
-            .iter()
-            .any(|branch| branch.ref_token_hex == current_ref.ref_token_hex)
-        {
-            branches.push(current_ref.clone());
-        }
+        ensure!(
+            branches
+                .iter()
+                .any(|branch| branch.ref_token_hex == current_ref.ref_token_hex),
+            "current branch ref is missing from refs/branches"
+        );
         branches.sort_by(|left, right| left.branch_name.cmp(&right.branch_name));
 
         Ok(branches
@@ -766,9 +787,10 @@ impl RepositoryFacade {
             planned_files.into_iter().zip(final_paths.into_iter())
         {
             let stage_result: Result<()> = (|| {
-                let temp_path = checkout_file_to_temp(&working_tree, &file, &final_path, |offset, length| {
-                    read_service.read_range(&file, offset, length)
-                })?;
+                let temp_path =
+                    checkout_file_to_temp(&working_tree, &file, &final_path, |offset, length| {
+                        read_service.read_range(&file, offset, length)
+                    })?;
                 staged.push((_snapshot_path, temp_path, final_path));
                 Ok(())
             })();
@@ -893,7 +915,9 @@ impl ReadService {
             .into_iter()
             .find(|entry| entry.name == file_name && entry.kind == "file");
         let entry = entry.with_context(|| format!("file not found in snapshot: {path}"))?;
-        let file = manifest_store.get_file(&entry.object_id)?;
+        let control_dir = self.repo_root.join(CONTROL_DIR);
+        let object_store = open_object_store(&control_dir)?;
+        let file = read_file_object_flattened(&object_store, &entry.object_id)?;
 
         Ok(FileHandle {
             snapshot_id: snapshot.snapshot_id.clone(),
@@ -1185,9 +1209,12 @@ fn read_all_branch_refs(control_dir: &Path, secrets: &RepoSecrets) -> Result<Vec
         return Ok(Vec::new());
     }
     let mut refs = Vec::new();
-    for entry in fs::read_dir(&refs_dir)
-        .with_context(|| format!("failed to read branch refs directory {}", refs_dir.display()))?
-    {
+    for entry in fs::read_dir(&refs_dir).with_context(|| {
+        format!(
+            "failed to read branch refs directory {}",
+            refs_dir.display()
+        )
+    })? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -1218,7 +1245,7 @@ fn branch_ref_stable_name(ref_token_hex: &str) -> String {
     format!("branch-ref:{ref_token_hex}")
 }
 
-fn encrypt_control_record(
+pub(crate) fn encrypt_control_record(
     secrets: &RepoSecrets,
     stable_name: &str,
     object_type: &str,
@@ -1252,7 +1279,7 @@ fn encrypt_control_record(
     postcard_to_vec(&envelope).context("failed to encode encrypted ref")
 }
 
-fn decrypt_control_record(
+pub(crate) fn decrypt_control_record(
     secrets: &RepoSecrets,
     stable_name: &str,
     object_type: &str,
@@ -1394,7 +1421,8 @@ fn build_tree_object(
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis()
-                        .min(u128::from(u64::MAX)) as u64;
+                        .min(u128::from(u64::MAX))
+                        as u64;
                     Ok((bytes, modified_unix_ms))
                 },
             )?;
@@ -1475,6 +1503,25 @@ where
         chunk_lengths.push(piece_len as u64);
     }
 
+    let (inline_chunk_ids, inline_chunk_lengths, shard_ids) =
+        if chunk_ids.len() > max_file_chunks_per_object() {
+            let mut shard_ids = Vec::new();
+            let mut start = 0usize;
+            while start < chunk_ids.len() {
+                let end = (start + max_file_chunks_per_object()).min(chunk_ids.len());
+                let shard = FileShardObject {
+                    schema_version: REPO_FORMAT_VERSION,
+                    chunks: chunk_ids[start..end].to_vec(),
+                    chunk_lengths: chunk_lengths[start..end].to_vec(),
+                };
+                shard_ids.push(write_object(object_store, "file_shard", &shard)?);
+                start = end;
+            }
+            (Vec::new(), Vec::new(), shard_ids)
+        } else {
+            (chunk_ids, chunk_lengths, Vec::new())
+        };
+
     let file_object = FileObject {
         schema_version: REPO_FORMAT_VERSION,
         entry_name: entry.name.clone(),
@@ -1482,8 +1529,9 @@ where
         modified_unix_ms,
         chunker_id: chunker.id().to_string(),
         chunker_config_id: chunker.config_fingerprint().to_string(),
-        chunks: chunk_ids,
-        chunk_lengths,
+        chunks: inline_chunk_ids,
+        chunk_lengths: inline_chunk_lengths,
+        shard_ids,
     };
     let file_id = write_object(object_store, "file", &file_object)?;
     *committed_files += 1;
@@ -1624,6 +1672,33 @@ fn read_file_object(object_store: &DirectLayoutObjectStore, object_id: &str) -> 
     Ok(file)
 }
 
+fn read_file_object_flattened(
+    object_store: &DirectLayoutObjectStore,
+    object_id: &str,
+) -> Result<FileObject> {
+    let mut file: FileObject = read_stored_object(object_store, object_id, "file")?;
+    validate_manifest_schema_version_local("file", file.schema_version)?;
+    if file.shard_ids.is_empty() {
+        return Ok(file);
+    }
+
+    let mut chunk_ids = Vec::new();
+    let mut chunk_lengths = Vec::new();
+    for shard_id in &file.shard_ids {
+        let shard: FileShardObject = read_stored_object(object_store, shard_id, "file_shard")?;
+        validate_manifest_schema_version_local("file_shard", shard.schema_version)?;
+        ensure!(
+            shard.chunks.len() == shard.chunk_lengths.len(),
+            "file shard metadata is inconsistent"
+        );
+        chunk_ids.extend(shard.chunks);
+        chunk_lengths.extend(shard.chunk_lengths);
+    }
+    file.chunks = chunk_ids;
+    file.chunk_lengths = chunk_lengths;
+    Ok(file)
+}
+
 #[cfg(test)]
 fn read_directory_root_object(
     object_store: &DirectLayoutObjectStore,
@@ -1731,6 +1806,25 @@ fn verify_file_graph(
     for chunk_id in file.chunks {
         let _ = read_chunk_object(object_store, &chunk_id)?;
     }
+    for shard_id in file.shard_ids {
+        let shard: FileShardObject = read_stored_object(object_store, &shard_id, "file_shard")?;
+        validate_manifest_schema_version_local("file_shard", shard.schema_version)?;
+        ensure!(
+            shard.chunks.len() == shard.chunk_lengths.len(),
+            "file shard metadata is inconsistent"
+        );
+        for chunk_id in shard.chunks {
+            let _ = read_chunk_object(object_store, &chunk_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_schema_version_local(object_type: &str, schema_version: u32) -> Result<()> {
+    ensure!(
+        schema_version == REPO_FORMAT_VERSION,
+        "unsupported manifest schema version for {object_type}: {schema_version}"
+    );
     Ok(())
 }
 
@@ -1884,9 +1978,9 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
 #[cfg(test)]
 mod facade_tests {
     use super::*;
-    use std::cell::RefCell;
     use crate::keyring::unlock_repo_secrets_uncached;
     use crate::working_tree::WorkingTreeEntry;
+    use std::cell::RefCell;
     use tempfile::tempdir;
 
     fn init_repo(temp_name: &str) -> (PathBuf, DirectLayoutObjectStore) {
@@ -1921,6 +2015,7 @@ mod facade_tests {
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
                 chunks: vec![],
                 chunk_lengths: vec![],
+                shard_ids: vec![],
             },
         )
         .unwrap();
@@ -2504,6 +2599,7 @@ mod facade_tests {
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
                 chunks: vec![chunk_id],
                 chunk_lengths: vec![5],
+                shard_ids: vec![],
             },
         )
         .unwrap();
@@ -2781,9 +2877,13 @@ mod facade_tests {
             chunker_id: "fastcdc".to_string(),
         };
 
-        let temp_path =
-            checkout_file_to_temp(&WorkingTree::new(temp.path()), &file, &final_path, read_service)
-                .unwrap();
+        let temp_path = checkout_file_to_temp(
+            &WorkingTree::new(temp.path()),
+            &file,
+            &final_path,
+            read_service,
+        )
+        .unwrap();
 
         assert_eq!(
             requested_lengths.borrow().as_slice(),

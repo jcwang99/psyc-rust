@@ -1,9 +1,13 @@
 use anyhow::Result;
 use fastcdc::v2020::FastCDC;
+use std::cell::Cell;
 
 pub const FASTCDC_MIN: u32 = 64 * 1024;
 pub const FASTCDC_AVG: u32 = 1024 * 1024;
 pub const FASTCDC_MAX: u32 = 8 * 1024 * 1024;
+thread_local! {
+    static FIXED_SPAN_BYTES_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkSpan {
@@ -30,6 +34,19 @@ impl FastCdcChunker {
     }
 
     pub fn split_spans(&self, bytes: &[u8]) -> Result<Vec<ChunkSpan>> {
+        if let Some(fixed_span_bytes) = FIXED_SPAN_BYTES_OVERRIDE.with(|cell| cell.get()) {
+            if bytes.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut spans = Vec::new();
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let length = fixed_span_bytes.min(bytes.len() - offset);
+                spans.push(ChunkSpan { offset, length });
+                offset += length;
+            }
+            return Ok(spans);
+        }
         let mut spans = Vec::new();
 
         for entry in FastCDC::new(bytes, FASTCDC_MIN, FASTCDC_AVG, FASTCDC_MAX) {
@@ -47,6 +64,27 @@ impl FastCdcChunker {
         }
 
         Ok(spans)
+    }
+}
+
+pub fn override_fixed_span_bytes_for_test(span_bytes: usize) -> FixedSpanBytesGuard {
+    let previous = FIXED_SPAN_BYTES_OVERRIDE.with(|cell| {
+        let previous = cell.get();
+        cell.set(Some(span_bytes));
+        previous
+    });
+    FixedSpanBytesGuard { previous }
+}
+
+pub struct FixedSpanBytesGuard {
+    previous: Option<usize>,
+}
+
+impl Drop for FixedSpanBytesGuard {
+    fn drop(&mut self) {
+        FIXED_SPAN_BYTES_OVERRIDE.with(|cell| {
+            cell.set(self.previous);
+        });
     }
 }
 

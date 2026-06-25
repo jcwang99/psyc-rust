@@ -11,7 +11,6 @@ use crate::fetch::{FetchOptions, fetch_remote, validate_remote_branch_control_pl
 pub struct CloneOptions {
     pub repo_root: PathBuf,
     pub password: String,
-    pub branch_name: String,
     pub branch_token: String,
 }
 
@@ -33,7 +32,7 @@ pub fn clone_remote<R: RemoteBackend>(remote: &R, options: CloneOptions) -> Resu
     } else {
         std::fs::create_dir_all(&options.repo_root)?;
     }
-    validate_remote_branch_control_plane(remote, &options.branch_token)?;
+    validate_remote_branch_control_plane(remote, &options.repo_root, &options.branch_token)?;
     std::fs::create_dir_all(options.repo_root.join(".e2v").join("objects"))?;
     std::fs::create_dir_all(options.repo_root.join(".e2v").join("journal"))?;
     std::fs::create_dir_all(options.repo_root.join(".e2v").join("refs"))?;

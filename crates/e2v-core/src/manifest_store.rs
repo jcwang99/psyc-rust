@@ -41,6 +41,7 @@ pub struct ManifestFileObject {
     pub chunker_config_id: String,
     pub chunks: Vec<String>,
     pub chunk_lengths: Vec<u64>,
+    pub shard_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,7 +107,7 @@ impl ManifestStoreApi for ManifestStore {
     fn get_file(&self, id: &str) -> Result<ManifestFileObject> {
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let object_store = open_object_store(&control_dir)?;
-        let file = read_file_object(&object_store, id)?;
+        let file = read_file_object_flattened(&object_store, id)?;
         Ok(ManifestFileObject {
             schema_version: file.schema_version,
             entry_name: file.entry_name,
@@ -116,6 +117,7 @@ impl ManifestStoreApi for ManifestStore {
             chunker_config_id: file.chunker_config_id,
             chunks: file.chunks,
             chunk_lengths: file.chunk_lengths,
+            shard_ids: file.shard_ids,
         })
     }
 
@@ -151,7 +153,12 @@ impl ManifestStoreApi for ManifestStore {
         let mut seen = HashSet::new();
         let snapshot = read_snapshot_object(&object_store, snapshot_id)?;
         push_reachable_id(&mut reachable, &mut seen, snapshot_id.to_string());
-        collect_tree_object_ids(&object_store, &snapshot.root_tree_id, &mut reachable, &mut seen)?;
+        collect_tree_object_ids(
+            &object_store,
+            &snapshot.root_tree_id,
+            &mut reachable,
+            &mut seen,
+        )?;
         Ok(reachable)
     }
 }
@@ -172,6 +179,14 @@ struct FileObject {
     pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
+    pub chunks: Vec<String>,
+    pub chunk_lengths: Vec<u64>,
+    pub shard_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FileShardObject {
+    pub schema_version: u32,
     pub chunks: Vec<String>,
     pub chunk_lengths: Vec<u64>,
 }
@@ -352,6 +367,40 @@ fn read_file_object(object_store: &dyn LogicalObjectStore, object_id: &str) -> R
     Ok(file)
 }
 
+fn read_file_shard_object(
+    object_store: &dyn LogicalObjectStore,
+    object_id: &str,
+) -> Result<FileShardObject> {
+    let file_shard: FileShardObject = read_stored_object(object_store, object_id, "file_shard")?;
+    validate_manifest_schema_version("file_shard", file_shard.schema_version)?;
+    Ok(file_shard)
+}
+
+fn read_file_object_flattened(
+    object_store: &dyn LogicalObjectStore,
+    object_id: &str,
+) -> Result<FileObject> {
+    let mut file = read_file_object(object_store, object_id)?;
+    if file.shard_ids.is_empty() {
+        return Ok(file);
+    }
+
+    let mut chunk_ids = Vec::new();
+    let mut chunk_lengths = Vec::new();
+    for shard_id in &file.shard_ids {
+        let shard = read_file_shard_object(object_store, shard_id)?;
+        ensure!(
+            shard.chunks.len() == shard.chunk_lengths.len(),
+            "file shard metadata is inconsistent"
+        );
+        chunk_ids.extend(shard.chunks);
+        chunk_lengths.extend(shard.chunk_lengths);
+    }
+    file.chunks = chunk_ids;
+    file.chunk_lengths = chunk_lengths;
+    Ok(file)
+}
+
 fn read_tree_shard_object(
     object_store: &dyn LogicalObjectStore,
     object_id: &str,
@@ -401,11 +450,18 @@ fn collect_tree_entries(
             "tree" => collect_tree_object_ids(object_store, &entry.object_id, reachable, seen)?,
             "file" => {
                 if push_reachable_id(reachable, seen, entry.object_id.clone()) {
-                    let file = read_file_object(object_store, &entry.object_id)?;
+                    let file = read_file_object_flattened(object_store, &entry.object_id)?;
                     for chunk_id in file.chunks {
-                        validate_object_id_value(&chunk_id)
-                            .with_context(|| format!("invalid chunk id in file {}", entry.object_id))?;
+                        validate_object_id_value(&chunk_id).with_context(|| {
+                            format!("invalid chunk id in file {}", entry.object_id)
+                        })?;
                         push_reachable_id(reachable, seen, chunk_id);
+                    }
+                    for shard_id in file.shard_ids {
+                        validate_object_id_value(&shard_id).with_context(|| {
+                            format!("invalid file shard id in file {}", entry.object_id)
+                        })?;
+                        push_reachable_id(reachable, seen, shard_id);
                     }
                 }
             }
@@ -417,7 +473,11 @@ fn collect_tree_entries(
     Ok(())
 }
 
-fn push_reachable_id(reachable: &mut Vec<String>, seen: &mut HashSet<String>, object_id: String) -> bool {
+fn push_reachable_id(
+    reachable: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    object_id: String,
+) -> bool {
     if seen.insert(object_id.clone()) {
         reachable.push(object_id);
         true

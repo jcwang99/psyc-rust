@@ -21,6 +21,7 @@ pub struct BackendCapability {
     pub supports_paged_list: bool,
     pub consistency_class: ConsistencyClass,
     pub supports_remote_lock_or_lease: bool,
+    pub supports_atomic_create_if_absent: bool,
     pub supports_transaction_markers: bool,
     pub supports_reliable_remote_time: bool,
     pub supports_object_generation_or_etag: bool,
@@ -41,6 +42,7 @@ impl BackendCapability {
 
     pub fn supports_safe_single_writer_push(&self) -> bool {
         self.supports_remote_lock_or_lease
+            && self.supports_atomic_create_if_absent
             && self.supports_transaction_markers
             && (self.supports_reliable_remote_time || self.supports_object_generation_or_etag)
     }

@@ -1,10 +1,11 @@
-pub const OBJECT_TYPE_CANDIDATES: [&str; 6] = [
+pub const OBJECT_TYPE_CANDIDATES: [&str; 7] = [
     "snapshot",
     "tree",
     "file",
     "chunk",
     "directory_root",
     "tree_shard",
+    "file_shard",
 ];
 
 pub fn candidate_object_types(hint: Option<&str>) -> Vec<&'static str> {
@@ -18,6 +19,7 @@ pub fn candidate_object_types(hint: Option<&str>) -> Vec<&'static str> {
                 "chunk" => "chunk",
                 "directory_root" => "directory_root",
                 "tree_shard" => "tree_shard",
+                "file_shard" => "file_shard",
                 _ => unreachable!(),
             });
         }
@@ -57,6 +59,7 @@ mod tests {
                 "chunk",
                 "directory_root",
                 "tree_shard",
+                "file_shard",
             ]
         );
     }
@@ -85,5 +88,21 @@ mod tests {
 
         assert_eq!(inferred, "file");
         assert_eq!(seen, vec!["snapshot", "tree", "file"]);
+    }
+
+    #[test]
+    fn candidate_object_types_include_file_shard() {
+        assert_eq!(
+            candidate_object_types(Some("file_shard")),
+            vec![
+                "file_shard",
+                "snapshot",
+                "tree",
+                "file",
+                "chunk",
+                "directory_root",
+                "tree_shard",
+            ]
+        );
     }
 }

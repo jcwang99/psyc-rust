@@ -17,10 +17,15 @@ tokio.workspace = true
 serde_urlencoded.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+url.workspace = true
 e2v-core = { path = "../e2v-core" }
 e2v-store = { path = "../e2v-store" }
+tempfile.workspace = true
 
 [dev-dependencies]
 http-body = "1.0"
 postcard.workspace = true
-tempfile.workspace = true
+
+[[bin]]
+name = "p1_c_pack_bench"
+path = "src/bin/p1_c_pack_bench.rs"

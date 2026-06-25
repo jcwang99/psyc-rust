@@ -12,7 +12,9 @@ pub mod testing {
 
     use anyhow::Result;
 
+    pub use crate::chunker::override_fixed_span_bytes_for_test;
     pub use crate::facade::RepositoryFacade;
+    pub use crate::facade::override_max_file_chunks_per_object_for_test;
     pub use crate::keyring::clear_unlocked_keyring_cache_for_test;
     pub use crate::working_tree::WorkingTree as TestWorkingTree;
     pub use crate::working_tree::{SnapshotReader, StableReadPolicy};
@@ -52,17 +54,25 @@ pub mod testing {
     ) -> RepositoryFacade {
         RepositoryFacade::with_snapshot_reader_and_policy(snapshot_reader, stable_read_policy)
     }
+
+    pub fn force_large_file_sharding_for_test() -> (
+        crate::chunker::FixedSpanBytesGuard,
+        crate::facade::MaxFileChunksPerObjectGuard,
+    ) {
+        (
+            crate::chunker::override_fixed_span_bytes_for_test(1024 * 1024),
+            crate::facade::override_max_file_chunks_per_object_for_test(2),
+        )
+    }
 }
 
 pub use facade::{
-    BranchState, BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
-    InitOptions, ReadService, RepositoryFacade, RepositoryState, SnapshotSummary,
+    BranchState, BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry,
+    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState, SnapshotSummary,
     validate_layout_root_value,
 };
 pub use keyring::clear_unlocked_keyring_cache;
-pub use local_index::{
-    FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult,
-};
+pub use local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
 pub use manifest_store::{
     ManifestFileObject, ManifestObject, ManifestSnapshotObject, ManifestStore, ManifestStoreApi,
     ManifestTreeEntry, ManifestTreeObject, TreeWalkEntry,
@@ -120,6 +130,11 @@ pub mod sync_support {
         ))
     }
 
+    pub fn read_repo_id(repo_root: impl AsRef<Path>) -> Result<String> {
+        let keyring = crate::keyring::read_current_keyring_state(&repo_root.as_ref().join(".e2v"))?;
+        Ok(keyring.repo_id)
+    }
+
     pub fn list_local_object_files(repo_root: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let objects_dir = repo_root.as_ref().join(".e2v").join("objects");
         let mut files = std::fs::read_dir(&objects_dir)?
@@ -132,12 +147,6 @@ pub mod sync_support {
     pub fn read_layout_root_bytes(repo_root: impl AsRef<Path>) -> Result<Vec<u8>> {
         Ok(std::fs::read(
             repo_root.as_ref().join(".e2v").join("layout_root.json"),
-        )?)
-    }
-
-    pub fn read_config_bytes(repo_root: impl AsRef<Path>) -> Result<Vec<u8>> {
-        Ok(std::fs::read(
-            repo_root.as_ref().join(".e2v").join("config.json"),
         )?)
     }
 
@@ -302,6 +311,38 @@ pub mod sync_support {
 
     pub fn open_repo_secrets_for_sync(control_dir: impl AsRef<Path>) -> Result<RepoSecrets> {
         super::keyring::open_repo_secrets(control_dir.as_ref())
+    }
+
+    pub fn unlock_repo_secrets_for_sync(
+        control_dir: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<RepoSecrets> {
+        super::keyring::unlock_repo_secrets_uncached(control_dir.as_ref(), password)
+    }
+
+    pub fn unlock_repo_secrets_from_keyring_bytes_for_sync(
+        keyring_bytes: &[u8],
+        password: &str,
+    ) -> Result<RepoSecrets> {
+        super::keyring::unlock_repo_secrets_from_keyring_bytes(keyring_bytes, password)
+    }
+
+    pub fn encrypt_control_record_for_sync(
+        secrets: &RepoSecrets,
+        stable_name: &str,
+        object_type: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        super::facade::encrypt_control_record(secrets, stable_name, object_type, plaintext)
+    }
+
+    pub fn decrypt_control_record_for_sync(
+        secrets: &RepoSecrets,
+        stable_name: &str,
+        object_type: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>> {
+        super::facade::decrypt_control_record(secrets, stable_name, object_type, bytes)
     }
 
     pub fn verify_snapshot_with_secrets_for_sync(

@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use e2v_core::{CommitOptions, InitOptions, ManifestStoreApi, RepositoryFacade};
 use e2v_store::{
-    BlobStore, DirectLayoutObjectStore, LayoutRootStore, MemoryBackend, OpendalMemoryBackend,
-    RefStore, RefToken, RemoteBackend, S3CompatibleMockBackend, StoredRef, WebdavAlistMockBackend,
+    BlobStore, DirectLayoutObjectStore, LayoutRootStore, ListedRef, MemoryBackend,
+    OpendalMemoryBackend, RefStore, RefToken, RemoteBackend, S3CompatibleMockBackend, StoredRef,
+    WebdavAlistMockBackend,
 };
 use tempfile::tempdir;
 
@@ -55,23 +56,27 @@ fn seed_remote() -> (
 }
 
 #[derive(Clone, Debug)]
-struct ConfigDisappearsAfterRefReadRemote {
+struct KeyringPointerDisappearsAfterRefReadRemote {
     inner: MemoryBackend,
-    config_deleted: Arc<AtomicBool>,
+    keyring_pointer_deleted: Arc<AtomicBool>,
 }
 
-impl ConfigDisappearsAfterRefReadRemote {
+impl KeyringPointerDisappearsAfterRefReadRemote {
     fn new(inner: MemoryBackend) -> Self {
         Self {
             inner,
-            config_deleted: Arc::new(AtomicBool::new(false)),
+            keyring_pointer_deleted: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-impl BlobStore for ConfigDisappearsAfterRefReadRemote {
+impl BlobStore for KeyringPointerDisappearsAfterRefReadRemote {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -104,13 +109,18 @@ impl BlobStore for ConfigDisappearsAfterRefReadRemote {
     }
 }
 
-impl RefStore for ConfigDisappearsAfterRefReadRemote {
+impl RefStore for KeyringPointerDisappearsAfterRefReadRemote {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         let stored = self.inner.read_ref(token)?;
-        if stored.is_some() && !self.config_deleted.swap(true, Ordering::SeqCst) {
-            self.inner.delete_physical("control/config.json")?;
+        if stored.is_some() && !self.keyring_pointer_deleted.swap(true, Ordering::SeqCst) {
+            self.inner
+                .delete_physical("control/keyring/keyring.current")?;
         }
         Ok(stored)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
     }
 
     fn compare_and_swap_ref(
@@ -123,7 +133,7 @@ impl RefStore for ConfigDisappearsAfterRefReadRemote {
     }
 }
 
-impl LayoutRootStore for ConfigDisappearsAfterRefReadRemote {
+impl LayoutRootStore for KeyringPointerDisappearsAfterRefReadRemote {
     fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
         self.inner.read_layout_root()
     }
@@ -141,7 +151,7 @@ impl LayoutRootStore for ConfigDisappearsAfterRefReadRemote {
     }
 }
 
-impl RemoteBackend for ConfigDisappearsAfterRefReadRemote {
+impl RemoteBackend for KeyringPointerDisappearsAfterRefReadRemote {
     fn capability(&self) -> &e2v_store::BackendCapability {
         self.inner.capability()
     }
@@ -172,6 +182,10 @@ impl KeyringPointerHiddenFromListRemote {
 impl BlobStore for KeyringPointerHiddenFromListRemote {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -213,6 +227,10 @@ impl RefStore for KeyringPointerHiddenFromListRemote {
         self.inner.read_ref(token)
     }
 
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
     fn compare_and_swap_ref(
         &self,
         token: &RefToken,
@@ -242,6 +260,102 @@ impl LayoutRootStore for KeyringPointerHiddenFromListRemote {
 }
 
 impl RemoteBackend for KeyringPointerHiddenFromListRemote {
+    fn capability(&self) -> &e2v_store::BackendCapability {
+        self.inner.capability()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackIndexListingForbiddenRemote {
+    inner: MemoryBackend,
+}
+
+impl PackIndexListingForbiddenRemote {
+    fn new(inner: MemoryBackend) -> Self {
+        Self { inner }
+    }
+}
+
+impl BlobStore for PackIndexListingForbiddenRemote {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        if prefix == "packs/index/" {
+            anyhow::bail!("pack index listing disabled for test");
+        }
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for PackIndexListingForbiddenRemote {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: e2v_store::EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for PackIndexListingForbiddenRemote {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for PackIndexListingForbiddenRemote {
     fn capability(&self) -> &e2v_store::BackendCapability {
         self.inner.capability()
     }
@@ -280,6 +394,10 @@ impl GetTrackingBackend {
 impl BlobStore for GetTrackingBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -323,6 +441,10 @@ impl BlobStore for GetTrackingBackend {
 impl RefStore for GetTrackingBackend {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
     }
 
     fn compare_and_swap_ref(
@@ -476,7 +598,6 @@ fn fetch_does_not_read_unreachable_remote_loose_objects_when_repo_is_already_unl
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -515,8 +636,8 @@ fn fetch_does_not_read_unreachable_remote_loose_objects_when_repo_is_already_unl
 }
 
 #[test]
-fn fetch_restores_bundled_objects_without_repeating_bundle_range_reads_per_object() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_restores_packed_objects_without_repeating_pack_range_reads_per_object() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -539,7 +660,7 @@ fn fetch_restores_bundled_objects_without_repeating_bundle_range_reads_per_objec
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-fetch-range-scaling".to_string(),
+            message: "packed-fetch-range-scaling".to_string(),
         })
         .unwrap();
 
@@ -550,7 +671,7 @@ fn fetch_restores_bundled_objects_without_repeating_bundle_range_reads_per_objec
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-fetch-range-scaling-op".to_string(),
+            operation_id: "packed-fetch-range-scaling-op".to_string(),
         },
     )
     .unwrap();
@@ -582,23 +703,299 @@ fn fetch_restores_bundled_objects_without_repeating_bundle_range_reads_per_objec
     let range_read_paths = tracked_remote.range_read_paths();
     assert!(
         !range_read_paths.is_empty(),
-        "expected bundled fetch to use bundle range reads"
+        "expected packed fetch to use pack range reads"
     );
-    let distinct_bundle_paths = range_read_paths
+    let distinct_pack_paths = range_read_paths
         .iter()
-        .filter(|path| path.starts_with("bundles/data/"))
+        .filter(|path| path.starts_with("packs/data/"))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     assert!(
-        range_read_paths.len() <= distinct_bundle_paths.len() + 2,
-        "expected fetch to avoid repeated per-object bundle reads, saw {:?}",
+        range_read_paths.len() <= distinct_pack_paths.len() + 2,
+        "expected fetch to avoid repeated per-object pack reads, saw {:?}",
         range_read_paths
     );
 }
 
 #[test]
-fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer_changes() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_restores_missing_packed_objects_without_relisting_remote_pack_indexes() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("cached-{index:02}.txt")),
+            format!("cached-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "packed-fetch-cache".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "packed-fetch-cache-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/index/").unwrap().is_empty());
+
+    let target_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&target_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let deleted_object_path = fs::read_dir(target_repo_root.join(".e2v").join("objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .next()
+        .unwrap();
+    fs::remove_file(&deleted_object_path).unwrap();
+    assert!(!deleted_object_path.exists());
+
+    let guarded_remote = PackIndexListingForbiddenRemote::new(remote);
+    let fetched = fetch_remote(
+        &guarded_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    assert!(deleted_object_path.is_file());
+}
+
+#[test]
+fn fetch_rejects_invalid_pack_index_root_instead_of_falling_back_to_segment_listing() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "invalid-pack-index-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "invalid-pack-index-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let mut root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &source_repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    root["schema_version"] = serde_json::Value::from(99u64);
+    remote
+        .put_physical(
+            "pack-index/root.json",
+            &e2v_sync::testing::encode_pack_index_root_value_for_test(
+                &source_repo_root.join(".e2v"),
+                &root,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let target_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&target_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let error = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root,
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("pack index root")
+            || error.to_string().contains("schema version"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn clone_and_fetch_restore_large_files_backed_by_file_shards() {
+    let (_chunk_guard, _file_shard_guard) = e2v_core::testing::force_large_file_sharding_for_test();
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let mut large_bytes = Vec::with_capacity(24 * 1024 * 1024);
+    for block in 0..24usize {
+        let fill = b'A' + (block as u8 % 26);
+        large_bytes.extend(std::iter::repeat_n(fill, 1024 * 1024));
+    }
+    fs::write(source_repo_root.join("large.bin"), &large_bytes).unwrap();
+
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "file-shard-sync".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "file-shard-sync-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let clone_repo_root = temp.path().join("clone-target");
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    fs::create_dir_all(clone_repo_root.join("checkout")).unwrap();
+    let clone_facade = RepositoryFacade::new();
+    clone_facade
+        .unlock(&clone_repo_root, "correct horse battery staple")
+        .unwrap();
+    clone_facade
+        .checkout(e2v_core::CheckoutOptions {
+            repo_root: clone_repo_root.clone(),
+            snapshot_id: clone_facade.snapshots(&clone_repo_root).unwrap()[0]
+                .snapshot_id
+                .clone(),
+            target_dir: clone_repo_root.join("checkout"),
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read(clone_repo_root.join("checkout").join("large.bin")).unwrap(),
+        large_bytes
+    );
+
+    let fetch_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&fetch_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: fetch_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: fetch_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    fs::create_dir_all(fetch_repo_root.join("checkout")).unwrap();
+    let fetch_facade = RepositoryFacade::new();
+    fetch_facade
+        .unlock(&fetch_repo_root, "correct horse battery staple")
+        .unwrap();
+    fetch_facade
+        .checkout(e2v_core::CheckoutOptions {
+            repo_root: fetch_repo_root.clone(),
+            snapshot_id: fetch_facade.snapshots(&fetch_repo_root).unwrap()[0]
+                .snapshot_id
+                .clone(),
+            target_dir: fetch_repo_root.join("checkout"),
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read(fetch_repo_root.join("checkout").join("large.bin")).unwrap(),
+        large_bytes
+    );
+}
+
+#[test]
+fn fetch_reuses_pack_reads_when_restoring_objects_after_remote_keyring_pointer_changes() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -621,7 +1018,7 @@ fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-base".to_string(),
+            message: "packed-base".to_string(),
         })
         .unwrap();
 
@@ -632,7 +1029,7 @@ fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-pointer-change-base".to_string(),
+            operation_id: "packed-pointer-change-base".to_string(),
         },
     )
     .unwrap();
@@ -643,7 +1040,6 @@ fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: state.branch.token_hex.clone(),
         },
     )
@@ -666,7 +1062,7 @@ fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer
     let committed = facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-pointer-change-next".to_string(),
+            message: "packed-pointer-change-next".to_string(),
         })
         .unwrap();
     let pushed = push_head(
@@ -675,7 +1071,7 @@ fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-pointer-change-next".to_string(),
+            operation_id: "packed-pointer-change-next".to_string(),
         },
     )
     .unwrap();
@@ -703,23 +1099,23 @@ fn fetch_reuses_bundle_reads_when_restoring_objects_after_remote_keyring_pointer
             .join(format!("{}.json", committed.snapshot_id))
             .is_file()
     );
-    let bundle_range_read_paths = tracked_remote
+    let pack_range_read_paths = tracked_remote
         .range_read_paths()
         .into_iter()
-        .filter(|path| path.starts_with("bundles/data/"))
+        .filter(|path| path.starts_with("packs/data/"))
         .collect::<Vec<_>>();
     assert!(
-        !bundle_range_read_paths.is_empty(),
-        "expected fetch to read bundled object data after the remote keyring pointer changed"
+        !pack_range_read_paths.is_empty(),
+        "expected fetch to read packed object data after the remote keyring pointer changed"
     );
-    let distinct_bundle_paths = bundle_range_read_paths
+    let distinct_pack_paths = pack_range_read_paths
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     assert!(
-        bundle_range_read_paths.len() <= distinct_bundle_paths.len() + 1,
-        "expected fetch to reuse bundle reads after the remote keyring pointer changed, saw {:?}",
-        bundle_range_read_paths
+        pack_range_read_paths.len() <= distinct_pack_paths.len() + 1,
+        "expected fetch to reuse pack reads after the remote keyring pointer changed, saw {:?}",
+        pack_range_read_paths
     );
 
     RepositoryFacade::new()
@@ -737,7 +1133,6 @@ fn fetch_does_not_publish_new_keyring_pointer_before_new_generation_file_is_writ
         CloneOptions {
             repo_root: target_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -1168,7 +1563,6 @@ fn fetch_updates_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_
         CloneOptions {
             repo_root: target_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -1242,7 +1636,6 @@ fn fetch_updates_current_keyring_generation_even_when_remote_keyring_listing_omi
         CloneOptions {
             repo_root: target_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -1398,7 +1791,6 @@ fn fetch_preserves_unlocked_access_when_remote_keyring_pointer_is_unchanged() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -1597,9 +1989,11 @@ fn fetch_rejects_missing_remote_branch_ref_without_mutating_local_state() {
 }
 
 #[test]
-fn fetch_rejects_missing_remote_config_without_downloading_objects() {
+fn fetch_succeeds_without_remote_config_file() {
     let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
-    remote.delete_physical("control/config.json").unwrap();
+    if remote.exists_physical("control/config.json") {
+        remote.delete_physical("control/config.json").unwrap();
+    }
 
     let target_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&target_repo_root).unwrap();
@@ -1622,7 +2016,7 @@ fn fetch_rejects_missing_remote_config_without_downloading_objects() {
     let original_layout_bytes =
         fs::read(target_repo_root.join(".e2v").join("layout_root.json")).unwrap();
 
-    let error = fetch_remote(
+    let fetched = fetch_remote(
         &remote,
         FetchOptions {
             password: Some("correct horse battery staple".to_string()),
@@ -1630,23 +2024,10 @@ fn fetch_rejects_missing_remote_config_without_downloading_objects() {
             branch_token,
         },
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        error.to_string().contains("config.json")
-            || error.to_string().contains("missing physical object"),
-        "unexpected error: {error:#}"
-    );
-    assert_eq!(
-        target_repo_root
-            .join(".e2v")
-            .join("objects")
-            .read_dir()
-            .unwrap()
-            .count(),
-        0
-    );
-    assert_eq!(
+    assert!(fetched.downloaded_objects > 0);
+    assert_ne!(
         fs::read(
             target_repo_root
                 .join(".e2v")
@@ -1658,7 +2039,8 @@ fn fetch_rejects_missing_remote_config_without_downloading_objects() {
     );
     assert_eq!(
         fs::read(target_repo_root.join(".e2v").join("layout_root.json")).unwrap(),
-        original_layout_bytes
+        original_layout_bytes,
+        "fetch without remote config should still preserve the valid layout root"
     );
 }
 
@@ -1725,7 +2107,6 @@ fn fetch_does_not_allow_unlocked_head_validation_to_write_outside_validation_roo
         CloneOptions {
             repo_root: target_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -1874,8 +2255,8 @@ fn fetch_leaves_no_partial_objects_when_invalid_remote_object_path_sorts_after_v
 }
 
 #[test]
-fn fetch_rejects_bundle_indexes_with_data_paths_outside_bundle_data_prefix() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_rejects_pack_indexes_with_data_paths_outside_pack_data_prefix() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -1888,11 +2269,11 @@ fn fetch_rejects_bundle_indexes_with_data_paths_outside_bundle_data_prefix() {
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-sync".to_string(),
+            message: "packed-sync".to_string(),
         })
         .unwrap();
 
@@ -1903,22 +2284,34 @@ fn fetch_rejects_bundle_indexes_with_data_paths_outside_bundle_data_prefix() {
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-path-escape".to_string(),
+            operation_id: "packed-path-escape".to_string(),
         },
     )
     .unwrap();
 
     let index_path = remote
-        .list_physical("bundles/index/")
+        .list_physical("packs/index/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&remote.get_physical(&index_path).unwrap()).unwrap();
+    let mut index = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+        &source_repo_root.join(".e2v"),
+        &index_path,
+        &remote.get_physical(&index_path).unwrap(),
+    )
+    .unwrap();
     index["data_path"] = serde_json::Value::String("../keep.txt".to_string());
     remote
-        .put_physical(&index_path, &serde_json::to_vec(&index).unwrap())
+        .put_physical(
+            &index_path,
+            &e2v_sync::testing::encode_pack_index_segment_value_for_test(
+                &source_repo_root.join(".e2v"),
+                &index_path,
+                &index,
+            )
+            .unwrap(),
+        )
         .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
@@ -1944,8 +2337,8 @@ fn fetch_rejects_bundle_indexes_with_data_paths_outside_bundle_data_prefix() {
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("bundle data path")
-            || error.to_string().contains("bundles/data/")
+        error.to_string().contains("pack data path")
+            || error.to_string().contains("packs/data/")
             || error.to_string().contains("path traversal"),
         "unexpected error: {error:#}"
     );
@@ -1956,8 +2349,8 @@ fn fetch_rejects_bundle_indexes_with_data_paths_outside_bundle_data_prefix() {
 }
 
 #[test]
-fn fetch_rejects_bundle_indexes_with_object_ids_that_escape_the_objects_directory() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_rejects_pack_indexes_with_object_ids_that_escape_the_objects_directory() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -1970,11 +2363,11 @@ fn fetch_rejects_bundle_indexes_with_object_ids_that_escape_the_objects_director
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-sync".to_string(),
+            message: "packed-sync".to_string(),
         })
         .unwrap();
 
@@ -1985,22 +2378,34 @@ fn fetch_rejects_bundle_indexes_with_object_ids_that_escape_the_objects_director
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-object-id-escape".to_string(),
+            operation_id: "packed-object-id-escape".to_string(),
         },
     )
     .unwrap();
 
     let index_path = remote
-        .list_physical("bundles/index/")
+        .list_physical("packs/index/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&remote.get_physical(&index_path).unwrap()).unwrap();
+    let mut index = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+        &source_repo_root.join(".e2v"),
+        &index_path,
+        &remote.get_physical(&index_path).unwrap(),
+    )
+    .unwrap();
     index["entries"][0]["object_id"] = serde_json::Value::String("../keep".to_string());
     remote
-        .put_physical(&index_path, &serde_json::to_vec(&index).unwrap())
+        .put_physical(
+            &index_path,
+            &e2v_sync::testing::encode_pack_index_segment_value_for_test(
+                &source_repo_root.join(".e2v"),
+                &index_path,
+                &index,
+            )
+            .unwrap(),
+        )
         .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
@@ -2026,7 +2431,7 @@ fn fetch_rejects_bundle_indexes_with_object_ids_that_escape_the_objects_director
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("invalid bundled object id")
+        error.to_string().contains("invalid packed object id")
             || error.to_string().contains("path traversal")
             || error.to_string().contains("object id"),
         "unexpected error: {error:#}"
@@ -2038,8 +2443,8 @@ fn fetch_rejects_bundle_indexes_with_object_ids_that_escape_the_objects_director
 }
 
 #[test]
-fn fetch_rejects_bundle_indexes_with_out_of_bounds_entry_ranges() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_rejects_pack_indexes_with_out_of_bounds_entry_ranges() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -2052,11 +2457,11 @@ fn fetch_rejects_bundle_indexes_with_out_of_bounds_entry_ranges() {
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-sync".to_string(),
+            message: "packed-sync".to_string(),
         })
         .unwrap();
 
@@ -2067,30 +2472,42 @@ fn fetch_rejects_bundle_indexes_with_out_of_bounds_entry_ranges() {
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-range-oob".to_string(),
+            operation_id: "packed-range-oob".to_string(),
         },
     )
     .unwrap();
 
     let index_path = remote
-        .list_physical("bundles/index/")
+        .list_physical("packs/index/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
     let data_path = remote
-        .list_physical("bundles/data/")
+        .list_physical("packs/data/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
     let data_len = remote.get_physical(&data_path).unwrap().len() as u64;
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&remote.get_physical(&index_path).unwrap()).unwrap();
+    let mut index = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+        &source_repo_root.join(".e2v"),
+        &index_path,
+        &remote.get_physical(&index_path).unwrap(),
+    )
+    .unwrap();
     index["entries"][0]["offset"] = serde_json::Value::from(data_len + 1);
     index["entries"][0]["length"] = serde_json::Value::from(10u64);
     remote
-        .put_physical(&index_path, &serde_json::to_vec(&index).unwrap())
+        .put_physical(
+            &index_path,
+            &e2v_sync::testing::encode_pack_index_segment_value_for_test(
+                &source_repo_root.join(".e2v"),
+                &index_path,
+                &index,
+            )
+            .unwrap(),
+        )
         .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
@@ -2115,9 +2532,8 @@ fn fetch_rejects_bundle_indexes_with_out_of_bounds_entry_ranges() {
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("bundle entry range")
-            || error.to_string().contains("out of bounds")
-            || error.to_string().contains("invalid bundle"),
+        error.to_string().contains("pack entry range")
+            || error.to_string().contains("out of bounds"),
         "unexpected error: {error:#}"
     );
     assert_eq!(
@@ -2132,8 +2548,8 @@ fn fetch_rejects_bundle_indexes_with_out_of_bounds_entry_ranges() {
 }
 
 #[test]
-fn fetch_rejects_bundle_indexes_with_entry_lengths_that_span_multiple_objects() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_rejects_pack_indexes_with_entry_lengths_that_span_multiple_objects() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -2146,11 +2562,11 @@ fn fetch_rejects_bundle_indexes_with_entry_lengths_that_span_multiple_objects() 
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-sync".to_string(),
+            message: "packed-sync".to_string(),
         })
         .unwrap();
 
@@ -2161,30 +2577,42 @@ fn fetch_rejects_bundle_indexes_with_entry_lengths_that_span_multiple_objects() 
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-range-overlap".to_string(),
+            operation_id: "packed-range-overlap".to_string(),
         },
     )
     .unwrap();
 
     let index_path = remote
-        .list_physical("bundles/index/")
+        .list_physical("packs/index/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
     let data_path = remote
-        .list_physical("bundles/data/")
+        .list_physical("packs/data/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
     let data_len = remote.get_physical(&data_path).unwrap().len() as u64;
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&remote.get_physical(&index_path).unwrap()).unwrap();
+    let mut index = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+        &source_repo_root.join(".e2v"),
+        &index_path,
+        &remote.get_physical(&index_path).unwrap(),
+    )
+    .unwrap();
     index["entries"][0]["offset"] = serde_json::Value::from(0u64);
     index["entries"][0]["length"] = serde_json::Value::from(data_len);
     remote
-        .put_physical(&index_path, &serde_json::to_vec(&index).unwrap())
+        .put_physical(
+            &index_path,
+            &e2v_sync::testing::encode_pack_index_segment_value_for_test(
+                &source_repo_root.join(".e2v"),
+                &index_path,
+                &index,
+            )
+            .unwrap(),
+        )
         .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
@@ -2209,9 +2637,7 @@ fn fetch_rejects_bundle_indexes_with_entry_lengths_that_span_multiple_objects() 
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("bundle entry range")
-            || error.to_string().contains("invalid bundle")
-            || error.to_string().contains("overlap"),
+        error.to_string().contains("pack entry range") || error.to_string().contains("overlap"),
         "unexpected error: {error:#}"
     );
     assert_eq!(
@@ -2226,8 +2652,8 @@ fn fetch_rejects_bundle_indexes_with_entry_lengths_that_span_multiple_objects() 
 }
 
 #[test]
-fn fetch_rejects_bundle_indexes_with_duplicate_object_ids() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_rejects_pack_indexes_with_duplicate_object_ids() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -2240,11 +2666,11 @@ fn fetch_rejects_bundle_indexes_with_duplicate_object_ids() {
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-sync".to_string(),
+            message: "packed-sync".to_string(),
         })
         .unwrap();
 
@@ -2255,26 +2681,38 @@ fn fetch_rejects_bundle_indexes_with_duplicate_object_ids() {
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-duplicate-object".to_string(),
+            operation_id: "packed-duplicate-object".to_string(),
         },
     )
     .unwrap();
 
     let index_path = remote
-        .list_physical("bundles/index/")
+        .list_physical("packs/index/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&remote.get_physical(&index_path).unwrap()).unwrap();
+    let mut index = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+        &source_repo_root.join(".e2v"),
+        &index_path,
+        &remote.get_physical(&index_path).unwrap(),
+    )
+    .unwrap();
     let duplicate_id = index["entries"][0]["object_id"]
         .as_str()
         .unwrap()
         .to_string();
     index["entries"][1]["object_id"] = serde_json::Value::String(duplicate_id);
     remote
-        .put_physical(&index_path, &serde_json::to_vec(&index).unwrap())
+        .put_physical(
+            &index_path,
+            &e2v_sync::testing::encode_pack_index_segment_value_for_test(
+                &source_repo_root.join(".e2v"),
+                &index_path,
+                &index,
+            )
+            .unwrap(),
+        )
         .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
@@ -2299,9 +2737,9 @@ fn fetch_rejects_bundle_indexes_with_duplicate_object_ids() {
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("duplicate bundled object id")
+        error.to_string().contains("duplicate packed object id")
             || error.to_string().contains("duplicate object id")
-            || error.to_string().contains("bundle"),
+            || error.to_string().contains("pack"),
         "unexpected error: {error:#}"
     );
     assert_eq!(
@@ -2316,8 +2754,8 @@ fn fetch_rejects_bundle_indexes_with_duplicate_object_ids() {
 }
 
 #[test]
-fn fetch_rejects_bundle_indexes_with_unknown_schema_version() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_rejects_pack_indexes_with_unknown_schema_version() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -2330,11 +2768,11 @@ fn fetch_rejects_bundle_indexes_with_unknown_schema_version() {
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
     facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-schema-version".to_string(),
+            message: "packed-schema-version".to_string(),
         })
         .unwrap();
 
@@ -2345,22 +2783,34 @@ fn fetch_rejects_bundle_indexes_with_unknown_schema_version() {
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-schema-version".to_string(),
+            operation_id: "packed-schema-version".to_string(),
         },
     )
     .unwrap();
 
     let index_path = remote
-        .list_physical("bundles/index/")
+        .list_physical("packs/index/")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&remote.get_physical(&index_path).unwrap()).unwrap();
+    let mut index = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+        &source_repo_root.join(".e2v"),
+        &index_path,
+        &remote.get_physical(&index_path).unwrap(),
+    )
+    .unwrap();
     index["schema_version"] = serde_json::Value::from(99u64);
     remote
-        .put_physical(&index_path, &serde_json::to_vec(&index).unwrap())
+        .put_physical(
+            &index_path,
+            &e2v_sync::testing::encode_pack_index_segment_value_for_test(
+                &source_repo_root.join(".e2v"),
+                &index_path,
+                &index,
+            )
+            .unwrap(),
+        )
         .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
@@ -2387,7 +2837,7 @@ fn fetch_rejects_bundle_indexes_with_unknown_schema_version() {
     assert!(
         error.to_string().contains("schema version")
             || error.to_string().contains("unsupported")
-            || error.to_string().contains("bundle"),
+            || error.to_string().contains("pack"),
         "unexpected error: {error:#}"
     );
     assert_eq!(
@@ -2542,7 +2992,6 @@ fn clone_bootstraps_local_repository_from_remote_head() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -2559,7 +3008,7 @@ fn clone_bootstraps_local_repository_from_remote_head() {
     );
     assert!(
         !remote.list_physical("objects/").unwrap().is_empty()
-            || !remote.list_physical("bundles/index/").unwrap().is_empty()
+            || !remote.list_physical("packs/index/").unwrap().is_empty()
     );
 }
 
@@ -2574,7 +3023,6 @@ fn clone_writes_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_f
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -2607,7 +3055,6 @@ fn clone_does_not_restore_remote_keyring_lock_file() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -2642,7 +3089,6 @@ fn clone_rejects_non_empty_target_directory() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -2672,7 +3118,6 @@ fn clone_rejects_missing_remote_branch_ref_without_creating_control_dir() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: "missing-branch-token".to_string(),
         },
     )
@@ -2687,28 +3132,25 @@ fn clone_rejects_missing_remote_branch_ref_without_creating_control_dir() {
 }
 
 #[test]
-fn clone_rejects_missing_remote_config_without_creating_control_dir() {
+fn clone_succeeds_without_remote_config_file() {
     let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
-    remote.delete_physical("control/config.json").unwrap();
+    if remote.exists_physical("control/config.json") {
+        remote.delete_physical("control/config.json").unwrap();
+    }
     let clone_repo_root = temp.path().join("clone-target");
 
-    let error = clone_remote(
+    let cloned = clone_remote(
         &remote,
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        error.to_string().contains("config.json")
-            || error.to_string().contains("missing physical object"),
-        "unexpected error: {error:#}"
-    );
-    assert!(!clone_repo_root.join(".e2v").exists());
+    assert!(cloned.head_snapshot_id.is_some());
+    assert!(clone_repo_root.join(".e2v").exists());
 }
 
 #[test]
@@ -2731,7 +3173,6 @@ fn clone_rejects_remote_keyring_pointer_that_references_missing_generation() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -2768,7 +3209,6 @@ fn clone_rejects_remote_layout_root_with_unsupported_schema_version() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -2803,7 +3243,6 @@ fn clone_cleans_up_control_dir_when_remote_head_snapshot_is_missing() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -2822,21 +3261,21 @@ fn clone_cleans_up_control_dir_when_remote_head_snapshot_is_missing() {
 fn clone_cleans_up_partial_control_dir_when_remote_breaks_after_preflight() {
     let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
     let clone_repo_root = temp.path().join("clone-target");
-    let flaky_remote = ConfigDisappearsAfterRefReadRemote::new(remote);
+    let flaky_remote = KeyringPointerDisappearsAfterRefReadRemote::new(remote);
 
     let error = clone_remote(
         &flaky_remote,
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("config.json")
+        error.to_string().contains("layout_root.json")
+            || error.to_string().contains("keyring")
             || error.to_string().contains("missing physical object"),
         "unexpected error: {error:#}"
     );
@@ -2853,7 +3292,6 @@ fn clone_cleans_up_control_dir_when_password_is_wrong() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "definitely wrong password".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -3218,7 +3656,6 @@ fn fetch_rejects_remote_ref_that_points_to_missing_head_snapshot_when_local_ref_
         CloneOptions {
             repo_root: target_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -3287,7 +3724,6 @@ fn fetch_rejects_remote_ref_that_points_to_missing_head_snapshot_after_password_
         CloneOptions {
             repo_root: target_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -3374,7 +3810,6 @@ fn fetch_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted_for_unlo
         CloneOptions {
             repo_root: target_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -3481,7 +3916,6 @@ fn clone_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -3568,7 +4002,6 @@ fn clone_rejects_remote_keyring_generation_without_password_envelope() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token,
         },
     )
@@ -3593,7 +4026,6 @@ fn fetch_updates_keyring_after_remote_password_rotation_without_new_snapshot() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -3657,7 +4089,6 @@ fn fetch_does_not_publish_rotated_keyring_pointer_before_default_ref_write_succe
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: branch_token.clone(),
         },
     )
@@ -3881,7 +4312,6 @@ fn sync_flows_work_with_s3_compatible_backend_adapter() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: state.branch.token_hex.clone(),
         },
     )
@@ -3937,18 +4367,6 @@ fn sync_flows_work_with_opendal_memory_backend_adapter() {
             .put_physical(&relative_path.0, &relative_path.1)
             .unwrap();
     }
-    remote
-        .put_physical(
-            "control/config.json",
-            &e2v_core::sync_support::read_config_bytes(&source_repo_root).unwrap(),
-        )
-        .unwrap();
-    remote
-        .put_physical(
-            "control/refs/default.json",
-            &e2v_core::sync_support::read_default_ref_bytes(&source_repo_root).unwrap(),
-        )
-        .unwrap();
     for keyring_file in e2v_core::sync_support::list_keyring_files(&source_repo_root).unwrap() {
         let file_name = keyring_file.file_name().unwrap().to_str().unwrap();
         remote
@@ -4003,7 +4421,6 @@ fn sync_flows_work_with_opendal_memory_backend_adapter() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: state.branch.token_hex.clone(),
         },
     )
@@ -4051,18 +4468,6 @@ fn fetch_and_clone_work_with_conservative_webdav_backend_adapter() {
             .put_physical(&relative_path.0, &relative_path.1)
             .unwrap();
     }
-    remote
-        .put_physical(
-            "control/config.json",
-            &e2v_core::sync_support::read_config_bytes(&source_repo_root).unwrap(),
-        )
-        .unwrap();
-    remote
-        .put_physical(
-            "control/refs/default.json",
-            &e2v_core::sync_support::read_default_ref_bytes(&source_repo_root).unwrap(),
-        )
-        .unwrap();
     for keyring_file in e2v_core::sync_support::list_keyring_files(&source_repo_root).unwrap() {
         let file_name = keyring_file.file_name().unwrap().to_str().unwrap();
         remote
@@ -4117,7 +4522,6 @@ fn fetch_and_clone_work_with_conservative_webdav_backend_adapter() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: state.branch.token_hex.clone(),
         },
     )
@@ -4126,8 +4530,7 @@ fn fetch_and_clone_work_with_conservative_webdav_backend_adapter() {
 }
 
 #[test]
-fn fetch_and_clone_restore_objects_from_remote_bundles() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn fetch_rejects_remote_layout_generation_rollback_below_local_high_water() {
     let temp = tempdir().unwrap();
     let source_repo_root = temp.path().join("source");
     fs::create_dir_all(&source_repo_root).unwrap();
@@ -4140,11 +4543,233 @@ fn fetch_and_clone_restore_objects_from_remote_bundles() {
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(source_repo_root.join("hello.txt"), b"hello bundled").unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello rollback").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    for relative_path in e2v_core::sync_support::list_local_object_files(&source_repo_root)
+        .unwrap()
+        .into_iter()
+        .map(|path| {
+            let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let bytes = fs::read(&path).unwrap();
+            (format!("objects/{file_name}"), bytes)
+        })
+    {
+        remote
+            .put_physical(&relative_path.0, &relative_path.1)
+            .unwrap();
+    }
+    for keyring_file in e2v_core::sync_support::list_keyring_files(&source_repo_root).unwrap() {
+        let file_name = keyring_file.file_name().unwrap().to_str().unwrap();
+        remote
+            .put_physical(
+                &format!("control/keyring/{file_name}"),
+                &fs::read(&keyring_file).unwrap(),
+            )
+            .unwrap();
+    }
+    let layout_root = remote.read_layout_root().unwrap();
+    let mut next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
+        &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),
+    )
+    .unwrap();
+    next_layout_root.generation = 3;
+    remote
+        .compare_and_swap_layout_root(layout_root.generation, next_layout_root)
+        .unwrap();
+    remote
+        .compare_and_swap_ref(
+            &RefToken::new(state.branch.token_hex.clone()),
+            None,
+            e2v_store::EncryptedRef::new(
+                e2v_core::sync_support::read_default_ref_bytes(&source_repo_root).unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let fetch_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&fetch_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: fetch_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let trusted_state_root = temp.path().join("trusted-state-fetch");
+    fs::create_dir_all(&trusted_state_root).unwrap();
+    let _trusted_state_guard =
+        e2v_sync::testing::override_trusted_state_dir_for_test(trusted_state_root.clone());
+    let remote_keyring_path = source_repo_root
+        .join(".e2v")
+        .join("keyring")
+        .join("keyring.1");
+    let remote_keyring: serde_json::Value =
+        serde_json::from_slice(&fs::read(&remote_keyring_path).unwrap()).unwrap();
+    let repo_id = remote_keyring["repo_id"]
+        .as_str()
+        .expect("remote keyring should contain repo_id");
+    fs::write(
+        trusted_state_root.join(format!("{repo_id}.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "repo_id": repo_id,
+            "min_layout_generation": 9u64,
+            "min_keyring_generation": 1u64,
+            "min_ref_generation": 1u64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: fetch_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("CRITICAL_ROLLBACK_DETECTED")
+            || error.to_string().contains("critical rollback detected"),
+        "expected rollback detection error, got: {error:#}"
+    );
+}
+
+#[test]
+fn clone_rejects_remote_layout_generation_rollback_below_external_high_water() {
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello rollback").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    for relative_path in e2v_core::sync_support::list_local_object_files(&source_repo_root)
+        .unwrap()
+        .into_iter()
+        .map(|path| {
+            let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let bytes = fs::read(&path).unwrap();
+            (format!("objects/{file_name}"), bytes)
+        })
+    {
+        remote
+            .put_physical(&relative_path.0, &relative_path.1)
+            .unwrap();
+    }
+    for keyring_file in e2v_core::sync_support::list_keyring_files(&source_repo_root).unwrap() {
+        let file_name = keyring_file.file_name().unwrap().to_str().unwrap();
+        remote
+            .put_physical(
+                &format!("control/keyring/{file_name}"),
+                &fs::read(&keyring_file).unwrap(),
+            )
+            .unwrap();
+    }
+    let layout_root = remote.read_layout_root().unwrap();
+    let next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
+        &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),
+    )
+    .unwrap();
+    remote
+        .compare_and_swap_layout_root(layout_root.generation, next_layout_root)
+        .unwrap();
+    remote
+        .compare_and_swap_ref(
+            &RefToken::new(state.branch.token_hex.clone()),
+            None,
+            e2v_store::EncryptedRef::new(
+                e2v_core::sync_support::read_default_ref_bytes(&source_repo_root).unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let trusted_state_root = temp.path().join("trusted-state");
+    fs::create_dir_all(&trusted_state_root).unwrap();
+    let _trusted_state_guard =
+        e2v_sync::testing::override_trusted_state_dir_for_test(trusted_state_root.clone());
+    let remote_keyring_path = source_repo_root
+        .join(".e2v")
+        .join("keyring")
+        .join("keyring.1");
+    let remote_keyring: serde_json::Value =
+        serde_json::from_slice(&fs::read(&remote_keyring_path).unwrap()).unwrap();
+    let repo_id = remote_keyring["repo_id"]
+        .as_str()
+        .expect("remote keyring should contain repo_id");
+    fs::write(
+        trusted_state_root.join(format!("{repo_id}.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "repo_id": repo_id,
+            "min_layout_generation": 9u64,
+            "min_keyring_generation": 1u64,
+            "min_ref_generation": 1u64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let clone_repo_root = temp.path().join("clone-target");
+    let error = clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("CRITICAL_ROLLBACK_DETECTED")
+            || error.to_string().contains("critical rollback detected"),
+        "expected rollback detection error, got: {error:#}"
+    );
+}
+
+#[test]
+fn fetch_and_clone_restore_objects_from_remote_packs() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
     let committed = facade
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundled-sync".to_string(),
+            message: "packed-sync".to_string(),
         })
         .unwrap();
 
@@ -4155,13 +4780,13 @@ fn fetch_and_clone_restore_objects_from_remote_bundles() {
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundled-sync-op".to_string(),
+            operation_id: "packed-sync-op".to_string(),
         },
     )
     .unwrap();
     assert!(pushed.uploaded_objects > 0);
     assert!(remote.list_physical("objects/").unwrap().is_empty());
-    assert!(!remote.list_physical("bundles/index/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/index/").unwrap().is_empty());
 
     let fetch_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&fetch_repo_root).unwrap();
@@ -4197,7 +4822,6 @@ fn fetch_and_clone_restore_objects_from_remote_bundles() {
         CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: state.branch.token_hex.clone(),
         },
     )

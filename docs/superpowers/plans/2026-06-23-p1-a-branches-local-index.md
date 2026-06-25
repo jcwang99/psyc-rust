@@ -166,7 +166,7 @@ Expected: FAIL until the edge-case handling is finished.
 
 Implement:
 - graceful empty-head handling
-- current-branch fallback in branch listing
+- explicit validation that the current branch ref exists under `refs/branches/`
 - index transaction cleanup and deterministic ordering
 
 - [ ] **Step 4: Run the full relevant verification**

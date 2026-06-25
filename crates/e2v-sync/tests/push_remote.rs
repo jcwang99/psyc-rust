@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use e2v_core::{CommitOptions, InitOptions, ManifestStore, ManifestStoreApi, RepositoryFacade};
 use e2v_store::{
     BackendCapability, BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot,
-    LayoutRootStore, MemoryBackend, RefStore, RefToken, RefVersion, RemoteBackend, StoredRef,
-    WebdavAlistMockBackend, WebdavFlavor,
+    LayoutRootStore, ListedRef, MemoryBackend, RefStore, RefToken, RefVersion, RemoteBackend,
+    StoredRef, WebdavAlistMockBackend,
 };
+use serde_json::Value;
 use tempfile::tempdir;
 
 use e2v_sync::{CloneOptions, PushOptions, ResumeOptions, clone_remote, push_head, resume_push};
@@ -28,6 +29,7 @@ impl RefConflictBackend {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -41,6 +43,10 @@ impl RefConflictBackend {
 impl BlobStore for RefConflictBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -76,6 +82,10 @@ impl BlobStore for RefConflictBackend {
 impl RefStore for RefConflictBackend {
     fn read_ref(&self, _token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         Ok(None)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        Ok(Vec::new())
     }
 
     fn compare_and_swap_ref(
@@ -119,6 +129,132 @@ impl RemoteBackend for RefConflictBackend {
 }
 
 #[derive(Debug, Clone)]
+struct FixedRemoteTimeSingleWriterBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    fixed_time: std::time::SystemTime,
+}
+
+impl FixedRemoteTimeSingleWriterBackend {
+    fn new(fixed_time: std::time::SystemTime) -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            fixed_time,
+        }
+    }
+}
+
+impl BlobStore for FixedRemoteTimeSingleWriterBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)?;
+        if relative_path.starts_with("transactions/active/") || relative_path.starts_with("leases/")
+        {
+            self.inner
+                .override_physical_modified_time_for_test(relative_path, self.fixed_time)?;
+        }
+        Ok(())
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        let created = self.inner.put_physical_if_absent(relative_path, bytes)?;
+        if created
+            && (relative_path.starts_with("transactions/active/")
+                || relative_path.starts_with("leases/"))
+        {
+            self.inner
+                .override_physical_modified_time_for_test(relative_path, self.fixed_time)?;
+        }
+        Ok(created)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for FixedRemoteTimeSingleWriterBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for FixedRemoteTimeSingleWriterBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for FixedRemoteTimeSingleWriterBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LayoutPublisherOnlyBackend {
     inner: MemoryBackend,
     capability: BackendCapability,
@@ -136,6 +272,7 @@ impl LayoutPublisherOnlyBackend {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -154,6 +291,10 @@ impl BlobStore for LayoutPublisherOnlyBackend {
             "push_head must not bypass TransactionPublisher for layout root publish"
         );
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -189,6 +330,10 @@ impl BlobStore for LayoutPublisherOnlyBackend {
 impl RefStore for LayoutPublisherOnlyBackend {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
     }
 
     fn compare_and_swap_ref(
@@ -230,6 +375,126 @@ impl RemoteBackend for LayoutPublisherOnlyBackend {
 }
 
 #[derive(Debug, Clone)]
+struct PackIndexRootPublisherOnlyBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    layout_cas_called: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl PackIndexRootPublisherOnlyBackend {
+    fn new() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: true,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            layout_cas_called: std::sync::Arc::new(std::sync::Mutex::new(false)),
+        }
+    }
+}
+
+impl BlobStore for PackIndexRootPublisherOnlyBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            relative_path != "pack-index/root.json" || *self.layout_cas_called.lock().unwrap(),
+            "push_head must not bypass TransactionPublisher for pack-index root publish"
+        );
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for PackIndexRootPublisherOnlyBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for PackIndexRootPublisherOnlyBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        let result = self.inner.compare_and_swap_layout_root(expected, next)?;
+        if result.applied {
+            *self.layout_cas_called.lock().unwrap() = true;
+        }
+        Ok(result)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for PackIndexRootPublisherOnlyBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ExistsCountingBackend {
     inner: MemoryBackend,
     capability: BackendCapability,
@@ -250,6 +515,7 @@ impl ExistsCountingBackend {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -290,12 +556,16 @@ impl ExistsCountingBackend {
 impl BlobStore for ExistsCountingBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
         if relative_path.starts_with("objects/")
-            || relative_path.starts_with("bundles/data/")
-            || relative_path.starts_with("bundles/index/")
+            || relative_path.starts_with("packs/data/")
+            || relative_path.starts_with("packs/index/")
         {
             *self.object_put_calls.lock().unwrap() += 1;
         }
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -337,6 +607,10 @@ impl BlobStore for ExistsCountingBackend {
 impl RefStore for ExistsCountingBackend {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
     }
 
     fn compare_and_swap_ref(
@@ -390,6 +664,7 @@ impl InventoryListingForbiddenBackend {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -403,6 +678,10 @@ impl InventoryListingForbiddenBackend {
 impl BlobStore for InventoryListingForbiddenBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -431,7 +710,7 @@ impl BlobStore for InventoryListingForbiddenBackend {
     }
 
     fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
-        if prefix == "objects/" || prefix == "bundles/index/" {
+        if prefix == "objects/" || prefix == "packs/index/" {
             anyhow::bail!("remote inventory listing is not allowed during resume for {prefix}");
         }
         self.inner.list_physical(prefix)
@@ -441,6 +720,10 @@ impl BlobStore for InventoryListingForbiddenBackend {
 impl RefStore for InventoryListingForbiddenBackend {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
     }
 
     fn compare_and_swap_ref(
@@ -495,6 +778,7 @@ impl InterruptingObjectUploadBackend {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -521,6 +805,10 @@ impl BlobStore for InterruptingObjectUploadBackend {
             }
         }
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -556,6 +844,10 @@ impl BlobStore for InterruptingObjectUploadBackend {
 impl RefStore for InterruptingObjectUploadBackend {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
     }
 
     fn compare_and_swap_ref(
@@ -609,6 +901,7 @@ impl SingleWriterMemoryBackend {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -622,6 +915,10 @@ impl SingleWriterMemoryBackend {
 impl BlobStore for SingleWriterMemoryBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -659,6 +956,10 @@ impl RefStore for SingleWriterMemoryBackend {
         self.inner.read_ref(token)
     }
 
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
     fn compare_and_swap_ref(
         &self,
         token: &RefToken,
@@ -688,6 +989,285 @@ impl LayoutRootStore for SingleWriterMemoryBackend {
 }
 
 impl RemoteBackend for SingleWriterMemoryBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InterruptingSingleWriterObjectUploadBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    remaining_object_uploads_before_failure: Arc<Mutex<Option<usize>>>,
+}
+
+impl InterruptingSingleWriterObjectUploadBackend {
+    fn new(successful_object_uploads_before_failure: usize) -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            remaining_object_uploads_before_failure: Arc::new(Mutex::new(Some(
+                successful_object_uploads_before_failure,
+            ))),
+        }
+    }
+}
+
+impl BlobStore for InterruptingSingleWriterObjectUploadBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        if relative_path.starts_with("objects/") {
+            let mut remaining = self.remaining_object_uploads_before_failure.lock().unwrap();
+            if let Some(successes_left) = remaining.as_mut() {
+                if *successes_left == 0 {
+                    *remaining = None;
+                    anyhow::bail!("simulated single-writer object upload interruption");
+                }
+                *successes_left -= 1;
+            }
+        }
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for InterruptingSingleWriterObjectUploadBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for InterruptingSingleWriterObjectUploadBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for InterruptingSingleWriterObjectUploadBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    remaining_object_uploads_before_failure: Arc<Mutex<Option<usize>>>,
+    current_time: Arc<Mutex<std::time::SystemTime>>,
+}
+
+impl AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
+    fn new(
+        successful_object_uploads_before_failure: usize,
+        initial_time: std::time::SystemTime,
+    ) -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            remaining_object_uploads_before_failure: Arc::new(Mutex::new(Some(
+                successful_object_uploads_before_failure,
+            ))),
+            current_time: Arc::new(Mutex::new(initial_time)),
+        }
+    }
+
+    fn stamp_current_time(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.override_physical_modified_time_for_test(
+            relative_path,
+            *self.current_time.lock().unwrap(),
+        )
+    }
+}
+
+impl BlobStore for AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        if relative_path.starts_with("objects/") {
+            let mut remaining = self.remaining_object_uploads_before_failure.lock().unwrap();
+            if let Some(successes_left) = remaining.as_mut() {
+                if *successes_left == 0 {
+                    *remaining = None;
+                    anyhow::bail!("simulated timed single-writer object upload interruption");
+                }
+                *successes_left -= 1;
+            }
+        }
+        self.inner.put_physical(relative_path, bytes)?;
+        if relative_path.starts_with("transactions/active/")
+            || relative_path.starts_with("leases/")
+            || relative_path.ends_with(".probe")
+        {
+            self.stamp_current_time(relative_path)?;
+        }
+        if relative_path.starts_with("objects/") {
+            let mut current_time = self.current_time.lock().unwrap();
+            *current_time += std::time::Duration::from_secs(11 * 60);
+        }
+        Ok(())
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        let created = self.inner.put_physical_if_absent(relative_path, bytes)?;
+        if created
+            && (relative_path.starts_with("transactions/active/")
+                || relative_path.starts_with("leases/")
+                || relative_path.ends_with(".probe"))
+        {
+            self.stamp_current_time(relative_path)?;
+        }
+        Ok(created)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }
@@ -743,6 +1323,55 @@ fn push_uploads_reachable_objects_and_publishes_remote_ref() {
 }
 
 #[test]
+fn first_packed_push_bootstraps_pack_index_root_without_inventory_listing_fallback() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello packed root").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "bootstrap-pack-index-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "bootstrap-pack-index-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(pushed.uploaded_objects > 0);
+    assert!(remote.exists_physical("pack-index/root.json"));
+    let root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let segments = root["segments"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !segments.is_empty(),
+        "expected first packed push to publish non-empty pack index root"
+    );
+}
+
+#[test]
 fn push_rejects_conservative_webdav_backend_by_default() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -780,7 +1409,7 @@ fn push_rejects_conservative_webdav_backend_by_default() {
 }
 
 #[test]
-fn push_uses_single_writer_lease_fallback_for_verified_webdav_backend() {
+fn push_uses_single_writer_lease_fallback_for_safe_single_writer_backend() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -793,23 +1422,23 @@ fn push_uses_single_writer_lease_fallback_for_verified_webdav_backend() {
             branch_name: "main".to_string(),
         })
         .unwrap();
-    fs::write(repo_root.join("hello.txt"), b"hello verified webdav").unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello safe single-writer").unwrap();
 
     let commit = facade
         .commit(CommitOptions {
             repo_root: repo_root.clone(),
-            message: "webdav-single-writer".to_string(),
+            message: "safe-single-writer".to_string(),
         })
         .unwrap();
 
-    let remote = WebdavAlistMockBackend::verified_single_writer(WebdavFlavor::Webdav);
+    let remote = SingleWriterMemoryBackend::new();
     let pushed = push_head(
         &facade,
         &remote,
         PushOptions {
             repo_root: repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "webdav-single-writer-op".to_string(),
+            operation_id: "safe-single-writer-op".to_string(),
         },
     )
     .unwrap();
@@ -822,6 +1451,88 @@ fn push_uses_single_writer_lease_fallback_for_verified_webdav_backend() {
             .is_some()
     );
     assert!(!remote.exists_physical(&format!("leases/{}.lock", state.branch.token_hex)));
+}
+
+#[test]
+fn push_writes_structured_markers_using_remote_observed_time_before_cleanup() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "remote-marker".to_string(),
+        })
+        .unwrap();
+
+    let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_731_111_111);
+    let fixed_ms = fixed_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let remote = FixedRemoteTimeSingleWriterBackend::new(fixed_time);
+    let operation_id = "remote-marker-op".to_string();
+
+    let result = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.published_snapshot_id, commit.snapshot_id);
+    assert!(
+        !remote.exists_physical(&format!("transactions/active/{operation_id}.intent")),
+        "completed push should clean up the active intent marker"
+    );
+    assert!(
+        !remote.exists_physical(&format!("leases/{}.lock", state.branch.token_hex)),
+        "completed push should release the single-writer lease"
+    );
+
+    let marker_remote = FixedRemoteTimeSingleWriterBackend::new(fixed_time);
+    marker_remote
+        .put_physical(
+            &format!("transactions/active/{operation_id}.intent"),
+            &serde_json::to_vec(&serde_json::json!({
+                "operation_id": operation_id,
+                "writer_id": "writer:remote-marker-op",
+                "started_at_remote_unix_ms": fixed_ms,
+                "heartbeat": {
+                    "remote_observed_at_unix_ms": fixed_ms,
+                    "sequence": 1
+                },
+                "expected_ref_version": null,
+                "target_branch_token": state.branch.token_hex,
+                "planned_snapshot_id": commit.snapshot_id,
+                "client_version": env!("CARGO_PKG_VERSION"),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let marker: Value = serde_json::from_slice(
+        &marker_remote
+            .get_physical("transactions/active/remote-marker-op.intent")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["started_at_remote_unix_ms"], fixed_ms);
+    assert_eq!(marker["heartbeat"]["remote_observed_at_unix_ms"], fixed_ms);
+    assert_eq!(marker["planned_snapshot_id"], commit.snapshot_id);
 }
 
 #[test]
@@ -993,6 +1704,67 @@ fn push_avoids_per_object_remote_exists_checks_when_validating_remote_ancestor_g
 }
 
 #[test]
+fn push_refreshes_single_writer_heartbeat_during_long_running_upload_before_interruption() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(repo_root.join("beta.txt"), b"beta").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "heartbeat-long-upload".to_string(),
+        })
+        .unwrap();
+
+    let remote = AdvancingTimeInterruptingSingleWriterObjectUploadBackend::new(
+        1,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_731_000_000),
+    );
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "heartbeat-long-upload-op".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("simulated timed single-writer object upload interruption")
+    );
+
+    let intent: Value = serde_json::from_slice(
+        &remote
+            .get_physical("transactions/active/heartbeat-long-upload-op.intent")
+            .unwrap(),
+    )
+    .unwrap();
+    let lease: Value = serde_json::from_slice(
+        &remote
+            .get_physical(&format!("leases/{}.lock", state.branch.token_hex))
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(intent["heartbeat"]["sequence"], 2);
+    assert_eq!(lease["heartbeat"]["sequence"], 2);
+}
+
+#[test]
 fn resume_avoids_per_object_remote_exists_checks_for_pending_objects() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1068,8 +1840,8 @@ fn resume_avoids_per_object_remote_exists_checks_for_pending_objects() {
 }
 
 #[test]
-fn resume_reuses_journal_recorded_bundle_locations_without_loading_remote_inventory() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn resume_reuses_journal_recorded_pack_locations_without_loading_remote_inventory() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -1092,7 +1864,7 @@ fn resume_reuses_journal_recorded_bundle_locations_without_loading_remote_invent
     let commit = facade
         .commit(CommitOptions {
             repo_root: repo_root.clone(),
-            message: "resume-bundled-journal-locations".to_string(),
+            message: "resume-packed-journal-locations".to_string(),
         })
         .unwrap();
 
@@ -1103,7 +1875,7 @@ fn resume_reuses_journal_recorded_bundle_locations_without_loading_remote_invent
         PushOptions {
             repo_root: repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "resume-bundled-journal-locations-op".to_string(),
+            operation_id: "resume-packed-journal-locations-op".to_string(),
         },
     )
     .unwrap();
@@ -1116,7 +1888,7 @@ fn resume_reuses_journal_recorded_bundle_locations_without_loading_remote_invent
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
     let operation_id =
-        e2v_sync::OperationId::new("resume-bundled-journal-locations-op".to_string()).unwrap();
+        e2v_sync::OperationId::new("resume-packed-journal-locations-op".to_string()).unwrap();
     for object_id in &reachable_object_ids {
         journal
             .record_uploaded(&operation_id, object_id, "object")
@@ -1404,8 +2176,8 @@ fn manifest_store_reachable_set_rejects_tampered_chunk_id_before_push_can_upload
 }
 
 #[test]
-fn push_batches_small_objects_into_remote_bundles_when_threshold_is_reached() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn push_batches_small_objects_into_remote_packs_when_threshold_is_reached() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -1422,7 +2194,7 @@ fn push_batches_small_objects_into_remote_bundles_when_threshold_is_reached() {
     facade
         .commit(CommitOptions {
             repo_root: repo_root.clone(),
-            message: "bundle-small-objects".to_string(),
+            message: "pack-small-objects".to_string(),
         })
         .unwrap();
 
@@ -1433,15 +2205,276 @@ fn push_batches_small_objects_into_remote_bundles_when_threshold_is_reached() {
         PushOptions {
             repo_root: repo_root.clone(),
             branch_token: state.branch.token_hex.clone(),
-            operation_id: "bundle-small-objects-op".to_string(),
+            operation_id: "pack-small-objects-op".to_string(),
         },
     )
     .unwrap();
 
     assert!(pushed.uploaded_objects > 0);
-    assert!(!remote.list_physical("bundles/index/").unwrap().is_empty());
-    assert!(!remote.list_physical("bundles/data/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/index/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/data/").unwrap().is_empty());
     assert!(remote.list_physical("objects/").unwrap().len() < pushed.uploaded_objects);
+}
+
+#[test]
+fn push_compacts_pack_index_root_when_l0_segment_bound_is_reached() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let remote = MemoryBackend::new();
+
+    for version in 0..6usize {
+        fs::write(repo_root.join("rolling.txt"), format!("rolling-{version}")).unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: format!("pack-index-bound-{version}"),
+            })
+            .unwrap();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: format!("pack-index-bound-op-{version}"),
+            },
+        )
+        .unwrap();
+    }
+
+    let root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let segments = root["segments"].as_array().cloned().unwrap_or_default();
+
+    assert!(
+        segments.len() <= 4,
+        "expected bounded pack-index root segments, saw {segments:?}"
+    );
+}
+
+#[test]
+fn push_publishes_pack_index_root_through_transaction_publisher() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello packed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "publisher-pack-index-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = PackIndexRootPublisherOnlyBackend::new();
+
+    let result = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root,
+            branch_token: state.branch.token_hex,
+            operation_id: "publisher-pack-index-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(!result.published_snapshot_id.is_empty());
+    assert!(remote.exists_physical("pack-index/root.json"));
+}
+
+#[test]
+fn push_stores_pack_index_root_as_authenticated_bytes() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello packed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "encrypted-pack-index-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root,
+            branch_token: state.branch.token_hex,
+            operation_id: "encrypted-pack-index-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let root_bytes = remote.get_physical("pack-index/root.json").unwrap();
+
+    assert!(
+        serde_json::from_slice::<Value>(&root_bytes).is_err(),
+        "pack-index root must not be stored as plaintext JSON"
+    );
+}
+
+#[test]
+fn push_stores_pack_index_segments_as_authenticated_bytes() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello packed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "encrypted-pack-index-segment".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root,
+            branch_token: state.branch.token_hex,
+            operation_id: "encrypted-pack-index-segment-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let index_path = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let index_bytes = remote.get_physical(&index_path).unwrap();
+
+    assert!(
+        serde_json::from_slice::<Value>(&index_bytes).is_err(),
+        "pack index segment must not be stored as plaintext JSON"
+    );
+}
+
+#[test]
+fn push_rejects_invalid_pack_index_root_instead_of_falling_back_to_segment_listing() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"first version").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first packed push".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "invalid-pack-index-root-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    let mut root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    root["schema_version"] = Value::from(99u64);
+    remote
+        .put_physical(
+            "pack-index/root.json",
+            &e2v_sync::testing::encode_pack_index_root_value_for_test(
+                &repo_root.join(".e2v"),
+                &root,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"second version").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second packed push".to_string(),
+        })
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root,
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "invalid-pack-index-root-repush".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("pack index root")
+            || error.to_string().contains("schema version"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]
@@ -1485,12 +2518,6 @@ fn resume_skips_uploaded_objects_and_republishes_missing_ref() {
             .put_physical(&path, &remote.get_physical(&path).unwrap())
             .unwrap();
     }
-    rebuilt
-        .put_physical(
-            "control/config.json",
-            &remote.get_physical("control/config.json").unwrap(),
-        )
-        .unwrap();
     for path in remote.list_physical("control/keyring/").unwrap() {
         rebuilt
             .put_physical(&path, &remote.get_physical(&path).unwrap())
@@ -1588,18 +2615,6 @@ fn resume_reuploads_missing_remote_objects_from_journal() {
         let bytes = remote.get_physical(&path).unwrap();
         rebuilt.put_physical(&path, &bytes).unwrap();
     }
-    rebuilt
-        .put_physical(
-            "control/config.json",
-            &remote.get_physical("control/config.json").unwrap(),
-        )
-        .unwrap();
-    rebuilt
-        .put_physical(
-            "control/refs/default.json",
-            &remote.get_physical("control/refs/default.json").unwrap(),
-        )
-        .unwrap();
     for path in remote.list_physical("control/keyring/").unwrap() {
         rebuilt
             .put_physical(&path, &remote.get_physical(&path).unwrap())
@@ -1922,19 +2937,19 @@ fn resume_restores_missing_control_plane_files_before_republishing_ref() {
 
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
     assert_eq!(
-        rebuilt.get_physical("control/config.json").unwrap(),
-        remote.get_physical("control/config.json").unwrap()
-    );
-    assert_eq!(
         rebuilt.list_physical("control/keyring/").unwrap(),
         remote.list_physical("control/keyring/").unwrap()
     );
     assert!(rebuilt.exists_physical("layout_root.json"));
-    assert!(rebuilt.exists_physical("control/refs/default.json"));
+    assert!(
+        !rebuilt.exists_physical("control/refs/default.json"),
+        "resume should not recreate a redundant remote ref mirror file"
+    );
 }
 
 #[test]
-fn resume_restores_control_ref_mirror_even_when_remote_ref_already_matches_local_head() {
+fn resume_succeeds_without_restoring_redundant_remote_ref_mirror_when_remote_ref_already_matches_local_head()
+ {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -1987,18 +3002,18 @@ fn resume_restores_control_ref_mirror_even_when_remote_ref_already_matches_local
     .unwrap();
 
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
-    assert_eq!(
-        remote.get_physical("control/refs/default.json").unwrap(),
-        e2v_core::sync_support::read_default_ref_bytes(&repo_root).unwrap()
+    assert!(
+        !remote.exists_physical("control/refs/default.json"),
+        "resume should not restore a redundant remote ref mirror file"
     );
     assert!(
         !remote.exists_physical("transactions/active/resume-control-ref-mirror-op.intent"),
-        "resume should clean up the active intent once the control-plane mirror is restored"
+        "resume should clean up the active intent without requiring remote ref mirror repair"
     );
 }
 
 #[test]
-fn resume_restores_missing_config_when_remote_ref_and_control_ref_mirror_match() {
+fn resume_succeeds_without_restoring_remote_config_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2031,7 +3046,9 @@ fn resume_restores_missing_config_when_remote_ref_and_control_ref_mirror_match()
     )
     .unwrap();
 
-    remote.delete_physical("control/config.json").unwrap();
+    if remote.exists_physical("control/config.json") {
+        remote.delete_physical("control/config.json").unwrap();
+    }
 
     let resumed = resume_push(
         &facade,
@@ -2045,14 +3062,14 @@ fn resume_restores_missing_config_when_remote_ref_and_control_ref_mirror_match()
     .unwrap();
 
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
-    assert_eq!(
-        remote.get_physical("control/config.json").unwrap(),
-        e2v_core::sync_support::read_config_bytes(&repo_root).unwrap()
+    assert!(
+        !remote.exists_physical("control/config.json"),
+        "resume should not restore redundant remote config"
     );
 }
 
 #[test]
-fn resume_repairs_stale_config_when_remote_ref_and_control_ref_mirror_match() {
+fn resume_ignores_stale_remote_config_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2103,12 +3120,12 @@ fn resume_repairs_stale_config_when_remote_ref_and_control_ref_mirror_match() {
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
     assert_eq!(
         remote.get_physical("control/config.json").unwrap(),
-        e2v_core::sync_support::read_config_bytes(&repo_root).unwrap()
+        br#"{"stale":true}"#
     );
 }
 
 #[test]
-fn resume_restores_missing_layout_root_when_remote_ref_and_control_ref_mirror_match() {
+fn resume_restores_missing_layout_root_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2162,7 +3179,7 @@ fn resume_restores_missing_layout_root_when_remote_ref_and_control_ref_mirror_ma
 }
 
 #[test]
-fn resume_repairs_stale_layout_root_when_remote_ref_and_control_ref_mirror_match() {
+fn resume_repairs_stale_layout_root_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2218,7 +3235,7 @@ fn resume_repairs_stale_layout_root_when_remote_ref_and_control_ref_mirror_match
 }
 
 #[test]
-fn resume_restores_missing_keyring_pointer_when_remote_ref_and_control_ref_mirror_match() {
+fn resume_restores_missing_keyring_pointer_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2282,7 +3299,7 @@ fn resume_restores_missing_keyring_pointer_when_remote_ref_and_control_ref_mirro
 }
 
 #[test]
-fn resume_repairs_stale_keyring_pointer_when_remote_ref_and_control_ref_mirror_match() {
+fn resume_repairs_stale_keyring_pointer_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2349,7 +3366,7 @@ fn resume_repairs_stale_keyring_pointer_when_remote_ref_and_control_ref_mirror_m
 }
 
 #[test]
-fn resume_restores_missing_keyring_generation_when_remote_ref_and_control_ref_mirror_match() {
+fn resume_restores_missing_keyring_generation_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2541,6 +3558,86 @@ fn resume_cleans_up_stale_single_writer_lease_when_remote_state_is_already_compl
 }
 
 #[test]
+fn resume_reacquires_expired_single_writer_lease_before_republishing_missing_ref() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-reacquire-lease".to_string(),
+        })
+        .unwrap();
+
+    let remote = InterruptingSingleWriterObjectUploadBackend::new(1);
+    let push_error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-reacquire-lease-op".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        push_error
+            .to_string()
+            .contains("simulated single-writer object upload interruption")
+    );
+
+    remote
+        .inner
+        .override_physical_modified_time_for_test(
+            &format!("transactions/active/{}.intent", "resume-reacquire-lease-op"),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+    remote
+        .inner
+        .override_physical_modified_time_for_test(
+            &format!("leases/{}.lock", state.branch.token_hex),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-reacquire-lease-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    let stored = remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !stored.value.bytes.is_empty(),
+        "resume should republish the missing remote ref after reacquiring a fresh lease"
+    );
+    assert!(
+        !remote.exists_physical(&format!("leases/{}.lock", state.branch.token_hex)),
+        "resume should release the reacquired lease after completion"
+    );
+}
+
+#[test]
 fn resume_rejects_stale_remote_ref_and_requires_rebase_recovery() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -2724,7 +3821,6 @@ fn stale_remote_head_marks_push_needs_rebase() {
         CloneOptions {
             repo_root: competitor_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: state.branch.token_hex.clone(),
         },
     )
@@ -2866,8 +3962,8 @@ fn push_rejects_operation_id_with_path_traversal_before_mutating_remote_state() 
         "unexpected error: {error:#}"
     );
     assert!(remote.list_physical("objects/").unwrap().is_empty());
-    assert!(remote.list_physical("bundles/index/").unwrap().is_empty());
-    assert!(remote.list_physical("bundles/data/").unwrap().is_empty());
+    assert!(remote.list_physical("packs/index/").unwrap().is_empty());
+    assert!(remote.list_physical("packs/data/").unwrap().is_empty());
     assert!(
         remote
             .read_ref(&RefToken::new(state.branch.token_hex.clone()))
@@ -2919,8 +4015,8 @@ fn push_rejects_branch_token_with_path_traversal_before_mutating_remote_state() 
         "unexpected error: {error:#}"
     );
     assert!(remote.list_physical("objects/").unwrap().is_empty());
-    assert!(remote.list_physical("bundles/index/").unwrap().is_empty());
-    assert!(remote.list_physical("bundles/data/").unwrap().is_empty());
+    assert!(remote.list_physical("packs/index/").unwrap().is_empty());
+    assert!(remote.list_physical("packs/data/").unwrap().is_empty());
     assert!(!remote.exists_physical("leases/../evil.lock"));
     assert!(!remote.exists_physical("transactions/active/invalid-branch-token-op.intent"));
 }
@@ -3204,7 +4300,7 @@ fn push_does_not_publish_control_ref_mirror_before_ref_cas_succeeds() {
     assert!(error.to_string().contains("needs-rebase"));
     assert!(
         !remote.exists_physical("control/refs/default.json"),
-        "control ref mirror must not be published before ref CAS succeeds"
+        "redundant remote ref mirror file must not be published before ref CAS succeeds"
     );
 }
 
@@ -3345,7 +4441,7 @@ fn push_rejects_ref_publish_when_reachable_remote_object_disappears() {
     for object_id in &reachable_object_ids {
         assert!(
             remote.exists_physical(&format!("objects/{object_id}.json"))
-                || !remote.list_physical("bundles/index/").unwrap().is_empty()
+                || !remote.list_physical("packs/index/").unwrap().is_empty()
         );
     }
 }
@@ -3391,7 +4487,6 @@ fn push_allows_fast_forward_when_remote_head_matches_local_parent() {
         e2v_sync::CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: source_state.branch.token_hex.clone(),
         },
     )
@@ -3431,8 +4526,8 @@ fn push_allows_fast_forward_when_remote_head_matches_local_parent() {
 }
 
 #[test]
-fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_packs() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
 
     let source_repo_root = temp.path().join("source");
@@ -3460,7 +4555,7 @@ fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: source_state.branch.token_hex.clone(),
-            operation_id: "bundle-ff-push-1".to_string(),
+            operation_id: "pack-ff-push-1".to_string(),
         },
     )
     .unwrap();
@@ -3473,7 +4568,6 @@ fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
         e2v_sync::CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: source_state.branch.token_hex.clone(),
         },
     )
@@ -3498,7 +4592,7 @@ fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
         PushOptions {
             repo_root: clone_repo_root.clone(),
             branch_token: source_state.branch.token_hex.clone(),
-            operation_id: "bundle-ff-push-2".to_string(),
+            operation_id: "pack-ff-push-2".to_string(),
         },
     )
     .unwrap();
@@ -3507,8 +4601,8 @@ fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_bundles() {
 }
 
 #[test]
-fn push_fast_forward_bundle_ancestor_validation_avoids_repeating_bundle_range_reads() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn push_fast_forward_pack_ancestor_validation_avoids_repeating_pack_range_reads() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
 
     let source_repo_root = temp.path().join("source");
@@ -3531,7 +4625,7 @@ fn push_fast_forward_bundle_ancestor_validation_avoids_repeating_bundle_range_re
     source
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "bundle-ancestor-v1".to_string(),
+            message: "pack-ancestor-v1".to_string(),
         })
         .unwrap();
 
@@ -3542,7 +4636,7 @@ fn push_fast_forward_bundle_ancestor_validation_avoids_repeating_bundle_range_re
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: source_state.branch.token_hex.clone(),
-            operation_id: "bundle-ancestor-v1-op".to_string(),
+            operation_id: "pack-ancestor-v1-op".to_string(),
         },
     )
     .unwrap();
@@ -3554,7 +4648,6 @@ fn push_fast_forward_bundle_ancestor_validation_avoids_repeating_bundle_range_re
         e2v_sync::CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: source_state.branch.token_hex.clone(),
         },
     )
@@ -3571,7 +4664,7 @@ fn push_fast_forward_bundle_ancestor_validation_avoids_repeating_bundle_range_re
     clone_facade
         .commit(CommitOptions {
             repo_root: clone_repo_root.clone(),
-            message: "bundle-ancestor-v2".to_string(),
+            message: "pack-ancestor-v2".to_string(),
         })
         .unwrap();
 
@@ -3583,28 +4676,28 @@ fn push_fast_forward_bundle_ancestor_validation_avoids_repeating_bundle_range_re
         PushOptions {
             repo_root: clone_repo_root.clone(),
             branch_token: source_state.branch.token_hex.clone(),
-            operation_id: "bundle-ancestor-v2-op".to_string(),
+            operation_id: "pack-ancestor-v2-op".to_string(),
         },
     )
     .unwrap();
 
     assert!(second_push.uploaded_objects > 0);
     let range_read_paths = remote.range_read_paths();
-    let distinct_bundle_paths = range_read_paths
+    let distinct_pack_paths = range_read_paths
         .iter()
-        .filter(|path| path.starts_with("bundles/data/"))
+        .filter(|path| path.starts_with("packs/data/"))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     assert!(
-        range_read_paths.len() <= distinct_bundle_paths.len() + 2,
-        "expected ancestor validation to avoid repeated bundle range reads, saw {:?}",
+        range_read_paths.len() <= distinct_pack_paths.len() + 2,
+        "expected ancestor validation to avoid repeated pack range reads, saw {:?}",
         range_read_paths
     );
 }
 
 #[test]
-fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_across_snapshots() {
-    let _guard = e2v_sync::testing::override_small_object_bundle_threshold_for_test(1);
+fn push_deep_fast_forward_pack_ancestor_validation_reuses_remote_pack_reads_across_snapshots() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
 
     let source_repo_root = temp.path().join("source");
@@ -3627,7 +4720,7 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
     source
         .commit(CommitOptions {
             repo_root: source_repo_root.clone(),
-            message: "deep-bundle-ancestor-v1".to_string(),
+            message: "deep-pack-ancestor-v1".to_string(),
         })
         .unwrap();
 
@@ -3638,7 +4731,7 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
         PushOptions {
             repo_root: source_repo_root.clone(),
             branch_token: source_state.branch.token_hex.clone(),
-            operation_id: "deep-bundle-ancestor-v1-op".to_string(),
+            operation_id: "deep-pack-ancestor-v1-op".to_string(),
         },
     )
     .unwrap();
@@ -3650,7 +4743,6 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
         e2v_sync::CloneOptions {
             repo_root: clone_repo_root.clone(),
             password: "correct horse battery staple".to_string(),
-            branch_name: "main".to_string(),
             branch_token: source_state.branch.token_hex.clone(),
         },
     )
@@ -3666,7 +4758,7 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
         clone_facade
             .commit(CommitOptions {
                 repo_root: clone_repo_root.clone(),
-                message: format!("deep-bundle-ancestor-v{version}"),
+                message: format!("deep-pack-ancestor-v{version}"),
             })
             .unwrap();
         push_head(
@@ -3675,7 +4767,7 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
             PushOptions {
                 repo_root: clone_repo_root.clone(),
                 branch_token: source_state.branch.token_hex.clone(),
-                operation_id: format!("deep-bundle-ancestor-v{version}-op"),
+                operation_id: format!("deep-pack-ancestor-v{version}-op"),
             },
         )
         .unwrap();
@@ -3685,7 +4777,7 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
     clone_facade
         .commit(CommitOptions {
             repo_root: clone_repo_root.clone(),
-            message: "deep-bundle-ancestor-v6".to_string(),
+            message: "deep-pack-ancestor-v6".to_string(),
         })
         .unwrap();
 
@@ -3697,21 +4789,21 @@ fn push_deep_fast_forward_bundle_ancestor_validation_reuses_remote_bundle_reads_
         PushOptions {
             repo_root: clone_repo_root.clone(),
             branch_token: source_state.branch.token_hex.clone(),
-            operation_id: "deep-bundle-ancestor-v6-op".to_string(),
+            operation_id: "deep-pack-ancestor-v6-op".to_string(),
         },
     )
     .unwrap();
 
     assert!(pushed.uploaded_objects > 0);
     let range_read_paths = remote.range_read_paths();
-    let distinct_bundle_paths = range_read_paths
+    let distinct_pack_paths = range_read_paths
         .iter()
-        .filter(|path| path.starts_with("bundles/data/"))
+        .filter(|path| path.starts_with("packs/data/"))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     assert!(
-        range_read_paths.len() <= distinct_bundle_paths.len() + 6,
-        "expected deep ancestor validation to reuse bundle reads across snapshots, saw {:?}",
+        range_read_paths.len() <= distinct_pack_paths.len() + 6,
+        "expected deep ancestor validation to reuse pack reads across snapshots, saw {:?}",
         range_read_paths
     );
 }

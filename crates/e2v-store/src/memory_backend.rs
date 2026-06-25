@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::Result;
 
@@ -9,11 +10,14 @@ use crate::capability::{BackendCapability, ConsistencyClass};
 use crate::layout::LayoutRoot;
 use crate::layout_root_store::{LayoutRootStore, LayoutRootVersion};
 use crate::local_backend::{BlobStore, ObjectStat};
-use crate::ref_store::{CasResult, EncryptedRef, RefStore, RefToken, RefVersion, StoredRef};
+use crate::ref_store::{
+    CasResult, EncryptedRef, ListedRef, RefStore, RefToken, RefVersion, StoredRef,
+};
 
 #[derive(Debug, Clone)]
 pub struct MemoryBackend {
     physical: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    physical_modified_at: Arc<Mutex<HashMap<String, SystemTime>>>,
     refs: Arc<Mutex<HashMap<String, StoredRef>>>,
     layout_root: Arc<Mutex<LayoutRoot>>,
     retained_layout_roots: Arc<Mutex<Vec<LayoutRoot>>>,
@@ -30,6 +34,7 @@ impl MemoryBackend {
         };
         Self {
             physical: Arc::new(Mutex::new(HashMap::new())),
+            physical_modified_at: Arc::new(Mutex::new(HashMap::new())),
             refs: Arc::new(Mutex::new(HashMap::new())),
             layout_root: Arc::new(Mutex::new(layout_root.clone())),
             retained_layout_roots: Arc::new(Mutex::new(vec![layout_root])),
@@ -40,6 +45,7 @@ impl MemoryBackend {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -52,12 +58,43 @@ impl MemoryBackend {
     pub fn capability(&self) -> &BackendCapability {
         &self.capability
     }
+
+    pub fn override_physical_modified_time_for_test(
+        &self,
+        relative_path: &str,
+        modified_at: SystemTime,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.exists_physical(relative_path),
+            "cannot override modified time for missing physical object {relative_path}"
+        );
+        self.physical_modified_at
+            .lock()
+            .unwrap()
+            .insert(relative_path.to_string(), modified_at);
+        Ok(())
+    }
 }
 
 impl RefStore for MemoryBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
         token.validate()?;
         Ok(self.refs.lock().unwrap().get(&token.value).cloned())
+    }
+
+    fn list_refs(&self) -> Result<Vec<ListedRef>> {
+        let mut listed = self
+            .refs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(token, stored)| ListedRef {
+                token: RefToken::new(token.clone()),
+                stored: stored.clone(),
+            })
+            .collect::<Vec<_>>();
+        listed.sort_by(|left, right| left.token.value.cmp(&right.token.value));
+        Ok(listed)
     }
 
     fn compare_and_swap_ref(
@@ -105,7 +142,25 @@ impl BlobStore for MemoryBackend {
             .lock()
             .unwrap()
             .insert(relative_path.to_string(), bytes.to_vec());
+        self.physical_modified_at
+            .lock()
+            .unwrap()
+            .insert(relative_path.to_string(), SystemTime::now());
         Ok(())
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+        let mut physical = self.physical.lock().unwrap();
+        if physical.contains_key(relative_path) {
+            return Ok(false);
+        }
+        physical.insert(relative_path.to_string(), bytes.to_vec());
+        drop(physical);
+        self.physical_modified_at
+            .lock()
+            .unwrap()
+            .insert(relative_path.to_string(), SystemTime::now());
+        Ok(true)
     }
 
     fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
@@ -131,6 +186,10 @@ impl BlobStore for MemoryBackend {
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
         self.physical.lock().unwrap().remove(relative_path);
+        self.physical_modified_at
+            .lock()
+            .unwrap()
+            .remove(relative_path);
         Ok(())
     }
 
@@ -142,6 +201,12 @@ impl BlobStore for MemoryBackend {
         let bytes = self.get_physical(relative_path)?;
         Ok(ObjectStat {
             length: bytes.len() as u64,
+            modified_at: self
+                .physical_modified_at
+                .lock()
+                .unwrap()
+                .get(relative_path)
+                .copied(),
         })
     }
 
@@ -236,6 +301,35 @@ mod tests {
         let backend = MemoryBackend::new();
 
         assert_eq!(backend.capability().writer_mode(), WriterMode::MultiWriter);
+    }
+
+    #[test]
+    fn list_refs_returns_tokens_in_sorted_order() {
+        let backend = MemoryBackend::new();
+        backend
+            .compare_and_swap_ref(
+                &RefToken::new("branches/zeta".to_string()),
+                None,
+                EncryptedRef::new(vec![1]),
+            )
+            .unwrap();
+        backend
+            .compare_and_swap_ref(
+                &RefToken::new("branches/alpha".to_string()),
+                None,
+                EncryptedRef::new(vec![2]),
+            )
+            .unwrap();
+
+        let listed = backend.list_refs().unwrap();
+
+        assert_eq!(
+            listed
+                .into_iter()
+                .map(|entry| entry.token.value)
+                .collect::<Vec<_>>(),
+            vec!["branches/alpha".to_string(), "branches/zeta".to_string()]
+        );
     }
 
     #[test]

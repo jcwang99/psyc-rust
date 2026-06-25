@@ -3,6 +3,12 @@ use anyhow::{Context, Result};
 use e2v_store::{BackendCapability, CasResult, EncryptedRef, LayoutRootVersion, RemoteBackend};
 
 use crate::journal::{ObjectUploadState, OperationId, OperationJournal, validate_sync_identifier};
+use crate::remote_markers::{
+    INTENT_EXPIRY_HOURS, RemoteWriteIntentMarker, RemoteWriterLeaseMarker,
+    build_write_intent_marker, build_writer_lease_marker, marker_is_fresh_at,
+    observe_remote_now_with_probe, remote_observed_at_unix_ms, renew_write_intent_marker,
+    renew_writer_lease_marker, system_time_to_unix_ms,
+};
 use crate::transaction::{PublishPlan, PublishSession, PublishedObject};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,14 +17,10 @@ pub enum RecoveryAction {
     NothingToDo,
 }
 
-#[derive(serde::Deserialize)]
-struct RemoteOwnershipMarker {
-    operation_id: String,
-}
-
 pub trait TransactionPublisher {
     fn begin(&self, plan: PublishPlan) -> Result<PublishSession>;
     fn record_uploaded(&self, session: &PublishSession, object: PublishedObject) -> Result<()>;
+    fn heartbeat(&self, session: &PublishSession) -> Result<()>;
     fn publish_layout_if_needed(&self, session: &PublishSession) -> Result<LayoutRootVersion>;
     fn pre_commit_verify(&self, session: &PublishSession) -> Result<()>;
     fn publish_ref(&self, session: &PublishSession, next: EncryptedRef) -> Result<CasResult>;
@@ -49,6 +51,50 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
     pub fn remote_backend(&self) -> &R {
         &self.remote_backend
     }
+
+    fn renew_intent_if_needed(
+        &self,
+        path: &str,
+        intent: &RemoteWriteIntentMarker,
+    ) -> Result<RemoteWriteIntentMarker> {
+        let observed_now =
+            observe_remote_now_with_probe(&self.remote_backend, ".e2v/publish-remote-time.probe")?;
+        if marker_is_fresh_at(
+            &self.remote_backend,
+            path,
+            observed_now,
+            INTENT_EXPIRY_HOURS,
+        )? {
+            return Ok(intent.clone());
+        }
+        let observed_at = system_time_to_unix_ms(observed_now)?;
+        let renewed = renew_write_intent_marker(intent, observed_at);
+        self.remote_backend
+            .put_physical(path, serde_json::to_vec(&renewed)?.as_slice())?;
+        Ok(renewed)
+    }
+
+    fn renew_lease_if_needed(
+        &self,
+        path: &str,
+        lease: &RemoteWriterLeaseMarker,
+    ) -> Result<RemoteWriterLeaseMarker> {
+        let observed_now =
+            observe_remote_now_with_probe(&self.remote_backend, ".e2v/publish-remote-time.probe")?;
+        if marker_is_fresh_at(
+            &self.remote_backend,
+            path,
+            observed_now,
+            INTENT_EXPIRY_HOURS,
+        )? {
+            return Ok(lease.clone());
+        }
+        let observed_at = system_time_to_unix_ms(observed_now)?;
+        let renewed = renew_writer_lease_marker(lease, observed_at);
+        self.remote_backend
+            .put_physical(path, serde_json::to_vec(&renewed)?.as_slice())?;
+        Ok(renewed)
+    }
 }
 
 impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
@@ -67,19 +113,52 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
         );
         let lease_path = if writer_mode == e2v_store::WriterMode::SingleWriter {
             let lease_path = format!("leases/{}.lock", plan.target_branch_token);
-            if self.remote_backend.exists_physical(&lease_path) {
-                anyhow::bail!(
+            let initial_lease_bytes =
+                serde_json::to_vec(&build_writer_lease_marker(&plan, 0, 1, 1))?;
+            if !self
+                .remote_backend
+                .put_physical_if_absent(&lease_path, initial_lease_bytes.as_slice())?
+            {
+                let observed_now = observe_remote_now_with_probe(
+                    &self.remote_backend,
+                    ".e2v/publish-remote-time.probe",
+                )?;
+                let lease_is_fresh = marker_is_fresh_at(
+                    &self.remote_backend,
+                    &lease_path,
+                    observed_now,
+                    INTENT_EXPIRY_HOURS,
+                )?;
+                if lease_is_fresh {
+                    anyhow::bail!(
+                        "writer lease acquisition failed for {}",
+                        plan.target_branch_token
+                    );
+                }
+                let lease_bytes = self.remote_backend.get_physical(&lease_path)?;
+                let existing: RemoteWriterLeaseMarker = serde_json::from_slice(&lease_bytes)
+                    .context("writer lease acquisition failed: invalid existing lease marker")?;
+                if existing.target_branch_token != plan.target_branch_token {
+                    anyhow::bail!(
+                        "writer lease acquisition failed for {}",
+                        plan.target_branch_token
+                    );
+                }
+                self.remote_backend.delete_physical(&lease_path)?;
+                let reacquired = self
+                    .remote_backend
+                    .put_physical_if_absent(&lease_path, initial_lease_bytes.as_slice())?;
+                anyhow::ensure!(
+                    reacquired,
                     "writer lease acquisition failed for {}",
                     plan.target_branch_token
                 );
             }
+            let observed_at = remote_observed_at_unix_ms(&self.remote_backend, &lease_path)?;
             self.remote_backend.put_physical(
                 &lease_path,
-                serde_json::to_vec(&serde_json::json!({
-                    "operation_id": plan.operation_id.value,
-                    "target_branch_token": plan.target_branch_token,
-                }))?
-                .as_slice(),
+                serde_json::to_vec(&build_writer_lease_marker(&plan, observed_at, 1, 1))?
+                    .as_slice(),
             )?;
             Some(lease_path)
         } else {
@@ -88,11 +167,12 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
         let active_intent_path = format!("transactions/active/{}.intent", plan.operation_id.value);
         self.remote_backend.put_physical(
             &active_intent_path,
-            serde_json::to_vec(&serde_json::json!({
-                "operation_id": plan.operation_id.value,
-                "target_branch_token": plan.target_branch_token,
-            }))?
-            .as_slice(),
+            serde_json::to_vec(&build_write_intent_marker(&plan, 0, 1))?.as_slice(),
+        )?;
+        let observed_at = remote_observed_at_unix_ms(&self.remote_backend, &active_intent_path)?;
+        self.remote_backend.put_physical(
+            &active_intent_path,
+            serde_json::to_vec(&build_write_intent_marker(&plan, observed_at, 1))?.as_slice(),
         )?;
         Ok(PublishSession {
             operation_id: plan.operation_id,
@@ -112,6 +192,48 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             &object.object_id,
             &object.object_type,
         )
+    }
+
+    fn heartbeat(&self, session: &PublishSession) -> Result<()> {
+        let intent_bytes = self
+            .remote_backend
+            .get_physical(&session.active_intent_path)?;
+        anyhow::ensure!(
+            !intent_bytes.is_empty(),
+            "heartbeat failed: active intent missing or empty"
+        );
+        let intent: RemoteWriteIntentMarker = serde_json::from_slice(&intent_bytes)
+            .context("heartbeat failed: invalid active intent marker")?;
+        anyhow::ensure!(
+            intent.operation_id == session.operation_id.value,
+            "heartbeat failed: active intent belongs to another operation"
+        );
+        let observed_now =
+            observe_remote_now_with_probe(&self.remote_backend, ".e2v/publish-remote-time.probe")?;
+        let observed_at = system_time_to_unix_ms(observed_now)?;
+        let renewed_intent = renew_write_intent_marker(&intent, observed_at);
+        self.remote_backend.put_physical(
+            &session.active_intent_path,
+            serde_json::to_vec(&renewed_intent)?.as_slice(),
+        )?;
+
+        if let Some(lease_path) = &session.lease_path {
+            let lease_bytes = self.remote_backend.get_physical(lease_path)?;
+            anyhow::ensure!(
+                !lease_bytes.is_empty(),
+                "heartbeat failed: writer lease missing or empty"
+            );
+            let lease: RemoteWriterLeaseMarker = serde_json::from_slice(&lease_bytes)
+                .context("heartbeat failed: invalid writer lease marker")?;
+            anyhow::ensure!(
+                lease.operation_id == session.operation_id.value,
+                "heartbeat failed: writer lease belongs to another operation"
+            );
+            let renewed_lease = renew_writer_lease_marker(&lease, observed_at);
+            self.remote_backend
+                .put_physical(lease_path, serde_json::to_vec(&renewed_lease)?.as_slice())?;
+        }
+        Ok(())
     }
 
     fn publish_layout_if_needed(&self, session: &PublishSession) -> Result<LayoutRootVersion> {
@@ -143,12 +265,13 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             !bytes.is_empty(),
             "pre-commit verify failed: active intent missing or empty"
         );
-        let intent: RemoteOwnershipMarker = serde_json::from_slice(&bytes)
+        let intent: RemoteWriteIntentMarker = serde_json::from_slice(&bytes)
             .context("pre-commit verify failed: invalid active intent marker")?;
         anyhow::ensure!(
             intent.operation_id == session.operation_id.value,
             "pre-commit verify failed: active intent belongs to another operation"
         );
+        let _intent = self.renew_intent_if_needed(&session.active_intent_path, &intent)?;
         if let Some(expected_ref_version) = session.expected_ref_version {
             validate_sync_identifier("branch token", &session.target_branch_token)?;
             let current = self.remote_backend.read_ref(&e2v_store::RefToken::new(
@@ -169,12 +292,13 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
                 !lease.is_empty(),
                 "pre-commit verify failed: writer lease missing or empty"
             );
-            let lease_marker: RemoteOwnershipMarker = serde_json::from_slice(&lease)
+            let lease_marker: RemoteWriterLeaseMarker = serde_json::from_slice(&lease)
                 .context("pre-commit verify failed: invalid writer lease marker")?;
             anyhow::ensure!(
                 lease_marker.operation_id == session.operation_id.value,
                 "pre-commit verify failed: writer lease belongs to another operation"
             );
+            let _lease = self.renew_lease_if_needed(lease_path, &lease_marker)?;
         }
         Ok(())
     }
@@ -223,11 +347,261 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
     use tempfile::tempdir;
 
-    use e2v_store::{BlobStore, ConsistencyClass, RefStore, WriterMode};
+    use e2v_store::{
+        BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot, LayoutRootStore,
+        ListedRef, RefStore, RefToken, RefVersion, StoredRef, WriterMode,
+    };
 
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct FixedRemoteTimeBackend {
+        inner: e2v_store::MemoryBackend,
+        fixed_time: std::sync::Arc<std::sync::Mutex<SystemTime>>,
+    }
+
+    impl FixedRemoteTimeBackend {
+        fn new(fixed_time: SystemTime) -> Self {
+            Self {
+                inner: e2v_store::MemoryBackend::new(),
+                fixed_time: std::sync::Arc::new(std::sync::Mutex::new(fixed_time)),
+            }
+        }
+
+        fn set_fixed_time_for_test(&self, fixed_time: SystemTime) {
+            *self.fixed_time.lock().unwrap() = fixed_time;
+        }
+    }
+
+    impl BlobStore for FixedRemoteTimeBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_physical(relative_path, bytes)?;
+            if relative_path.starts_with("transactions/active/")
+                || relative_path.starts_with("leases/")
+                || relative_path.ends_with(".probe")
+            {
+                self.inner.override_physical_modified_time_for_test(
+                    relative_path,
+                    *self.fixed_time.lock().unwrap(),
+                )?;
+            }
+            Ok(())
+        }
+
+        fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+            let created = self.inner.put_physical_if_absent(relative_path, bytes)?;
+            if created
+                && (relative_path.starts_with("transactions/active/")
+                    || relative_path.starts_with("leases/")
+                    || relative_path.ends_with(".probe"))
+            {
+                self.inner.override_physical_modified_time_for_test(
+                    relative_path,
+                    *self.fixed_time.lock().unwrap(),
+                )?;
+            }
+            Ok(created)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<e2v_store::ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl RefStore for FixedRemoteTimeBackend {
+        fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+            self.inner.read_ref(token)
+        }
+
+        fn list_refs(&self) -> Result<Vec<ListedRef>> {
+            self.inner.list_refs()
+        }
+
+        fn compare_and_swap_ref(
+            &self,
+            token: &RefToken,
+            expected: Option<RefVersion>,
+            next: EncryptedRef,
+        ) -> Result<CasResult> {
+            self.inner.compare_and_swap_ref(token, expected, next)
+        }
+    }
+
+    impl LayoutRootStore for FixedRemoteTimeBackend {
+        fn read_layout_root(&self) -> Result<LayoutRoot> {
+            self.inner.read_layout_root()
+        }
+
+        fn compare_and_swap_layout_root(
+            &self,
+            expected: u64,
+            next: LayoutRoot,
+        ) -> Result<CasResult> {
+            self.inner.compare_and_swap_layout_root(expected, next)
+        }
+
+        fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
+            self.inner.list_retained_layout_roots()
+        }
+    }
+
+    impl e2v_store::RemoteBackend for FixedRemoteTimeBackend {
+        fn capability(&self) -> &BackendCapability {
+            self.inner.capability()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RaceInjectingLeaseBackend {
+        inner: e2v_store::MemoryBackend,
+        injected: Arc<Mutex<bool>>,
+    }
+
+    impl RaceInjectingLeaseBackend {
+        fn new() -> Self {
+            Self {
+                inner: e2v_store::MemoryBackend::new(),
+                injected: Arc::new(Mutex::new(false)),
+            }
+        }
+    }
+
+    impl BlobStore for RaceInjectingLeaseBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+            if relative_path == "leases/branch-token.lock" {
+                let mut injected = self.injected.lock().unwrap();
+                if !*injected && !self.inner.exists_physical(relative_path) {
+                    self.inner
+                        .put_physical(
+                            relative_path,
+                            serde_json::to_vec(&serde_json::json!({
+                                "writer_id": "writer:foreign-operation",
+                                "operation_id": "foreign-operation",
+                                "target_branch_token": "branch-token",
+                                "remote_observed_at_unix_ms": 1,
+                                "lease_generation": 1,
+                                "heartbeat": {
+                                    "remote_observed_at_unix_ms": 1,
+                                    "sequence": 1
+                                }
+                            }))
+                            .unwrap()
+                            .as_slice(),
+                        )
+                        .unwrap();
+                    *injected = true;
+                    return Ok(false);
+                }
+            }
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<e2v_store::ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl RefStore for RaceInjectingLeaseBackend {
+        fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+            self.inner.read_ref(token)
+        }
+
+        fn list_refs(&self) -> Result<Vec<ListedRef>> {
+            self.inner.list_refs()
+        }
+
+        fn compare_and_swap_ref(
+            &self,
+            token: &RefToken,
+            expected: Option<RefVersion>,
+            next: EncryptedRef,
+        ) -> Result<CasResult> {
+            self.inner.compare_and_swap_ref(token, expected, next)
+        }
+    }
+
+    impl LayoutRootStore for RaceInjectingLeaseBackend {
+        fn read_layout_root(&self) -> Result<LayoutRoot> {
+            self.inner.read_layout_root()
+        }
+
+        fn compare_and_swap_layout_root(
+            &self,
+            expected: u64,
+            next: LayoutRoot,
+        ) -> Result<CasResult> {
+            self.inner.compare_and_swap_layout_root(expected, next)
+        }
+
+        fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
+            self.inner.list_retained_layout_roots()
+        }
+    }
+
+    impl e2v_store::RemoteBackend for RaceInjectingLeaseBackend {
+        fn capability(&self) -> &BackendCapability {
+            self.inner.capability()
+        }
+    }
 
     #[test]
     fn begin_selects_multi_writer_mode_when_capability_supports_conditional_put() {
@@ -241,6 +615,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -256,6 +631,7 @@ mod tests {
                 operation_id: OperationId::new("op-1".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -264,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_writes_active_intent_marker() {
+    fn begin_writes_structured_active_intent_marker() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
         let publisher = SimpleTransactionPublisher::new(
@@ -275,6 +651,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -290,6 +667,7 @@ mod tests {
                 operation_id: OperationId::new("op-intent".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -298,8 +676,24 @@ mod tests {
             .remote_backend()
             .get_physical("transactions/active/op-intent.intent")
             .unwrap();
+        let intent: serde_json::Value = serde_json::from_slice(&active_intent).unwrap();
+
         assert!(!active_intent.is_empty());
         assert_eq!(session.operation_id.value, "op-intent");
+        assert_eq!(intent["operation_id"], "op-intent");
+        assert_eq!(intent["writer_id"], "writer:op-intent");
+        assert_eq!(intent["target_branch_token"], "branch-token");
+        assert_eq!(intent["client_version"], env!("CARGO_PKG_VERSION"));
+        assert!(intent["expected_ref_version"].is_null());
+        assert!(intent["planned_snapshot_id"].is_null());
+        assert!(intent["started_at_remote_unix_ms"].as_u64().unwrap() > 0);
+        assert!(
+            intent["heartbeat"]["remote_observed_at_unix_ms"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(intent["heartbeat"]["sequence"], 1);
     }
 
     #[test]
@@ -314,6 +708,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -329,6 +724,7 @@ mod tests {
                 operation_id: OperationId::new("op-precommit".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -354,6 +750,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::StrongWhitelisted,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -369,6 +766,7 @@ mod tests {
                 operation_id: OperationId::new("op-intent-owner".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -402,6 +800,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::UnknownOrEventual,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -417,11 +816,83 @@ mod tests {
                 operation_id: OperationId::new("op-single-writer".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+        let lease = publisher
+            .remote_backend()
+            .get_physical("leases/branch-token.lock")
+            .unwrap();
+        let lease_marker: serde_json::Value = serde_json::from_slice(&lease).unwrap();
+
+        assert_eq!(session.writer_mode, WriterMode::SingleWriter);
+        assert_eq!(lease_marker["operation_id"], "op-single-writer");
+        assert_eq!(lease_marker["writer_id"], "writer:op-single-writer");
+        assert_eq!(lease_marker["target_branch_token"], "branch-token");
+        assert_eq!(lease_marker["lease_generation"], 1);
+        assert!(lease_marker["remote_observed_at_unix_ms"].as_u64().unwrap() > 0);
+        assert!(
+            lease_marker["heartbeat"]["remote_observed_at_unix_ms"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(lease_marker["heartbeat"]["sequence"], 1);
+    }
+
+    #[test]
+    fn begin_uses_remote_modified_time_for_marker_observed_timestamps() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let fixed_ms = fixed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let remote = FixedRemoteTimeBackend::new(fixed_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let _session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-remote-time".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: Some(7),
+                planned_snapshot_id: Some("snapshot-123".to_string()),
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
 
-        assert_eq!(session.writer_mode, WriterMode::SingleWriter);
+        let intent: serde_json::Value = serde_json::from_slice(
+            &remote
+                .get_physical("transactions/active/op-remote-time.intent")
+                .unwrap(),
+        )
+        .unwrap();
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(intent["started_at_remote_unix_ms"], fixed_ms);
+        assert_eq!(intent["heartbeat"]["remote_observed_at_unix_ms"], fixed_ms);
+        assert_eq!(intent["expected_ref_version"], 7);
+        assert_eq!(intent["planned_snapshot_id"], "snapshot-123");
+        assert_eq!(lease["remote_observed_at_unix_ms"], fixed_ms);
+        assert_eq!(lease["heartbeat"]["remote_observed_at_unix_ms"], fixed_ms);
     }
 
     #[test]
@@ -440,6 +911,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::UnknownOrEventual,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -455,11 +927,242 @@ mod tests {
                 operation_id: OperationId::new("op-single-writer-fail".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap_err();
 
         assert!(error.to_string().contains("lease"));
+    }
+
+    #[test]
+    fn begin_rejects_single_writer_when_foreign_writer_wins_lease_race() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = RaceInjectingLeaseBackend::new();
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let error = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-race".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap_err();
+
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert!(error.to_string().contains("lease"));
+        assert_eq!(lease["operation_id"], "foreign-operation");
+    }
+
+    #[test]
+    fn begin_reacquires_expired_single_writer_lease_from_previous_operation() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let remote = FixedRemoteTimeBackend::new(fixed_time);
+        let previous_observed_ms =
+            fixed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        remote
+            .put_physical(
+                "leases/branch-token.lock",
+                serde_json::to_vec(&serde_json::json!({
+                    "writer_id": "writer:old-operation",
+                    "operation_id": "old-operation",
+                    "target_branch_token": "branch-token",
+                    "remote_observed_at_unix_ms": previous_observed_ms,
+                    "lease_generation": 7,
+                    "heartbeat": {
+                        "remote_observed_at_unix_ms": previous_observed_ms,
+                        "sequence": 4
+                    }
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        remote
+            .inner
+            .override_physical_modified_time_for_test(
+                "leases/branch-token.lock",
+                fixed_time - Duration::from_secs(73 * 60 * 60),
+            )
+            .unwrap();
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("new-operation".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(session.writer_mode, WriterMode::SingleWriter);
+        assert_eq!(lease["operation_id"], "new-operation");
+        assert_eq!(lease["writer_id"], "writer:new-operation");
+    }
+
+    #[test]
+    fn begin_still_rejects_fresh_single_writer_lease_from_previous_operation() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let remote = FixedRemoteTimeBackend::new(fixed_time);
+        let observed_ms = fixed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        remote
+            .put_physical(
+                "leases/branch-token.lock",
+                serde_json::to_vec(&serde_json::json!({
+                    "writer_id": "writer:old-operation",
+                    "operation_id": "old-operation",
+                    "target_branch_token": "branch-token",
+                    "remote_observed_at_unix_ms": observed_ms,
+                    "lease_generation": 7,
+                    "heartbeat": {
+                        "remote_observed_at_unix_ms": observed_ms,
+                        "sequence": 4
+                    }
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote,
+        );
+
+        let error = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("new-operation".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("lease"));
+    }
+
+    #[test]
+    fn heartbeat_renews_intent_and_lease_during_long_running_publish() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let next_time = fixed_time + Duration::from_secs(11 * 60);
+        let initial_ms = fixed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let next_ms = next_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let remote = FixedRemoteTimeBackend::new(fixed_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-heartbeat".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-heartbeat".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+        remote.set_fixed_time_for_test(next_time);
+
+        publisher.heartbeat(&session).unwrap();
+
+        let intent: serde_json::Value = serde_json::from_slice(
+            &remote
+                .get_physical("transactions/active/op-heartbeat.intent")
+                .unwrap(),
+        )
+        .unwrap();
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(intent["started_at_remote_unix_ms"], initial_ms);
+        assert_eq!(intent["heartbeat"]["remote_observed_at_unix_ms"], next_ms);
+        assert_eq!(intent["heartbeat"]["sequence"], 2);
+        assert_eq!(lease["remote_observed_at_unix_ms"], next_ms);
+        assert_eq!(lease["heartbeat"]["remote_observed_at_unix_ms"], next_ms);
+        assert_eq!(lease["heartbeat"]["sequence"], 2);
+        assert_eq!(lease["lease_generation"], 2);
     }
 
     #[test]
@@ -474,6 +1177,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::UnknownOrEventual,
                 supports_remote_lock_or_lease: false,
+                supports_atomic_create_if_absent: false,
                 supports_transaction_markers: false,
                 supports_reliable_remote_time: false,
                 supports_object_generation_or_etag: false,
@@ -489,6 +1193,7 @@ mod tests {
                 operation_id: OperationId::new("op-read-only".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap_err();
@@ -508,6 +1213,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::UnknownOrEventual,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: false,
                 supports_object_generation_or_etag: false,
@@ -523,6 +1229,7 @@ mod tests {
                 operation_id: OperationId::new("op-risky-single-writer".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap_err();
@@ -542,6 +1249,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::UnknownOrEventual,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -557,6 +1265,7 @@ mod tests {
                 operation_id: OperationId::new("op-lease-owner".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -594,6 +1303,7 @@ mod tests {
                 operation_id: OperationId::new("op-stale-precommit".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: Some(1),
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -608,6 +1318,84 @@ mod tests {
         let error = publisher.pre_commit_verify(&session).unwrap_err();
 
         assert!(error.to_string().contains("ref"));
+    }
+
+    #[test]
+    fn pre_commit_verify_renews_expired_intent_and_lease_with_remote_observed_time() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let renewed_time = initial_time + Duration::from_secs(73 * 60 * 60);
+        let initial_ms = initial_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let renewed_ms = renewed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-renew-precommit".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-renew".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .inner
+            .override_physical_modified_time_for_test(
+                "transactions/active/op-renew-precommit.intent",
+                renewed_time - Duration::from_secs(73 * 60 * 60),
+            )
+            .unwrap();
+        remote
+            .inner
+            .override_physical_modified_time_for_test(
+                "leases/branch-token.lock",
+                renewed_time - Duration::from_secs(73 * 60 * 60),
+            )
+            .unwrap();
+        remote.set_fixed_time_for_test(renewed_time);
+
+        publisher.pre_commit_verify(&session).unwrap();
+
+        let intent: serde_json::Value = serde_json::from_slice(
+            &remote
+                .get_physical("transactions/active/op-renew-precommit.intent")
+                .unwrap(),
+        )
+        .unwrap();
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(intent["started_at_remote_unix_ms"], initial_ms);
+        assert_eq!(
+            intent["heartbeat"]["remote_observed_at_unix_ms"],
+            renewed_ms
+        );
+        assert_eq!(intent["heartbeat"]["sequence"], 2);
+        assert_eq!(lease["remote_observed_at_unix_ms"], renewed_ms);
+        assert_eq!(lease["heartbeat"]["remote_observed_at_unix_ms"], renewed_ms);
+        assert_eq!(lease["heartbeat"]["sequence"], 2);
+        assert_eq!(lease["lease_generation"], 2);
     }
 
     #[test]
@@ -626,6 +1414,7 @@ mod tests {
                 operation_id: OperationId::new("op-publish-ref".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: Some(1),
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -654,6 +1443,7 @@ mod tests {
                 operation_id: OperationId::new("op-complete-intent".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -676,6 +1466,7 @@ mod tests {
                 supports_paged_list: true,
                 consistency_class: ConsistencyClass::UnknownOrEventual,
                 supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
                 supports_transaction_markers: true,
                 supports_reliable_remote_time: true,
                 supports_object_generation_or_etag: true,
@@ -690,6 +1481,7 @@ mod tests {
                 operation_id: OperationId::new("op-complete-lease-1".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -701,6 +1493,7 @@ mod tests {
                 operation_id: OperationId::new("op-complete-lease-2".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
@@ -724,6 +1517,7 @@ mod tests {
                 operation_id: OperationId::new("op-invalid-branch".to_string()).unwrap(),
                 target_branch_token: "../evil".to_string(),
                 expected_ref_version: None,
+                planned_snapshot_id: None,
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap_err();

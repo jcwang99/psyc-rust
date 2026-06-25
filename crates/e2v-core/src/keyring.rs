@@ -101,6 +101,15 @@ pub fn unlock_repo_secrets_from_generation_file(
     unlock_repo_secrets_from_state(&keyring, password)
 }
 
+pub fn unlock_repo_secrets_from_keyring_bytes(
+    keyring_bytes: &[u8],
+    password: &str,
+) -> Result<RepoSecrets> {
+    let keyring: KeyringState =
+        serde_json::from_slice(keyring_bytes).context("failed to decode keyring state")?;
+    unlock_repo_secrets_from_state(&keyring, password)
+}
+
 fn unlock_repo_secrets_from_state(keyring: &KeyringState, password: &str) -> Result<RepoSecrets> {
     let password_envelope = keyring
         .envelopes
