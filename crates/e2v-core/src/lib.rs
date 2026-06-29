@@ -80,10 +80,17 @@ pub use manifest_store::{
 pub use working_tree::{SnapshotReader, StableReadPolicy};
 
 pub mod sync_support {
+    use std::collections::BTreeMap;
+    use std::path::Component;
     use std::path::{Path, PathBuf};
 
-    use anyhow::{Result, ensure};
-    use e2v_store::{RepoSecrets, validate_object_id_value};
+    use anyhow::{Context, Result, ensure};
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+    use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
+    use e2v_store::{
+        LayoutObjectLocation, PackStorageLayout, PhysicalObjectRef, RepoSecrets, StorageLayout,
+        validate_object_id_value,
+    };
     use serde::{Deserialize, Serialize};
 
     use crate::facade::{RepositoryState, SnapshotSummary};
@@ -174,6 +181,157 @@ pub mod sync_support {
         )?)
     }
 
+    pub fn read_cached_pack_object_bytes(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+    ) -> Result<Vec<u8>> {
+        fn cached_pack_data_path(repo_root: &Path, container_id: &str) -> Result<PathBuf> {
+            let relative = Path::new(container_id);
+            ensure!(
+                !container_id.is_empty(),
+                "cached pack container id must not be empty"
+            );
+            ensure!(
+                !relative.is_absolute(),
+                "cached pack container id must be relative"
+            );
+            ensure!(
+                relative
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+                "cached pack container path traversal is not allowed"
+            );
+            let mut path = repo_root.join(".e2v").join("cache").join("pack-data");
+            for segment in relative.components() {
+                let Component::Normal(segment) = segment else {
+                    unreachable!("validated above")
+                };
+                path.push(segment);
+            }
+            Ok(path)
+        }
+
+        let physical_ref = load_cached_pack_physical_ref_for_object_id(&repo_root, object_id)?;
+        let offset = usize::try_from(physical_ref.offset.unwrap_or(0))
+            .map_err(|_| anyhow::anyhow!("cached pack offset is too large to read"))?;
+        let length = usize::try_from(physical_ref.length)
+            .map_err(|_| anyhow::anyhow!("cached pack length is too large to read"))?;
+        let pack_path = cached_pack_data_path(repo_root.as_ref(), &physical_ref.container_id)?;
+        let bytes = std::fs::read(&pack_path).with_context(|| {
+            format!(
+                "cached pack data is missing for {}",
+                physical_ref.container_id
+            )
+        })?;
+        let end = offset.saturating_add(length);
+        ensure!(
+            end <= bytes.len(),
+            "cached pack object range out of bounds for {object_id}"
+        );
+        Ok(bytes[offset..end].to_vec())
+    }
+
+    pub fn decode_object_bytes_for_sync(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+        expected_type: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>> {
+        const ENVELOPE_MAGIC: &[u8; 4] = b"E2V0";
+        const ENVELOPE_FORMAT_VERSION: u32 = 1;
+        const CRYPTO_SUITE: &str = "xchacha20poly1305";
+        const PADDING_POLICY_NONE: &str = "none";
+
+        let control_dir = repo_root.as_ref().join(".e2v");
+        let secrets = open_repo_secrets_for_sync(&control_dir)?;
+        let mut cursor = 0usize;
+
+        let magic = take_exact(bytes, &mut cursor, ENVELOPE_MAGIC.len())?;
+        ensure!(magic == ENVELOPE_MAGIC, "object authentication failed");
+
+        let format_version = read_u32(bytes, &mut cursor)?;
+        ensure!(
+            format_version == ENVELOPE_FORMAT_VERSION,
+            "unsupported object format version"
+        );
+
+        let object_type = read_string(bytes, &mut cursor)?;
+        let crypto_suite = read_string(bytes, &mut cursor)?;
+        let key_epoch = read_u32(bytes, &mut cursor)?;
+        let padding_policy = read_string(bytes, &mut cursor)?;
+        let stored_object_id = read_string(bytes, &mut cursor)?;
+        let nonce_len = read_u8(bytes, &mut cursor)? as usize;
+        ensure!(nonce_len == 24, "object authentication failed");
+        let nonce = take_exact(bytes, &mut cursor, nonce_len)?.to_vec();
+        let ciphertext_len = read_u64(bytes, &mut cursor)? as usize;
+        let ciphertext = take_exact(bytes, &mut cursor, ciphertext_len)?.to_vec();
+        let auth_tag = take_exact(bytes, &mut cursor, 16)?.to_vec();
+        ensure!(cursor == bytes.len(), "object authentication failed");
+
+        ensure!(
+            object_type == expected_type,
+            "object type mismatch: expected {expected_type}, got {object_type}"
+        );
+        ensure!(
+            crypto_suite == CRYPTO_SUITE,
+            "unsupported crypto suite: {crypto_suite}"
+        );
+        ensure!(
+            stored_object_id == object_id,
+            "object id mismatch in stored envelope"
+        );
+        ensure!(key_epoch > 0, "object authentication failed");
+
+        let mut associated_data = Vec::new();
+        associated_data.extend_from_slice(ENVELOPE_MAGIC);
+        associated_data.extend_from_slice(&ENVELOPE_FORMAT_VERSION.to_le_bytes());
+        associated_data.extend_from_slice(secrets.repo_id.as_bytes());
+        associated_data.extend_from_slice(object_type.as_bytes());
+        associated_data.extend_from_slice(stored_object_id.as_bytes());
+        associated_data.extend_from_slice(CRYPTO_SUITE.as_bytes());
+        associated_data.extend_from_slice(&secrets.active_epoch.to_le_bytes());
+        associated_data.extend_from_slice(padding_policy.as_bytes());
+
+        let cipher = XChaCha20Poly1305::new((&secrets.repo_manifest_enc_key).into());
+        let mut plaintext = ciphertext;
+        cipher
+            .decrypt_in_place_detached(
+                XNonce::from_slice(&nonce),
+                &associated_data,
+                &mut plaintext,
+                Tag::from_slice(&auth_tag),
+            )
+            .map_err(|_| anyhow::anyhow!("object authentication failed"))?;
+
+        let plaintext = if padding_policy == PADDING_POLICY_NONE {
+            plaintext
+        } else {
+            ensure!(plaintext.len() >= 4, "object authentication failed");
+            let mut pad_len_bytes = [0u8; 4];
+            pad_len_bytes.copy_from_slice(&plaintext[..4]);
+            let pad_len = u32::from_le_bytes(pad_len_bytes) as usize;
+            ensure!(
+                plaintext.len() >= 4 + pad_len,
+                "object authentication failed"
+            );
+            let end = plaintext.len() - pad_len;
+            plaintext[4..end].to_vec()
+        };
+
+        let mut input = Vec::with_capacity(expected_type.len() + 8 + plaintext.len());
+        input.extend_from_slice(expected_type.as_bytes());
+        input.extend_from_slice(&(plaintext.len() as u64).to_le_bytes());
+        input.extend_from_slice(&plaintext);
+        let recomputed_id =
+            hex::encode(blake3::keyed_hash(&secrets.repo_dedup_key, &input).as_bytes());
+        ensure!(
+            recomputed_id == object_id,
+            "object authentication failed: object id mismatch"
+        );
+
+        Ok(plaintext)
+    }
+
     pub fn local_object_envelope_looks_valid(
         repo_root: impl AsRef<Path>,
         object_id: &str,
@@ -186,6 +344,188 @@ pub mod sync_support {
         object_id: &str,
     ) -> Result<String> {
         Ok(parse_local_object_envelope_header(repo_root, object_id)?.object_type)
+    }
+
+    pub fn load_cached_pack_physical_ref_for_object_id(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+    ) -> Result<PhysicalObjectRef> {
+        const PACK_INDEX_ROOT_SCHEMA_VERSION: u32 = 1;
+        const PACK_INDEX_ROOT_STABLE_NAME: &str = "pack-index-root";
+        const PACK_INDEX_ROOT_OBJECT_TYPE: &str = "pack-index-root";
+        const PACK_INDEX_SEGMENT_OBJECT_TYPE: &str = "pack-index-segment";
+        const PACK_INDEX_SEGMENT_STABLE_NAME_PREFIX: &str = "pack-index-segment:";
+        const REMOTE_PACK_INDEX_PREFIX: &str = "packs/index/";
+        const PACK_INDEX_COMPACTED_SEGMENT_PREFIX: &str = "pack-index/segments/";
+        const REMOTE_PACK_DATA_PREFIX: &str = "packs/data/";
+
+        #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+        struct CachedPackIndexRoot {
+            schema_version: u32,
+            layout_id: String,
+            segments: Vec<String>,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+        struct CachedObjectPackIndex {
+            schema_version: u32,
+            data_path: String,
+            entries: Vec<CachedObjectPackEntry>,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+        struct CachedObjectPackEntry {
+            object_id: String,
+            offset: u64,
+            length: u64,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+        struct CachedAggregatePackIndexSegment {
+            schema_version: u32,
+            entries: Vec<CachedAggregatePackIndexEntry>,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+        struct CachedAggregatePackIndexEntry {
+            object_id: String,
+            data_path: String,
+            offset: u64,
+            length: u64,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct CachedPackedObjectLocation {
+            data_path: String,
+            offset: usize,
+            length: usize,
+        }
+
+        impl CachedPackedObjectLocation {
+            fn physical_ref(&self) -> Result<PhysicalObjectRef> {
+                PackStorageLayout.resolve(LayoutObjectLocation::PackedObject {
+                    container_id: &self.data_path,
+                    offset: self.offset as u64,
+                    length: self.length as u64,
+                })
+            }
+        }
+
+        fn cached_segment_path(cache_dir: &Path, segment_path: &str) -> PathBuf {
+            cache_dir
+                .join("segments")
+                .join(segment_path.replace('/', "__"))
+        }
+
+        fn decode_root(bytes: &[u8], secrets: &RepoSecrets) -> Result<CachedPackIndexRoot> {
+            let plaintext = decrypt_control_record_for_sync(
+                secrets,
+                PACK_INDEX_ROOT_STABLE_NAME,
+                PACK_INDEX_ROOT_OBJECT_TYPE,
+                bytes,
+            )?;
+            serde_json::from_slice(&plaintext)
+                .context("failed to decode authenticated pack index root")
+        }
+
+        fn decode_segment(
+            segment_path: &str,
+            bytes: &[u8],
+            secrets: &RepoSecrets,
+        ) -> Result<Vec<CachedAggregatePackIndexEntry>> {
+            let plaintext = decrypt_control_record_for_sync(
+                secrets,
+                &format!("{PACK_INDEX_SEGMENT_STABLE_NAME_PREFIX}{segment_path}"),
+                PACK_INDEX_SEGMENT_OBJECT_TYPE,
+                bytes,
+            )
+            .with_context(|| {
+                format!("failed to decrypt authenticated pack index segment {segment_path}")
+            })?;
+
+            if segment_path.starts_with(REMOTE_PACK_INDEX_PREFIX) {
+                let index: CachedObjectPackIndex = serde_json::from_slice(&plaintext)?;
+                ensure!(
+                    index.schema_version == PACK_INDEX_ROOT_SCHEMA_VERSION,
+                    "unsupported pack index schema version {}",
+                    index.schema_version
+                );
+                ensure!(
+                    index.data_path.starts_with(REMOTE_PACK_DATA_PREFIX),
+                    "invalid pack data path {}",
+                    index.data_path
+                );
+                return Ok(index
+                    .entries
+                    .into_iter()
+                    .map(|entry| CachedAggregatePackIndexEntry {
+                        object_id: entry.object_id,
+                        data_path: index.data_path.clone(),
+                        offset: entry.offset,
+                        length: entry.length,
+                    })
+                    .collect());
+            }
+
+            let aggregate: CachedAggregatePackIndexSegment = serde_json::from_slice(&plaintext)?;
+            ensure!(
+                aggregate.schema_version == PACK_INDEX_ROOT_SCHEMA_VERSION,
+                "unsupported aggregate pack index schema version {}",
+                aggregate.schema_version
+            );
+            Ok(aggregate.entries)
+        }
+
+        validate_object_id_value(object_id)?;
+        let control_dir = repo_root.as_ref().join(".e2v");
+        let secrets = open_repo_secrets_for_sync(&control_dir)?;
+        let cache_dir = control_dir.join("cache").join("pack-index");
+        let root_bytes = std::fs::read(cache_dir.join("root.json"))
+            .context("cached pack index root is missing")?;
+        let root = decode_root(&root_bytes, &secrets)?;
+        ensure!(
+            root.schema_version == PACK_INDEX_ROOT_SCHEMA_VERSION,
+            "unsupported pack index root schema version {}",
+            root.schema_version
+        );
+        ensure!(
+            !root.layout_id.trim().is_empty(),
+            "pack index root layout id must not be empty"
+        );
+
+        let mut locations = BTreeMap::new();
+        for segment_path in &root.segments {
+            ensure!(
+                segment_path.starts_with(REMOTE_PACK_INDEX_PREFIX)
+                    || segment_path.starts_with(PACK_INDEX_COMPACTED_SEGMENT_PREFIX),
+                "invalid pack index segment path {}",
+                segment_path
+            );
+            let segment_bytes = std::fs::read(cached_segment_path(&cache_dir, segment_path))
+                .with_context(|| {
+                    format!("cached pack index segment is missing for {}", segment_path)
+                })?;
+            for entry in decode_segment(segment_path, &segment_bytes, &secrets)? {
+                ensure!(
+                    entry.data_path.starts_with(REMOTE_PACK_DATA_PREFIX),
+                    "invalid aggregate pack data path {}",
+                    entry.data_path
+                );
+                locations.insert(
+                    entry.object_id,
+                    CachedPackedObjectLocation {
+                        data_path: entry.data_path,
+                        offset: entry.offset as usize,
+                        length: entry.length as usize,
+                    },
+                );
+            }
+        }
+
+        let location = locations.remove(object_id).ok_or_else(|| {
+            anyhow::anyhow!("cached pack index has no entry for object {object_id}")
+        })?;
+        location.physical_ref()
     }
 
     struct LocalObjectEnvelopeHeader {

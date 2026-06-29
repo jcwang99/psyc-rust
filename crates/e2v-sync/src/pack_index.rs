@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use e2v_core::sync_support::{
     decrypt_control_record_for_sync, encrypt_control_record_for_sync, open_repo_secrets_for_sync,
 };
-use e2v_store::{BlobStore, RepoSecrets};
+use e2v_store::{BlobStore, PhysicalObjectRef, RepoSecrets};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -159,6 +159,17 @@ pub fn load_remote_operation_pack_locations_with_secrets<B: BlobStore>(
         batch_index += 1;
     }
     Ok(locations)
+}
+
+#[must_use]
+pub fn load_cached_pack_physical_ref_for_object_id(
+    control_dir: &Path,
+    object_id: &str,
+) -> Result<PhysicalObjectRef> {
+    let repo_root = control_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("control_dir has no parent repository root"))?;
+    e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(repo_root, object_id)
 }
 
 #[doc(hidden)]
@@ -506,6 +517,46 @@ mod tests {
             load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
                 .unwrap();
         assert!(cached.contains_key("abc"));
+    }
+
+    #[test]
+    fn cached_pack_index_segments_can_restore_a_physical_ref_for_object_id() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        let (index, payload) =
+            build_pack("op", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index.data_path, &payload).unwrap();
+        let segment_path = "packs/index/op-00000000.json";
+        remote
+            .put_physical(
+                segment_path,
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    segment_path,
+                    &serde_json::to_vec(&index).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_path.to_string()],
+        )
+        .unwrap();
+
+        load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets)).unwrap();
+        remote.delete_physical(segment_path).unwrap();
+
+        let physical_ref =
+            load_cached_pack_physical_ref_for_object_id(&control_dir, "abc").unwrap();
+
+        assert_eq!(physical_ref.layout_id, "pack");
+        assert_eq!(physical_ref.container_id, "packs/data/op-00000000.bin");
+        assert_eq!(physical_ref.offset, Some(0));
+        assert_eq!(physical_ref.length, payload.len() as u64);
     }
 
     #[test]

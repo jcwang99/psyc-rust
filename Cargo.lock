@@ -624,6 +624,7 @@ dependencies = [
  "e2v-core",
  "e2v-store",
  "e2v-sync",
+ "e2v-vfs",
  "serde",
  "serde_json",
  "tempfile",
@@ -687,6 +688,20 @@ dependencies = [
  "tokio",
  "tower",
  "url",
+]
+
+[[package]]
+name = "e2v-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chacha20poly1305",
+ "e2v-core",
+ "getrandom 0.3.4",
+ "hex",
+ "tempfile",
+ "unicode-normalization",
 ]
 
 [[package]]

@@ -370,6 +370,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
                             &remote_loose_object_ids,
                             &pack_locations,
                             &mut pack_cache,
+                            Some(&control_dir),
                             object_id,
                         )? {
                             if !local_object_matches_bytes(&options.repo_root, object_id, &bytes) {
@@ -389,6 +390,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
                 &remote_loose_object_ids,
                 &pack_locations,
                 &mut pack_cache,
+                Some(&control_dir),
                 object_id,
             )? {
                 std::fs::write(&target_path, bytes)?;
@@ -474,6 +476,7 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
                 validation_secrets,
                 head_snapshot_id,
             )?;
+            persist_cached_pack_data(repo_root.join(".e2v"), &pack_cache)?;
             reachable_object_ids
         }
         None => Vec::new(),
@@ -482,6 +485,16 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
         validation_root,
         reachable_object_ids,
     })
+}
+
+fn persist_cached_pack_data(
+    control_dir: PathBuf,
+    pack_cache: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    for (container_id, pack_bytes) in pack_cache {
+        cache_pack_data_bytes(&control_dir, container_id, pack_bytes)?;
+    }
+    Ok(())
 }
 
 fn classify_repository_sync_mode<R: RemoteBackend>(
@@ -650,6 +663,7 @@ pub(crate) fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
     loose_object_ids: &BTreeSet<String>,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
     pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    control_dir: Option<&Path>,
     object_id: &str,
 ) -> Result<Option<Vec<u8>>> {
     if loose_object_ids.contains(object_id) {
@@ -669,6 +683,9 @@ pub(crate) fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
             .try_into()
             .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
         let pack_bytes = remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
+        if let Some(control_dir) = control_dir {
+            cache_pack_data_bytes(control_dir, &physical_ref.container_id, &pack_bytes)?;
+        }
         pack_cache.insert(physical_ref.container_id.clone(), pack_bytes);
     }
     let pack_bytes = pack_cache.get(&physical_ref.container_id).unwrap();
@@ -682,6 +699,21 @@ pub(crate) fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
         "packed object range out of bounds for {object_id}"
     );
     Ok(Some(pack_bytes[offset..end].to_vec()))
+}
+
+fn cache_pack_data_bytes(control_dir: &Path, container_id: &str, pack_bytes: &[u8]) -> Result<()> {
+    validate_remote_relative_name(container_id)?;
+    let cache_path = control_dir
+        .join("cache")
+        .join("pack-data")
+        .join(container_id);
+    if cache_path.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write_bytes(cache_path, pack_bytes)
 }
 
 fn remote_object_authenticates_for_repo<R: RemoteBackend>(
@@ -1408,6 +1440,7 @@ fn fetch_remote_object_into_validation_root<R: RemoteBackend>(
         remote_loose_object_ids,
         pack_locations,
         pack_cache,
+        None,
         object_id,
     )?
     .with_context(|| format!("missing remote object {object_id}"))?;

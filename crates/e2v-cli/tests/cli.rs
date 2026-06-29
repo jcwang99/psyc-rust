@@ -116,6 +116,80 @@ fn search_command_prints_filename_matches() {
 }
 
 #[test]
+fn mount_snapshot_command_delegates_to_e2v_vfs() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let snapshot_id = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap()
+        .snapshot_id;
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "mount",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "snapshot",
+        "--snapshot",
+        &snapshot_id,
+        "--mount-point",
+        "X:",
+    ])
+    .unwrap();
+
+    assert!(output.contains("snapshot-pinned"));
+    assert!(output.contains("X:"));
+    assert!(output.contains("KernelCacheWithInvalidation"));
+    assert!(output.contains("read-only"));
+    assert!(output.contains("stream-only"));
+}
+
+#[test]
+fn mount_branch_command_delegates_to_e2v_vfs() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "mount",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "branch",
+        "--branch-token",
+        &branch_token,
+        "--mount-point",
+        "Y:",
+    ])
+    .unwrap();
+
+    assert!(output.contains("live-branch"));
+    assert!(output.contains("Y:"));
+    assert!(output.contains("KernelCacheWithInvalidation"));
+    assert!(output.contains("read-only"));
+    assert!(output.contains("stream-only"));
+}
+
+#[test]
 fn remote_add_persists_default_remote_spec() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

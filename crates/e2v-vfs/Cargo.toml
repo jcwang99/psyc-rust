@@ -1,0 +1,17 @@
+[package]
+name = "e2v-vfs"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+e2v-core = { path = "../e2v-core" }
+getrandom.workspace = true
+hex.workspace = true
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true

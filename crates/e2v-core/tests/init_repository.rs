@@ -1043,6 +1043,31 @@ fn read_service_reads_directory_and_file_content_from_snapshot() {
 }
 
 #[test]
+fn read_service_can_be_constructed_without_repository_facade() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let read_service = e2v_core::ReadService::new(&repo_root);
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let content = read_service.read_range(&file, 0, 5).unwrap();
+
+    assert_eq!(String::from_utf8(content).unwrap(), "hello");
+}
+
+#[test]
 fn read_service_reads_empty_files_from_snapshot() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -2409,6 +2434,404 @@ fn read_range_rejects_tampered_chunk_before_returning_bytes() {
         error.to_string().contains("authentication"),
         "unexpected error: {error:#}"
     );
+}
+
+#[test]
+fn read_range_reports_missing_physical_chunk_with_layout_generation_context() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "missing-physical-chunk".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{chunk_id}.json"));
+    fs::remove_file(&chunk_path).unwrap();
+
+    let error = read_service.read_range(&file, 0, 5).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("stale-layout fallback unavailable"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("layout generation {}", file.layout_generation())),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        error.to_string().contains(&chunk_id),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_range_still_reads_healthy_chunks_after_missing_chunk_error_improvement() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "healthy-after-missing-error-improvement".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+
+    let bytes = read_service.read_range(&file, 0, 5).unwrap();
+
+    assert_eq!(bytes, b"hello");
+}
+
+#[test]
+fn sync_support_can_resolve_cached_pack_physical_ref_for_object_id() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["packs/index/op-00000000.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "pack_id": "op-00000000",
+        "data_path": "packs/data/op-00000000.bin",
+        "entries": [
+            {
+                "object_id": "abc",
+                "offset": 3u64,
+                "length": 5u64,
+            }
+        ],
+    });
+    let segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:packs/index/op-00000000.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000000.json"),
+        segment_bytes,
+    )
+    .unwrap();
+
+    let physical_ref =
+        e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(&repo_root, "abc")
+            .unwrap();
+
+    assert_eq!(physical_ref.layout_id, "pack");
+    assert_eq!(physical_ref.container_id, "packs/data/op-00000000.bin");
+    assert_eq!(physical_ref.offset, Some(3));
+    assert_eq!(physical_ref.length, 5);
+}
+
+#[test]
+fn sync_support_reports_missing_cached_pack_entry_for_object_id() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["packs/index/op-00000000.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "pack_id": "op-00000000",
+        "data_path": "packs/data/op-00000000.bin",
+        "entries": [],
+    });
+    let segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:packs/index/op-00000000.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000000.json"),
+        segment_bytes,
+    )
+    .unwrap();
+
+    let error =
+        e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(&repo_root, "abc")
+            .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("cached pack index has no entry for object abc"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_range_falls_back_to_cached_pack_data_when_loose_chunk_is_missing() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "cached-pack-fallback".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let control_dir = repo_root.join(".e2v");
+    let chunk_path = control_dir.join("objects").join(format!("{chunk_id}.json"));
+    let chunk_bytes = fs::read(&chunk_path).unwrap();
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["packs/index/op-00000000.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "pack_id": "op-00000000",
+        "data_path": "packs/data/op-00000000.bin",
+        "entries": [
+            {
+                "object_id": chunk_id,
+                "offset": 0u64,
+                "length": chunk_bytes.len() as u64,
+            }
+        ],
+    });
+    let segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:packs/index/op-00000000.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000000.json"),
+        segment_bytes,
+    )
+    .unwrap();
+
+    let cached_pack_path = control_dir
+        .join("cache")
+        .join("pack-data")
+        .join("packs")
+        .join("data")
+        .join("op-00000000.bin");
+    fs::create_dir_all(cached_pack_path.parent().unwrap()).unwrap();
+    fs::write(&cached_pack_path, chunk_bytes).unwrap();
+    fs::remove_file(&chunk_path).unwrap();
+
+    let bytes = read_service.read_range(&file, 0, 5).unwrap();
+
+    assert_eq!(bytes, b"hello");
+}
+
+#[test]
+fn read_range_reports_unavailable_fallback_when_cached_pack_data_is_missing() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "cached-pack-fallback-missing-pack".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let control_dir = repo_root.join(".e2v");
+    let chunk_path = control_dir.join("objects").join(format!("{chunk_id}.json"));
+    let chunk_bytes = fs::read(&chunk_path).unwrap();
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["packs/index/op-00000000.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "pack_id": "op-00000000",
+        "data_path": "packs/data/op-00000000.bin",
+        "entries": [
+            {
+                "object_id": chunk_id,
+                "offset": 0u64,
+                "length": chunk_bytes.len() as u64,
+            }
+        ],
+    });
+    let segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:packs/index/op-00000000.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000000.json"),
+        segment_bytes,
+    )
+    .unwrap();
+
+    fs::remove_file(&chunk_path).unwrap();
+
+    let error = read_service.read_range(&file, 0, 5).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("stale-layout fallback unavailable"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_range_still_prefers_healthy_loose_chunk_over_cached_pack_fallback() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "healthy-loose-preferred".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+
+    let bytes = read_service.read_range(&file, 0, 5).unwrap();
+
+    assert_eq!(bytes, b"hello");
 }
 
 #[test]

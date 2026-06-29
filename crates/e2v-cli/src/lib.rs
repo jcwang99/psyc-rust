@@ -13,6 +13,7 @@ use e2v_sync::{
     gc_execute_capability_status, load_trusted_remote_state_for_repo,
     remote_spec::RemoteBackendRef, repair_remote, verify_remote,
 };
+use e2v_vfs::{MountLaunchSummary, mount_live_branch, mount_snapshot};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -69,6 +70,12 @@ enum Command {
         #[arg(long)]
         bundle: Option<PathBuf>,
     },
+    Mount {
+        #[command(subcommand)]
+        command: MountCommand,
+        #[arg(long)]
+        repo: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -105,6 +112,22 @@ enum GcCommand {
             default_value_t = false
         )]
         confirm_single_writer_maintenance_window: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MountCommand {
+    Snapshot {
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long = "mount-point")]
+        mount_point: PathBuf,
+    },
+    Branch {
+        #[arg(long = "branch-token")]
+        branch_token: String,
+        #[arg(long = "mount-point")]
+        mount_point: PathBuf,
     },
 }
 
@@ -386,6 +409,22 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(format!("{}\n", serde_json::to_string_pretty(&summary)?))
             }
         }
+        Command::Mount { command, repo } => match command {
+            MountCommand::Snapshot {
+                snapshot,
+                mount_point,
+            } => {
+                let summary = mount_snapshot(repo, snapshot, mount_point)?;
+                Ok(format_mount_summary(&summary))
+            }
+            MountCommand::Branch {
+                branch_token,
+                mount_point,
+            } => {
+                let summary = mount_live_branch(repo, branch_token, mount_point)?;
+                Ok(format_mount_summary(&summary))
+            }
+        },
     }
 }
 
@@ -452,4 +491,26 @@ fn redact_remote_spec(spec: &str) -> String {
         return format!("{}://<redacted>", url.scheme());
     }
     "<redacted>".to_string()
+}
+
+fn format_mount_summary(summary: &MountLaunchSummary) -> String {
+    let access_mode = if summary.read_only {
+        "read-only"
+    } else {
+        "writable"
+    };
+    let io_mode = if summary.stream_only {
+        "stream-only"
+    } else {
+        "disk-like"
+    };
+    format!(
+        "mounted {} at {} with {:?}, {}, {} ({})\n",
+        summary.mount_mode,
+        summary.mount_point.display(),
+        summary.cache_policy,
+        access_mode,
+        io_mode,
+        summary.status_message
+    )
 }

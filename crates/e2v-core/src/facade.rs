@@ -852,6 +852,12 @@ impl RepositoryFacade {
 }
 
 impl ReadService {
+    pub fn new(repo_root: impl AsRef<Path>) -> Self {
+        Self {
+            repo_root: repo_root.as_ref().to_path_buf(),
+        }
+    }
+
     pub fn open_snapshot(&self, snapshot_id: &str) -> Result<SnapshotHandle> {
         validate_object_id_value(snapshot_id).context("invalid snapshot id")?;
         let repo_state = RepositoryFacade::new().open(&self.repo_root)?;
@@ -969,7 +975,33 @@ impl ReadService {
                 break;
             }
 
-            let chunk = read_chunk_object(&object_store, chunk_id)?;
+            let chunk = if object_store.exists_object(chunk_id) {
+                read_chunk_object(&object_store, chunk_id)?
+            } else {
+                let fallback_bytes =
+                    crate::sync_support::read_cached_pack_object_bytes(&self.repo_root, chunk_id)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "stale-layout fallback unavailable for missing chunk {chunk_id} at layout generation {}",
+                                file.layout_generation
+                            )
+                        })?;
+                let fallback_plaintext = crate::sync_support::decode_object_bytes_for_sync(
+                    &self.repo_root,
+                    chunk_id,
+                    "chunk",
+                    &fallback_bytes,
+                )
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "stale-layout fallback unavailable for missing chunk {chunk_id} at layout generation {}",
+                        file.layout_generation
+                    )
+                })?;
+                let chunk: ChunkObject = postcard_from_bytes(&fallback_plaintext)
+                    .context("failed to decode object plaintext")?;
+                chunk
+            };
             ensure!(
                 chunk.data.len() == chunk_len,
                 "file chunk metadata does not match chunk payload length"

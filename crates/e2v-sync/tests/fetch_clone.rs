@@ -805,6 +805,107 @@ fn fetch_restores_missing_packed_objects_without_relisting_remote_pack_indexes()
 }
 
 #[test]
+fn fetch_allows_read_service_to_fallback_to_cached_pack_data_when_local_chunk_goes_missing() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("cached-{index:02}.txt")),
+            format!("cached-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "packed-fetch-read-fallback".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "packed-fetch-read-fallback-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/data/").unwrap().is_empty());
+
+    let target_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&target_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert!(fetched.downloaded_objects > 0);
+
+    let cache_pack_data_root = target_repo_root
+        .join(".e2v")
+        .join("cache")
+        .join("pack-data");
+    RepositoryFacade::new()
+        .unlock(&target_repo_root, "correct horse battery staple")
+        .unwrap();
+    let read_service = RepositoryFacade::new()
+        .read_service(&target_repo_root)
+        .unwrap();
+    let snapshot = read_service
+        .resolve_branch(&state.branch.token_hex)
+        .unwrap();
+    let file = read_service.open_file(&snapshot, "cached-00.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let chunk_path = target_repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{chunk_id}.json"));
+    fs::remove_file(&chunk_path).unwrap();
+    assert!(!chunk_path.exists());
+
+    let bytes = read_service
+        .read_range(&file, 0, "cached-payload-00".len())
+        .unwrap();
+
+    assert_eq!(String::from_utf8(bytes).unwrap(), "cached-payload-00");
+    assert!(cache_pack_data_root.is_dir());
+    assert!(
+        fs::read_dir(cache_pack_data_root.join("packs").join("data"))
+            .unwrap()
+            .next()
+            .is_some()
+    );
+}
+
+#[test]
 fn fetch_rejects_invalid_pack_index_root_instead_of_falling_back_to_segment_listing() {
     let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
