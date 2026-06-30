@@ -35,3 +35,4 @@ serde_urlencoded = "0.7"
 bytes = "1.10"
 futures-util = "0.3"
 url = "2.5"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }

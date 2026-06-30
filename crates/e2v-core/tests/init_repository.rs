@@ -474,7 +474,7 @@ fn unlock_recovers_when_generation_exists_but_journal_is_still_writing_generatio
 }
 
 #[test]
-fn unlock_restores_access_after_fresh_process_lock_state() {
+fn open_restores_access_after_fresh_process_lock_state_via_local_device() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -483,17 +483,70 @@ fn unlock_restores_access_after_fresh_process_lock_state() {
     let created = facade.init(init_options(&repo_root)).unwrap();
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
 
-    let open_error = facade.open(&repo_root).unwrap_err();
-    assert!(
-        open_error.to_string().contains("locked")
-            || open_error.to_string().contains("unlock")
-            || open_error.to_string().contains("keyring"),
-        "unexpected error: {open_error:#}"
-    );
+    let reopened = facade.open(&repo_root).unwrap();
+    assert_eq!(reopened, created);
 
-    let reopened = facade
+    let unlocked = facade
         .unlock(&repo_root, "correct horse battery staple")
         .unwrap();
+    assert_eq!(unlocked, created);
+}
+
+#[test]
+fn local_device_unlock_and_open_restore_access_without_password_after_cache_clear() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let reopened = facade.open(&repo_root).unwrap();
+    assert_eq!(reopened, created);
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let unlocked = e2v_core::testing::unlock_with_local_device_for_test(&repo_root).unwrap();
+    assert_eq!(unlocked, created);
+}
+
+#[test]
+fn local_device_unlock_survives_password_rotation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let reopened = e2v_core::testing::unlock_with_local_device_for_test(&repo_root).unwrap();
+
+    assert_eq!(reopened, created);
+}
+
+#[test]
+fn local_device_unlock_survives_epoch_rotation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let reopened = e2v_core::testing::unlock_with_local_device_for_test(&repo_root).unwrap();
 
     assert_eq!(reopened, created);
 }
@@ -690,16 +743,10 @@ fn clearing_test_unlock_cache_only_evicts_the_requested_repo() {
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root_a.join(".e2v"));
 
-    let open_error = facade.open(&repo_root_a).unwrap_err();
-    assert!(
-        open_error.to_string().contains("locked")
-            || open_error.to_string().contains("unlock")
-            || open_error.to_string().contains("keyring"),
-        "unexpected error: {open_error:#}"
-    );
-
+    let opened_a = facade.open(&repo_root_a).unwrap();
     let opened_b = facade.open(&repo_root_b).unwrap();
 
+    assert_eq!(opened_a, created_a);
     assert_eq!(opened_b, created_b);
     let reopened_a = facade
         .unlock(&repo_root_a, "correct horse battery staple")
@@ -3858,5 +3905,665 @@ fn manifest_store_streaming_tree_walk_defers_deep_file_validation_until_iteratio
     assert!(
         error.to_string().contains("authentication"),
         "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn rotated_active_epoch_keeps_old_snapshot_readable() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "beta").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service
+        .open_snapshot(&first_commit.snapshot_id)
+        .unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+
+    assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+}
+
+#[test]
+fn control_record_decryption_uses_envelope_key_epoch_after_rotation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let default_ref_before_rotation =
+        fs::read(control_dir.join("refs").join("default.json")).unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let secrets_after_rotation = e2v_core::sync_support::unlock_repo_secrets_for_sync(
+        &control_dir,
+        "correct horse battery staple",
+    )
+    .unwrap();
+    let plaintext = e2v_core::sync_support::decrypt_control_record_for_sync(
+        &secrets_after_rotation,
+        "default",
+        "ref",
+        &default_ref_before_rotation,
+    )
+    .unwrap();
+    let record: RefRecordMirror = postcard::from_bytes(&plaintext).unwrap();
+
+    assert_eq!(record.branch_name, "main");
+}
+
+#[test]
+fn share_list_exposes_owner_actor_and_local_device() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let listing = facade.share_list(&repo_root).unwrap();
+
+    assert_eq!(listing.actors.len(), 1);
+    assert_eq!(listing.actors[0].role, "owner_admin");
+    assert_eq!(listing.devices.len(), 1);
+    assert_eq!(listing.devices[0].status, "active");
+}
+
+#[test]
+fn share_invite_member_creates_repository_scoped_bundle() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let invite = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    assert!(!invite.actor_id.is_empty());
+    assert!(!invite.device_id.is_empty());
+    assert!(!invite.bundle_bytes.is_empty());
+}
+
+fn read_current_keyring_json(repo_root: &std::path::Path) -> serde_json::Value {
+    let keyring_dir = repo_root.join(".e2v").join("keyring");
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(keyring_dir.join("keyring.current")).unwrap()).unwrap();
+    let current = pointer["current"].as_str().unwrap();
+    serde_json::from_slice(&fs::read(keyring_dir.join(current)).unwrap()).unwrap()
+}
+
+fn keyring_contains_actor_envelope(keyring: &serde_json::Value, actor_id: &str) -> bool {
+    keyring["envelopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|envelope| envelope["actor_id"].as_str() == Some(actor_id))
+}
+
+#[test]
+fn share_accept_member_creates_writer_member_device() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let invite = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let accepted = facade
+        .share_accept_member(
+            &repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(accepted.actor_id, invite.actor_id);
+    assert_eq!(accepted.role, "writer_member");
+    assert!(!accepted.device_id.is_empty());
+
+    let keyring = read_current_keyring_json(&repo_root);
+    assert_eq!(keyring["generation"].as_u64(), Some(2));
+    assert!(
+        keyring["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
+                    && actor["role"].as_str() == Some("writer_member")
+            )
+    );
+    assert!(keyring["devices"].as_array().unwrap().iter().any(
+        |device| device["actor_id"].as_str() == Some(invite.actor_id.as_str())
+            && device["label"].as_str() == Some("alice-laptop")
+            && device["status"].as_str() == Some("active")
+    ));
+    assert!(keyring_contains_actor_envelope(&keyring, &invite.actor_id));
+}
+
+#[test]
+fn share_accept_member_bootstraps_empty_recipient_repo() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&owner_root)).unwrap();
+
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let accepted = facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(accepted.actor_id, invite.actor_id);
+    assert_eq!(accepted.role, "writer_member");
+    assert!(!accepted.device_id.is_empty());
+
+    let recipient_control = recipient_root.join(".e2v");
+    assert!(
+        recipient_control
+            .join("keyring")
+            .join("keyring.current")
+            .is_file()
+    );
+    assert!(
+        recipient_control
+            .join("device")
+            .join("local-device.json")
+            .is_file()
+    );
+
+    let pointer: serde_json::Value = serde_json::from_slice(
+        &fs::read(recipient_control.join("keyring").join("keyring.current")).unwrap(),
+    )
+    .unwrap();
+    let current = pointer["current"].as_str().unwrap();
+    let keyring: serde_json::Value =
+        serde_json::from_slice(&fs::read(recipient_control.join("keyring").join(current)).unwrap())
+            .unwrap();
+
+    assert_eq!(
+        keyring["repo_id"].as_str(),
+        read_current_keyring_json(&owner_root)["repo_id"].as_str()
+    );
+    assert!(
+        keyring["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
+                    && actor["role"].as_str() == Some("writer_member")
+            )
+    );
+    assert!(keyring["devices"].as_array().unwrap().iter().any(
+        |device| device["device_id"].as_str() == Some(accepted.device_id.as_str())
+            && device["label"].as_str() == Some("alice-laptop")
+            && device["status"].as_str() == Some("active")
+    ));
+}
+
+#[test]
+fn share_revoke_member_advances_active_epoch_and_removes_member_envelope() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    facade
+        .share_accept_member(
+            &repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    let before = read_current_keyring_json(&repo_root);
+    let before_epoch = before["active_epoch"].as_u64().unwrap();
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+
+    facade
+        .share_revoke_member(&repo_root, &invite.actor_id)
+        .unwrap();
+
+    let after = read_current_keyring_json(&repo_root);
+    assert_eq!(after["generation"].as_u64(), Some(3));
+    assert_eq!(after["active_epoch"].as_u64(), Some(before_epoch + 1));
+    assert!(
+        after["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
+                    && actor["role"].as_str() == Some("writer_member")
+            )
+    );
+    assert!(
+        after["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|device| device["actor_id"].as_str() == Some(invite.actor_id.as_str()))
+            .all(|device| device["status"].as_str() == Some("revoked"))
+    );
+    assert!(!keyring_contains_actor_envelope(&after, &invite.actor_id));
+}
+
+#[test]
+fn share_revoke_member_blocks_local_device_unlock_after_revocation() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner-repo");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&owner_root)).unwrap();
+    let owner_credential_bytes = fs::read(
+        owner_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let accepted = facade
+        .share_accept_member(
+            &owner_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    let member_credential: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            owner_root
+                .join(".e2v")
+                .join("device")
+                .join("local-device.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        member_credential["actor_id"].as_str(),
+        Some(accepted.actor_id.as_str())
+    );
+
+    fs::write(
+        owner_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+
+    facade
+        .share_revoke_member(&owner_root, &invite.actor_id)
+        .unwrap();
+
+    fs::write(
+        owner_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        serde_json::to_vec_pretty(&member_credential).unwrap(),
+    )
+    .unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&owner_root.join(".e2v"));
+    let error = e2v_core::testing::unlock_with_local_device_for_test(&owner_root).unwrap_err();
+    assert!(
+        error.to_string().contains("matching local device envelope")
+            || error.to_string().contains("device unlock failed")
+            || error.to_string().contains("locked"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn share_invite_device_and_accept_device_adds_second_active_device_for_actor() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let member_invite = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let accepted_member = facade
+        .share_accept_member(
+            &repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: member_invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+    let device_invite = facade
+        .share_invite_device(
+            &repo_root,
+            e2v_core::ShareInviteDeviceOptions {
+                actor_id: accepted_member.actor_id.clone(),
+                device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let accepted_device = facade
+        .share_accept_device(
+            &repo_root,
+            e2v_core::ShareAcceptDeviceOptions {
+                invite_bytes: device_invite.bundle_bytes.clone(),
+                local_device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(accepted_device.actor_id, accepted_member.actor_id);
+    assert_eq!(accepted_device.role, "writer_member");
+    assert_ne!(accepted_device.device_id, accepted_member.device_id);
+
+    let keyring = read_current_keyring_json(&repo_root);
+    let actor_devices = keyring["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|device| device["actor_id"].as_str() == Some(accepted_member.actor_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(actor_devices.len(), 2);
+    assert!(
+        actor_devices
+            .iter()
+            .all(|device| device["status"].as_str() == Some("active"))
+    );
+    assert!(
+        keyring["envelopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|envelope| envelope["device_id"].as_str()
+                == Some(accepted_device.device_id.as_str()))
+    );
+}
+
+#[test]
+fn share_revoke_device_advances_epoch_and_only_revokes_target_device() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let member_invite = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let accepted_member = facade
+        .share_accept_member(
+            &repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: member_invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes.clone(),
+    )
+    .unwrap();
+    let device_invite = facade
+        .share_invite_device(
+            &repo_root,
+            e2v_core::ShareInviteDeviceOptions {
+                actor_id: accepted_member.actor_id.clone(),
+                device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let accepted_device = facade
+        .share_accept_device(
+            &repo_root,
+            e2v_core::ShareAcceptDeviceOptions {
+                invite_bytes: device_invite.bundle_bytes.clone(),
+                local_device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+
+    let before = read_current_keyring_json(&repo_root);
+    let before_epoch = before["active_epoch"].as_u64().unwrap();
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+
+    facade
+        .share_revoke_device(&repo_root, &accepted_device.device_id)
+        .unwrap();
+
+    let after = read_current_keyring_json(&repo_root);
+    assert_eq!(after["active_epoch"].as_u64(), Some(before_epoch + 1));
+    assert!(
+        after["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |device| device["device_id"].as_str() == Some(accepted_device.device_id.as_str())
+                    && device["status"].as_str() == Some("revoked")
+            )
+    );
+    assert!(
+        after["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |device| device["device_id"].as_str() == Some(accepted_member.device_id.as_str())
+                    && device["status"].as_str() == Some("active")
+            )
+    );
+    assert!(
+        !after["envelopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|envelope| envelope["device_id"].as_str()
+                == Some(accepted_device.device_id.as_str()))
+    );
+}
+
+#[test]
+fn writer_member_cannot_issue_share_admin_operations() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let member_invite = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let accepted_member = facade
+        .share_accept_member(
+            &repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: member_invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    let invite_error = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Bob".to_string(),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        invite_error.to_string().contains("owner-admin")
+            || invite_error.to_string().contains("not authorized")
+            || invite_error.to_string().contains("share admin"),
+        "unexpected invite error: {invite_error:#}"
+    );
+
+    let revoke_error = facade
+        .share_revoke_member(&repo_root, &accepted_member.actor_id)
+        .unwrap_err();
+    assert!(
+        revoke_error.to_string().contains("owner-admin")
+            || revoke_error.to_string().contains("not authorized")
+            || revoke_error.to_string().contains("share admin"),
+        "unexpected revoke error: {revoke_error:#}"
     );
 }

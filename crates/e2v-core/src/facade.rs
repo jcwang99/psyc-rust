@@ -10,7 +10,7 @@ use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use e2v_store::{
-    DirectLayoutObjectStore, LayoutRoot, RepoSecrets, validate_object_id_value,
+    DirectLayoutObjectStore, EpochSecrets, LayoutRoot, RepoSecrets, validate_object_id_value,
     validate_ref_token_value,
 };
 use postcard::{from_bytes as postcard_from_bytes, to_stdvec as postcard_to_vec};
@@ -19,9 +19,13 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::chunker::FastCdcChunker;
 use crate::keyring::{
-    KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_secrets,
-    open_repo_secrets, seal_repo_secrets, unlock_repo_secrets,
-    unlock_repo_secrets_from_generation_file, unlock_repo_secrets_uncached,
+    KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_password,
+    cache_unlocked_secrets, generate_local_device_credential, open_repo_secrets,
+    read_cached_password, read_current_keyring_state, read_local_device_credential,
+    seal_repo_secrets, seal_repo_secrets_for_device, unlock_repo_secrets,
+    unlock_repo_secrets_from_generation_file,
+    unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
+    unlock_repo_secrets_with_local_device, write_local_device_credential,
 };
 use crate::local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
 use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreApi};
@@ -197,6 +201,82 @@ pub struct BranchSummary {
     pub token_hex: String,
     pub head_snapshot_id: Option<String>,
     pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareActorSummary {
+    pub actor_id: String,
+    pub display_name: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareDeviceSummary {
+    pub device_id: String,
+    pub actor_id: String,
+    pub label: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareListResult {
+    pub actors: Vec<ShareActorSummary>,
+    pub devices: Vec<ShareDeviceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareInviteMemberOptions {
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareAcceptMemberOptions {
+    pub invite_bytes: Vec<u8>,
+    pub local_device_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareInviteDeviceOptions {
+    pub actor_id: String,
+    pub device_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareAcceptDeviceOptions {
+    pub invite_bytes: Vec<u8>,
+    pub local_device_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInviteBundle {
+    pub actor_id: String,
+    pub device_id: String,
+    pub bundle_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareAcceptResult {
+    pub actor_id: String,
+    pub device_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ShareInvitePayload {
+    repo_id: String,
+    actor_id: String,
+    device_id: String,
+    display_name: String,
+    role: String,
+    invite_kind: String,
+    active_epoch: u32,
+    branch_name: String,
+    branch_token_hex: String,
+    default_ref_bytes_hex: String,
+    layout_root_bytes_hex: String,
+    bootstrap_credential: crate::keyring::LocalDeviceCredential,
+    bootstrap_keyring_state: KeyringState,
+    bootstrap_keyring_pointer: KeyringPointer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +459,11 @@ impl RepositoryFacade {
             name: branch_name.clone(),
             token_hex: derive_branch_token(&repo_secrets.repo_ref_key, &branch_name),
         };
+        let local_device_credential = generate_local_device_credential(
+            "owner-admin".to_string(),
+            "device-local".to_string(),
+            "local-device".to_string(),
+        )?;
         let layout_root = LayoutRoot {
             schema_version: REPO_FORMAT_VERSION,
             layout_id: DIRECT_LAYOUT_ID.to_string(),
@@ -397,13 +482,39 @@ impl RepositoryFacade {
             active_epoch: DEFAULT_ACTIVE_EPOCH,
             crypto_suite: "xchacha20poly1305".to_string(),
             kdf: "argon2id".to_string(),
-            envelopes: vec![seal_repo_secrets(
-                &repo_id,
-                DEFAULT_ACTIVE_EPOCH,
-                &options.password,
-                &repo_secrets,
-                redact_password_hint(&options.password),
-            )?],
+            actors: vec![crate::keyring::ActorRecord {
+                actor_id: local_device_credential.actor_id.clone(),
+                display_name: "Local Owner".to_string(),
+                role: "owner_admin".to_string(),
+            }],
+            devices: vec![crate::keyring::DeviceRecord {
+                device_id: local_device_credential.device_id.clone(),
+                actor_id: local_device_credential.actor_id.clone(),
+                label: local_device_credential.label.clone(),
+                device_pubkey_hex: local_device_credential.public_key_hex.clone(),
+                status: "active".to_string(),
+            }],
+            epochs: vec![crate::keyring::EpochDescriptor {
+                epoch: DEFAULT_ACTIVE_EPOCH,
+                status: "active".to_string(),
+            }],
+            envelopes: vec![
+                seal_repo_secrets(
+                    &repo_id,
+                    DEFAULT_ACTIVE_EPOCH,
+                    &options.password,
+                    &repo_secrets,
+                    redact_password_hint(&options.password),
+                )?,
+                seal_repo_secrets_for_device(
+                    &repo_id,
+                    DEFAULT_ACTIVE_EPOCH,
+                    &local_device_credential.public_key_hex,
+                    &repo_secrets,
+                    &local_device_credential.actor_id,
+                    &local_device_credential.device_id,
+                )?,
+            ],
         };
         let keyring_pointer = KeyringPointer {
             generation: 1,
@@ -417,9 +528,11 @@ impl RepositoryFacade {
             &keyring_state,
             &keyring_pointer,
         )?;
+        write_local_device_credential(&control_dir, &local_device_credential)?;
         write_default_ref(&control_dir, &repo_secrets, &default_ref)?;
         write_branch_ref(&control_dir, &repo_secrets, &default_ref)?;
         cache_unlocked_secrets(&control_dir, &repo_secrets);
+        cache_unlocked_password(&control_dir, &options.password);
 
         Ok(RepositoryState {
             repo_root,
@@ -460,6 +573,7 @@ impl RepositoryFacade {
                         )?;
                         let _ = fs::remove_file(&journal_path);
                         cache_unlocked_secrets(&control_dir, &secrets);
+                        cache_unlocked_password(&control_dir, password);
                         Ok(secrets)
                     } else {
                         Err(primary_error)
@@ -488,13 +602,11 @@ impl RepositoryFacade {
         let next_file_name = format!("keyring.{next_generation}");
         let next_state = KeyringState {
             generation: next_generation,
-            envelopes: vec![seal_repo_secrets(
-                &repo_secrets.repo_id,
-                repo_secrets.active_epoch,
-                new_password,
+            envelopes: rebuild_local_device_and_password_envelopes(
+                &current_state,
                 &repo_secrets,
-                redact_password_hint(new_password),
-            )?],
+                new_password,
+            )?,
             ..current_state
         };
         let next_pointer = KeyringPointer {
@@ -508,6 +620,7 @@ impl RepositoryFacade {
             &next_pointer,
         )?;
         cache_unlocked_secrets(&control_dir, &repo_secrets);
+        cache_unlocked_password(&control_dir, new_password);
         Ok(())
     }
 
@@ -516,7 +629,14 @@ impl RepositoryFacade {
         let control_dir = repo_root.join(CONTROL_DIR);
 
         let layout_root = validate_layout_root(&control_dir)?;
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = match open_repo_secrets(&control_dir) {
+            Ok(secrets) => secrets,
+            Err(_) => {
+                let secrets = unlock_repo_secrets_with_local_device(&control_dir)?;
+                cache_unlocked_secrets(&control_dir, &secrets);
+                secrets
+            }
+        };
         let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
         ensure!(
             !default_ref.branch_name.trim().is_empty(),
@@ -711,6 +831,510 @@ impl RepositoryFacade {
                 is_current: branch.ref_token_hex == current_ref.ref_token_hex,
             })
             .collect())
+    }
+
+    pub fn share_list(&self, repo_root: impl AsRef<Path>) -> Result<ShareListResult> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let keyring = read_current_keyring_state(&control_dir)?;
+        Ok(ShareListResult {
+            actors: keyring
+                .actors
+                .into_iter()
+                .map(|actor| ShareActorSummary {
+                    actor_id: actor.actor_id,
+                    display_name: actor.display_name,
+                    role: actor.role,
+                })
+                .collect(),
+            devices: keyring
+                .devices
+                .into_iter()
+                .map(|device| ShareDeviceSummary {
+                    device_id: device.device_id,
+                    actor_id: device.actor_id,
+                    label: device.label,
+                    status: device.status,
+                })
+                .collect(),
+        })
+    }
+
+    pub fn share_invite_member(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: ShareInviteMemberOptions,
+    ) -> Result<ShareInviteBundle> {
+        ensure!(
+            !options.display_name.trim().is_empty(),
+            "share invite display name must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        ensure_local_share_admin(&control_dir)?;
+        let keyring = read_current_keyring_state(&control_dir)?;
+        let actor_id = format!("member-{}", random_hex_identifier()?);
+        let bootstrap_credential = generate_local_device_credential(
+            actor_id.clone(),
+            format!("device-{}", random_hex_identifier()?),
+            "bootstrap-device".to_string(),
+        )?;
+        let branch = self.open(&repo_root)?.branch;
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let bootstrap_generation = keyring.generation + 1;
+        let bootstrap_generation_file = format!(
+            "keyring.{}.bootstrap-{}",
+            bootstrap_generation, bootstrap_credential.device_id
+        );
+        let bootstrap_keyring_state = KeyringState {
+            format_version: keyring.format_version,
+            generation: bootstrap_generation,
+            repo_id: keyring.repo_id.clone(),
+            active_epoch: keyring.active_epoch,
+            crypto_suite: keyring.crypto_suite.clone(),
+            kdf: keyring.kdf.clone(),
+            actors: vec![crate::keyring::ActorRecord {
+                actor_id: actor_id.clone(),
+                display_name: options.display_name.clone(),
+                role: "writer_member".to_string(),
+            }],
+            devices: vec![crate::keyring::DeviceRecord {
+                device_id: bootstrap_credential.device_id.clone(),
+                actor_id: actor_id.clone(),
+                label: bootstrap_credential.label.clone(),
+                device_pubkey_hex: bootstrap_credential.public_key_hex.clone(),
+                status: "active".to_string(),
+            }],
+            epochs: keyring.epochs.clone(),
+            envelopes: vec![seal_repo_secrets_for_device(
+                &keyring.repo_id,
+                keyring.active_epoch,
+                &bootstrap_credential.public_key_hex,
+                &repo_secrets,
+                &actor_id,
+                &bootstrap_credential.device_id,
+            )?],
+        };
+        let bootstrap_keyring_pointer = KeyringPointer {
+            generation: bootstrap_generation,
+            current: bootstrap_generation_file,
+        };
+        let bundle_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "repo_id": keyring.repo_id,
+            "actor_id": actor_id,
+            "device_id": bootstrap_credential.device_id,
+            "display_name": options.display_name,
+            "role": "writer_member",
+            "invite_kind": "member",
+            "active_epoch": keyring.active_epoch,
+            "branch_name": branch.name,
+            "branch_token_hex": branch.token_hex,
+            "default_ref_bytes_hex": hex::encode(std::fs::read(control_dir.join(DEFAULT_REF_FILE))?),
+            "layout_root_bytes_hex": hex::encode(std::fs::read(control_dir.join(LAYOUT_ROOT_FILE))?),
+            "bootstrap_credential": bootstrap_credential,
+            "bootstrap_keyring_state": bootstrap_keyring_state,
+            "bootstrap_keyring_pointer": bootstrap_keyring_pointer
+        }))
+        .context("failed to encode share invite bundle")?;
+        Ok(ShareInviteBundle {
+            actor_id,
+            device_id: bootstrap_keyring_state.devices[0].device_id.clone(),
+            bundle_bytes,
+        })
+    }
+
+    pub fn share_accept_member(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: ShareAcceptMemberOptions,
+    ) -> Result<ShareAcceptResult> {
+        let invite: ShareInvitePayload = serde_json::from_slice(&options.invite_bytes)
+            .context("failed to decode share invite bundle")?;
+        ensure!(
+            invite.invite_kind == "member",
+            "share invite bundle is not a member invite"
+        );
+        self.accept_share_device(repo_root, &invite, &options.local_device_label, true)
+    }
+
+    pub fn share_invite_device(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: ShareInviteDeviceOptions,
+    ) -> Result<ShareInviteBundle> {
+        ensure!(
+            !options.actor_id.trim().is_empty(),
+            "share invite actor id must not be empty"
+        );
+        ensure!(
+            !options.device_label.trim().is_empty(),
+            "share invite device label must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        ensure_local_share_admin(&control_dir)?;
+        let keyring = read_current_keyring_state(&control_dir)?;
+        let actor = keyring
+            .actors
+            .iter()
+            .find(|actor| actor.actor_id == options.actor_id)
+            .with_context(|| format!("share actor not found: {}", options.actor_id))?;
+        let bootstrap_credential = generate_local_device_credential(
+            actor.actor_id.clone(),
+            format!("device-{}", random_hex_identifier()?),
+            options.device_label.clone(),
+        )?;
+        let branch = self.open(&repo_root)?.branch;
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let bootstrap_generation = keyring.generation + 1;
+        let bootstrap_generation_file = format!(
+            "keyring.{}.bootstrap-{}",
+            bootstrap_generation, bootstrap_credential.device_id
+        );
+        let bootstrap_keyring_state = KeyringState {
+            format_version: keyring.format_version,
+            generation: bootstrap_generation,
+            repo_id: keyring.repo_id.clone(),
+            active_epoch: keyring.active_epoch,
+            crypto_suite: keyring.crypto_suite.clone(),
+            kdf: keyring.kdf.clone(),
+            actors: vec![actor.clone()],
+            devices: vec![crate::keyring::DeviceRecord {
+                device_id: bootstrap_credential.device_id.clone(),
+                actor_id: actor.actor_id.clone(),
+                label: bootstrap_credential.label.clone(),
+                device_pubkey_hex: bootstrap_credential.public_key_hex.clone(),
+                status: "active".to_string(),
+            }],
+            epochs: keyring.epochs.clone(),
+            envelopes: vec![seal_repo_secrets_for_device(
+                &keyring.repo_id,
+                keyring.active_epoch,
+                &bootstrap_credential.public_key_hex,
+                &repo_secrets,
+                &actor.actor_id,
+                &bootstrap_credential.device_id,
+            )?],
+        };
+        let bootstrap_keyring_pointer = KeyringPointer {
+            generation: bootstrap_generation,
+            current: bootstrap_generation_file,
+        };
+        let bundle_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "repo_id": keyring.repo_id,
+            "actor_id": actor.actor_id,
+            "device_id": bootstrap_credential.device_id,
+            "display_name": actor.display_name,
+            "role": actor.role,
+            "invite_kind": "device",
+            "active_epoch": keyring.active_epoch,
+            "branch_name": branch.name,
+            "branch_token_hex": branch.token_hex,
+            "default_ref_bytes_hex": hex::encode(std::fs::read(control_dir.join(DEFAULT_REF_FILE))?),
+            "layout_root_bytes_hex": hex::encode(std::fs::read(control_dir.join(LAYOUT_ROOT_FILE))?),
+            "bootstrap_credential": bootstrap_credential,
+            "bootstrap_keyring_state": bootstrap_keyring_state,
+            "bootstrap_keyring_pointer": bootstrap_keyring_pointer
+        }))
+        .context("failed to encode share device invite bundle")?;
+        Ok(ShareInviteBundle {
+            actor_id: actor.actor_id.clone(),
+            device_id: bootstrap_keyring_state.devices[0].device_id.clone(),
+            bundle_bytes,
+        })
+    }
+
+    pub fn share_accept_device(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: ShareAcceptDeviceOptions,
+    ) -> Result<ShareAcceptResult> {
+        let invite: ShareInvitePayload = serde_json::from_slice(&options.invite_bytes)
+            .context("failed to decode share device invite bundle")?;
+        ensure!(
+            invite.invite_kind == "device",
+            "share invite bundle is not a device invite"
+        );
+        self.accept_share_device(repo_root, &invite, &options.local_device_label, false)
+    }
+
+    pub fn share_revoke_device(&self, repo_root: impl AsRef<Path>, device_id: &str) -> Result<()> {
+        ensure!(
+            !device_id.trim().is_empty(),
+            "share device id must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        ensure_local_share_admin(&control_dir)?;
+        let mut repo_secrets = open_repo_secrets(&control_dir)?;
+        let password = read_cached_password(&control_dir)?;
+        let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+        let current_state: KeyringState =
+            read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+        let target_device = current_state
+            .devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .with_context(|| format!("share device not found: {device_id}"))?;
+        ensure!(
+            current_state.actors.iter().all(
+                |actor| actor.actor_id != target_device.actor_id || actor.role != "owner_admin"
+            ),
+            "cannot revoke owner-admin device"
+        );
+
+        let next_generation = current_state.generation + 1;
+        let next_file_name = format!("keyring.{next_generation}");
+        repo_secrets.active_epoch += 1;
+        repo_secrets.repo_manifest_enc_key = random_key_material()?;
+        repo_secrets.repo_nonce_key = random_key_material()?;
+        repo_secrets.epoch_keys.insert(
+            repo_secrets.active_epoch,
+            EpochSecrets {
+                manifest_enc_key: repo_secrets.repo_manifest_enc_key,
+                nonce_key: repo_secrets.repo_nonce_key,
+            },
+        );
+
+        let devices = current_state
+            .devices
+            .iter()
+            .cloned()
+            .map(|mut device| {
+                if device.device_id == device_id {
+                    device.status = "revoked".to_string();
+                }
+                device
+            })
+            .collect::<Vec<_>>();
+        let epochs = build_epoch_descriptors(&repo_secrets);
+        let mut next_state = KeyringState {
+            generation: next_generation,
+            active_epoch: repo_secrets.active_epoch,
+            devices,
+            epochs,
+            envelopes: rebuild_local_device_and_password_envelopes(
+                &current_state,
+                &repo_secrets,
+                &password,
+            )?,
+            ..current_state
+        };
+        next_state
+            .envelopes
+            .retain(|envelope| envelope.device_id != device_id);
+
+        let next_pointer = KeyringPointer {
+            generation: next_generation,
+            current: next_file_name.clone(),
+        };
+        write_keyring_generation_and_pointer(
+            &control_dir,
+            &next_file_name,
+            &next_state,
+            &next_pointer,
+        )?;
+        cache_unlocked_secrets(&control_dir, &repo_secrets);
+        cache_unlocked_password(&control_dir, &password);
+        Ok(())
+    }
+
+    pub fn share_revoke_member(&self, repo_root: impl AsRef<Path>, actor_id: &str) -> Result<()> {
+        ensure!(
+            !actor_id.trim().is_empty(),
+            "share actor id must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        ensure_local_share_admin(&control_dir)?;
+        let mut repo_secrets = open_repo_secrets(&control_dir)?;
+        let password = read_cached_password(&control_dir)?;
+        let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+        let current_state: KeyringState =
+            read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+        ensure!(
+            current_state
+                .actors
+                .iter()
+                .any(|actor| actor.actor_id == actor_id),
+            "share actor not found: {actor_id}"
+        );
+        ensure!(
+            current_state
+                .actors
+                .iter()
+                .all(|actor| actor.actor_id != actor_id || actor.role != "owner_admin"),
+            "cannot revoke owner-admin actor"
+        );
+
+        let next_generation = current_state.generation + 1;
+        let next_file_name = format!("keyring.{next_generation}");
+        repo_secrets.active_epoch += 1;
+        repo_secrets.repo_manifest_enc_key = random_key_material()?;
+        repo_secrets.repo_nonce_key = random_key_material()?;
+        repo_secrets.epoch_keys.insert(
+            repo_secrets.active_epoch,
+            EpochSecrets {
+                manifest_enc_key: repo_secrets.repo_manifest_enc_key,
+                nonce_key: repo_secrets.repo_nonce_key,
+            },
+        );
+
+        let devices = current_state
+            .devices
+            .iter()
+            .cloned()
+            .map(|mut device| {
+                if device.actor_id == actor_id {
+                    device.status = "revoked".to_string();
+                }
+                device
+            })
+            .collect::<Vec<_>>();
+
+        let epochs = build_epoch_descriptors(&repo_secrets);
+        let mut next_state = KeyringState {
+            generation: next_generation,
+            active_epoch: repo_secrets.active_epoch,
+            devices,
+            epochs,
+            envelopes: rebuild_local_device_and_password_envelopes(
+                &current_state,
+                &repo_secrets,
+                &password,
+            )?,
+            ..current_state
+        };
+        next_state
+            .envelopes
+            .retain(|envelope| envelope.actor_id != actor_id);
+
+        let next_pointer = KeyringPointer {
+            generation: next_generation,
+            current: next_file_name.clone(),
+        };
+        write_keyring_generation_and_pointer(
+            &control_dir,
+            &next_file_name,
+            &next_state,
+            &next_pointer,
+        )?;
+        cache_unlocked_secrets(&control_dir, &repo_secrets);
+        cache_unlocked_password(&control_dir, &password);
+        Ok(())
+    }
+
+    fn accept_share_device(
+        &self,
+        repo_root: impl AsRef<Path>,
+        invite: &ShareInvitePayload,
+        local_device_label: &str,
+        create_actor: bool,
+    ) -> Result<ShareAcceptResult> {
+        ensure!(
+            !local_device_label.trim().is_empty(),
+            "share accept local device label must not be empty"
+        );
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        if !control_dir.exists() {
+            bootstrap_recipient_repository(&repo_root, invite, local_device_label)?;
+            return Ok(ShareAcceptResult {
+                actor_id: invite.actor_id.clone(),
+                device_id: invite.bootstrap_credential.device_id.clone(),
+                role: invite.role.clone(),
+            });
+        }
+
+        let repo_secrets = open_repo_secrets(&control_dir)?;
+        ensure!(
+            repo_secrets.repo_id == invite.repo_id,
+            "share invite bundle targets a different repository"
+        );
+
+        let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+        let current_state: KeyringState =
+            read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+        if create_actor {
+            ensure!(
+                !current_state
+                    .actors
+                    .iter()
+                    .any(|actor| actor.actor_id == invite.actor_id),
+                "share actor already exists"
+            );
+        } else {
+            ensure!(
+                current_state
+                    .actors
+                    .iter()
+                    .any(|actor| actor.actor_id == invite.actor_id),
+                "share actor not found: {}",
+                invite.actor_id
+            );
+        }
+
+        let next_generation = current_state.generation + 1;
+        let next_file_name = format!("keyring.{next_generation}");
+        let local_device = generate_local_device_credential(
+            invite.actor_id.clone(),
+            format!("device-{}", random_hex_identifier()?),
+            local_device_label.to_string(),
+        )?;
+
+        let mut actors = current_state.actors.clone();
+        if create_actor {
+            actors.push(crate::keyring::ActorRecord {
+                actor_id: invite.actor_id.clone(),
+                display_name: invite.display_name.clone(),
+                role: invite.role.clone(),
+            });
+        }
+
+        let mut devices = current_state.devices.clone();
+        devices.push(crate::keyring::DeviceRecord {
+            device_id: local_device.device_id.clone(),
+            actor_id: invite.actor_id.clone(),
+            label: local_device.label.clone(),
+            device_pubkey_hex: local_device.public_key_hex.clone(),
+            status: "active".to_string(),
+        });
+
+        let mut envelopes = current_state.envelopes.clone();
+        envelopes.push(seal_repo_secrets_for_device(
+            &repo_secrets.repo_id,
+            repo_secrets.active_epoch,
+            &local_device.public_key_hex,
+            &repo_secrets,
+            &invite.actor_id,
+            &local_device.device_id,
+        )?);
+
+        let next_state = KeyringState {
+            generation: next_generation,
+            actors,
+            devices,
+            envelopes,
+            ..current_state
+        };
+        let next_pointer = KeyringPointer {
+            generation: next_generation,
+            current: next_file_name.clone(),
+        };
+        write_keyring_generation_and_pointer(
+            &control_dir,
+            &next_file_name,
+            &next_state,
+            &next_pointer,
+        )?;
+        write_local_device_credential(&control_dir, &local_device)?;
+        cache_unlocked_secrets(&control_dir, &repo_secrets);
+
+        Ok(ShareAcceptResult {
+            actor_id: invite.actor_id.clone(),
+            device_id: local_device.device_id,
+            role: invite.role.clone(),
+        })
     }
 
     pub fn delete_branch(&self, repo_root: impl AsRef<Path>, branch_name: &str) -> Result<()> {
@@ -1093,14 +1717,24 @@ fn redact_password_hint(password: &str) -> String {
 }
 
 fn generate_repo_secrets(repo_id: &str) -> Result<RepoSecrets> {
+    let repo_manifest_enc_key = random_key_material()?;
+    let repo_nonce_key = random_key_material()?;
+    let active_epoch = DEFAULT_ACTIVE_EPOCH;
     Ok(RepoSecrets {
         repo_id: repo_id.to_string(),
-        active_epoch: DEFAULT_ACTIVE_EPOCH,
+        active_epoch,
         repo_dedup_key: random_key_material()?,
         repo_ref_key: random_key_material()?,
-        repo_manifest_enc_key: random_key_material()?,
-        repo_nonce_key: random_key_material()?,
+        repo_manifest_enc_key,
+        repo_nonce_key,
         repo_path_index_key: random_key_material()?,
+        epoch_keys: std::collections::BTreeMap::from([(
+            active_epoch,
+            EpochSecrets {
+                manifest_enc_key: repo_manifest_enc_key,
+                nonce_key: repo_nonce_key,
+            },
+        )]),
     })
 }
 
@@ -1109,6 +1743,450 @@ fn random_key_material() -> Result<[u8; 32]> {
     getrandom::fill(&mut bytes)
         .map_err(|_| anyhow::anyhow!("failed to obtain repository key material"))?;
     Ok(bytes)
+}
+
+fn random_hex_identifier() -> Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("failed to obtain random identifier"))?;
+    Ok(hex::encode(bytes))
+}
+
+pub fn rotate_active_epoch_for_test(repo_root: impl AsRef<Path>, password: &str) -> Result<()> {
+    let repo_root = repo_root.as_ref().to_path_buf();
+    let control_dir = repo_root.join(CONTROL_DIR);
+    let mut repo_secrets = unlock_repo_secrets_uncached(&control_dir, password)?;
+    let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+    let current_state: KeyringState =
+        read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+    let next_generation = current_state.generation + 1;
+    let next_file_name = format!("keyring.{next_generation}");
+
+    repo_secrets.active_epoch += 1;
+    repo_secrets.repo_manifest_enc_key = random_key_material()?;
+    repo_secrets.repo_nonce_key = random_key_material()?;
+    repo_secrets.epoch_keys.insert(
+        repo_secrets.active_epoch,
+        EpochSecrets {
+            manifest_enc_key: repo_secrets.repo_manifest_enc_key,
+            nonce_key: repo_secrets.repo_nonce_key,
+        },
+    );
+
+    let next_state = KeyringState {
+        generation: next_generation,
+        active_epoch: repo_secrets.active_epoch,
+        epochs: build_epoch_descriptors(&repo_secrets),
+        envelopes: rebuild_local_device_and_password_envelopes(
+            &current_state,
+            &repo_secrets,
+            password,
+        )?,
+        ..current_state
+    };
+    let next_pointer = KeyringPointer {
+        generation: next_generation,
+        current: next_file_name.clone(),
+    };
+    write_keyring_generation_and_pointer(
+        &control_dir,
+        &next_file_name,
+        &next_state,
+        &next_pointer,
+    )?;
+    cache_unlocked_secrets(&control_dir, &repo_secrets);
+    Ok(())
+}
+
+pub fn unlock_with_local_device_for_test(repo_root: impl AsRef<Path>) -> Result<RepositoryState> {
+    let repo_root = repo_root.as_ref().to_path_buf();
+    let control_dir = repo_root.join(CONTROL_DIR);
+    let secrets = unlock_repo_secrets_with_local_device(&control_dir)?;
+    cache_unlocked_secrets(&control_dir, &secrets);
+    RepositoryFacade::new().open(&repo_root)
+}
+
+pub fn reconcile_remote_keyring_for_sync(
+    repo_root: impl AsRef<Path>,
+    remote_keyring_bytes: &[u8],
+) -> Result<bool> {
+    let repo_root = repo_root.as_ref().to_path_buf();
+    let control_dir = repo_root.join(CONTROL_DIR);
+    let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+    let local_state: KeyringState =
+        read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+    let remote_state: KeyringState = serde_json::from_slice(remote_keyring_bytes)
+        .context("failed to decode remote keyring state")?;
+    ensure!(
+        local_state.repo_id == remote_state.repo_id,
+        "remote keyring targets a different repository"
+    );
+
+    let local_secrets = match open_repo_secrets(&control_dir) {
+        Ok(secrets) => secrets,
+        Err(_) => unlock_repo_secrets_with_local_device(&control_dir)?,
+    };
+    let merged_active_epoch = local_state.active_epoch.max(remote_state.active_epoch);
+    let authoritative_secrets = if local_secrets.active_epoch == merged_active_epoch {
+        local_secrets.clone()
+    } else {
+        unlock_repo_secrets_from_keyring_bytes_with_local_device(
+            &control_dir,
+            remote_keyring_bytes,
+        )?
+    };
+
+    let mut merged_actors = merge_actor_records(&local_state, &remote_state)?;
+    merged_actors.sort_by(|left, right| left.actor_id.cmp(&right.actor_id));
+    let mut merged_devices = merge_device_records(&local_state, &remote_state)?;
+    merged_devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+    let merged_epochs =
+        merge_epoch_descriptors(&local_state, &remote_state, &authoritative_secrets);
+    let merged_state_without_envelopes = KeyringState {
+        format_version: local_state.format_version.max(remote_state.format_version),
+        generation: 0,
+        repo_id: local_state.repo_id.clone(),
+        active_epoch: merged_active_epoch,
+        crypto_suite: local_state.crypto_suite.clone(),
+        kdf: local_state.kdf.clone(),
+        actors: merged_actors,
+        devices: merged_devices,
+        epochs: merged_epochs,
+        envelopes: Vec::new(),
+    };
+
+    let local_comparable = comparable_keyring_state(&local_state);
+    let remote_comparable = comparable_keyring_state(&remote_state);
+    let merged_comparable = merged_state_without_envelopes.clone();
+    if merged_comparable == local_comparable || merged_comparable == remote_comparable {
+        return Ok(false);
+    }
+
+    let mut merged_envelopes = Vec::new();
+    if let Some(password_envelope) =
+        select_password_envelope_for_active_epoch(&local_state, &remote_state, merged_active_epoch)?
+    {
+        merged_envelopes.push(password_envelope);
+    }
+    merged_envelopes.extend(build_device_envelopes_for_active_devices(
+        &local_state.repo_id,
+        &merged_state_without_envelopes.devices,
+        merged_active_epoch,
+        &authoritative_secrets,
+    )?);
+    merged_envelopes.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then(left.actor_id.cmp(&right.actor_id))
+            .then(left.device_id.cmp(&right.device_id))
+            .then(left.envelope_id.cmp(&right.envelope_id))
+    });
+
+    let merged_state = KeyringState {
+        generation: local_state.generation.max(remote_state.generation) + 1,
+        envelopes: merged_envelopes,
+        ..merged_state_without_envelopes
+    };
+
+    let local_content = comparable_keyring_state(&local_state);
+    let merged_content = comparable_keyring_state(&merged_state);
+    if local_content == merged_content {
+        return Ok(false);
+    }
+    let next_file_name = format!("keyring.{}", merged_state.generation);
+    let next_pointer = KeyringPointer {
+        generation: merged_state.generation,
+        current: next_file_name.clone(),
+    };
+    write_keyring_generation_and_pointer(
+        &control_dir,
+        &next_file_name,
+        &merged_state,
+        &next_pointer,
+    )?;
+    cache_unlocked_secrets(&control_dir, &authoritative_secrets);
+    Ok(true)
+}
+
+fn rebuild_local_device_and_password_envelopes(
+    current_state: &KeyringState,
+    repo_secrets: &RepoSecrets,
+    password: &str,
+) -> Result<Vec<crate::keyring::KeyringEnvelope>> {
+    let mut envelopes = Vec::new();
+    envelopes.push(seal_repo_secrets(
+        &repo_secrets.repo_id,
+        repo_secrets.active_epoch,
+        password,
+        repo_secrets,
+        redact_password_hint(password),
+    )?);
+    for envelope in &current_state.envelopes {
+        if envelope.kind != "device" || envelope.recipient_pubkey_hex.is_empty() {
+            continue;
+        }
+        envelopes.push(seal_repo_secrets_for_device(
+            &repo_secrets.repo_id,
+            repo_secrets.active_epoch,
+            &envelope.recipient_pubkey_hex,
+            repo_secrets,
+            &envelope.actor_id,
+            &envelope.device_id,
+        )?);
+    }
+    Ok(envelopes)
+}
+
+fn build_epoch_descriptors(repo_secrets: &RepoSecrets) -> Vec<crate::keyring::EpochDescriptor> {
+    repo_secrets
+        .epoch_keys
+        .keys()
+        .copied()
+        .map(|epoch| crate::keyring::EpochDescriptor {
+            epoch,
+            status: if epoch == repo_secrets.active_epoch {
+                "active".to_string()
+            } else {
+                "retired".to_string()
+            },
+        })
+        .collect()
+}
+
+fn ensure_local_share_admin(control_dir: &Path) -> Result<()> {
+    let credential = read_local_device_credential(control_dir)?;
+    let keyring = read_current_keyring_state(control_dir)?;
+    let actor = keyring
+        .actors
+        .iter()
+        .find(|actor| actor.actor_id == credential.actor_id)
+        .with_context(|| format!("share actor not found: {}", credential.actor_id))?;
+    ensure!(
+        actor.role == "owner_admin",
+        "share admin operations require an owner-admin local device"
+    );
+    Ok(())
+}
+
+fn comparable_keyring_state(state: &KeyringState) -> KeyringState {
+    let mut comparable = state.clone();
+    comparable.generation = 0;
+    comparable.envelopes.clear();
+    comparable
+}
+
+fn merge_actor_records(
+    local_state: &KeyringState,
+    remote_state: &KeyringState,
+) -> Result<Vec<crate::keyring::ActorRecord>> {
+    let mut merged: std::collections::BTreeMap<String, crate::keyring::ActorRecord> =
+        std::collections::BTreeMap::new();
+    for actor in local_state.actors.iter().chain(remote_state.actors.iter()) {
+        match merged.get(&actor.actor_id) {
+            Some(existing)
+                if existing.display_name != actor.display_name || existing.role != actor.role =>
+            {
+                anyhow::bail!("manual resolution required for actor {}", actor.actor_id);
+            }
+            Some(_) => {}
+            None => {
+                merged.insert(actor.actor_id.clone(), actor.clone());
+            }
+        }
+    }
+    Ok(merged.into_values().collect())
+}
+
+fn merge_device_records(
+    local_state: &KeyringState,
+    remote_state: &KeyringState,
+) -> Result<Vec<crate::keyring::DeviceRecord>> {
+    let mut merged: std::collections::BTreeMap<String, crate::keyring::DeviceRecord> =
+        std::collections::BTreeMap::new();
+    for device in local_state
+        .devices
+        .iter()
+        .chain(remote_state.devices.iter())
+    {
+        match merged.get(&device.device_id) {
+            Some(existing)
+                if existing.actor_id != device.actor_id
+                    || existing.device_pubkey_hex != device.device_pubkey_hex =>
+            {
+                anyhow::bail!("manual resolution required for device {}", device.device_id);
+            }
+            Some(existing) => {
+                if existing.label != device.label
+                    && existing.status == device.status
+                    && existing.status != "revoked"
+                {
+                    anyhow::bail!("manual resolution required for device {}", device.device_id);
+                }
+                let merged_status = if existing.status == "revoked" || device.status == "revoked" {
+                    "revoked".to_string()
+                } else {
+                    existing.status.clone()
+                };
+                let merged_label = if merged_status == "revoked" {
+                    existing.label.clone()
+                } else {
+                    device.label.clone()
+                };
+                merged.insert(
+                    device.device_id.clone(),
+                    crate::keyring::DeviceRecord {
+                        device_id: device.device_id.clone(),
+                        actor_id: device.actor_id.clone(),
+                        label: merged_label,
+                        device_pubkey_hex: device.device_pubkey_hex.clone(),
+                        status: merged_status,
+                    },
+                );
+            }
+            None => {
+                merged.insert(device.device_id.clone(), device.clone());
+            }
+        }
+    }
+    Ok(merged.into_values().collect())
+}
+
+fn merge_epoch_descriptors(
+    local_state: &KeyringState,
+    remote_state: &KeyringState,
+    repo_secrets: &RepoSecrets,
+) -> Vec<crate::keyring::EpochDescriptor> {
+    let mut epochs = std::collections::BTreeSet::new();
+    epochs.extend(local_state.epochs.iter().map(|epoch| epoch.epoch));
+    epochs.extend(remote_state.epochs.iter().map(|epoch| epoch.epoch));
+    epochs.extend(repo_secrets.epoch_keys.keys().copied());
+    epochs
+        .into_iter()
+        .map(|epoch| crate::keyring::EpochDescriptor {
+            epoch,
+            status: if epoch == repo_secrets.active_epoch {
+                "active".to_string()
+            } else {
+                "retired".to_string()
+            },
+        })
+        .collect()
+}
+
+fn select_password_envelope_for_active_epoch(
+    local_state: &KeyringState,
+    remote_state: &KeyringState,
+    active_epoch: u32,
+) -> Result<Option<crate::keyring::KeyringEnvelope>> {
+    let local_password = local_state
+        .envelopes
+        .iter()
+        .find(|envelope| envelope.kind == "password")
+        .cloned();
+    let remote_password = remote_state
+        .envelopes
+        .iter()
+        .find(|envelope| envelope.kind == "password")
+        .cloned();
+    if local_state.active_epoch == active_epoch && local_password.is_some() {
+        return Ok(local_password);
+    }
+    if remote_state.active_epoch == active_epoch && remote_password.is_some() {
+        return Ok(remote_password);
+    }
+    if local_password.is_some() {
+        return Ok(local_password);
+    }
+    Ok(remote_password)
+}
+
+fn build_device_envelopes_for_active_devices(
+    repo_id: &str,
+    devices: &[crate::keyring::DeviceRecord],
+    active_epoch: u32,
+    repo_secrets: &RepoSecrets,
+) -> Result<Vec<crate::keyring::KeyringEnvelope>> {
+    let mut envelopes = Vec::new();
+    for device in devices {
+        if device.status != "active" {
+            continue;
+        }
+        envelopes.push(seal_repo_secrets_for_device(
+            repo_id,
+            active_epoch,
+            &device.device_pubkey_hex,
+            repo_secrets,
+            &device.actor_id,
+            &device.device_id,
+        )?);
+    }
+    Ok(envelopes)
+}
+
+fn bootstrap_recipient_repository(
+    repo_root: &Path,
+    invite: &ShareInvitePayload,
+    local_device_label: &str,
+) -> Result<()> {
+    ensure!(
+        !repo_root.join(CONTROL_DIR).exists(),
+        "share recipient repository is already initialized"
+    );
+    let control_dir = repo_root.join(CONTROL_DIR);
+    fs::create_dir_all(control_dir.join("objects")).with_context(|| {
+        format!(
+            "failed to create bootstrap objects directory at {}",
+            control_dir.join("objects").display()
+        )
+    })?;
+    fs::create_dir_all(control_dir.join("journal")).with_context(|| {
+        format!(
+            "failed to create bootstrap journal directory at {}",
+            control_dir.join("journal").display()
+        )
+    })?;
+    fs::create_dir_all(control_dir.join("refs")).with_context(|| {
+        format!(
+            "failed to create bootstrap refs directory at {}",
+            control_dir.join("refs").display()
+        )
+    })?;
+    fs::create_dir_all(control_dir.join(KEYRING_DIR)).with_context(|| {
+        format!(
+            "failed to create bootstrap keyring directory at {}",
+            control_dir.join(KEYRING_DIR).display()
+        )
+    })?;
+
+    let mut credential = invite.bootstrap_credential.clone();
+    credential.label = local_device_label.to_string();
+    let mut keyring_state = invite.bootstrap_keyring_state.clone();
+    if let Some(device) = keyring_state.devices.iter_mut().find(|device| {
+        device.device_id == credential.device_id && device.actor_id == credential.actor_id
+    }) {
+        device.label = credential.label.clone();
+        device.device_pubkey_hex = credential.public_key_hex.clone();
+    }
+    let keyring_pointer = invite.bootstrap_keyring_pointer.clone();
+
+    atomic_write_bytes(
+        control_dir.join(LAYOUT_ROOT_FILE),
+        &hex::decode(&invite.layout_root_bytes_hex).context("invalid invite layout root bytes")?,
+    )?;
+    atomic_write_bytes(
+        control_dir.join(DEFAULT_REF_FILE),
+        &hex::decode(&invite.default_ref_bytes_hex).context("invalid invite default ref bytes")?,
+    )?;
+    write_keyring_generation_and_pointer(
+        &control_dir,
+        &keyring_pointer.current,
+        &keyring_state,
+        &keyring_pointer,
+    )?;
+    write_local_device_credential(&control_dir, &credential)?;
+    let secrets = unlock_repo_secrets_with_local_device(&control_dir)?;
+    cache_unlocked_secrets(&control_dir, &secrets);
+    Ok(())
 }
 
 fn open_object_store(control_dir: &Path) -> Result<DirectLayoutObjectStore> {
@@ -1285,9 +2363,11 @@ pub(crate) fn encrypt_control_record(
 ) -> Result<Vec<u8>> {
     let object_id = derive_control_object_id(secrets, stable_name, object_type, plaintext);
     let nonce = derive_control_nonce(secrets, &object_id, object_type);
-    let cipher = XChaCha20Poly1305::new((&secrets.repo_manifest_enc_key).into());
+    let epoch_keys = secrets.active_epoch_keys()?;
+    let cipher = XChaCha20Poly1305::new((&epoch_keys.manifest_enc_key).into());
     let mut ciphertext = plaintext.to_vec();
-    let associated_data = control_record_associated_data(secrets, &object_id, object_type);
+    let associated_data =
+        control_record_associated_data(secrets, &object_id, object_type, secrets.active_epoch);
     let auth_tag = cipher
         .encrypt_in_place_detached(
             XNonce::from_slice(&nonce),
@@ -1338,9 +2418,15 @@ pub(crate) fn decrypt_control_record(
     ensure!(envelope.nonce.len() == 24, "ref authentication failed");
     ensure!(envelope.auth_tag.len() == 16, "ref authentication failed");
 
-    let cipher = XChaCha20Poly1305::new((&secrets.repo_manifest_enc_key).into());
+    let epoch_keys = secrets.epoch_keys(envelope.key_epoch)?;
+    let cipher = XChaCha20Poly1305::new((&epoch_keys.manifest_enc_key).into());
     let mut plaintext = envelope.ciphertext.clone();
-    let associated_data = control_record_associated_data(secrets, &envelope.object_id, object_type);
+    let associated_data = control_record_associated_data(
+        secrets,
+        &envelope.object_id,
+        object_type,
+        envelope.key_epoch,
+    );
 
     cipher
         .decrypt_in_place_detached(
@@ -1376,7 +2462,10 @@ fn derive_control_object_id(
 }
 
 fn derive_control_nonce(secrets: &RepoSecrets, object_id: &str, object_type: &str) -> [u8; 24] {
-    let mut hasher = Hasher::new_keyed(&secrets.repo_nonce_key);
+    let epoch_keys = secrets
+        .active_epoch_keys()
+        .expect("active epoch keys must be present");
+    let mut hasher = Hasher::new_keyed(&epoch_keys.nonce_key);
     hasher.update(object_id.as_bytes());
     hasher.update(object_type.as_bytes());
     hasher.update(b"control-record");
@@ -1390,6 +2479,7 @@ fn control_record_associated_data(
     secrets: &RepoSecrets,
     object_id: &str,
     object_type: &str,
+    key_epoch: u32,
 ) -> Vec<u8> {
     let mut data = Vec::new();
     data.extend_from_slice(CONTROL_REF_MAGIC);
@@ -1398,7 +2488,7 @@ fn control_record_associated_data(
     data.extend_from_slice(object_type.as_bytes());
     data.extend_from_slice(object_id.as_bytes());
     data.extend_from_slice(b"xchacha20poly1305");
-    data.extend_from_slice(&secrets.active_epoch.to_le_bytes());
+    data.extend_from_slice(&key_epoch.to_le_bytes());
     data
 }
 
@@ -2272,6 +3362,13 @@ mod facade_tests {
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
             repo_path_index_key: [4u8; 32],
+            epoch_keys: std::collections::BTreeMap::from([(
+                DEFAULT_ACTIVE_EPOCH,
+                EpochSecrets {
+                    manifest_enc_key: [2u8; 32],
+                    nonce_key: [3u8; 32],
+                },
+            )]),
         };
         let mut keyring_one: KeyringState = read_json(generation_one_path.clone()).unwrap();
         keyring_one.generation = 2;
@@ -2365,6 +3462,13 @@ mod facade_tests {
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
             repo_path_index_key: [4u8; 32],
+            epoch_keys: std::collections::BTreeMap::from([(
+                DEFAULT_ACTIVE_EPOCH,
+                EpochSecrets {
+                    manifest_enc_key: [2u8; 32],
+                    nonce_key: [3u8; 32],
+                },
+            )]),
         };
         let keyring_two = KeyringState {
             generation: 2,

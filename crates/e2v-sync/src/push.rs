@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
 use e2v_store::{EncryptedRef, LayoutRoot, RefToken, RemoteBackend, validate_object_id_value};
@@ -123,7 +123,7 @@ fn load_remote_object_inventory<R: RemoteBackend>(
     control_dir: &Path,
     remote: &R,
 ) -> Result<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
-    let secrets = sync_support::open_repo_secrets_for_sync(control_dir)?;
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let pack_locations =
         load_remote_pack_locations_with_local_cache(remote, control_dir, Some(&secrets))?;
     Ok((load_remote_loose_object_ids(remote)?, pack_locations))
@@ -134,7 +134,7 @@ fn load_remote_resume_pack_locations<R: RemoteBackend>(
     remote: &R,
     operation_id: &OperationId,
 ) -> Result<BTreeMap<String, PackedObjectLocation>> {
-    let secrets = sync_support::open_repo_secrets_for_sync(control_dir)?;
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(control_dir)?;
     crate::pack_index::load_remote_operation_pack_locations_with_secrets(
         remote,
         &operation_id.value,
@@ -437,7 +437,8 @@ where
         if !packed_object_ids.is_empty() {
             let (index, payload) = builder.finish();
             let (_, data_path, index_path) = pack_paths(&operation_id.value, *pack_batch_index)?;
-            let secrets = sync_support::open_repo_secrets_for_sync(repo_root.join(".e2v"))?;
+            let secrets =
+                sync_support::open_or_unlock_repo_secrets_for_sync(repo_root.join(".e2v"))?;
             remote.put_physical(&data_path, &payload)?;
             remote.put_physical(
                 &index_path,
@@ -549,14 +550,116 @@ fn upload_remote_keyring_generations<R: RemoteBackend>(
 fn publish_remote_keyring_pointer<R: RemoteBackend>(
     remote: &R,
     keyring_files: &[PathBuf],
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let pointer_file = keyring_files
         .iter()
         .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("keyring.current"))
         .context("missing local keyring pointer file")?;
     let bytes = std::fs::read(pointer_file)?;
-    remote.put_physical("control/keyring/keyring.current", &bytes)?;
+    let keyring_pointer: serde_json::Value =
+        serde_json::from_slice(&bytes).context("failed to decode local keyring pointer")?;
+    let generation = keyring_pointer["generation"]
+        .as_u64()
+        .context("invalid local keyring pointer generation")?;
+    let current = keyring_pointer["current"]
+        .as_str()
+        .context("invalid local keyring pointer current file")?;
+    let current_keyring = keyring_files
+        .iter()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(current))
+        .context("missing local current keyring generation file")?;
+    let repo_id = serde_json::from_slice::<serde_json::Value>(&std::fs::read(current_keyring)?)
+        .context("failed to decode local keyring state for pointer ref")?["repo_id"]
+        .as_str()
+        .context("local keyring state is missing repo_id")?
+        .to_string();
+    let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
+    if let Some(current) = remote.read_ref(&pointer_token)? {
+        if current.value.bytes == bytes {
+            ensure!(
+                generation >= 1,
+                "invalid local keyring pointer generation {generation}"
+            );
+            return Ok(bytes);
+        }
+    }
+    let expected = remote
+        .read_ref(&pointer_token)?
+        .map(|stored| stored.version);
+    let cas =
+        remote.compare_and_swap_ref(&pointer_token, expected, EncryptedRef::new(bytes.clone()))?;
+    ensure!(cas.applied, "keyring pointer publish conflict");
+    ensure!(
+        generation >= 1,
+        "invalid local keyring pointer generation {generation}"
+    );
+    Ok(bytes)
+}
+
+fn mirror_remote_keyring_pointer<R: RemoteBackend>(remote: &R, pointer_bytes: &[u8]) -> Result<()> {
+    remote.put_physical("control/keyring/keyring.current", pointer_bytes)?;
     Ok(())
+}
+
+fn read_remote_current_keyring_bytes<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let repo_id = e2v_core::sync_support::read_repo_id(repo_root)?;
+    let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
+    let pointer_bytes = match remote.read_ref(&pointer_token)? {
+        Some(stored) => stored.value.bytes,
+        None => {
+            if !remote.exists_physical("control/keyring/keyring.current") {
+                return Ok(None);
+            }
+            remote.get_physical("control/keyring/keyring.current")?
+        }
+    };
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes)
+        .context("failed to decode remote keyring pointer")?;
+    let current = pointer["current"]
+        .as_str()
+        .context("invalid remote keyring pointer current file")?;
+    match remote.get_physical(&format!("control/keyring/{current}")) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.to_string().contains("missing physical object") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn reconcile_local_keyring_with_remote_if_needed<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<()> {
+    if let Some(remote_keyring_bytes) = read_remote_current_keyring_bytes(remote, repo_root)? {
+        let _ = sync_support::reconcile_remote_keyring_for_sync(repo_root, &remote_keyring_bytes)?;
+    }
+    Ok(())
+}
+
+fn publish_remote_keyring_pointer_with_retry<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<Vec<u8>> {
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let keyring_files = sync_support::list_keyring_files(repo_root)?;
+        match publish_remote_keyring_pointer(remote, &keyring_files) {
+            Ok(pointer_bytes) => return Ok(pointer_bytes),
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("keyring pointer publish conflict")
+                    && attempt == 0 =>
+            {
+                reconcile_local_keyring_with_remote_if_needed(remote, repo_root)?;
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("keyring pointer publish conflict")))
 }
 
 fn cleanup_completed_operation_markers<R: RemoteBackend>(
@@ -592,6 +695,7 @@ pub fn push_head<R: RemoteBackend + Clone>(
 ) -> Result<PushResult> {
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
+    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let (_state, snapshot) = sync_support::export_head_snapshot(facade, &options.repo_root)?;
     let layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;
     let keyring_files = sync_support::list_keyring_files(&options.repo_root)?;
@@ -618,7 +722,9 @@ pub fn push_head<R: RemoteBackend + Clone>(
                     if remote_ref_matches_local {
                         upload_remote_keyring_generations(remote, &keyring_files)?;
                         remote.put_physical("layout_root.json", &layout_root_bytes)?;
-                        publish_remote_keyring_pointer(remote, &keyring_files)?;
+                        let pointer_bytes =
+                            publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
+                        mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
                         return Ok(PushResult {
                             published_snapshot_id: snapshot.snapshot_id,
                             uploaded_objects: 0,
@@ -640,7 +746,7 @@ pub fn push_head<R: RemoteBackend + Clone>(
             None => None,
         };
     let control_dir = options.repo_root.join(".e2v");
-    let pack_index_secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
     let (mut remote_loose_object_ids, mut remote_pack_locations) =
         load_remote_object_inventory(&control_dir, remote)?;
     let mut remote_pack_cache = BTreeMap::new();
@@ -750,12 +856,13 @@ pub fn push_head<R: RemoteBackend + Clone>(
         &remote_pack_locations,
         &reachable_object_ids,
     )?;
+    let pointer_bytes = publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
     let publish_result =
         publisher.publish_ref(&session, EncryptedRef::new(default_ref_bytes.clone()))?;
     if !publish_result.applied {
         anyhow::bail!("push requires needs-rebase recovery");
     }
-    publish_remote_keyring_pointer(remote, &keyring_files)?;
+    mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
     publisher.complete(session)?;
 
     Ok(PushResult {
@@ -771,6 +878,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
 ) -> Result<ResumeResult> {
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
+    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let (_state, snapshot) = sync_support::export_head_snapshot(facade, &options.repo_root)?;
     let journal =
         OperationJournal::new(options.repo_root.join(".e2v").join("journal").join("sync"))?;
@@ -807,7 +915,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         .unwrap_or(false);
     let mut saw_journal_objects = false;
     let control_dir = options.repo_root.join(".e2v");
-    let pack_index_secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
+    let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
     let mut remote_pack_locations =
         load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
     let mut remote_inventory = None;
@@ -935,7 +1043,8 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     };
     if remote_ref_matches_local {
         upload_remote_keyring_generations(remote, &keyring_files)?;
-        publish_remote_keyring_pointer(remote, &keyring_files)?;
+        let pointer_bytes = publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
+        mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
         publisher.publish_layout_if_needed(&session)?;
         if !published_pack_index_segments.is_empty() {
             let segment_paths = next_pack_index_segment_paths(
@@ -987,12 +1096,13 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         &snapshot.snapshot_id,
         &reachable_object_ids,
     )?;
+    let pointer_bytes = publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
     let publish_result =
         publisher.publish_ref(&session, EncryptedRef::new(default_ref_bytes.clone()))?;
     if !publish_result.applied {
         anyhow::bail!("push requires needs-rebase recovery");
     }
-    publish_remote_keyring_pointer(remote, &keyring_files)?;
+    mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
     publisher.complete(session)?;
 
     Ok(ResumeResult {

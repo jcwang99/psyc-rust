@@ -55,6 +55,13 @@ fn seed_remote() -> (
     (temp, facade, repo_root, state.branch.token_hex, remote)
 }
 
+fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
+    RefToken::new(format!(
+        "keyring/{}",
+        e2v_core::sync_support::read_repo_id(repo_root).unwrap()
+    ))
+}
+
 #[derive(Clone, Debug)]
 struct KeyringPointerDisappearsAfterRefReadRemote {
     inner: MemoryBackend,
@@ -113,8 +120,23 @@ impl RefStore for KeyringPointerDisappearsAfterRefReadRemote {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
         let stored = self.inner.read_ref(token)?;
         if stored.is_some() && !self.keyring_pointer_deleted.swap(true, Ordering::SeqCst) {
-            self.inner
-                .delete_physical("control/keyring/keyring.current")?;
+            let pointer_token = self
+                .inner
+                .list_refs()?
+                .into_iter()
+                .find(|listed| listed.token.value.starts_with("keyring/"))
+                .map(|listed| listed.stored.value.bytes)
+                .or_else(|| {
+                    self.inner
+                        .get_physical("control/keyring/keyring.current")
+                        .ok()
+                });
+            if let Some(pointer_bytes) = pointer_token {
+                let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+                let current = pointer["current"].as_str().unwrap();
+                self.inner
+                    .delete_physical(&format!("control/keyring/{current}"))?;
+            }
         }
         Ok(stored)
     }
@@ -1728,6 +1750,79 @@ fn fetch_updates_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_
 }
 
 #[test]
+fn fetch_uses_keyring_pointer_ref_when_physical_pointer_file_is_missing() {
+    let (temp, facade, source_repo_root, branch_token, remote) = seed_remote();
+    let target_repo_root = temp.path().join("clone-target");
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: branch_token.clone(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .change_password(
+            &source_repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "rotate-password-with-pointer-ref".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pointer_bytes = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+    let expected_version = remote
+        .read_ref(&keyring_pointer_ref_token(&source_repo_root))
+        .unwrap()
+        .map(|stored| stored.version);
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            expected_version,
+            e2v_store::EncryptedRef::new(pointer_bytes.clone()),
+        )
+        .unwrap();
+    remote
+        .delete_physical("control/keyring/keyring.current")
+        .unwrap();
+
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(
+            target_repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap(),
+        pointer_bytes
+    );
+}
+
+#[test]
 fn fetch_updates_current_keyring_generation_even_when_remote_keyring_listing_omits_it() {
     let (temp, facade, source_repo_root, branch_token, remote) = seed_remote();
     let target_repo_root = temp.path().join("clone-target");
@@ -1813,17 +1908,26 @@ fn fetch_updates_current_keyring_generation_even_when_remote_keyring_listing_omi
 
 #[test]
 fn fetch_rejects_remote_keyring_pointer_path_traversal_even_when_listing_omits_pointed_file() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
     let pointed_path = "control/keyring/../../evil.json";
+    let malicious_pointer = serde_json::to_vec(&serde_json::json!({
+        "generation": 7u64,
+        "current": "../../evil.json"
+    }))
+    .unwrap();
+    let expected_version = remote
+        .read_ref(&keyring_pointer_ref_token(&source_repo_root))
+        .unwrap()
+        .map(|stored| stored.version);
     remote
-        .put_physical(
-            "control/keyring/keyring.current",
-            &serde_json::to_vec(&serde_json::json!({
-                "generation": 7u64,
-                "current": "../../evil.json"
-            }))
-            .unwrap(),
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            expected_version,
+            e2v_store::EncryptedRef::new(malicious_pointer.clone()),
         )
+        .unwrap();
+    remote
+        .put_physical("control/keyring/keyring.current", &malicious_pointer)
         .unwrap();
     remote
         .put_physical(
@@ -3144,6 +3248,47 @@ fn clone_writes_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_f
 }
 
 #[test]
+fn clone_uses_keyring_pointer_ref_when_physical_pointer_file_is_missing() {
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
+    let pointer_bytes = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            None,
+            e2v_store::EncryptedRef::new(pointer_bytes.clone()),
+        )
+        .unwrap();
+    remote
+        .delete_physical("control/keyring/keyring.current")
+        .unwrap();
+    let clone_repo_root = temp.path().join("clone-target");
+
+    let cloned = clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token,
+        },
+    )
+    .unwrap();
+
+    assert!(cloned.head_snapshot_id.is_some());
+    assert_eq!(
+        fs::read(
+            clone_repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap(),
+        pointer_bytes
+    );
+}
+
+#[test]
 fn clone_does_not_restore_remote_keyring_lock_file() {
     let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
     remote
@@ -3256,16 +3401,25 @@ fn clone_succeeds_without_remote_config_file() {
 
 #[test]
 fn clone_rejects_remote_keyring_pointer_that_references_missing_generation() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
+    let pointer_bytes = serde_json::to_vec(&serde_json::json!({
+        "generation": 2u64,
+        "current": "keyring.2"
+    }))
+    .unwrap();
+    let expected_version = remote
+        .read_ref(&keyring_pointer_ref_token(&source_repo_root))
+        .unwrap()
+        .map(|stored| stored.version);
     remote
-        .put_physical(
-            "control/keyring/keyring.current",
-            &serde_json::to_vec(&serde_json::json!({
-                "generation": 2u64,
-                "current": "keyring.2"
-            }))
-            .unwrap(),
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            expected_version,
+            e2v_store::EncryptedRef::new(pointer_bytes.clone()),
         )
+        .unwrap();
+    remote
+        .put_physical("control/keyring/keyring.current", &pointer_bytes)
         .unwrap();
     let clone_repo_root = temp.path().join("clone-target");
 
@@ -3406,6 +3560,39 @@ fn clone_cleans_up_control_dir_when_password_is_wrong() {
         "unexpected error: {error:#}"
     );
     assert!(!clone_repo_root.join(".e2v").exists());
+}
+
+#[test]
+fn fetch_preserves_local_device_credential_file() {
+    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let target_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&target_repo_root).unwrap();
+    let local = RepositoryFacade::new();
+    local
+        .init(InitOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    let device_file = target_repo_root
+        .join(".e2v")
+        .join("device")
+        .join("local-device.json");
+    let original = fs::read(&device_file).unwrap();
+
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&device_file).unwrap(), original);
 }
 
 #[test]
@@ -4930,5 +5117,498 @@ fn fetch_and_clone_restore_objects_from_remote_packs() {
     assert_eq!(
         cloned.head_snapshot_id.as_deref(),
         Some(committed.snapshot_id.as_str())
+    );
+}
+
+#[test]
+fn revoked_device_cannot_fetch_future_remote_head() {
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let owner_credential_bytes = fs::read(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let member_invite = facade
+        .share_invite_member(
+            &source_repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let member = facade
+        .share_accept_member(
+            &source_repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: member_invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fs::write(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes.clone(),
+    )
+    .unwrap();
+    let device_invite = facade
+        .share_invite_device(
+            &source_repo_root,
+            e2v_core::ShareInviteDeviceOptions {
+                actor_id: member.actor_id.clone(),
+                device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let device = facade
+        .share_accept_device(
+            &source_repo_root,
+            e2v_core::ShareAcceptDeviceOptions {
+                invite_bytes: device_invite.bundle_bytes,
+                local_device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let revoked_device_credential_bytes = fs::read(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    fs::write(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes.clone(),
+    )
+    .unwrap();
+
+    fs::write(source_repo_root.join("hello.txt"), b"before revoke").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "before-revoke".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-before-device-revoke".to_string(),
+        },
+    )
+    .unwrap();
+
+    let revoked_clone_root = temp.path().join("revoked-clone");
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: revoked_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_revoke_device(&source_repo_root, &device.device_id)
+        .unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"after revoke").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "after-revoke".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-after-device-revoke".to_string(),
+        },
+    )
+    .unwrap();
+
+    let member_device_credential =
+        serde_json::from_slice::<serde_json::Value>(&revoked_device_credential_bytes).unwrap();
+    assert_eq!(
+        member_device_credential["device_id"].as_str(),
+        Some(device.device_id.as_str())
+    );
+    let member_keyring_files = fs::read_dir(source_repo_root.join(".e2v").join("keyring"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    for path in member_keyring_files {
+        let file_name = path.file_name().unwrap();
+        fs::copy(
+            &path,
+            revoked_clone_root
+                .join(".e2v")
+                .join("keyring")
+                .join(file_name),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(revoked_clone_root.join(".e2v").join("device")).unwrap();
+    fs::write(
+        revoked_clone_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        serde_json::to_vec_pretty(&member_device_credential).unwrap(),
+    )
+    .unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&revoked_clone_root.join(".e2v"));
+
+    let error = fetch_remote(
+        &remote,
+        FetchOptions {
+            repo_root: revoked_clone_root,
+            branch_token: state.branch.token_hex.clone(),
+            password: None,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("missing epoch keys")
+            || error.to_string().contains("matching local device envelope")
+            || error.to_string().contains("device unlock failed")
+            || error
+                .to_string()
+                .contains("current local device cannot unlock remote keyring"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn accepted_member_bootstrap_can_fetch_remote_without_password() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"hello shared").unwrap();
+    let committed = facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "shared-seed".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "shared-seed-push".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    let reopened = e2v_core::testing::unlock_with_local_device_for_test(&recipient_root).unwrap();
+    assert_eq!(reopened.branch.token_hex, state.branch.token_hex);
+    assert!(
+        recipient_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{}.json", committed.snapshot_id))
+            .is_file()
+    );
+}
+
+#[test]
+fn accepted_member_published_keyring_can_fetch_future_epoch_after_owner_rotation() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"epoch-one").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-one".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "future-epoch-bootstrap-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "future-epoch-recipient-publish".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(owner_root.join("future.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "future-epoch-owner-rotate".to_string(),
+        },
+    )
+    .unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    let reopened = e2v_core::testing::unlock_with_local_device_for_test(&recipient_root).unwrap();
+    assert_eq!(reopened.branch.token_hex, state.branch.token_hex);
+}
+
+#[test]
+fn accepted_member_bootstrap_fetch_then_open_supports_clone_equivalent_readiness() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let bootstrap_root = temp.path().join("bootstrap");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&bootstrap_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"clone-shared").unwrap();
+    let committed = facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "clone-shared".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "clone-shared-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &bootstrap_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: bootstrap_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let reopened = e2v_core::testing::unlock_with_local_device_for_test(&bootstrap_root).unwrap();
+    assert_eq!(reopened.branch.token_hex, state.branch.token_hex);
+    assert!(
+        bootstrap_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{}.json", committed.snapshot_id))
+            .is_file()
+    );
+}
+
+#[test]
+fn remote_keyring_generation_rollback_via_pointer_ref_is_rejected() {
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
+    let trusted_state_root = temp.path().join("trusted-state");
+    fs::create_dir_all(&trusted_state_root).unwrap();
+    let _trusted_state_guard =
+        e2v_sync::testing::override_trusted_state_dir_for_test(trusted_state_root.clone());
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&source_repo_root).unwrap();
+    fs::write(
+        trusted_state_root.join(format!("{repo_id}.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "repo_id": repo_id,
+            "min_layout_generation": 1u64,
+            "min_keyring_generation": 2u64,
+            "min_ref_generation": 1u64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let current_pointer = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            None,
+            e2v_store::EncryptedRef::new(current_pointer),
+        )
+        .unwrap();
+
+    let clone_repo_root = temp.path().join("clone-target");
+    let error = clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_repo_root,
+            password: "correct horse battery staple".to_string(),
+            branch_token,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("CRITICAL_ROLLBACK_DETECTED")
+            || error.to_string().contains("critical rollback detected"),
+        "expected rollback detection error, got: {error:#}"
     );
 }

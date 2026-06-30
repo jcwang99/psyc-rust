@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use e2v_core::sync_support::{
-    decrypt_control_record_for_sync, encrypt_control_record_for_sync, open_repo_secrets_for_sync,
+    decrypt_control_record_for_sync, encrypt_control_record_for_sync,
+    open_or_unlock_repo_secrets_for_sync,
 };
 use e2v_store::{BlobStore, PhysicalObjectRef, RepoSecrets};
 use serde::{Deserialize, Serialize};
@@ -174,14 +175,14 @@ pub fn load_cached_pack_physical_ref_for_object_id(
 
 #[doc(hidden)]
 pub fn decode_pack_index_root_value_for_test(control_dir: &Path, bytes: &[u8]) -> Result<Value> {
-    let secrets = open_repo_secrets_for_sync(control_dir)?;
+    let secrets = open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let root = decode_pack_index_root_bytes(bytes, Some(&secrets))?;
     serde_json::to_value(root).map_err(Into::into)
 }
 
 #[doc(hidden)]
 pub fn encode_pack_index_root_value_for_test(control_dir: &Path, value: &Value) -> Result<Vec<u8>> {
-    let secrets = open_repo_secrets_for_sync(control_dir)?;
+    let secrets = open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let root: PackIndexRoot = serde_json::from_value(value.clone())?;
     encode_pack_index_root_bytes(&secrets, &root)
 }
@@ -192,7 +193,7 @@ pub fn decode_pack_index_segment_value_for_test(
     segment_path: &str,
     bytes: &[u8],
 ) -> Result<Value> {
-    let secrets = open_repo_secrets_for_sync(control_dir)?;
+    let secrets = open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let plaintext = decode_pack_index_segment_plaintext(segment_path, bytes, Some(&secrets))?;
     let index: ObjectPackIndex = serde_json::from_slice(&plaintext)?;
     serde_json::to_value(index).map_err(Into::into)
@@ -204,7 +205,7 @@ pub fn encode_pack_index_segment_value_for_test(
     segment_path: &str,
     value: &Value,
 ) -> Result<Vec<u8>> {
-    let secrets = open_repo_secrets_for_sync(control_dir)?;
+    let secrets = open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let index: ObjectPackIndex = serde_json::from_value(value.clone())?;
     encode_pack_index_segment_bytes(&secrets, segment_path, &serde_json::to_vec(&index)?)
 }
@@ -456,6 +457,7 @@ fn read_segment_entries(
 
 #[cfg(test)]
 mod tests {
+    use e2v_core::sync_support::open_repo_secrets_for_sync;
     use e2v_core::{InitOptions, RepositoryFacade};
     use e2v_store::MemoryBackend;
     use tempfile::tempdir;

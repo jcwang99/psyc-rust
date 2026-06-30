@@ -18,6 +18,7 @@ serde_json.workspace = true
 rusqlite.workspace = true
 unicode-normalization = "0.1"
 e2v-store = { path = "../e2v-store" }
+x25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

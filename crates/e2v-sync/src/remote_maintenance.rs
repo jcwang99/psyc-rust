@@ -714,7 +714,7 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
     let (default_branch_token, _) =
         sync_support::decode_default_ref_record(repo_root, &local_default_ref_bytes)?;
     let mut reachable = BTreeSet::new();
-    for listed_ref in remote.list_refs()? {
+    for listed_ref in list_remote_branch_refs(remote, repo_root)? {
         let (decoded_branch_token, head_snapshot_id) =
             sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)
                 .with_context(|| {
@@ -892,6 +892,7 @@ fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> 
     let refs = remote
         .list_refs()?
         .into_iter()
+        .filter(|entry| !entry.token.value.starts_with("keyring/"))
         .map(|entry| {
             (
                 entry.token.value,
@@ -909,6 +910,24 @@ fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> 
         active_lease_paths,
         layout_root_generation,
     })
+}
+
+fn list_remote_branch_refs<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &std::path::Path,
+) -> Result<Vec<e2v_store::ListedRef>> {
+    let mut refs = Vec::new();
+    for listed_ref in remote.list_refs()? {
+        if listed_ref.token.value.starts_with("keyring/") {
+            continue;
+        }
+        if sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)
+            .is_ok()
+        {
+            refs.push(listed_ref);
+        }
+    }
+    Ok(refs)
 }
 
 fn observed_remote_safe_horizon<R: RemoteBackend>(

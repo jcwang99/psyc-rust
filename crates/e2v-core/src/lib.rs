@@ -15,6 +15,9 @@ pub mod testing {
     pub use crate::chunker::override_fixed_span_bytes_for_test;
     pub use crate::facade::RepositoryFacade;
     pub use crate::facade::override_max_file_chunks_per_object_for_test;
+    pub use crate::facade::reconcile_remote_keyring_for_sync;
+    pub use crate::facade::rotate_active_epoch_for_test;
+    pub use crate::facade::unlock_with_local_device_for_test;
     pub use crate::keyring::clear_unlocked_keyring_cache_for_test;
     pub use crate::working_tree::WorkingTree as TestWorkingTree;
     pub use crate::working_tree::{SnapshotReader, StableReadPolicy};
@@ -68,7 +71,9 @@ pub mod testing {
 
 pub use facade::{
     BranchState, BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry,
-    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState, SnapshotSummary,
+    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState,
+    ShareAcceptDeviceOptions, ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle,
+    ShareInviteDeviceOptions, ShareInviteMemberOptions, ShareListResult, SnapshotSummary,
     validate_layout_root_value,
 };
 pub use keyring::clear_unlocked_keyring_cache;
@@ -653,6 +658,15 @@ pub mod sync_support {
         super::keyring::open_repo_secrets(control_dir.as_ref())
     }
 
+    pub fn open_or_unlock_repo_secrets_for_sync(
+        control_dir: impl AsRef<Path>,
+    ) -> Result<RepoSecrets> {
+        match super::keyring::open_repo_secrets(control_dir.as_ref()) {
+            Ok(secrets) => Ok(secrets),
+            Err(_) => super::keyring::unlock_repo_secrets_with_local_device(control_dir.as_ref()),
+        }
+    }
+
     pub fn unlock_repo_secrets_for_sync(
         control_dir: impl AsRef<Path>,
         password: &str,
@@ -665,6 +679,16 @@ pub mod sync_support {
         password: &str,
     ) -> Result<RepoSecrets> {
         super::keyring::unlock_repo_secrets_from_keyring_bytes(keyring_bytes, password)
+    }
+
+    pub fn unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
+        control_dir: impl AsRef<Path>,
+        keyring_bytes: &[u8],
+    ) -> Result<RepoSecrets> {
+        super::keyring::unlock_repo_secrets_from_keyring_bytes_with_local_device(
+            control_dir.as_ref(),
+            keyring_bytes,
+        )
     }
 
     pub fn encrypt_control_record_for_sync(
@@ -691,6 +715,13 @@ pub mod sync_support {
         snapshot_id: &str,
     ) -> Result<()> {
         super::facade::verify_snapshot_with_secrets_for_sync(repo_root, secrets, snapshot_id)
+    }
+
+    pub fn reconcile_remote_keyring_for_sync(
+        repo_root: impl AsRef<Path>,
+        remote_keyring_bytes: &[u8],
+    ) -> Result<bool> {
+        super::facade::reconcile_remote_keyring_for_sync(repo_root, remote_keyring_bytes)
     }
 
     pub fn list_keyring_files(repo_root: impl AsRef<Path>) -> Result<Vec<PathBuf>> {

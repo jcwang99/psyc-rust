@@ -45,18 +45,32 @@ pub fn clone_remote<R: RemoteBackend>(remote: &R, options: CloneOptions) -> Resu
         FetchOptions {
             repo_root: options.repo_root.clone(),
             branch_token: options.branch_token.clone(),
-            password: Some(options.password.clone()),
+            password: if options.password.is_empty() {
+                None
+            } else {
+                Some(options.password.clone())
+            },
         },
     );
     if let Err(error) = fetch_result {
         let _ = std::fs::remove_dir_all(options.repo_root.join(".e2v"));
         return Err(error);
     }
-    let reopened = match facade.unlock(&options.repo_root, &options.password) {
-        Ok(reopened) => reopened,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(options.repo_root.join(".e2v"));
-            return Err(error);
+    let reopened = if options.password.is_empty() {
+        match facade.open(&options.repo_root) {
+            Ok(reopened) => reopened,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(options.repo_root.join(".e2v"));
+                return Err(error);
+            }
+        }
+    } else {
+        match facade.unlock(&options.repo_root, &options.password) {
+            Ok(reopened) => reopened,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(options.repo_root.join(".e2v"));
+                return Err(error);
+            }
         }
     };
     if let Err(error) = facade.verify_ref(&options.repo_root) {

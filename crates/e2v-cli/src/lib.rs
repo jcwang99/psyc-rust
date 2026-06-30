@@ -36,6 +36,12 @@ enum Command {
         #[arg(long)]
         repo: PathBuf,
     },
+    Share {
+        #[command(subcommand)]
+        command: ShareCommand,
+        #[arg(long)]
+        repo: PathBuf,
+    },
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
@@ -84,6 +90,45 @@ enum BranchCommand {
     Create { name: String },
     Checkout { name: String },
     Delete { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShareCommand {
+    List,
+    InviteMember {
+        #[arg(long = "name")]
+        name: String,
+        #[arg(long = "out")]
+        out: PathBuf,
+    },
+    AcceptMember {
+        #[arg(long = "bundle")]
+        bundle: PathBuf,
+        #[arg(long = "label")]
+        label: String,
+    },
+    InviteDevice {
+        #[arg(long = "actor")]
+        actor: String,
+        #[arg(long = "label")]
+        label: String,
+        #[arg(long = "out")]
+        out: PathBuf,
+    },
+    AcceptDevice {
+        #[arg(long = "bundle")]
+        bundle: PathBuf,
+        #[arg(long = "label")]
+        label: String,
+    },
+    RevokeMember {
+        #[arg(long = "actor")]
+        actor: String,
+    },
+    RevokeDevice {
+        #[arg(long = "device")]
+        device: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -219,6 +264,88 @@ fn execute(cli: Cli) -> Result<String> {
                 .map(|result| format!("{}\n", result.path))
                 .collect())
         }
+        Command::Share { command, repo } => match command {
+            ShareCommand::List => {
+                let listing = facade.share_list(&repo)?;
+                let mut output = String::new();
+                for actor in listing.actors {
+                    output.push_str(&format!(
+                        "{} {} {}\n",
+                        actor.actor_id, actor.role, actor.display_name
+                    ));
+                }
+                for device in listing.devices {
+                    output.push_str(&format!(
+                        "{} {} {} {}\n",
+                        device.device_id, device.actor_id, device.status, device.label
+                    ));
+                }
+                Ok(output)
+            }
+            ShareCommand::InviteMember { name, out } => {
+                let invite = facade.share_invite_member(
+                    &repo,
+                    e2v_core::ShareInviteMemberOptions { display_name: name },
+                )?;
+                std::fs::write(&out, &invite.bundle_bytes)?;
+                Ok(format!(
+                    "wrote member invite {} to {}\n",
+                    invite.actor_id,
+                    out.display()
+                ))
+            }
+            ShareCommand::AcceptMember { bundle, label } => {
+                let invite_bytes = std::fs::read(&bundle)?;
+                let accepted = facade.share_accept_member(
+                    &repo,
+                    e2v_core::ShareAcceptMemberOptions {
+                        invite_bytes,
+                        local_device_label: label,
+                    },
+                )?;
+                Ok(format!(
+                    "accepted member {} {} {}\n",
+                    accepted.actor_id, accepted.device_id, accepted.role
+                ))
+            }
+            ShareCommand::InviteDevice { actor, label, out } => {
+                let invite = facade.share_invite_device(
+                    &repo,
+                    e2v_core::ShareInviteDeviceOptions {
+                        actor_id: actor,
+                        device_label: label,
+                    },
+                )?;
+                std::fs::write(&out, &invite.bundle_bytes)?;
+                Ok(format!(
+                    "wrote device invite {} to {}\n",
+                    invite.actor_id,
+                    out.display()
+                ))
+            }
+            ShareCommand::AcceptDevice { bundle, label } => {
+                let invite_bytes = std::fs::read(&bundle)?;
+                let accepted = facade.share_accept_device(
+                    &repo,
+                    e2v_core::ShareAcceptDeviceOptions {
+                        invite_bytes,
+                        local_device_label: label,
+                    },
+                )?;
+                Ok(format!(
+                    "accepted device {} {} {}\n",
+                    accepted.actor_id, accepted.device_id, accepted.role
+                ))
+            }
+            ShareCommand::RevokeMember { actor } => {
+                facade.share_revoke_member(&repo, &actor)?;
+                Ok(format!("revoked member {actor}\n"))
+            }
+            ShareCommand::RevokeDevice { device } => {
+                facade.share_revoke_device(&repo, &device)?;
+                Ok(format!("revoked device {device}\n"))
+            }
+        },
         Command::Remote { command, repo } => match command {
             RemoteCommand::Add { name, url } => {
                 let stored = remote_registry::add_remote(&repo, &name, &url)?;

@@ -29,6 +29,45 @@ fn init_repo(repo_root: &std::path::Path) {
         .unwrap();
 }
 
+fn init_shared_repo(repo_root: &std::path::Path) -> (RepositoryFacade, String) {
+    init_repo(repo_root);
+    let facade = RepositoryFacade::new();
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let invite = facade
+        .share_invite_member(
+            repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let actor_id = invite.actor_id.clone();
+    facade
+        .share_accept_member(
+            repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+    (facade, actor_id)
+}
+
 #[test]
 fn branch_commands_create_list_and_checkout() {
     let temp = tempdir().unwrap();
@@ -215,6 +254,205 @@ fn remote_add_persists_default_remote_spec() {
     let stored = fs::read_to_string(config_path).unwrap();
     assert!(stored.contains("\"name\":\"origin\""));
     assert!(stored.contains(&format!("\"spec\":\"{spec}\"")));
+}
+
+#[test]
+fn share_list_prints_member_and_device_records() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_shared_repo(&repo_root);
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "list",
+    ])
+    .unwrap();
+
+    assert!(output.contains("owner_admin"));
+    assert!(output.contains("writer_member"));
+    assert!(output.contains("alice-laptop"));
+}
+
+#[test]
+fn share_member_round_trip_via_bundle_file() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let bundle_path = temp.path().join("invite.e2vshare");
+
+    let invite_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "invite-member",
+        "--name",
+        "Alice",
+        "--out",
+        bundle_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(invite_output.contains("invite"));
+    assert!(bundle_path.is_file());
+
+    let accept_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "accept-member",
+        "--bundle",
+        bundle_path.to_str().unwrap(),
+        "--label",
+        "alice-laptop",
+    ])
+    .unwrap();
+    assert!(accept_output.contains("writer_member"));
+
+    let listing = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "list",
+    ])
+    .unwrap();
+    assert!(listing.contains("Alice"));
+    assert!(listing.contains("alice-laptop"));
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+
+    let actor_id = listing
+        .lines()
+        .find_map(|line| {
+            if line.contains("writer_member") {
+                line.split_whitespace()
+                    .next()
+                    .map(|value| value.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let revoke_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "revoke-member",
+        "--actor",
+        &actor_id,
+    ])
+    .unwrap();
+    assert!(revoke_output.contains("revoked"));
+}
+
+#[test]
+fn share_device_round_trip_via_bundle_file() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    let (_facade, actor_id) = init_shared_repo(&repo_root);
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let bundle_path = temp.path().join("device.e2vshare");
+
+    let invite_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "invite-device",
+        "--actor",
+        &actor_id,
+        "--label",
+        "alice-phone",
+        "--out",
+        bundle_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(invite_output.contains("invite"));
+    assert!(bundle_path.is_file());
+
+    let accept_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "accept-device",
+        "--bundle",
+        bundle_path.to_str().unwrap(),
+        "--label",
+        "alice-phone",
+    ])
+    .unwrap();
+    assert!(accept_output.contains("accepted device"));
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+
+    let listing = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "list",
+    ])
+    .unwrap();
+    assert!(listing.contains("alice-phone"));
+
+    let device_id = listing
+        .lines()
+        .filter(|line| line.contains(" active "))
+        .find_map(|line| {
+            if line.contains("alice-phone") {
+                line.split_whitespace()
+                    .next()
+                    .map(|value| value.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let revoke_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "revoke-device",
+        "--device",
+        &device_id,
+    ])
+    .unwrap();
+    assert!(revoke_output.contains("revoked"));
 }
 
 #[test]

@@ -14,7 +14,10 @@ use crate::trusted_state::{
 };
 use e2v_core::{
     RepositoryFacade, clear_unlocked_keyring_cache,
-    sync_support::{unlock_repo_secrets_for_sync, unlock_repo_secrets_from_keyring_bytes_for_sync},
+    sync_support::{
+        unlock_repo_secrets_for_sync, unlock_repo_secrets_from_keyring_bytes_for_sync,
+        unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync,
+    },
     validate_layout_root_value,
 };
 use e2v_store::{
@@ -189,6 +192,8 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found"))?;
     let stored_ref_bytes = stored_ref.value.bytes.clone();
     let control_plane = read_remote_control_plane(remote, stored_ref.value.bytes.clone())?;
+    let preserve_newer_local_keyring =
+        local_keyring_is_newer_than_remote(&control_dir, &control_plane)?;
     ensure!(
         control_plane.keyring_pointer.generation > 0
             && !control_plane.keyring_pointer.current.trim().is_empty(),
@@ -196,6 +201,24 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
     );
     assert_remote_generations_meet_local_floor(&stored_ref, &control_plane)?;
     let local_repo_secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).ok();
+    let remote_current_device_secrets = if matches!(
+        sync_mode,
+        RepositorySyncMode::SameRepositoryPointerUnchanged
+            | RepositorySyncMode::SameRepositoryPointerChanged
+    ) {
+        match unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
+            &control_dir,
+            &control_plane.current_keyring_bytes,
+        ) {
+            Ok(secrets) => Some(secrets),
+            Err(error) if options.password.is_none() && !preserve_newer_local_keyring => {
+                return Err(error).context("current local device cannot unlock remote keyring");
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let pack_index_secrets = match sync_mode {
         RepositorySyncMode::ReplaceLocalState => options.password.as_deref().and_then(|password| {
             unlock_repo_secrets_from_keyring_bytes_for_sync(
@@ -207,6 +230,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
         RepositorySyncMode::SameRepositoryPointerUnchanged
         | RepositorySyncMode::SameRepositoryPointerChanged => local_repo_secrets
             .clone()
+            .or_else(|| remote_current_device_secrets.clone())
             .or_else(|| {
                 options
                     .password
@@ -262,6 +286,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             &options.repo_root,
             &control_plane,
             options.password.as_deref(),
+            remote_current_device_secrets.as_ref(),
             &stored_ref_bytes,
             &remote_loose_object_ids,
             &pack_locations,
@@ -399,16 +424,19 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
         }
     }
     if matches!(sync_mode, RepositorySyncMode::ReplaceLocalState) {
-        verify_replace_local_state_with_password(
+        verify_replace_local_state(
             &options.repo_root,
             &objects_dir,
             &control_plane,
             options.password.as_deref(),
+            remote_current_device_secrets.as_ref(),
         )?;
     }
 
-    for (file_name, bytes) in &control_plane.keyring_files {
-        atomic_write_bytes(control_dir.join("keyring").join(file_name), bytes)?;
+    if !preserve_newer_local_keyring {
+        for (file_name, bytes) in &control_plane.keyring_files {
+            atomic_write_bytes(control_dir.join("keyring").join(file_name), bytes)?;
+        }
     }
     atomic_write_bytes(
         control_dir.join("refs").join("default.json"),
@@ -418,10 +446,12 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
         control_dir.join("layout_root.json"),
         &control_plane.layout_root_bytes,
     )?;
-    atomic_write_bytes(
-        control_dir.join("keyring").join("keyring.current"),
-        &control_plane.keyring_pointer_bytes,
-    )?;
+    if !preserve_newer_local_keyring {
+        atomic_write_bytes(
+            control_dir.join("keyring").join("keyring.current"),
+            &control_plane.keyring_pointer_bytes,
+        )?;
+    }
     if !matches!(
         sync_mode,
         RepositorySyncMode::SameRepositoryPointerUnchanged
@@ -433,11 +463,47 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
     Ok(FetchResult { downloaded_objects })
 }
 
+fn local_keyring_is_newer_than_remote(
+    control_dir: &Path,
+    control_plane: &RemoteControlPlane,
+) -> Result<bool> {
+    let local_pointer_path = control_dir.join("keyring").join("keyring.current");
+    if !local_pointer_path.is_file() {
+        return Ok(false);
+    }
+    let local_pointer: KeyringPointer =
+        serde_json::from_slice(&std::fs::read(&local_pointer_path)?)
+            .with_context(|| format!("failed to decode {}", local_pointer_path.display()))?;
+    if local_pointer.generation <= control_plane.keyring_pointer.generation {
+        return Ok(false);
+    }
+    let local_keyring_path = control_dir.join("keyring").join(&local_pointer.current);
+    let local_keyring_bytes = match std::fs::read(&local_keyring_path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    let _local_keyring: KeyringStateSummary = match serde_json::from_slice(&local_keyring_bytes) {
+        Ok(keyring) => keyring,
+        Err(_) => return Ok(false),
+    };
+    if e2v_core::sync_support::open_repo_secrets_for_sync(control_dir).is_err()
+        && e2v_core::sync_support::unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
+            control_dir,
+            &local_keyring_bytes,
+        )
+        .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn prepare_remote_fetch_plan<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
     control_plane: &RemoteControlPlane,
     password: Option<&str>,
+    device_validation_secrets: Option<&RepoSecrets>,
     default_ref_bytes: &[u8],
     remote_loose_object_ids: &BTreeSet<String>,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
@@ -446,7 +512,8 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
         path: next_validation_root(repo_root)?,
     };
     write_remote_control_plane_to_validation_root(&validation_root, control_plane)?;
-    let validation_secrets = load_remote_validation_secrets(&validation_root, password)?;
+    let validation_secrets =
+        load_remote_validation_secrets(&validation_root, password, device_validation_secrets)?;
     let mut pack_cache = BTreeMap::new();
     let (_, head_snapshot_id) = e2v_core::sync_support::decode_default_ref_record(
         &validation_root.path,
@@ -524,10 +591,6 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
                 .with_context(|| format!("failed to decode {}", local_pointer_path.display()));
         }
     };
-    let remote_pointer_bytes = remote.get_physical("control/keyring/keyring.current")?;
-    let remote_pointer: KeyringPointer = serde_json::from_slice(&remote_pointer_bytes)
-        .context("failed to decode remote keyring pointer")?;
-
     let local_keyring_path = control_dir.join("keyring").join(&local_pointer.current);
     let local_state_bytes = match std::fs::read(&local_keyring_path) {
         Ok(bytes) => bytes,
@@ -546,6 +609,10 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
         }
         Err(error) => return Err(error).context("failed to decode local keyring state"),
     };
+    let remote_pointer_bytes =
+        read_remote_keyring_pointer_bytes(remote, Some(&local_state.repo_id))?;
+    let remote_pointer: KeyringPointer = serde_json::from_slice(&remote_pointer_bytes)
+        .context("failed to decode remote keyring pointer")?;
     let remote_state: KeyringStateSummary = serde_json::from_slice(
         &remote.get_physical(&format!("control/keyring/{}", remote_pointer.current))?,
     )
@@ -833,7 +900,7 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
     remote: &R,
     default_ref_bytes: Vec<u8>,
 ) -> Result<RemoteControlPlane> {
-    let keyring_pointer_bytes = remote.get_physical("control/keyring/keyring.current")?;
+    let keyring_pointer_bytes = read_remote_keyring_pointer_bytes(remote, None)?;
     let keyring_pointer: KeyringPointer = serde_json::from_slice(&keyring_pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
     validate_remote_relative_name(&keyring_pointer.current).map_err(|error| {
@@ -842,7 +909,6 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
             keyring_pointer.current
         )
     })?;
-    let mut keyring_files = Vec::new();
     let pointed_keyring_path = format!("control/keyring/{}", keyring_pointer.current);
     let pointed_keyring_bytes = remote.get_physical(&pointed_keyring_path)?;
     let pointed_keyring_state: RemoteKeyringStateValidation =
@@ -852,6 +918,10 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
                 keyring_pointer.current
             )
         })?;
+    let repo_id = serde_json::from_slice::<KeyringStateSummary>(&pointed_keyring_bytes)
+        .context("failed to decode remote keyring state summary")?
+        .repo_id;
+    let mut keyring_files = Vec::new();
     keyring_files.push((
         keyring_pointer.current.clone(),
         pointed_keyring_bytes.clone(),
@@ -889,9 +959,7 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
     let layout_root_bytes = serde_json::to_vec_pretty(&layout_root)?;
 
     Ok(RemoteControlPlane {
-        repo_id: serde_json::from_slice::<KeyringStateSummary>(&pointed_keyring_bytes)
-            .context("failed to decode remote keyring state summary")?
-            .repo_id,
+        repo_id,
         keyring_pointer_bytes,
         keyring_pointer,
         current_keyring_bytes: pointed_keyring_bytes.clone(),
@@ -899,6 +967,33 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
         layout_root_bytes,
         default_ref_bytes,
     })
+}
+
+fn read_remote_keyring_pointer_bytes<R: RemoteBackend>(
+    remote: &R,
+    repo_id: Option<&str>,
+) -> Result<Vec<u8>> {
+    if let Some(repo_id) = repo_id {
+        let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
+        if let Some(stored) = remote.read_ref(&pointer_token)? {
+            return Ok(stored.value.bytes);
+        }
+    } else {
+        let keyring_refs = remote
+            .list_refs()?
+            .into_iter()
+            .filter(|listed| listed.token.value.starts_with("keyring/"))
+            .collect::<Vec<_>>();
+        if keyring_refs.len() == 1 {
+            return Ok(keyring_refs[0].stored.value.bytes.clone());
+        }
+        if keyring_refs.len() > 1 {
+            anyhow::bail!("ambiguous remote keyring pointer refs");
+        }
+    }
+    remote
+        .get_physical("control/keyring/keyring.current")
+        .context("missing physical object control/keyring/keyring.current")
 }
 
 pub(crate) fn validate_remote_branch_control_plane<R: RemoteBackend>(
@@ -1073,14 +1168,13 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
     Ok(())
 }
 
-fn verify_replace_local_state_with_password(
+fn verify_replace_local_state(
     repo_root: &Path,
     objects_dir: &Path,
     control_plane: &RemoteControlPlane,
     password: Option<&str>,
+    device_validation_secrets: Option<&RepoSecrets>,
 ) -> Result<()> {
-    let password = password
-        .context("fetch into replacement repository requires password-based verification")?;
     let validation_root = next_validation_root(repo_root)?;
     let validation_control = validation_root.join(".e2v");
     std::fs::create_dir_all(validation_control.join("objects"))?;
@@ -1114,10 +1208,21 @@ fn verify_replace_local_state_with_password(
     }
 
     let facade = e2v_core::RepositoryFacade::new();
-    let result = facade
-        .unlock(&validation_root, password)
-        .and_then(|_| facade.verify_ref(&validation_root))
-        .context("remote head snapshot graph failed validation");
+    let result = if let Some(password) = password {
+        facade
+            .unlock(&validation_root, password)
+            .and_then(|_| facade.verify_ref(&validation_root))
+            .context("remote head snapshot graph failed validation")
+    } else if device_validation_secrets.is_some() {
+        facade
+            .open(&validation_root)
+            .and_then(|_| facade.verify_ref(&validation_root))
+            .context("remote head snapshot graph failed validation")
+    } else {
+        anyhow::bail!(
+            "fetch into replacement repository requires password or local device verification"
+        );
+    };
     e2v_core::clear_unlocked_keyring_cache(&validation_control);
     let _ = std::fs::remove_dir_all(&validation_root);
     result
@@ -1162,10 +1267,16 @@ pub(crate) fn write_remote_control_plane_to_validation_root(
 fn load_remote_validation_secrets(
     validation_root: &RemoteValidationRoot,
     password: Option<&str>,
+    device_validation_secrets: Option<&RepoSecrets>,
 ) -> Result<RepoSecrets> {
-    let password = password.context("fetch requires password-based remote validation")?;
-    RepositoryFacade::new().unlock(&validation_root.path, password)?;
-    e2v_core::sync_support::open_repo_secrets_for_sync(validation_root.control_dir())
+    if let Some(password) = password {
+        RepositoryFacade::new().unlock(&validation_root.path, password)?;
+        return e2v_core::sync_support::open_repo_secrets_for_sync(validation_root.control_dir());
+    }
+    if let Some(secrets) = device_validation_secrets {
+        return Ok(secrets.clone());
+    }
+    anyhow::bail!("fetch requires password or local device remote validation")
 }
 
 pub(crate) fn collect_remote_reachable_object_ids<R: RemoteBackend>(

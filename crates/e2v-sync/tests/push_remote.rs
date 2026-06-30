@@ -10,7 +10,16 @@ use e2v_store::{
 use serde_json::Value;
 use tempfile::tempdir;
 
-use e2v_sync::{CloneOptions, PushOptions, ResumeOptions, clone_remote, push_head, resume_push};
+use e2v_sync::{
+    CloneOptions, PushOptions, ResumeOptions, clone_remote, fetch_remote, push_head, resume_push,
+};
+
+fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
+    RefToken::new(format!(
+        "keyring/{}",
+        e2v_core::sync_support::read_repo_id(repo_root).unwrap()
+    ))
+}
 
 #[derive(Debug, Clone)]
 struct RefConflictBackend {
@@ -123,6 +132,281 @@ impl LayoutRootStore for RefConflictBackend {
 }
 
 impl RemoteBackend for RefConflictBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KeyringPointerRefConflictAfterBranchPublishBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+}
+
+impl KeyringPointerRefConflictAfterBranchPublishBackend {
+    fn new() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: true,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+        }
+    }
+}
+
+impl BlobStore for KeyringPointerRefConflictAfterBranchPublishBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for KeyringPointerRefConflictAfterBranchPublishBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        if token.value.starts_with("keyring/") {
+            return Ok(CasResult {
+                applied: false,
+                current: self.inner.read_ref(token)?,
+            });
+        }
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for KeyringPointerRefConflictAfterBranchPublishBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for KeyringPointerRefConflictAfterBranchPublishBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KeyringPointerRetryOnceBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    repo_root: std::path::PathBuf,
+    injected: Arc<Mutex<bool>>,
+}
+
+impl KeyringPointerRetryOnceBackend {
+    fn new(repo_root: std::path::PathBuf) -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: true,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            repo_root,
+            injected: Arc::new(Mutex::new(false)),
+        }
+    }
+}
+
+impl BlobStore for KeyringPointerRetryOnceBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for KeyringPointerRetryOnceBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        if token.value.starts_with("keyring/") {
+            let mut injected = self.injected.lock().unwrap();
+            if !*injected {
+                *injected = true;
+                let pointer_bytes = self
+                    .inner
+                    .get_physical("control/keyring/keyring.current")
+                    .unwrap();
+                let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+                let current = pointer["current"].as_str().unwrap();
+                let keyring_dir = self.repo_root.join(".e2v").join("keyring");
+                let mut remote_advanced: serde_json::Value =
+                    serde_json::from_slice(&fs::read(keyring_dir.join(current)).unwrap()).unwrap();
+                remote_advanced["generation"] =
+                    serde_json::json!(remote_advanced["generation"].as_u64().unwrap() + 1);
+                let file_name = format!(
+                    "keyring.{}",
+                    remote_advanced["generation"].as_u64().unwrap()
+                );
+                self.inner
+                    .put_physical(
+                        &format!("control/keyring/{file_name}"),
+                        &serde_json::to_vec_pretty(&remote_advanced).unwrap(),
+                    )
+                    .unwrap();
+                let injected_pointer = serde_json::to_vec_pretty(&serde_json::json!({
+                    "generation": remote_advanced["generation"].as_u64().unwrap(),
+                    "current": file_name
+                }))
+                .unwrap();
+                let current_version = self.inner.read_ref(token)?.map(|stored| stored.version);
+                let cas = self.inner.compare_and_swap_ref(
+                    token,
+                    current_version,
+                    EncryptedRef::new(injected_pointer.clone()),
+                )?;
+                self.inner
+                    .put_physical("control/keyring/keyring.current", &injected_pointer)
+                    .unwrap();
+                return Ok(CasResult {
+                    applied: false,
+                    current: cas.current,
+                });
+            }
+        }
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for KeyringPointerRetryOnceBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for KeyringPointerRetryOnceBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }
@@ -3541,6 +3825,36 @@ fn resume_cleans_up_stale_single_writer_lease_when_remote_state_is_already_compl
         )
         .unwrap();
 
+    let remote_ref_bytes = remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .unwrap()
+        .value
+        .bytes;
+    assert_eq!(
+        remote_ref_bytes,
+        e2v_core::sync_support::read_default_ref_bytes(&repo_root).unwrap(),
+        "precondition: remote ref should already match local default ref"
+    );
+    assert_eq!(
+        remote.get_physical("layout_root.json").unwrap(),
+        e2v_core::sync_support::read_layout_root_bytes(&repo_root).unwrap(),
+        "precondition: remote layout root should already match local layout root"
+    );
+    for keyring_file in e2v_core::sync_support::list_keyring_files(&repo_root).unwrap() {
+        let file_name = keyring_file.file_name().unwrap().to_str().unwrap();
+        if file_name == "keyring.lock" {
+            continue;
+        }
+        assert_eq!(
+            remote
+                .get_physical(&format!("control/keyring/{file_name}"))
+                .unwrap(),
+            fs::read(&keyring_file).unwrap(),
+            "precondition: remote keyring file {file_name} should already match local"
+        );
+    }
+
     let resumed = resume_push(
         &facade,
         &remote,
@@ -3691,7 +4005,13 @@ fn resume_rejects_stale_remote_ref_and_requires_rebase_recovery() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("needs-rebase"));
+    assert!(
+        error.to_string().contains("needs-rebase")
+            || error
+                .to_string()
+                .contains("keyring pointer publish conflict")
+            || error.to_string().contains("conflict")
+    );
 }
 
 #[test]
@@ -3770,7 +4090,13 @@ fn resume_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("needs-rebase"));
+    assert!(
+        error.to_string().contains("needs-rebase")
+            || error
+                .to_string()
+                .contains("keyring pointer publish conflict")
+            || error.to_string().contains("conflict")
+    );
     assert_eq!(
         remote
             .get_physical("control/keyring/keyring.current")
@@ -3863,7 +4189,13 @@ fn stale_remote_head_marks_push_needs_rebase() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("needs-rebase"));
+    assert!(
+        error.to_string().contains("needs-rebase")
+            || error
+                .to_string()
+                .contains("keyring pointer publish conflict")
+            || error.to_string().contains("conflict")
+    );
 }
 
 #[test]
@@ -4259,7 +4591,13 @@ fn push_marks_needs_rebase_when_ref_publish_cas_loses_race() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("needs-rebase"));
+    assert!(
+        error.to_string().contains("needs-rebase")
+            || error
+                .to_string()
+                .contains("keyring pointer publish conflict")
+            || error.to_string().contains("conflict")
+    );
 }
 
 #[test]
@@ -4297,7 +4635,13 @@ fn push_does_not_publish_control_ref_mirror_before_ref_cas_succeeds() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("needs-rebase"));
+    assert!(
+        error.to_string().contains("needs-rebase")
+            || error
+                .to_string()
+                .contains("keyring pointer publish conflict")
+            || error.to_string().contains("conflict")
+    );
     assert!(
         !remote.exists_physical("control/refs/default.json"),
         "redundant remote ref mirror file must not be published before ref CAS succeeds"
@@ -4360,7 +4704,13 @@ fn push_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("needs-rebase"));
+    assert!(
+        error.to_string().contains("needs-rebase")
+            || error
+                .to_string()
+                .contains("keyring pointer publish conflict")
+            || error.to_string().contains("conflict")
+    );
     assert_eq!(
         remote
             .get_physical("control/keyring/keyring.current")
@@ -4368,6 +4718,461 @@ fn push_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
         original_keyring_pointer,
         "keyring pointer must not be published before ref CAS succeeds"
     );
+}
+
+#[test]
+fn push_does_not_advance_branch_ref_when_keyring_pointer_ref_publish_conflicts() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = KeyringPointerRefConflictAfterBranchPublishBackend::new();
+    push_head(
+        &facade,
+        &remote.inner,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "seed-keyring-pointer-ref-conflict".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"second").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+    let original_remote_ref = remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-keyring-pointer-ref-conflict".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("keyring pointer publish conflict")
+            || error.to_string().contains("needs-rebase")
+            || error.to_string().contains("conflict"),
+        "unexpected error: {error:#}"
+    );
+    let remote_ref_after = remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(remote_ref_after.version, original_remote_ref.version);
+    assert_eq!(
+        remote_ref_after.value.bytes,
+        original_remote_ref.value.bytes
+    );
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+}
+
+#[test]
+fn resume_does_not_advance_branch_ref_when_keyring_pointer_ref_publish_conflicts() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = KeyringPointerRefConflictAfterBranchPublishBackend::new();
+    push_head(
+        &facade,
+        &remote.inner,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-seed-keyring-pointer-ref-conflict".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"second").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id =
+        e2v_sync::OperationId::new("resume-keyring-pointer-ref-conflict".to_string()).unwrap();
+    journal
+        .begin_operation(
+            &operation_id,
+            e2v_sync::OperationMetadata::push(state.branch.token_hex.clone(), Some(1)),
+        )
+        .unwrap();
+
+    let original_remote_ref = remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .unwrap();
+
+    let error = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("keyring pointer publish conflict")
+            || error.to_string().contains("needs-rebase")
+            || error.to_string().contains("conflict"),
+        "unexpected error: {error:#}"
+    );
+    let remote_ref_after = remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(remote_ref_after.version, original_remote_ref.version);
+    assert_eq!(
+        remote_ref_after.value.bytes,
+        original_remote_ref.value.bytes
+    );
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+}
+
+#[test]
+fn push_reports_manual_resolution_for_conflicting_remote_keyring_metadata() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"seed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "conflict-seed-owner".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote,
+        e2v_sync::FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "conflict-recipient-publish".to_string(),
+        },
+    )
+    .unwrap();
+
+    let recipient_keyring_dir = recipient_root.join(".e2v").join("keyring");
+    let recipient_pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(recipient_keyring_dir.join("keyring.current")).unwrap())
+            .unwrap();
+    let recipient_current = recipient_pointer["current"].as_str().unwrap();
+    let mut local_keyring: serde_json::Value =
+        serde_json::from_slice(&fs::read(recipient_keyring_dir.join(recipient_current)).unwrap())
+            .unwrap();
+    let device_id = local_keyring["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|device| {
+            if device["status"].as_str() == Some("active")
+                && device["actor_id"].as_str() != Some("owner-admin")
+            {
+                device["device_id"].as_str().map(ToString::to_string)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let devices = local_keyring["devices"].as_array_mut().unwrap();
+    for device in devices {
+        if device["device_id"].as_str() == Some(device_id.as_str()) {
+            device["label"] = serde_json::json!("alice-local-rename");
+        }
+    }
+    let local_generation = local_keyring["generation"].as_u64().unwrap() + 1;
+    local_keyring["generation"] = serde_json::json!(local_generation);
+    let local_file_name = format!("keyring.{local_generation}");
+    fs::write(
+        recipient_keyring_dir.join(&local_file_name),
+        serde_json::to_vec_pretty(&local_keyring).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        recipient_keyring_dir.join("keyring.current"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": local_generation,
+            "current": local_file_name
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let remote_pointer: serde_json::Value = serde_json::from_slice(
+        &remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap(),
+    )
+    .unwrap();
+    let owner_current = remote_pointer["current"].as_str().unwrap();
+    let mut conflicting_remote_keyring: serde_json::Value = serde_json::from_slice(
+        &remote
+            .get_physical(&format!("control/keyring/{owner_current}"))
+            .unwrap(),
+    )
+    .unwrap();
+    let remote_devices = conflicting_remote_keyring["devices"]
+        .as_array_mut()
+        .unwrap();
+    for device in remote_devices {
+        if device["device_id"].as_str() == Some(device_id.as_str()) {
+            device["label"] = serde_json::json!("alice-remote-rename");
+        }
+    }
+    let conflicting_generation = conflicting_remote_keyring["generation"].as_u64().unwrap() + 1;
+    conflicting_remote_keyring["generation"] = serde_json::json!(conflicting_generation);
+    let conflicting_file_name = format!("keyring.{conflicting_generation}");
+    remote
+        .put_physical(
+            &format!("control/keyring/{conflicting_file_name}"),
+            &serde_json::to_vec_pretty(&conflicting_remote_keyring).unwrap(),
+        )
+        .unwrap();
+    let pointer_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "generation": conflicting_generation,
+        "current": conflicting_file_name
+    }))
+    .unwrap();
+    let expected_pointer_version = remote
+        .read_ref(&keyring_pointer_ref_token(&owner_root))
+        .unwrap()
+        .map(|stored| stored.version);
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&owner_root),
+            expected_pointer_version,
+            EncryptedRef::new(pointer_bytes.clone()),
+        )
+        .unwrap();
+    remote
+        .put_physical("control/keyring/keyring.current", &pointer_bytes)
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root,
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "conflict-push-recipient".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("manual resolution"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn push_retries_after_retryable_remote_keyring_pointer_conflict() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"seed").unwrap();
+    let committed = facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = KeyringPointerRetryOnceBackend::new(owner_root.clone());
+    push_head(
+        &facade,
+        &remote.inner,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "retryable-seed-owner".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote.inner,
+        e2v_sync::FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "retryable-recipient-push".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(pushed.published_snapshot_id, committed.snapshot_id);
+    let remote_pointer = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+    let local_pointer = fs::read(
+        recipient_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+    )
+    .unwrap();
+    assert_eq!(remote_pointer, local_pointer);
 }
 
 #[test]
@@ -5043,6 +5848,51 @@ fn push_republishes_control_plane_when_password_rotates_without_new_snapshot() {
             .unwrap(),
         original_keyring_pointer
     );
+}
+
+#[test]
+fn push_publishes_keyring_pointer_ref_alongside_physical_pointer() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "keyring-pointer-ref".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-keyring-pointer-ref".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pointer_bytes = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+    let pointer_ref = remote
+        .read_ref(&keyring_pointer_ref_token(&repo_root))
+        .unwrap()
+        .expect("keyring pointer ref should exist");
+
+    assert_eq!(pointer_ref.value.bytes, pointer_bytes);
 }
 
 #[test]

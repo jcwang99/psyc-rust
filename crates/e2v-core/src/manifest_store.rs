@@ -512,8 +512,8 @@ mod tests {
     use crate::keyring::{
         KeyringPointer, KeyringState, seal_repo_secrets, unlock_repo_secrets_uncached,
     };
-    use e2v_store::RepoSecrets;
     use e2v_store::logical_object_store::LogicalObjectStore;
+    use e2v_store::{EpochSecrets, RepoSecrets};
 
     fn store_for_tests() -> DirectLayoutObjectStore {
         let temp = tempdir().unwrap();
@@ -529,6 +529,13 @@ mod tests {
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
             repo_path_index_key: [5u8; 32],
+            epoch_keys: std::collections::BTreeMap::from([(
+                1,
+                EpochSecrets {
+                    manifest_enc_key: [2u8; 32],
+                    nonce_key: [3u8; 32],
+                },
+            )]),
         };
         DirectLayoutObjectStore::new(control_dir, secrets)
     }
@@ -616,6 +623,13 @@ mod tests {
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
             repo_path_index_key: [5u8; 32],
+            epoch_keys: std::collections::BTreeMap::from([(
+                1,
+                EpochSecrets {
+                    manifest_enc_key: [2u8; 32],
+                    nonce_key: [3u8; 32],
+                },
+            )]),
         };
         let secrets_two = RepoSecrets {
             repo_id: "repo".to_string(),
@@ -625,6 +639,13 @@ mod tests {
             repo_manifest_enc_key: [8u8; 32],
             repo_nonce_key: [3u8; 32],
             repo_path_index_key: [5u8; 32],
+            epoch_keys: std::collections::BTreeMap::from([(
+                1,
+                EpochSecrets {
+                    manifest_enc_key: [8u8; 32],
+                    nonce_key: [3u8; 32],
+                },
+            )]),
         };
         let keyring_one = KeyringState {
             format_version: REPO_FORMAT_VERSION,
@@ -633,6 +654,9 @@ mod tests {
             active_epoch: 1,
             crypto_suite: "xchacha20poly1305".to_string(),
             kdf: "argon2id".to_string(),
+            actors: vec![],
+            devices: vec![],
+            epochs: vec![],
             envelopes: vec![
                 seal_repo_secrets("repo", 1, "password", &secrets_one, "len:8".to_string())
                     .unwrap(),
@@ -685,6 +709,13 @@ mod tests {
             repo_manifest_enc_key: [2u8; 32],
             repo_nonce_key: [3u8; 32],
             repo_path_index_key: [5u8; 32],
+            epoch_keys: std::collections::BTreeMap::from([(
+                1,
+                EpochSecrets {
+                    manifest_enc_key: [2u8; 32],
+                    nonce_key: [3u8; 32],
+                },
+            )]),
         };
         let keyring = KeyringState {
             format_version: REPO_FORMAT_VERSION,
@@ -693,6 +724,9 @@ mod tests {
             active_epoch: 1,
             crypto_suite: "xchacha20poly1305".to_string(),
             kdf: "argon2id".to_string(),
+            actors: vec![],
+            devices: vec![],
+            epochs: vec![],
             envelopes: vec![
                 seal_repo_secrets("repo", 1, "password", &secrets, "len:8".to_string()).unwrap(),
             ],

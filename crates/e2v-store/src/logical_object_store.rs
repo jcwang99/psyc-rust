@@ -1,8 +1,9 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use getrandom::fill as getrandom_fill;
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::local_backend::LocalFolderBackend;
@@ -17,6 +18,12 @@ const NONCE_SIZE: usize = 24;
 const TAG_SIZE: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochSecrets {
+    pub manifest_enc_key: [u8; 32],
+    pub nonce_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSecrets {
     pub repo_id: String,
     pub active_epoch: u32,
@@ -25,6 +32,19 @@ pub struct RepoSecrets {
     pub repo_manifest_enc_key: [u8; 32],
     pub repo_nonce_key: [u8; 32],
     pub repo_path_index_key: [u8; 32],
+    pub epoch_keys: BTreeMap<u32, EpochSecrets>,
+}
+
+impl RepoSecrets {
+    pub fn active_epoch_keys(&self) -> Result<&EpochSecrets> {
+        self.epoch_keys(self.active_epoch)
+    }
+
+    pub fn epoch_keys(&self, epoch: u32) -> Result<&EpochSecrets> {
+        self.epoch_keys
+            .get(&epoch)
+            .ok_or_else(|| anyhow!("missing epoch keys for epoch {epoch}"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,7 +238,11 @@ impl DirectLayoutObjectStore {
         object_type: &str,
         padding_policy: &str,
     ) -> [u8; NONCE_SIZE] {
-        let mut hasher = Hasher::new_keyed(&self.secrets.repo_nonce_key);
+        let epoch_keys = self
+            .secrets
+            .active_epoch_keys()
+            .expect("active epoch keys must be present");
+        let mut hasher = Hasher::new_keyed(&epoch_keys.nonce_key);
         hasher.update(object_id.as_bytes());
         hasher.update(object_type.as_bytes());
         hasher.update(&ENVELOPE_FORMAT_VERSION.to_le_bytes());
@@ -254,8 +278,14 @@ impl DirectLayoutObjectStore {
         nonce: &[u8; NONCE_SIZE],
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, [u8; TAG_SIZE])> {
-        let cipher = XChaCha20Poly1305::new((&self.secrets.repo_manifest_enc_key).into());
-        let associated_data = self.associated_data(object_id, object_type, padding_policy);
+        let epoch_keys = self.secrets.active_epoch_keys()?;
+        let cipher = XChaCha20Poly1305::new((&epoch_keys.manifest_enc_key).into());
+        let associated_data = self.associated_data(
+            object_id,
+            object_type,
+            padding_policy,
+            self.secrets.active_epoch,
+        );
         let mut buffer = plaintext.to_vec();
         let tag = cipher
             .encrypt_in_place_detached(XNonce::from_slice(nonce), &associated_data, &mut buffer)
@@ -267,11 +297,13 @@ impl DirectLayoutObjectStore {
     }
 
     fn decrypt_object(&self, envelope: &EncryptedObjectEnvelope) -> Result<Vec<u8>> {
-        let cipher = XChaCha20Poly1305::new((&self.secrets.repo_manifest_enc_key).into());
+        let epoch_keys = self.secrets.epoch_keys(envelope.key_epoch)?;
+        let cipher = XChaCha20Poly1305::new((&epoch_keys.manifest_enc_key).into());
         let associated_data = self.associated_data(
             &envelope.object_id,
             &envelope.object_type,
             &envelope.padding_policy,
+            envelope.key_epoch,
         );
         let mut buffer = envelope.ciphertext.clone();
 
@@ -287,7 +319,13 @@ impl DirectLayoutObjectStore {
         Ok(buffer)
     }
 
-    fn associated_data(&self, object_id: &str, object_type: &str, padding_policy: &str) -> Vec<u8> {
+    fn associated_data(
+        &self,
+        object_id: &str,
+        object_type: &str,
+        padding_policy: &str,
+        key_epoch: u32,
+    ) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(ENVELOPE_MAGIC);
         data.extend_from_slice(&ENVELOPE_FORMAT_VERSION.to_le_bytes());
@@ -295,7 +333,7 @@ impl DirectLayoutObjectStore {
         data.extend_from_slice(object_type.as_bytes());
         data.extend_from_slice(object_id.as_bytes());
         data.extend_from_slice(CRYPTO_SUITE.as_bytes());
-        data.extend_from_slice(&self.secrets.active_epoch.to_le_bytes());
+        data.extend_from_slice(&key_epoch.to_le_bytes());
         data.extend_from_slice(padding_policy.as_bytes());
         data
     }
@@ -490,26 +528,37 @@ fn take_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
 
     use super::{
-        DirectLayoutObjectStore, EncryptedObjectEnvelope, LogicalObjectStore, PhysicalObjectRef,
-        RepoSecrets,
+        DirectLayoutObjectStore, EncryptedObjectEnvelope, EpochSecrets, LogicalObjectStore,
+        PhysicalObjectRef, RepoSecrets,
     };
     use crate::storage_layout::{
         DirectStorageLayout, LayoutObjectLocation, PackStorageLayout, StorageLayout,
     };
 
     fn secrets(repo_id: &str) -> RepoSecrets {
+        let active_epoch = 1;
+        let repo_manifest_enc_key = [2u8; 32];
+        let repo_nonce_key = [3u8; 32];
         RepoSecrets {
             repo_id: repo_id.to_string(),
-            active_epoch: 1,
+            active_epoch,
             repo_dedup_key: [1u8; 32],
             repo_ref_key: [4u8; 32],
-            repo_manifest_enc_key: [2u8; 32],
-            repo_nonce_key: [3u8; 32],
+            repo_manifest_enc_key,
+            repo_nonce_key,
             repo_path_index_key: [5u8; 32],
+            epoch_keys: BTreeMap::from([(
+                active_epoch,
+                EpochSecrets {
+                    manifest_enc_key: repo_manifest_enc_key,
+                    nonce_key: repo_nonce_key,
+                },
+            )]),
         }
     }
 
@@ -843,6 +892,58 @@ mod tests {
 
         assert_eq!(object_id, same_object_id);
         assert_ne!(first_envelope.nonce, second_envelope.nonce);
+    }
+
+    #[test]
+    fn object_decryption_uses_envelope_key_epoch() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let epoch_one_keys = EpochSecrets {
+            manifest_enc_key: [2u8; 32],
+            nonce_key: [3u8; 32],
+        };
+        let epoch_two_keys = EpochSecrets {
+            manifest_enc_key: [8u8; 32],
+            nonce_key: [9u8; 32],
+        };
+        let mut epoch_keys = BTreeMap::new();
+        epoch_keys.insert(1, epoch_one_keys.clone());
+        epoch_keys.insert(2, epoch_two_keys.clone());
+
+        let epoch_one_store = DirectLayoutObjectStore::new(
+            &repo_root,
+            RepoSecrets {
+                repo_id: "repo-a".to_string(),
+                active_epoch: 1,
+                repo_dedup_key: [1u8; 32],
+                repo_ref_key: [4u8; 32],
+                repo_manifest_enc_key: epoch_one_keys.manifest_enc_key,
+                repo_nonce_key: epoch_one_keys.nonce_key,
+                repo_path_index_key: [5u8; 32],
+                epoch_keys: epoch_keys.clone(),
+            },
+        );
+        let object_id = epoch_one_store.put_object("chunk", b"alpha").unwrap();
+
+        let epoch_two_store = DirectLayoutObjectStore::new(
+            &repo_root,
+            RepoSecrets {
+                repo_id: "repo-a".to_string(),
+                active_epoch: 2,
+                repo_dedup_key: [1u8; 32],
+                repo_ref_key: [4u8; 32],
+                repo_manifest_enc_key: epoch_two_keys.manifest_enc_key,
+                repo_nonce_key: epoch_two_keys.nonce_key,
+                repo_path_index_key: [5u8; 32],
+                epoch_keys,
+            },
+        );
+
+        let bytes = epoch_two_store.get_object(&object_id, "chunk").unwrap();
+
+        assert_eq!(bytes, b"alpha");
     }
 
     #[test]
