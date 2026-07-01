@@ -392,6 +392,48 @@ fn sdk_public_workflows_can_be_typed_without_internal_crates() {
 }
 
 #[test]
+fn sdk_snapshot_and_file_views_do_not_serialize_internal_handles() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    fs::write(repo_root.join("typed.txt"), "typed").unwrap();
+    let commit = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            message: "typed".to_string(),
+        })
+        .unwrap();
+
+    let read = sdk.open_read_handle(&repo_root).unwrap();
+    let snapshot = read.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read.open_file(&snapshot, "typed.txt").unwrap();
+
+    let snapshot_json = serde_json::to_value(&snapshot).unwrap();
+    let file_json = serde_json::to_value(&file).unwrap();
+
+    let snapshot_object = snapshot_json.as_object().unwrap();
+    let file_object = file_json.as_object().unwrap();
+
+    assert!(!snapshot_object.contains_key("inner"));
+    assert!(!snapshot_json.to_string().contains("root_tree_id"));
+
+    assert!(!file_object.contains_key("inner"));
+    assert!(!file_json.to_string().contains("chunk_ids"));
+    assert!(!file_json.to_string().contains("chunk_lengths"));
+    assert!(!file_json.to_string().contains("shard_ids"));
+    assert!(!file_json.to_string().contains("shard_byte_lengths"));
+}
+
+#[test]
 fn sdk_can_change_password_and_unlock_with_new_password() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

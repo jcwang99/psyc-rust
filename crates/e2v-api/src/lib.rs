@@ -245,15 +245,16 @@ pub struct DirectoryEntryInfo {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SnapshotView {
     pub snapshot_id: String,
     pub layout_generation: u64,
     pub branch_token: Option<String>,
+    #[serde(skip)]
     inner: e2v_core::facade::SnapshotHandle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileView {
     pub snapshot_id: String,
     pub file_object_id: String,
@@ -263,6 +264,7 @@ pub struct FileView {
     pub crypto_suite: String,
     pub key_epoch: u32,
     pub chunker_id: String,
+    #[serde(skip)]
     inner: FileHandle,
 }
 
