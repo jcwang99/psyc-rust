@@ -484,6 +484,36 @@ fn encrypted_disk_cache_full_file_entry_can_serve_later_subrange_reads() {
 }
 
 #[test]
+fn encrypted_disk_cache_file_names_do_not_expose_requested_offsets() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root, snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir.clone())
+            .with_plaintext_memory_cache_budget_bytes(0),
+    )
+    .unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let bytes = vfs.read(&handle, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "lph");
+
+    let cache_file_names = fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        cache_file_names.iter().all(|name| !name.contains("-1-3")),
+        "encrypted cache file names should not expose requested offsets/lengths: {cache_file_names:?}"
+    );
+}
+
+#[test]
 fn prefix_reads_do_not_require_unrelated_later_chunks_to_authenticate() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

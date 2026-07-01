@@ -565,7 +565,17 @@ impl EncryptedRangeCache {
             }
             Err(error) => return Err(error.into()),
         };
-        Ok(Some(self.decrypt_blob(&bytes)?))
+        let (cached_offset, plaintext) = self.decrypt_blob(&bytes)?;
+        if cached_offset != offset || plaintext.len() != length {
+            return self.read_covering_range(
+                snapshot_id,
+                file_object_id,
+                layout_generation,
+                offset,
+                length,
+            );
+        }
+        Ok(Some(plaintext))
     }
 
     fn write_range(
@@ -583,7 +593,7 @@ impl EncryptedRangeCache {
             offset,
             plaintext.len(),
         );
-        let ciphertext = self.encrypt_blob(plaintext)?;
+        let ciphertext = self.encrypt_blob(offset, plaintext)?;
         fs::write(cache_path, ciphertext)?;
         Ok(())
     }
@@ -593,12 +603,11 @@ impl EncryptedRangeCache {
         snapshot_id: &str,
         file_object_id: &str,
         layout_generation: u64,
-        offset: usize,
-        length: usize,
+        _offset: usize,
+        _length: usize,
     ) -> PathBuf {
         let prefix = self.cache_key_prefix(snapshot_id, file_object_id, layout_generation);
-        self.cache_dir
-            .join(format!("{prefix}-{offset}-{length}.bin"))
+        self.cache_dir.join(format!("{prefix}.bin"))
     }
 
     fn cache_key_prefix(
@@ -624,10 +633,7 @@ impl EncryptedRangeCache {
         offset: usize,
         length: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let prefix = format!(
-            "{}-",
-            self.cache_key_prefix(snapshot_id, file_object_id, layout_generation)
-        );
+        let prefix = self.cache_key_prefix(snapshot_id, file_object_id, layout_generation);
         for entry in fs::read_dir(&self.cache_dir)? {
             let path = entry?.path();
             let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
@@ -636,29 +642,18 @@ impl EncryptedRangeCache {
             let Some(encoded) = file_name.strip_suffix(".bin") else {
                 continue;
             };
-            let Some(encoded) = encoded.strip_prefix(&prefix) else {
-                continue;
-            };
-            let mut parts = encoded.split('-');
-            let Some(cached_offset) = parts.next().and_then(|value| value.parse::<usize>().ok())
-            else {
-                continue;
-            };
-            let Some(cached_length) = parts.next().and_then(|value| value.parse::<usize>().ok())
-            else {
-                continue;
-            };
-            if parts.next().is_some() {
-                continue;
-            }
-            let cached_end = cached_offset.saturating_add(cached_length);
-            let requested_end = offset.saturating_add(length);
-            if cached_offset > offset || cached_end < requested_end {
+            if encoded != prefix {
                 continue;
             }
             let bytes = fs::read(&path)?;
-            let plaintext = self.decrypt_blob(&bytes)?;
-            if plaintext.len() != cached_length {
+            let (cached_offset, plaintext) = match self.decrypt_blob(&bytes) {
+                Ok(decoded) => decoded,
+                Err(_) => continue,
+            };
+            let cached_length = plaintext.len();
+            let cached_end = cached_offset.saturating_add(cached_length);
+            let requested_end = offset.saturating_add(length);
+            if cached_offset > offset || cached_end < requested_end {
                 continue;
             }
             let start = offset - cached_offset;
@@ -668,29 +663,42 @@ impl EncryptedRangeCache {
         Ok(None)
     }
 
-    fn encrypt_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt_blob(&self, offset: usize, plaintext: &[u8]) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new((&self.cipher_key).into());
         let mut nonce = [0u8; 24];
         getrandom_fill(&mut nonce)
             .map_err(|_| anyhow::anyhow!("failed to obtain encrypted cache nonce"))?;
+        let offset = u64::try_from(offset)
+            .map_err(|_| anyhow::anyhow!("failed to encode encrypted cache offset"))?;
+        let mut framed_plaintext = offset.to_le_bytes().to_vec();
+        framed_plaintext.extend_from_slice(plaintext);
         let ciphertext = cipher
-            .encrypt(XNonce::from_slice(&nonce), plaintext)
+            .encrypt(XNonce::from_slice(&nonce), framed_plaintext.as_slice())
             .map_err(|_| anyhow::anyhow!("failed to encrypt VFS disk cache entry"))?;
         let mut output = nonce.to_vec();
         output.extend_from_slice(&ciphertext);
         Ok(output)
     }
 
-    fn decrypt_blob(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_blob(&self, bytes: &[u8]) -> Result<(usize, Vec<u8>)> {
         anyhow::ensure!(
             bytes.len() >= 24,
             "encrypted VFS disk cache entry is truncated"
         );
         let (nonce, ciphertext) = bytes.split_at(24);
         let cipher = XChaCha20Poly1305::new((&self.cipher_key).into());
-        cipher
+        let plaintext = cipher
             .decrypt(XNonce::from_slice(nonce), ciphertext)
-            .map_err(|_| anyhow::anyhow!("failed to decrypt VFS disk cache entry"))
+            .map_err(|_| anyhow::anyhow!("failed to decrypt VFS disk cache entry"))?;
+        anyhow::ensure!(
+            plaintext.len() >= std::mem::size_of::<u64>(),
+            "encrypted VFS disk cache entry is truncated"
+        );
+        let mut offset_bytes = [0u8; 8];
+        offset_bytes.copy_from_slice(&plaintext[..8]);
+        let offset = usize::try_from(u64::from_le_bytes(offset_bytes))
+            .map_err(|_| anyhow::anyhow!("encrypted VFS disk cache offset is too large"))?;
+        Ok((offset, plaintext[8..].to_vec()))
     }
 }
 
