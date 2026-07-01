@@ -998,7 +998,7 @@ fn c_abi_smoke_program_compiles_links_and_runs() {
     let compile_script = workspace_root.join("target").join("ffi-smoke-build.cmd");
     fs::write(
         &compile_script,
-        "@echo off\r\ncall \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul\r\ncl /nologo /MD /I crates\\e2v-api\\include crates\\e2v-api\\tests\\ffi_smoke.c /link /OUT:target\\ffi-smoke.exe target\\release\\e2v_api.dll.lib\r\n",
+        "@echo off\r\ncall \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul\r\ncl /nologo /MD /Fo:target\\ffi_smoke.obj /I crates\\e2v-api\\include crates\\e2v-api\\tests\\ffi_smoke.c /link /OUT:target\\ffi-smoke.exe target\\release\\e2v_api.dll.lib\r\n",
     )
     .unwrap();
 
@@ -1014,4 +1014,8 @@ fn c_abi_smoke_program_compiles_links_and_runs() {
         .status()
         .unwrap();
     assert!(run_status.success());
+    assert!(
+        !workspace_root.join("ffi_smoke.obj").exists(),
+        "ffi smoke build should not leave ffi_smoke.obj in the workspace root"
+    );
 }
