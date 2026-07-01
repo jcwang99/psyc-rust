@@ -1,4 +1,6 @@
-use e2v_store::{WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities};
+use e2v_store::{
+    S3RemoteConfig, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
+};
 use std::path::PathBuf;
 
 #[test]
@@ -59,4 +61,44 @@ fn parse_remote_spec_decodes_file_url_into_local_remote() {
     let spec = e2v_sync::RemoteSpec::parse(raw).unwrap();
 
     assert_eq!(spec, e2v_sync::RemoteSpec::LocalFolder(expected));
+}
+
+#[test]
+fn parse_remote_spec_decodes_s3_url_into_remote_config() {
+    let spec = e2v_sync::RemoteSpec::parse(
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1",
+    )
+    .unwrap();
+
+    assert_eq!(
+        spec,
+        e2v_sync::RemoteSpec::S3(S3RemoteConfig {
+            endpoint: "https://s3.example.com".to_string(),
+            bucket: "example-bucket".to_string(),
+            root: "/sync-root".to_string(),
+            region: Some("us-east-1".to_string()),
+            access_key_id: Some("alice".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            session_token: None,
+            disable_config_load: true,
+        })
+    );
+}
+
+#[test]
+fn s3_remote_spec_can_construct_a_remote_backend_boundary() {
+    let spec = e2v_sync::RemoteSpec::parse(
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1",
+    )
+    .unwrap();
+
+    let kind = spec
+        .with_backend(|remote| match remote {
+            e2v_sync::RemoteBackendRef::S3(_) => Ok("s3"),
+            e2v_sync::RemoteBackendRef::LocalFolder(_) => Ok("local"),
+            e2v_sync::RemoteBackendRef::Webdav(_) => Ok("webdav"),
+        })
+        .unwrap();
+
+    assert_eq!(kind, "s3");
 }

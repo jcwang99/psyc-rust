@@ -23,6 +23,7 @@ macro_rules! with_remote_backend {
     ($remote_spec:expr, |$backend:ident| $body:expr) => {
         $remote_spec.with_backend(|remote| match remote {
             e2v_sync::RemoteBackendRef::LocalFolder($backend) => $body,
+            e2v_sync::RemoteBackendRef::S3($backend) => $body,
             e2v_sync::RemoteBackendRef::Webdav($backend) => $body,
         })
     };

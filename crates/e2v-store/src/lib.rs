@@ -18,8 +18,9 @@ pub use logical_object_store::{
 };
 pub use memory_backend::MemoryBackend;
 pub use opendal_backend::{
-    OpendalMemoryBackend, OpendalWebdavBackend, RemoteBackend, S3CompatibleMockBackend,
-    WebdavAlistMockBackend, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
+    OpendalMemoryBackend, OpendalS3Backend, OpendalWebdavBackend, RemoteBackend,
+    S3CompatibleMockBackend, S3RemoteConfig, WebdavAlistMockBackend, WebdavFlavor,
+    WebdavRemoteConfig, WebdavVerifiedCapabilities,
 };
 pub use ref_store::{
     CasResult, EncryptedRef, ListedRef, RefStore, RefToken, RefVersion, StoredRef,

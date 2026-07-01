@@ -2,13 +2,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use e2v_store::{
-    LocalFolderBackend, OpendalWebdavBackend, WebdavFlavor, WebdavRemoteConfig,
-    WebdavVerifiedCapabilities,
+    LocalFolderBackend, OpendalS3Backend, OpendalWebdavBackend, S3RemoteConfig, WebdavFlavor,
+    WebdavRemoteConfig, WebdavVerifiedCapabilities,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteSpec {
     LocalFolder(PathBuf),
+    S3(S3RemoteConfig),
     Webdav(WebdavRemoteConfig),
 }
 
@@ -19,6 +20,9 @@ impl RemoteSpec {
         }
         if value.starts_with("file://") {
             return parse_file_url(value);
+        }
+        if let Some(raw_url) = value.strip_prefix("s3+") {
+            return parse_s3_url(raw_url);
         }
 
         let (flavor, raw_url) = if let Some(url) = value.strip_prefix("webdav+") {
@@ -88,6 +92,10 @@ impl RemoteSpec {
                 let backend = LocalFolderBackend::new(path);
                 handler(RemoteBackendRef::LocalFolder(&backend))
             }
+            Self::S3(config) => {
+                let backend = OpendalS3Backend::new(config.clone())?;
+                handler(RemoteBackendRef::S3(&backend))
+            }
             Self::Webdav(config) => {
                 let backend = OpendalWebdavBackend::new(config.clone())?;
                 handler(RemoteBackendRef::Webdav(&backend))
@@ -98,6 +106,7 @@ impl RemoteSpec {
 
 pub enum RemoteBackendRef<'a> {
     LocalFolder(&'a LocalFolderBackend),
+    S3(&'a OpendalS3Backend),
     Webdav(&'a OpendalWebdavBackend),
 }
 
@@ -113,4 +122,57 @@ fn parse_file_url(raw_url: &str) -> Result<RemoteSpec> {
         .to_file_path()
         .map_err(|_| anyhow::anyhow!("file remote url must be an absolute filesystem path"))?;
     Ok(RemoteSpec::LocalFolder(path))
+}
+
+fn parse_s3_url(raw_url: &str) -> Result<RemoteSpec> {
+    let parsed = url::Url::parse(raw_url)
+        .map_err(|error| anyhow::anyhow!("invalid remote url {raw_url}: {error}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "https" || parsed.scheme() == "http",
+        "unsupported remote url scheme: {}",
+        parsed.scheme()
+    );
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("remote url must include a host"))?;
+    let endpoint = if let Some(port) = parsed.port() {
+        format!("{}://{}:{port}", parsed.scheme(), host)
+    } else {
+        format!("{}://{}", parsed.scheme(), host)
+    };
+    let mut segments = parsed
+        .path_segments()
+        .ok_or_else(|| anyhow::anyhow!("s3 remote url must include a bucket path"))?;
+    let bucket = segments
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("s3 remote url must include a bucket path"))?
+        .to_string();
+    let remainder = segments.collect::<Vec<_>>();
+    let root = if remainder.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", remainder.join("/"))
+    };
+
+    Ok(RemoteSpec::S3(S3RemoteConfig {
+        endpoint,
+        bucket,
+        root,
+        region: parsed
+            .query_pairs()
+            .find(|(key, _)| key == "region")
+            .map(|(_, value)| value.to_string()),
+        access_key_id: if parsed.username().is_empty() {
+            None
+        } else {
+            Some(parsed.username().to_string())
+        },
+        secret_access_key: parsed.password().map(ToString::to_string),
+        session_token: parsed
+            .query_pairs()
+            .find(|(key, _)| key == "session_token")
+            .map(|(_, value)| value.to_string()),
+        disable_config_load: true,
+    }))
 }

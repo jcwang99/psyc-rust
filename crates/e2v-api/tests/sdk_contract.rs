@@ -77,6 +77,19 @@ fn sdk_remote_parse_rejects_unsupported_scheme_with_invalid_argument() {
 }
 
 #[test]
+fn sdk_remote_parse_accepts_s3_remote_specs() {
+    let parsed = parse_remote_spec(
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1",
+    )
+    .unwrap();
+
+    assert_eq!(
+        parsed.as_str(),
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1"
+    );
+}
+
+#[test]
 fn sdk_can_register_default_remote_and_push_fetch_through_it() {
     let temp = tempfile::tempdir().unwrap();
     let source_repo = temp.path().join("source");
@@ -869,4 +882,27 @@ fn sdk_default_remote_workflows_also_support_webdav_specs() {
     let loaded = sdk.load_default_remote(&repo_root).unwrap();
     assert_eq!(loaded.name, "origin");
     assert_eq!(loaded.spec, "webdav+https://alice:secret@example.com/repo");
+}
+
+#[test]
+fn sdk_can_register_s3_remote_specs_as_default_remotes() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec =
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1";
+    sdk.add_remote(&repo_root, "origin", remote_spec).unwrap();
+
+    let loaded = sdk.load_default_remote(&repo_root).unwrap();
+    assert_eq!(loaded.name, "origin");
+    assert_eq!(loaded.spec, remote_spec);
 }

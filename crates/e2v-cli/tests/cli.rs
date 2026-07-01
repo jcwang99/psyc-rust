@@ -1320,3 +1320,47 @@ fn doctor_bundle_redacts_plaintext_repo_and_remote_paths() {
         "bundle summary leaked file remote url: {summary}"
     );
 }
+
+#[test]
+fn doctor_bundle_redacts_s3_remote_credentials() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let bundle_root = temp.path().join("bundle-out");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    e2v_cli::run_cli_for_test([
+        "e2v",
+        "remote",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "add",
+        "origin",
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1",
+    ])
+    .unwrap();
+
+    e2v_cli::run_cli_for_test([
+        "e2v",
+        "doctor",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "--bundle",
+        bundle_root.to_str().unwrap(),
+    ])
+    .unwrap();
+
+    let summary = fs::read_to_string(bundle_root.join("doctor-summary.json")).unwrap();
+    assert!(
+        !summary.contains("alice"),
+        "bundle summary leaked s3 access key id: {summary}"
+    );
+    assert!(
+        !summary.contains("secret"),
+        "bundle summary leaked s3 secret key: {summary}"
+    );
+    assert!(
+        !summary.contains("example-bucket"),
+        "bundle summary leaked s3 bucket name: {summary}"
+    );
+}

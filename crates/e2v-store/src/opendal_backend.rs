@@ -78,6 +78,18 @@ pub struct WebdavVerifiedCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3RemoteConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub root: String,
+    pub region: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub disable_config_load: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebdavRemoteConfig {
     pub flavor: WebdavFlavor,
     pub endpoint: String,
@@ -94,6 +106,62 @@ pub struct OpendalWebdavBackend {
     operator: opendal::blocking::Operator,
     capability: BackendCapability,
     flavor: WebdavFlavor,
+}
+
+#[derive(Clone)]
+pub struct OpendalS3Backend {
+    operator: opendal::blocking::Operator,
+    capability: BackendCapability,
+}
+
+impl OpendalS3Backend {
+    pub fn new(config: S3RemoteConfig) -> Result<Self> {
+        anyhow::ensure!(!config.endpoint.trim().is_empty(), "s3 endpoint must not be empty");
+        anyhow::ensure!(!config.bucket.trim().is_empty(), "s3 bucket must not be empty");
+        anyhow::ensure!(!config.root.trim().is_empty(), "s3 root must not be empty");
+
+        let _guard = OPENDAL_RUNTIME.enter();
+        let mut builder = opendal::services::S3::default()
+            .endpoint(&config.endpoint)
+            .bucket(&config.bucket)
+            .root(&config.root);
+
+        if let Some(region) = &config.region {
+            builder = builder.region(region);
+        }
+        if let Some(access_key_id) = &config.access_key_id {
+            builder = builder.access_key_id(access_key_id);
+        }
+        if let Some(secret_access_key) = &config.secret_access_key {
+            builder = builder.secret_access_key(secret_access_key);
+        }
+        if let Some(session_token) = &config.session_token {
+            builder = builder.session_token(session_token);
+        }
+        if config.disable_config_load {
+            builder = builder.disable_config_load();
+        }
+
+        let operator = opendal::blocking::Operator::new(opendal::Operator::new(builder)?.finish())?;
+
+        Ok(Self {
+            operator,
+            capability: BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: false,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: false,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: false,
+                supports_reliable_remote_time: false,
+                supports_object_generation_or_etag: false,
+                supports_layout_root_cas: false,
+                supports_oblivious_access_schedule: false,
+            },
+        })
+    }
 }
 
 impl OpendalWebdavBackend {
@@ -783,6 +851,204 @@ impl RemoteBackend for WebdavAlistMockBackend {
 }
 
 impl RemoteBackend for OpendalMemoryBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+impl BlobStore for OpendalS3Backend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+        self.operator.write(relative_path, bytes.to_vec())?;
+        Ok(())
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+        let opts = opendal::options::WriteOptions {
+            if_not_exists: true,
+            ..Default::default()
+        };
+        match self
+            .operator
+            .write_options(relative_path, bytes.to_vec(), opts)
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+        Ok(self.operator.read(relative_path)?.to_vec())
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self.get_physical(relative_path)?;
+        anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
+        let end = offset.saturating_add(length).min(bytes.len());
+        Ok(bytes[offset..end].to_vec())
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> Result<()> {
+        if self.exists_physical(relative_path) {
+            self.operator.delete(relative_path)?;
+        }
+        Ok(())
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.operator.exists(relative_path).unwrap_or(false)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+        let metadata = self.operator.stat(relative_path)?;
+        Ok(ObjectStat {
+            length: metadata.content_length(),
+            modified_at: metadata.last_modified().map(Into::into),
+        })
+    }
+
+    fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut listed = self
+            .operator
+            .list(prefix)?
+            .into_iter()
+            .filter_map(|entry: opendal::Entry| {
+                let path = entry.path().to_string();
+                if path == prefix || path.ends_with('/') {
+                    None
+                } else {
+                    Some(path)
+                }
+            })
+            .collect::<Vec<_>>();
+        listed.sort();
+        Ok(listed)
+    }
+}
+
+impl RefStore for OpendalS3Backend {
+    fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+        token.validate()?;
+        let path = OpendalMemoryBackend::ref_path(token);
+        if !self.exists_physical(&path) {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&self.get_physical(&path)?)?))
+    }
+
+    fn list_refs(&self) -> Result<Vec<ListedRef>> {
+        let mut listed = self
+            .list_physical("control/refs/by-token/")?
+            .into_iter()
+            .filter_map(|path| {
+                let token = path
+                    .strip_prefix("control/refs/by-token/")?
+                    .strip_suffix(".json")?
+                    .to_string();
+                Some((path, token))
+            })
+            .map(|(path, token)| -> Result<ListedRef> {
+                Ok(ListedRef {
+                    token: RefToken::new(token),
+                    stored: serde_json::from_slice(&self.get_physical(&path)?)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        listed.sort_by(|left, right| left.token.value.cmp(&right.token.value));
+        Ok(listed)
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> Result<CasResult> {
+        token.validate()?;
+        let current = self.read_ref(token)?;
+        let matches = match (&current, expected) {
+            (None, None) => true,
+            (Some(stored), Some(expected_version)) => stored.version == expected_version,
+            _ => false,
+        };
+        if !matches {
+            return Ok(CasResult {
+                applied: false,
+                current,
+            });
+        }
+
+        let stored = StoredRef {
+            version: RefVersion {
+                value: current
+                    .as_ref()
+                    .map(|existing| existing.version.value + 1)
+                    .unwrap_or(1),
+            },
+            value: next,
+        };
+        self.put_physical(
+            &OpendalMemoryBackend::ref_path(token),
+            &serde_json::to_vec_pretty(&stored)?,
+        )?;
+        Ok(CasResult {
+            applied: true,
+            current: Some(stored),
+        })
+    }
+}
+
+impl LayoutRootStore for OpendalS3Backend {
+    fn read_layout_root(&self) -> Result<LayoutRoot> {
+        if !self.exists_physical("layout_root.json") {
+            return Ok(OpendalMemoryBackend::default_layout_root());
+        }
+        Ok(serde_json::from_slice(
+            &self.get_physical("layout_root.json")?,
+        )?)
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: LayoutRootVersion,
+        next: LayoutRoot,
+    ) -> Result<CasResult> {
+        let current = self.read_layout_root()?;
+        if current.generation != expected {
+            return Ok(CasResult {
+                applied: false,
+                current: None,
+            });
+        }
+
+        let bytes = serde_json::to_vec_pretty(&next)?;
+        self.put_physical("layout_root.json", &bytes)?;
+        self.put_physical(&OpendalMemoryBackend::layout_history_path(next.generation), &bytes)?;
+        Ok(CasResult {
+            applied: true,
+            current: None,
+        })
+    }
+
+    fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
+        let retained_paths = self.list_physical("control/layout-roots/")?;
+        if retained_paths.is_empty() {
+            return Ok(vec![self.read_layout_root()?]);
+        }
+
+        retained_paths
+            .into_iter()
+            .map(|path| serde_json::from_slice(&self.get_physical(&path)?).map_err(Into::into))
+            .collect()
+    }
+}
+
+impl RemoteBackend for OpendalS3Backend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }

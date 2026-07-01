@@ -524,6 +524,7 @@ fn parse_grace_period_days(value: &str) -> Result<u64> {
 fn remote_capability<'a>(remote: &'a RemoteBackendRef<'a>) -> &'a BackendCapability {
     match remote {
         RemoteBackendRef::LocalFolder(remote) => remote.capability(),
+        RemoteBackendRef::S3(remote) => remote.capability(),
         RemoteBackendRef::Webdav(remote) => remote.capability(),
     }
 }
@@ -531,6 +532,7 @@ fn remote_capability<'a>(remote: &'a RemoteBackendRef<'a>) -> &'a BackendCapabil
 fn remote_kind_label(remote: &RemoteBackendRef<'_>) -> &'static str {
     match remote {
         RemoteBackendRef::LocalFolder(_) => "local-folder",
+        RemoteBackendRef::S3(_) => "s3",
         RemoteBackendRef::Webdav(_) => "webdav",
     }
 }
