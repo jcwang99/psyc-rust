@@ -1,5 +1,6 @@
 use e2v_store::{
-    S3RemoteConfig, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
+    RemoteBackend, S3RemoteConfig, WebdavFlavor, WebdavRemoteConfig,
+    WebdavVerifiedCapabilities, WriterMode,
 };
 use std::path::PathBuf;
 
@@ -101,4 +102,42 @@ fn s3_remote_spec_can_construct_a_remote_backend_boundary() {
         .unwrap();
 
     assert_eq!(kind, "s3");
+}
+
+#[test]
+fn s3_remote_spec_exposes_safe_single_writer_push_capability() {
+    let spec = e2v_sync::RemoteSpec::parse(
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1",
+    )
+    .unwrap();
+
+    let writer_mode = spec
+        .with_backend(|remote| match remote {
+            e2v_sync::RemoteBackendRef::S3(remote) => Ok(remote.capability().push_write_mode()),
+            _ => unreachable!("expected s3 remote backend"),
+        })
+        .unwrap();
+
+    assert_eq!(writer_mode, WriterMode::SingleWriter);
+}
+
+#[test]
+fn s3_remote_spec_constructs_backend_with_transaction_safety_capabilities() {
+    let spec = e2v_sync::RemoteSpec::parse(
+        "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1",
+    )
+    .unwrap();
+
+    let capability = spec
+        .with_backend(|remote| match remote {
+            e2v_sync::RemoteBackendRef::S3(remote) => Ok(remote.capability().clone()),
+            _ => unreachable!("expected s3 remote backend"),
+        })
+        .unwrap();
+
+    assert!(capability.supports_remote_lock_or_lease);
+    assert!(capability.supports_transaction_markers);
+    assert!(capability.supports_reliable_remote_time);
+    assert!(capability.supports_object_generation_or_etag);
+    assert!(capability.supports_layout_root_cas);
 }
