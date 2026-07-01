@@ -189,7 +189,7 @@ impl MountRequest {
 pub struct OpenedFile {
     inode_id: u64,
     logical_path: String,
-    plaintext_cache: Arc<Mutex<Option<Vec<u8>>>>,
+    plaintext_cache: Arc<Mutex<Option<CachedRange>>>,
     file: FileHandle,
 }
 
@@ -221,6 +221,12 @@ pub struct ReadOnlyVfs {
 
 type PlaintextCacheKey = (String, String, u64);
 type PlaintextCache = HashMap<PlaintextCacheKey, Vec<u8>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedRange {
+    offset: usize,
+    bytes: Vec<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountLaunchSummary {
@@ -355,10 +361,8 @@ impl ReadOnlyVfs {
             opened_file.layout_generation(),
         );
 
-        if let Some(cached) = opened_file.plaintext_cache.lock().unwrap().as_ref() {
-            let start = offset.min(cached.len());
-            let end = offset.saturating_add(length).min(cached.len());
-            return Ok(cached[start..end].to_vec());
+        if let Some(cached) = opened_file.cached_range_bytes(offset, length) {
+            return Ok(cached);
         }
 
         if let Some(cached) = self
@@ -370,7 +374,10 @@ impl ReadOnlyVfs {
         {
             let start = offset.min(cached.len());
             let end = offset.saturating_add(length).min(cached.len());
-            *opened_file.plaintext_cache.lock().unwrap() = Some(cached.clone());
+            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
+                offset: 0,
+                bytes: cached.clone(),
+            });
             return Ok(cached[start..end].to_vec());
         }
 
@@ -383,6 +390,10 @@ impl ReadOnlyVfs {
                 length,
             )?
         {
+            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
+                offset,
+                bytes: cached.clone(),
+            });
             return Ok(cached);
         }
 
@@ -400,7 +411,10 @@ impl ReadOnlyVfs {
         }
         let file_size = opened_file.file.file_size() as usize;
         if offset == 0 && offset.saturating_add(bytes.len()) >= file_size {
-            *opened_file.plaintext_cache.lock().unwrap() = Some(bytes.clone());
+            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
+                offset: 0,
+                bytes: bytes.clone(),
+            });
             self.plaintext_cache
                 .lock()
                 .unwrap()
@@ -413,7 +427,15 @@ impl ReadOnlyVfs {
                 .lock()
                 .unwrap()
                 .insert(cache_key, full.clone());
-            *opened_file.plaintext_cache.lock().unwrap() = Some(full);
+            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
+                offset: 0,
+                bytes: full,
+            });
+        } else {
+            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
+                offset,
+                bytes: bytes.clone(),
+            });
         }
         Ok(bytes)
     }
@@ -565,6 +587,19 @@ impl EncryptedRangeCache {
 }
 
 impl OpenedFile {
+    fn cached_range_bytes(&self, offset: usize, length: usize) -> Option<Vec<u8>> {
+        let cached = self.plaintext_cache.lock().unwrap();
+        let cached = cached.as_ref()?;
+        let cache_end = cached.offset.saturating_add(cached.bytes.len());
+        let request_end = offset.saturating_add(length);
+        if offset < cached.offset || request_end > cache_end {
+            return None;
+        }
+        let start = offset - cached.offset;
+        let end = start + length;
+        Some(cached.bytes[start..end].to_vec())
+    }
+
     pub fn snapshot_id(&self) -> &str {
         &self.file.snapshot_id
     }
@@ -586,7 +621,11 @@ impl OpenedFile {
     }
 
     pub fn cached_plaintext_for_test(&self) -> Option<Vec<u8>> {
-        self.plaintext_cache.lock().unwrap().clone()
+        self.plaintext_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cached| cached.bytes.clone())
     }
 }
 

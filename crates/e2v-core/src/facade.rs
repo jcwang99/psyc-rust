@@ -135,8 +135,11 @@ pub struct FileHandle {
     pub snapshot_id: String,
     pub file_object_id: String,
     file_size: u64,
+    chunk_count: usize,
     chunk_ids: Vec<String>,
     chunk_lengths: Vec<u64>,
+    shard_ids: Vec<String>,
+    shard_byte_lengths: Vec<u64>,
     layout_generation: u64,
     crypto_suite: String,
     key_epoch: u32,
@@ -145,7 +148,7 @@ pub struct FileHandle {
 
 impl FileHandle {
     pub fn chunk_count(&self) -> usize {
-        self.chunk_ids.len()
+        self.chunk_count
     }
 
     pub fn file_size(&self) -> u64 {
@@ -175,6 +178,7 @@ impl FileHandle {
     pub fn debug_chunk_lengths(&self) -> &[u64] {
         &self.chunk_lengths
     }
+
 }
 
 #[derive(Debug, Clone)]
@@ -325,9 +329,11 @@ struct FileObject {
     pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
+    pub chunk_count: u64,
     pub chunks: Vec<String>,
     pub chunk_lengths: Vec<u64>,
     pub shard_ids: Vec<String>,
+    pub shard_byte_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1568,14 +1574,17 @@ impl ReadService {
         let entry = entry.with_context(|| format!("file not found in snapshot: {path}"))?;
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let object_store = open_object_store(&control_dir)?;
-        let file = read_file_object_flattened(&object_store, &entry.object_id)?;
+        let file = read_file_object(&object_store, &entry.object_id)?;
 
         Ok(FileHandle {
             snapshot_id: snapshot.snapshot_id.clone(),
             file_object_id: entry.object_id,
             file_size: file.file_size,
+            chunk_count: file.chunk_count as usize,
             chunk_ids: file.chunks,
             chunk_lengths: file.chunk_lengths,
+            shard_ids: file.shard_ids,
+            shard_byte_lengths: file.shard_byte_lengths,
             layout_generation: snapshot.layout_generation,
             crypto_suite: "xchacha20poly1305".to_string(),
             key_epoch: DEFAULT_ACTIVE_EPOCH,
@@ -1595,66 +1604,74 @@ impl ReadService {
         if offset == end {
             return Ok(Vec::new());
         }
-        ensure!(!file.chunk_ids.is_empty(), "file has no chunks");
-        ensure!(
-            file.chunk_ids.len() == file.chunk_lengths.len(),
-            "file chunk metadata is inconsistent"
-        );
-
         let mut output = Vec::with_capacity(end - offset);
         let mut chunk_start = 0usize;
-        for (chunk_id, chunk_length) in file.chunk_ids.iter().zip(file.chunk_lengths.iter()) {
-            if output.len() >= end - offset {
-                break;
-            }
-
-            let chunk_len: usize = (*chunk_length)
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("chunk length does not fit in usize"))?;
-            let chunk_end = chunk_start.saturating_add(chunk_len);
-            if chunk_end <= offset {
-                chunk_start = chunk_end;
-                continue;
-            }
-            if chunk_start >= end {
-                break;
-            }
-
-            let chunk = if object_store.exists_object(chunk_id) {
-                read_chunk_object(&object_store, chunk_id)?
-            } else {
-                let fallback_bytes =
-                    crate::sync_support::read_cached_pack_object_bytes(&self.repo_root, chunk_id)
-                        .map_err(|_| {
-                            anyhow::anyhow!(
-                                "stale-layout fallback unavailable for missing chunk {chunk_id} at layout generation {}",
-                                file.layout_generation
-                            )
-                        })?;
-                let fallback_plaintext = crate::sync_support::decode_object_bytes_for_sync(
-                    &self.repo_root,
-                    chunk_id,
-                    "chunk",
-                    &fallback_bytes,
-                )
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "stale-layout fallback unavailable for missing chunk {chunk_id} at layout generation {}",
-                        file.layout_generation
-                    )
-                })?;
-                let chunk: ChunkObject = postcard_from_bytes(&fallback_plaintext)
-                    .context("failed to decode object plaintext")?;
-                chunk
-            };
+        if !file.chunk_ids.is_empty() {
             ensure!(
-                chunk.data.len() == chunk_len,
-                "file chunk metadata does not match chunk payload length"
+                file.chunk_ids.len() == file.chunk_lengths.len(),
+                "file chunk metadata is inconsistent"
             );
-            let slice_start = offset.saturating_sub(chunk_start);
-            let slice_end = (end - chunk_start).min(chunk_len);
-            output.extend_from_slice(&chunk.data[slice_start..slice_end]);
-            chunk_start = chunk_end;
+            let mut chunk_read_context = ChunkReadContext {
+                output: &mut output,
+                object_store: &object_store,
+                repo_root: &self.repo_root,
+                file,
+                offset,
+                end,
+                chunk_start: &mut chunk_start,
+            };
+            append_requested_bytes_from_chunks(
+                &mut chunk_read_context,
+                &file.chunk_ids,
+                &file.chunk_lengths,
+            )?;
+        } else {
+            ensure!(!file.shard_ids.is_empty(), "file has no chunks");
+            ensure!(
+                file.shard_ids.len() == file.shard_byte_lengths.len(),
+                "file shard metadata is inconsistent"
+            );
+            let mut shard_byte_start = 0usize;
+            for (shard_id, shard_byte_length) in
+                file.shard_ids.iter().zip(file.shard_byte_lengths.iter())
+            {
+                let shard_len: usize = (*shard_byte_length)
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("file shard length does not fit in usize"))?;
+                let shard_byte_end = shard_byte_start.saturating_add(shard_len);
+                if output.len() >= end - offset {
+                    break;
+                }
+                if shard_byte_end <= offset {
+                    chunk_start = shard_byte_end;
+                    shard_byte_start = shard_byte_end;
+                    continue;
+                }
+                if shard_byte_start >= end {
+                    break;
+                }
+                let shard: FileShardObject = read_stored_object(&object_store, shard_id, "file_shard")?;
+                validate_manifest_schema_version_local("file_shard", shard.schema_version)?;
+                ensure!(
+                    shard.chunks.len() == shard.chunk_lengths.len(),
+                    "file shard metadata is inconsistent"
+                );
+                let mut chunk_read_context = ChunkReadContext {
+                    output: &mut output,
+                    object_store: &object_store,
+                    repo_root: &self.repo_root,
+                    file,
+                    offset,
+                    end,
+                    chunk_start: &mut chunk_start,
+                };
+                append_requested_bytes_from_chunks(
+                    &mut chunk_read_context,
+                    &shard.chunks,
+                    &shard.chunk_lengths,
+                )?;
+                shard_byte_start = shard_byte_end;
+            }
         }
 
         ensure!(
@@ -2655,9 +2672,11 @@ where
         chunk_lengths.push(piece_len as u64);
     }
 
-    let (inline_chunk_ids, inline_chunk_lengths, shard_ids) =
+    let total_chunk_count = chunk_ids.len() as u64;
+    let (inline_chunk_ids, inline_chunk_lengths, shard_ids, shard_byte_lengths) =
         if chunk_ids.len() > max_file_chunks_per_object() {
             let mut shard_ids = Vec::new();
+            let mut shard_byte_lengths = Vec::new();
             let mut start = 0usize;
             while start < chunk_ids.len() {
                 let end = (start + max_file_chunks_per_object()).min(chunk_ids.len());
@@ -2666,12 +2685,13 @@ where
                     chunks: chunk_ids[start..end].to_vec(),
                     chunk_lengths: chunk_lengths[start..end].to_vec(),
                 };
+                shard_byte_lengths.push(chunk_lengths[start..end].iter().sum());
                 shard_ids.push(write_object(object_store, "file_shard", &shard)?);
                 start = end;
             }
-            (Vec::new(), Vec::new(), shard_ids)
+            (Vec::new(), Vec::new(), shard_ids, shard_byte_lengths)
         } else {
-            (chunk_ids, chunk_lengths, Vec::new())
+            (chunk_ids, chunk_lengths, Vec::new(), Vec::new())
         };
 
     let file_object = FileObject {
@@ -2681,9 +2701,11 @@ where
         modified_unix_ms,
         chunker_id: chunker.id().to_string(),
         chunker_config_id: chunker.config_fingerprint().to_string(),
+        chunk_count: total_chunk_count,
         chunks: inline_chunk_ids,
         chunk_lengths: inline_chunk_lengths,
         shard_ids,
+        shard_byte_lengths,
     };
     let file_id = write_object(object_store, "file", &file_object)?;
     *committed_files += 1;
@@ -2817,38 +2839,83 @@ fn read_tree_object(object_store: &DirectLayoutObjectStore, object_id: &str) -> 
     Ok(tree)
 }
 
-#[cfg(test)]
 fn read_file_object(object_store: &DirectLayoutObjectStore, object_id: &str) -> Result<FileObject> {
     let file: FileObject = read_stored_object(object_store, object_id, "file")?;
-    validate_manifest_schema_version("file", file.schema_version)?;
+    validate_manifest_schema_version_local("file", file.schema_version)?;
     Ok(file)
 }
 
-fn read_file_object_flattened(
-    object_store: &DirectLayoutObjectStore,
-    object_id: &str,
-) -> Result<FileObject> {
-    let mut file: FileObject = read_stored_object(object_store, object_id, "file")?;
-    validate_manifest_schema_version_local("file", file.schema_version)?;
-    if file.shard_ids.is_empty() {
-        return Ok(file);
-    }
+struct ChunkReadContext<'a> {
+    output: &'a mut Vec<u8>,
+    object_store: &'a DirectLayoutObjectStore,
+    repo_root: &'a Path,
+    file: &'a FileHandle,
+    offset: usize,
+    end: usize,
+    chunk_start: &'a mut usize,
+}
 
-    let mut chunk_ids = Vec::new();
-    let mut chunk_lengths = Vec::new();
-    for shard_id in &file.shard_ids {
-        let shard: FileShardObject = read_stored_object(object_store, shard_id, "file_shard")?;
-        validate_manifest_schema_version_local("file_shard", shard.schema_version)?;
+fn append_requested_bytes_from_chunks(
+    context: &mut ChunkReadContext<'_>,
+    chunk_ids: &[String],
+    chunk_lengths: &[u64],
+) -> Result<()> {
+    for (chunk_id, chunk_length) in chunk_ids.iter().zip(chunk_lengths.iter()) {
+        if context.output.len() >= context.end - context.offset {
+            break;
+        }
+
+        let chunk_len: usize = (*chunk_length)
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("chunk length does not fit in usize"))?;
+        let chunk_end = context.chunk_start.saturating_add(chunk_len);
+        if chunk_end <= context.offset {
+            *context.chunk_start = chunk_end;
+            continue;
+        }
+        if *context.chunk_start >= context.end {
+            break;
+        }
+
+        let chunk = if context.object_store.exists_object(chunk_id) {
+            read_chunk_object(context.object_store, chunk_id)?
+        } else {
+            let fallback_bytes =
+                crate::sync_support::read_cached_pack_object_bytes(context.repo_root, chunk_id)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "stale-layout fallback unavailable for missing chunk {chunk_id} at layout generation {}",
+                            context.file.layout_generation
+                        )
+                    })?;
+            let fallback_plaintext = crate::sync_support::decode_object_bytes_for_sync(
+                context.repo_root,
+                chunk_id,
+                "chunk",
+                &fallback_bytes,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "stale-layout fallback unavailable for missing chunk {chunk_id} at layout generation {}",
+                    context.file.layout_generation
+                )
+            })?;
+            let chunk: ChunkObject = postcard_from_bytes(&fallback_plaintext)
+                .context("failed to decode object plaintext")?;
+            chunk
+        };
         ensure!(
-            shard.chunks.len() == shard.chunk_lengths.len(),
-            "file shard metadata is inconsistent"
+            chunk.data.len() == chunk_len,
+            "file chunk metadata does not match chunk payload length"
         );
-        chunk_ids.extend(shard.chunks);
-        chunk_lengths.extend(shard.chunk_lengths);
+        let slice_start = context.offset.saturating_sub(*context.chunk_start);
+        let slice_end = (context.end - *context.chunk_start).min(chunk_len);
+        context
+            .output
+            .extend_from_slice(&chunk.data[slice_start..slice_end]);
+        *context.chunk_start = chunk_end;
     }
-    file.chunks = chunk_ids;
-    file.chunk_lengths = chunk_lengths;
-    Ok(file)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3165,9 +3232,11 @@ mod facade_tests {
                 modified_unix_ms: 1,
                 chunker_id: "fastcdc".to_string(),
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
+                chunk_count: 0,
                 chunks: vec![],
                 chunk_lengths: vec![],
                 shard_ids: vec![],
+                shard_byte_lengths: vec![],
             },
         )
         .unwrap();
@@ -3763,9 +3832,11 @@ mod facade_tests {
                 modified_unix_ms: 1,
                 chunker_id: "fastcdc".to_string(),
                 chunker_config_id: "fastcdc-64k-1m-8m".to_string(),
+                chunk_count: 1,
                 chunks: vec![chunk_id],
                 chunk_lengths: vec![5],
                 shard_ids: vec![],
+                shard_byte_lengths: vec![],
             },
         )
         .unwrap();
@@ -4035,8 +4106,11 @@ mod facade_tests {
             snapshot_id: "snapshot".to_string(),
             file_object_id: "file".to_string(),
             file_size,
+            chunk_count: 0,
             chunk_ids: Vec::new(),
             chunk_lengths: Vec::new(),
+            shard_ids: Vec::new(),
+            shard_byte_lengths: Vec::new(),
             layout_generation: 1,
             crypto_suite: "xchacha20poly1305".to_string(),
             key_epoch: DEFAULT_ACTIVE_EPOCH,

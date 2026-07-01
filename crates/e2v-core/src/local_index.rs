@@ -223,7 +223,7 @@ fn load_snapshot_file_rows(
             .rsplit_once('.')
             .map(|(_, ext)| ext.to_lowercase());
         let file = read_service.open_file(&snapshot, &path)?;
-        let manifest_file = store.get_file(&file.file_object_id)?;
+        let manifest_file = store.get_file_metadata(&file.file_object_id)?;
         rows.insert(
             path.clone(),
             IndexedFileRow {

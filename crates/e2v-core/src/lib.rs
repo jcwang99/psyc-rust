@@ -295,10 +295,11 @@ pub mod sync_support {
         associated_data.extend_from_slice(object_type.as_bytes());
         associated_data.extend_from_slice(stored_object_id.as_bytes());
         associated_data.extend_from_slice(CRYPTO_SUITE.as_bytes());
-        associated_data.extend_from_slice(&secrets.active_epoch.to_le_bytes());
+        associated_data.extend_from_slice(&key_epoch.to_le_bytes());
         associated_data.extend_from_slice(padding_policy.as_bytes());
 
-        let cipher = XChaCha20Poly1305::new((&secrets.repo_manifest_enc_key).into());
+        let epoch_keys = secrets.epoch_keys(key_epoch)?;
+        let cipher = XChaCha20Poly1305::new((&epoch_keys.manifest_enc_key).into());
         let mut plaintext = ciphertext;
         cipher
             .decrypt_in_place_detached(

@@ -123,9 +123,11 @@ struct RemoteFileObject {
     modified_unix_ms: u64,
     chunker_id: String,
     chunker_config_id: String,
+    chunk_count: u64,
     chunks: Vec<String>,
     chunk_lengths: Vec<u64>,
     shard_ids: Vec<String>,
+    shard_byte_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

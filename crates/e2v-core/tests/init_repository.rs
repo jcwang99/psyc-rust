@@ -3092,6 +3092,124 @@ fn read_range_only_requires_chunks_covering_the_requested_suffix() {
 }
 
 #[test]
+fn read_range_prefix_does_not_require_unrelated_later_file_shard_metadata() {
+    let _guard = e2v_core::testing::override_max_file_chunks_per_object_for_test(2);
+    let _chunk_guard = e2v_core::testing::override_fixed_span_bytes_for_test(1024 * 1024);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let mut content = Vec::with_capacity(9_000_000);
+    for index in 0..9_000_000usize {
+        content.push((index % 251) as u8);
+    }
+    fs::write(repo_root.join("large.bin"), &content).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "prefix-file-shard-range".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot_manifest = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let tree = manifest_store
+        .get_tree_node(&snapshot_manifest.root_tree_id)
+        .unwrap();
+    let file_entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "large.bin" && entry.kind == "file")
+        .unwrap();
+    let file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    assert!(
+        file_manifest.shard_ids.len() >= 2,
+        "expected multiple file_shard objects, got {}",
+        file_manifest.shard_ids.len()
+    );
+
+    let later_shard_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", file_manifest.shard_ids.last().unwrap()));
+    let mut bytes = fs::read(&later_shard_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&later_shard_path, bytes).unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.bin").unwrap();
+    let prefix = read_service.read_range(&file, 0, 16).unwrap();
+
+    assert_eq!(prefix, content[..16].to_vec());
+}
+
+#[test]
+fn read_range_suffix_does_not_require_unrelated_earlier_file_shard_metadata() {
+    let _guard = e2v_core::testing::override_max_file_chunks_per_object_for_test(2);
+    let _chunk_guard = e2v_core::testing::override_fixed_span_bytes_for_test(1024 * 1024);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let mut content = Vec::with_capacity(9_000_000);
+    for index in 0..9_000_000usize {
+        content.push((index % 251) as u8);
+    }
+    fs::write(repo_root.join("large.bin"), &content).unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "suffix-file-shard-range".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot_manifest = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let tree = manifest_store
+        .get_tree_node(&snapshot_manifest.root_tree_id)
+        .unwrap();
+    let file_entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "large.bin" && entry.kind == "file")
+        .unwrap();
+    let file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    assert!(
+        file_manifest.shard_ids.len() >= 2,
+        "expected multiple file_shard objects, got {}",
+        file_manifest.shard_ids.len()
+    );
+
+    let first_shard_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", file_manifest.shard_ids.first().unwrap()));
+    let mut bytes = fs::read(&first_shard_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&first_shard_path, bytes).unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "large.bin").unwrap();
+    let suffix_len = 64usize;
+    let suffix_offset = content.len() - suffix_len;
+    let suffix = read_service
+        .read_range(&file, suffix_offset, suffix_len)
+        .unwrap();
+
+    assert_eq!(suffix, content[suffix_offset..].to_vec());
+}
+
+#[test]
 fn read_range_rejects_authenticated_file_graph_with_incomplete_chunk_coverage() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -3667,6 +3785,72 @@ fn metadata_search_filters_by_size_bounds() {
 }
 
 #[test]
+fn metadata_search_does_not_require_unrelated_later_file_shard_metadata() {
+    let _guard = e2v_core::testing::override_max_file_chunks_per_object_for_test(2);
+    let _chunk_guard = e2v_core::testing::override_fixed_span_bytes_for_test(1024 * 1024);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let mut content = Vec::with_capacity(9_000_000);
+    for index in 0..9_000_000usize {
+        content.push((index % 251) as u8);
+    }
+    fs::write(repo_root.join("large.bin"), &content).unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "metadata-file-shard-index".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let snapshot_manifest = manifest_store.get_snapshot(&commit.snapshot_id).unwrap();
+    let tree = manifest_store
+        .get_tree_node(&snapshot_manifest.root_tree_id)
+        .unwrap();
+    let file_entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.name == "large.bin" && entry.kind == "file")
+        .unwrap();
+    let file_manifest = manifest_store.get_file(&file_entry.object_id).unwrap();
+    assert!(
+        file_manifest.shard_ids.len() >= 2,
+        "expected multiple file_shard objects, got {}",
+        file_manifest.shard_ids.len()
+    );
+
+    let later_shard_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", file_manifest.shard_ids.last().unwrap()));
+    let mut bytes = fs::read(&later_shard_path).unwrap();
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0x01;
+    fs::write(&later_shard_path, bytes).unwrap();
+
+    let results = facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: Some("bin".to_string()),
+                path_prefix: Some("large.bin".to_string()),
+                min_size: None,
+                max_size: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, "large.bin");
+    assert_eq!(results[0].size_bytes, content.len() as u64);
+}
+
+#[test]
 fn filename_search_finds_visible_files_and_refreshes_after_commit_and_branch_checkout() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -4060,6 +4244,41 @@ fn rotated_active_epoch_keeps_old_snapshot_readable() {
     let bytes = read_service.read_range(&file, 0, 64).unwrap();
 
     assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+}
+
+#[test]
+fn sync_support_decode_object_bytes_accepts_objects_from_previous_epoch() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let snapshot_bytes =
+        e2v_core::sync_support::read_local_object_bytes(&repo_root, &first_commit.snapshot_id)
+            .unwrap();
+    let decoded = e2v_core::sync_support::decode_object_bytes_for_sync(
+        &repo_root,
+        &first_commit.snapshot_id,
+        "snapshot",
+        &snapshot_bytes,
+    )
+    .unwrap();
+    let snapshot: ManifestSnapshotObject = postcard::from_bytes(&decoded).unwrap();
+
+    assert_eq!(snapshot.message, "first");
 }
 
 #[test]

@@ -1029,6 +1029,117 @@ impl e2v_store::RemoteBackend for FailOnceOnDeleteBackend {
     }
 }
 
+#[derive(Clone, Debug)]
+struct RangeReadTrackingBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    range_read_paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RangeReadTrackingBackend {
+    fn new(inner: MemoryBackend) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            range_read_paths: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn range_read_paths(&self) -> Vec<String> {
+        self.range_read_paths.lock().unwrap().clone()
+    }
+
+    fn reset_range_reads(&self) {
+        self.range_read_paths.lock().unwrap().clear();
+    }
+}
+
+impl BlobStore for RangeReadTrackingBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.range_read_paths
+            .lock()
+            .unwrap()
+            .push(relative_path.to_string());
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for RangeReadTrackingBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for RangeReadTrackingBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for RangeReadTrackingBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
 #[test]
 fn gc_execute_rejects_weak_backend_capabilities() {
     let temp = tempdir().unwrap();
@@ -1957,5 +2068,91 @@ fn verify_remote_rejects_remote_layout_generation_rollback_below_local_high_wate
         error.to_string().contains("CRITICAL_ROLLBACK_DETECTED")
             || error.to_string().contains("critical rollback detected"),
         "expected rollback detection error, got: {error:#}"
+    );
+}
+
+#[test]
+fn verify_remote_reuses_cached_pack_data_across_repeated_runs() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            repo_root.join(format!("packed-{index:02}.txt")),
+            format!("packed-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "packed-seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-maintenance-pack-cache".to_string(),
+        },
+    )
+    .unwrap();
+
+    let tracked_remote = RangeReadTrackingBackend::new(remote);
+    let first = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    assert!(first.sampled_objects > 0);
+
+    let first_range_reads = tracked_remote
+        .range_read_paths()
+        .into_iter()
+        .filter(|path| path.starts_with("packs/data/"))
+        .collect::<Vec<_>>();
+    assert!(
+        !first_range_reads.is_empty(),
+        "expected first verify_remote run to fetch packed data from remote"
+    );
+
+    tracked_remote.reset_range_reads();
+
+    let second = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    assert_eq!(second.sampled_objects, first.sampled_objects);
+
+    let second_range_reads = tracked_remote
+        .range_read_paths()
+        .into_iter()
+        .filter(|path| path.starts_with("packs/data/"))
+        .collect::<Vec<_>>();
+    assert!(
+        second_range_reads.is_empty(),
+        "expected second verify_remote run to reuse local pack-data cache, saw remote range reads: {:?}",
+        second_range_reads
     );
 }

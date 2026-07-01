@@ -4482,6 +4482,72 @@ fn push_accepts_healthy_remote_parent_snapshot_when_object_verifies() {
 }
 
 #[test]
+fn push_validates_healthy_remote_parent_without_rewriting_local_ancestor_object() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"first").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "readonly-parent-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let local_parent_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", first.snapshot_id));
+    let mut permissions = fs::metadata(&local_parent_path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&local_parent_path, permissions).unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"second").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "readonly-parent-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(pushed.published_snapshot_id, second.snapshot_id);
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+}
+
+#[test]
 fn push_rejects_remote_parent_snapshot_when_reachable_chunk_is_corrupted() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

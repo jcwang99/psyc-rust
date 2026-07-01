@@ -66,8 +66,15 @@ impl PhysicalObjectRef {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedObject {
+    pub object_type: String,
+    pub plaintext: Vec<u8>,
+}
+
 pub trait LogicalObjectStore {
     fn put_object(&self, object_type: &str, plaintext: &[u8]) -> Result<String>;
+    fn get_typed_object(&self, object_id: &str) -> Result<LoadedObject>;
     fn get_object(&self, object_id: &str, expected_type: &str) -> Result<Vec<u8>>;
     fn get_object_range(
         &self,
@@ -147,19 +154,13 @@ impl DirectLayoutObjectStore {
         Ok(object_id)
     }
 
-    pub fn get_object(&self, object_id: &str, expected_type: &str) -> Result<Vec<u8>> {
+    pub fn get_typed_object(&self, object_id: &str) -> Result<LoadedObject> {
         validate_object_id_value(object_id)?;
         let bytes = self
             .backend
             .get_object(&self.relative_object_path(object_id))
             .with_context(|| format!("failed to read object {}", object_id))?;
         let envelope = EncryptedObjectEnvelope::decode(&bytes)?;
-
-        ensure!(
-            envelope.object_type == expected_type,
-            "object type mismatch: expected {expected_type}, got {}",
-            envelope.object_type
-        );
         ensure!(
             envelope.crypto_suite == CRYPTO_SUITE,
             "unsupported crypto suite: {}",
@@ -172,13 +173,26 @@ impl DirectLayoutObjectStore {
 
         let padded_plaintext = self.decrypt_object(&envelope)?;
         let plaintext = self.remove_padding_policy(&envelope.padding_policy, &padded_plaintext)?;
-        let recomputed_id = self.derive_object_id(expected_type, &plaintext);
+        let recomputed_id = self.derive_object_id(&envelope.object_type, &plaintext);
         ensure!(
             recomputed_id == object_id,
             "object authentication failed: object id mismatch"
         );
 
-        Ok(plaintext)
+        Ok(LoadedObject {
+            object_type: envelope.object_type,
+            plaintext,
+        })
+    }
+
+    pub fn get_object(&self, object_id: &str, expected_type: &str) -> Result<Vec<u8>> {
+        let loaded = self.get_typed_object(object_id)?;
+        ensure!(
+            loaded.object_type == expected_type,
+            "object type mismatch: expected {expected_type}, got {}",
+            loaded.object_type
+        );
+        Ok(loaded.plaintext)
     }
 
     pub fn get_object_range(
@@ -388,6 +402,10 @@ impl DirectLayoutObjectStore {
 impl LogicalObjectStore for DirectLayoutObjectStore {
     fn put_object(&self, object_type: &str, plaintext: &[u8]) -> Result<String> {
         DirectLayoutObjectStore::put_object(self, object_type, plaintext)
+    }
+
+    fn get_typed_object(&self, object_id: &str) -> Result<LoadedObject> {
+        DirectLayoutObjectStore::get_typed_object(self, object_id)
     }
 
     fn get_object(&self, object_id: &str, expected_type: &str) -> Result<Vec<u8>> {

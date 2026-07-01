@@ -190,6 +190,53 @@ fn repeated_range_reads_can_use_encrypted_disk_cache_after_local_objects_become_
 }
 
 #[test]
+fn encrypted_disk_cache_hits_are_promoted_into_open_file_memory_cache() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root.clone(), snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir.clone()),
+    )
+    .unwrap();
+
+    let warm_handle = vfs.open_file("tracked.txt").unwrap();
+    let first = vfs.read(&warm_handle, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(first).unwrap(), "lph");
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(warm_handle.snapshot_id()).unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    for chunk_id in file.debug_chunk_ids() {
+        let chunk_path = repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{chunk_id}.json"));
+        let mut bytes = fs::read(&chunk_path).unwrap();
+        let last_index = bytes.len() - 1;
+        bytes[last_index] ^= 0x01;
+        fs::write(chunk_path, bytes).unwrap();
+    }
+
+    let reopened = vfs.open_file("tracked.txt").unwrap();
+    let second = vfs.read(&reopened, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(second).unwrap(), "lph");
+    assert_eq!(
+        String::from_utf8(reopened.cached_plaintext_for_test().unwrap()).unwrap(),
+        "lph"
+    );
+
+    fs::remove_dir_all(&cache_dir).unwrap();
+
+    let third = vfs.read(&reopened, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(third).unwrap(), "lph");
+}
+
+#[test]
 fn prefix_reads_do_not_require_unrelated_later_chunks_to_authenticate() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use e2v_core::{RepositoryFacade, sync_support};
@@ -113,6 +113,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     let pack_locations =
         load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
     let mut pack_cache = BTreeMap::new();
+    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
@@ -130,6 +131,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
         )?,
         None => Vec::new(),
     };
+    persist_cached_pack_data(&control_dir, &pack_cache)?;
 
     let mut repaired_objects = 0usize;
     let objects_dir = control_dir.join("objects");
@@ -140,6 +142,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
             &remote_loose_object_ids,
             &pack_locations,
             &mut pack_cache,
+            Some(&control_dir),
             object_id,
         )?
         .with_context(|| format!("missing remote object {object_id}"))?;
@@ -190,6 +193,7 @@ pub fn verify_remote<R: RemoteBackend>(
     let pack_locations =
         load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
     let mut pack_cache = BTreeMap::new();
+    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let facade = RepositoryFacade::new();
     let mut repaired_local_objects = 0usize;
 
@@ -208,6 +212,7 @@ pub fn verify_remote<R: RemoteBackend>(
         &mut pack_cache,
         &head_snapshot_id,
     )?;
+    persist_cached_pack_data(&control_dir, &pack_cache)?;
     let sampled_object_ids = sample_object_ids(&reachable_object_ids, options.sample_percent);
     let validation_object_store =
         DirectLayoutObjectStore::new(validation_root.control_dir(), secrets.clone());
@@ -218,6 +223,7 @@ pub fn verify_remote<R: RemoteBackend>(
             &remote_loose_object_ids,
             &pack_locations,
             &mut pack_cache,
+            Some(&control_dir),
             object_id,
         )?
         .with_context(|| format!("missing sampled remote object {object_id}"))?;
@@ -279,6 +285,7 @@ pub fn repair_remote<R: RemoteBackend>(
     let pack_locations =
         load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
     let mut pack_cache = BTreeMap::new();
+    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
@@ -294,6 +301,7 @@ pub fn repair_remote<R: RemoteBackend>(
         &mut pack_cache,
         &head_snapshot_id,
     )?;
+    persist_cached_pack_data(&control_dir, &pack_cache)?;
 
     let mut repaired_objects = 0usize;
     for object_id in &reachable_object_ids {
@@ -302,6 +310,7 @@ pub fn repair_remote<R: RemoteBackend>(
             &remote_loose_object_ids,
             &pack_locations,
             &mut pack_cache,
+            Some(&control_dir),
             object_id,
         )?
         .with_context(|| format!("missing remote object {object_id}"))?;
@@ -344,6 +353,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
     let mut pack_cache = BTreeMap::new();
+    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let mut reachable_object_ids = collect_all_remote_reachable_object_ids(
         remote,
         &options.repo_root,
@@ -353,6 +363,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
         &secrets,
         &mut pack_cache,
     )?;
+    persist_cached_pack_data(&control_dir, &pack_cache)?;
     let mut maintenance_context = MaintenanceReachabilityContext {
         remote,
         repo_root: &options.repo_root,
@@ -541,6 +552,7 @@ fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
     loose_object_ids: &BTreeSet<String>,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
     pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    control_dir: Option<&Path>,
     object_id: &str,
 ) -> Result<Option<Vec<u8>>> {
     if loose_object_ids.contains(object_id) {
@@ -554,12 +566,28 @@ fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
     };
     let physical_ref = location.physical_ref();
     if !pack_cache.contains_key(&physical_ref.container_id) {
-        let pack_len: usize = remote
-            .stat_physical(&physical_ref.container_id)?
-            .length
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
-        let pack_bytes = remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
+        let pack_bytes = if let Some(control_dir) = control_dir {
+            if let Some(cached) = read_cached_pack_data_bytes(control_dir, &physical_ref.container_id)?
+            {
+                cached
+            } else {
+                let pack_len: usize = remote
+                    .stat_physical(&physical_ref.container_id)?
+                    .length
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
+                let pack_bytes = remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
+                cache_pack_data_bytes(control_dir, &physical_ref.container_id, &pack_bytes)?;
+                pack_bytes
+            }
+        } else {
+            let pack_len: usize = remote
+                .stat_physical(&physical_ref.container_id)?
+                .length
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
+            remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?
+        };
         pack_cache.insert(physical_ref.container_id.clone(), pack_bytes);
     }
     let pack_bytes = pack_cache.get(&physical_ref.container_id).unwrap();
@@ -573,6 +601,71 @@ fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
         "packed object range out of bounds for {object_id}"
     );
     Ok(Some(pack_bytes[offset..end].to_vec()))
+}
+
+fn cache_pack_data_bytes(control_dir: &Path, container_id: &str, pack_bytes: &[u8]) -> Result<()> {
+    validate_remote_relative_name(container_id)?;
+    let cache_path = control_dir
+        .join("cache")
+        .join("pack-data")
+        .join(container_id);
+    if cache_path.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cache_path, pack_bytes)?;
+    Ok(())
+}
+
+fn read_cached_pack_data_bytes(control_dir: &Path, container_id: &str) -> Result<Option<Vec<u8>>> {
+    validate_remote_relative_name(container_id)?;
+    let cache_path = control_dir
+        .join("cache")
+        .join("pack-data")
+        .join(container_id);
+    match std::fs::read(cache_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn persist_cached_pack_data(control_dir: &Path, pack_cache: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+    for (container_id, pack_bytes) in pack_cache {
+        cache_pack_data_bytes(control_dir, container_id, pack_bytes)?;
+    }
+    Ok(())
+}
+
+fn preload_cached_pack_data(
+    control_dir: &Path,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    for location in pack_locations.values() {
+        let container_id = &location.physical_ref().container_id;
+        if pack_cache.contains_key(container_id) {
+            continue;
+        }
+        if let Some(bytes) = read_cached_pack_data_bytes(control_dir, container_id)? {
+            pack_cache.insert(container_id.clone(), bytes);
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_relative_name(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    anyhow::ensure!(!value.is_empty(), "empty relative path");
+    anyhow::ensure!(!path.is_absolute(), "path escapes target directory");
+    anyhow::ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "path traversal is not allowed"
+    );
+    Ok(())
 }
 
 fn infer_remote_object_type(

@@ -39,9 +39,11 @@ pub struct ManifestFileObject {
     pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
+    pub chunk_count: u64,
     pub chunks: Vec<String>,
     pub chunk_lengths: Vec<u64>,
     pub shard_ids: Vec<String>,
+    pub shard_byte_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +65,7 @@ pub trait ManifestStoreApi {
     fn get_snapshot(&self, id: &str) -> Result<ManifestSnapshotObject>;
     fn get_tree_node(&self, id: &str) -> Result<ManifestTreeObject>;
     fn get_file(&self, id: &str) -> Result<ManifestFileObject>;
+    fn get_file_metadata(&self, id: &str) -> Result<ManifestFileObject>;
     fn get_many(&self, ids: &[(&str, &str)]) -> Result<Vec<ManifestObject>>;
     fn walk_tree(&self, snapshot_id: &str) -> Result<Vec<TreeWalkEntry>>;
     fn walk_tree_iter(&self, snapshot_id: &str) -> Result<TreeWalkIter>;
@@ -108,17 +111,14 @@ impl ManifestStoreApi for ManifestStore {
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let object_store = open_object_store(&control_dir)?;
         let file = read_file_object_flattened(&object_store, id)?;
-        Ok(ManifestFileObject {
-            schema_version: file.schema_version,
-            entry_name: file.entry_name,
-            file_size: file.file_size,
-            modified_unix_ms: file.modified_unix_ms,
-            chunker_id: file.chunker_id,
-            chunker_config_id: file.chunker_config_id,
-            chunks: file.chunks,
-            chunk_lengths: file.chunk_lengths,
-            shard_ids: file.shard_ids,
-        })
+        Ok(manifest_file_from_file_object(file))
+    }
+
+    fn get_file_metadata(&self, id: &str) -> Result<ManifestFileObject> {
+        let control_dir = self.repo_root.join(CONTROL_DIR);
+        let object_store = open_object_store(&control_dir)?;
+        let file = read_file_object(&object_store, id)?;
+        Ok(manifest_file_from_file_object(file))
     }
 
     fn get_many(&self, ids: &[(&str, &str)]) -> Result<Vec<ManifestObject>> {
@@ -163,6 +163,22 @@ impl ManifestStoreApi for ManifestStore {
     }
 }
 
+fn manifest_file_from_file_object(file: FileObject) -> ManifestFileObject {
+    ManifestFileObject {
+        schema_version: file.schema_version,
+        entry_name: file.entry_name,
+        file_size: file.file_size,
+        modified_unix_ms: file.modified_unix_ms,
+        chunker_id: file.chunker_id,
+        chunker_config_id: file.chunker_config_id,
+        chunk_count: file.chunk_count,
+        chunks: file.chunks,
+        chunk_lengths: file.chunk_lengths,
+        shard_ids: file.shard_ids,
+        shard_byte_lengths: file.shard_byte_lengths,
+    }
+}
+
 impl ManifestStore {
     pub fn new(repo_root: impl AsRef<Path>) -> Self {
         Self {
@@ -179,9 +195,11 @@ struct FileObject {
     pub modified_unix_ms: u64,
     pub chunker_id: String,
     pub chunker_config_id: String,
+    pub chunk_count: u64,
     pub chunks: Vec<String>,
     pub chunk_lengths: Vec<u64>,
     pub shard_ids: Vec<String>,
+    pub shard_byte_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,37 +339,27 @@ fn read_snapshot_object(
     Ok(snapshot)
 }
 
-fn read_tree_object(object_store: &dyn LogicalObjectStore, object_id: &str) -> Result<TreeObject> {
-    let tree: TreeObject = read_stored_object(object_store, object_id, "tree")?;
-    validate_manifest_schema_version("tree", tree.schema_version)?;
-    Ok(tree)
-}
-
-fn read_directory_root_object(
-    object_store: &dyn LogicalObjectStore,
-    object_id: &str,
-) -> Result<DirectoryRootObject> {
-    let directory_root: DirectoryRootObject =
-        read_stored_object(object_store, object_id, "directory_root")?;
-    validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
-    Ok(directory_root)
-}
-
 fn read_directory_entries(
     object_store: &dyn LogicalObjectStore,
     object_id: &str,
 ) -> Result<Vec<TreeEntry>> {
-    match read_tree_object(object_store, object_id) {
-        Ok(tree) => return Ok(tree.entries),
-        Err(error) => {
-            let message = error.to_string();
-            if !message.contains("object type mismatch") {
-                return Err(error);
-            }
+    let loaded = object_store.get_typed_object(object_id)?;
+    match loaded.object_type.as_str() {
+        "tree" => {
+            let tree: TreeObject = postcard_from_bytes(&loaded.plaintext)
+                .context("failed to decode object plaintext")?;
+            validate_manifest_schema_version("tree", tree.schema_version)?;
+            return Ok(tree.entries);
+        }
+        "directory_root" => {}
+        other => {
+            anyhow::bail!("unsupported directory object type {other}");
         }
     }
 
-    let directory_root = read_directory_root_object(object_store, object_id)?;
+    let directory_root: DirectoryRootObject = postcard_from_bytes(&loaded.plaintext)
+        .context("failed to decode object plaintext")?;
+    validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
     let mut entries = Vec::new();
     for shard_id in directory_root.shards {
         let shard = read_tree_shard_object(object_store, &shard_id)?;
@@ -420,13 +428,18 @@ fn collect_tree_object_ids(
         return Ok(());
     }
 
-    match read_tree_object(object_store, tree_id) {
-        Ok(tree) => collect_tree_entries(object_store, tree.entries, reachable, seen),
-        Err(error) => {
-            if !error.to_string().contains("object type mismatch") {
-                return Err(error);
-            }
-            let directory_root = read_directory_root_object(object_store, tree_id)?;
+    let loaded = object_store.get_typed_object(tree_id)?;
+    match loaded.object_type.as_str() {
+        "tree" => {
+            let tree: TreeObject = postcard_from_bytes(&loaded.plaintext)
+                .context("failed to decode object plaintext")?;
+            validate_manifest_schema_version("tree", tree.schema_version)?;
+            collect_tree_entries(object_store, tree.entries, reachable, seen)
+        }
+        "directory_root" => {
+            let directory_root: DirectoryRootObject = postcard_from_bytes(&loaded.plaintext)
+                .context("failed to decode object plaintext")?;
+            validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
             for shard_id in directory_root.shards {
                 if !push_reachable_id(reachable, seen, shard_id.clone()) {
                     continue;
@@ -436,6 +449,7 @@ fn collect_tree_object_ids(
             }
             Ok(())
         }
+        other => anyhow::bail!("unsupported directory object type {other}"),
     }
 }
 
@@ -505,7 +519,9 @@ fn validate_manifest_schema_version(object_type: &str, schema_version: u32) -> R
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     use super::*;
@@ -538,6 +554,71 @@ mod tests {
             )]),
         };
         DirectLayoutObjectStore::new(control_dir, secrets)
+    }
+
+    #[derive(Clone)]
+    struct CountingObjectStore {
+        inner: DirectLayoutObjectStore,
+        loads: Arc<Mutex<HashMap<String, usize>>>,
+    }
+
+    impl CountingObjectStore {
+        fn new(inner: DirectLayoutObjectStore) -> Self {
+            Self {
+                inner,
+                loads: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn record_load(&self, object_id: &str) {
+            let mut loads = self.loads.lock().unwrap();
+            *loads.entry(object_id.to_string()).or_insert(0) += 1;
+        }
+
+        fn get_load_count(&self, object_id: &str) -> usize {
+            self.loads
+                .lock()
+                .unwrap()
+                .get(object_id)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl LogicalObjectStore for CountingObjectStore {
+        fn put_object(&self, object_type: &str, plaintext: &[u8]) -> Result<String> {
+            self.inner.put_object(object_type, plaintext)
+        }
+
+        fn get_typed_object(&self, object_id: &str) -> Result<e2v_store::LoadedObject> {
+            self.record_load(object_id);
+            self.inner.get_typed_object(object_id)
+        }
+
+        fn get_object(&self, object_id: &str, expected_type: &str) -> Result<Vec<u8>> {
+            let _ = expected_type;
+            self.record_load(object_id);
+            self.inner.get_object(object_id, expected_type)
+        }
+
+        fn get_object_range(
+            &self,
+            object_id: &str,
+            expected_type: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner
+                .get_object_range(object_id, expected_type, offset, length)
+        }
+
+        fn exists_object(&self, object_id: &str) -> bool {
+            self.inner.exists_object(object_id)
+        }
+
+        fn resolve_object(&self, object_id: &str) -> Result<e2v_store::PhysicalObjectRef> {
+            self.inner.resolve_object(object_id)
+        }
     }
 
     #[test]
@@ -580,6 +661,45 @@ mod tests {
         let object = read_tree_shard_object(trait_store, &object_id).unwrap();
 
         assert_eq!(object.range_end, "c");
+    }
+
+    #[test]
+    fn read_directory_entries_only_reads_directory_root_once() {
+        let base_store = store_for_tests();
+        let shard_id = base_store
+            .put_object(
+                "tree_shard",
+                &postcard::to_stdvec(&TreeShardObject {
+                    schema_version: REPO_FORMAT_VERSION,
+                    range_start: "a".to_string(),
+                    range_end: "z".to_string(),
+                    entries: vec![TreeEntry {
+                        name: "nested.txt".to_string(),
+                        kind: "file".to_string(),
+                        object_id: "child-file".to_string(),
+                    }],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let directory_root_id = base_store
+            .put_object(
+                "directory_root",
+                &postcard::to_stdvec(&DirectoryRootObject {
+                    schema_version: REPO_FORMAT_VERSION,
+                    fanout: 1,
+                    shards: vec![shard_id],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let counting_store = CountingObjectStore::new(base_store);
+
+        let entries = read_directory_entries(&counting_store, &directory_root_id).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "nested.txt");
+        assert_eq!(counting_store.get_load_count(&directory_root_id), 1);
     }
 
     #[test]

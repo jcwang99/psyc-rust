@@ -150,29 +150,14 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
     object_id: &str,
     expected_type: &str,
 ) -> bool {
-    let control_dir = repo_root.join(".e2v");
-    let secrets = match e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir) {
-        Ok(secrets) => secrets,
-        Err(_) => return false,
-    };
-    let store = e2v_store::DirectLayoutObjectStore::new(&control_dir, secrets);
-
     if let Ok(bytes) = remote.get_physical(&format!("objects/{object_id}.json")) {
-        let target_path = local_object_path(repo_root, object_id);
-        let original = std::fs::read(&target_path).ok();
-        if std::fs::write(&target_path, &bytes).is_err() {
-            return false;
-        }
-        let verified = store.get_object(object_id, expected_type).is_ok();
-        match original {
-            Some(original_bytes) => {
-                let _ = std::fs::write(&target_path, original_bytes);
-            }
-            None => {
-                let _ = std::fs::remove_file(&target_path);
-            }
-        }
-        return verified;
+        return e2v_core::sync_support::decode_object_bytes_for_sync(
+            repo_root,
+            object_id,
+            expected_type,
+            &bytes,
+        )
+        .is_ok();
     }
 
     if let Some(location) = pack_locations.get(object_id) {
@@ -208,21 +193,13 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
             return false;
         }
         let bytes = pack_bytes[offset..end].to_vec();
-        let target_path = local_object_path(repo_root, object_id);
-        let original = std::fs::read(&target_path).ok();
-        if std::fs::write(&target_path, &bytes).is_err() {
-            return false;
-        }
-        let verified = store.get_object(object_id, expected_type).is_ok();
-        match original {
-            Some(original_bytes) => {
-                let _ = std::fs::write(&target_path, original_bytes);
-            }
-            None => {
-                let _ = std::fs::remove_file(&target_path);
-            }
-        }
-        return verified;
+        return e2v_core::sync_support::decode_object_bytes_for_sync(
+            repo_root,
+            object_id,
+            expected_type,
+            &bytes,
+        )
+        .is_ok();
     }
 
     false
