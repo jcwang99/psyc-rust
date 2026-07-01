@@ -554,7 +554,15 @@ impl EncryptedRangeCache {
         );
         let bytes = match fs::read(&cache_path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return self.read_covering_range(
+                    snapshot_id,
+                    file_object_id,
+                    layout_generation,
+                    offset,
+                    length,
+                );
+            }
             Err(error) => return Err(error.into()),
         };
         Ok(Some(self.decrypt_blob(&bytes)?))
@@ -588,16 +596,76 @@ impl EncryptedRangeCache {
         offset: usize,
         length: usize,
     ) -> PathBuf {
+        let prefix = self.cache_key_prefix(snapshot_id, file_object_id, layout_generation);
+        self.cache_dir
+            .join(format!("{prefix}-{offset}-{length}.bin"))
+    }
+
+    fn cache_key_prefix(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+    ) -> String {
         let mut hasher = Hasher::new();
         hasher.update(snapshot_id.as_bytes());
         hasher.update(&[0]);
         hasher.update(file_object_id.as_bytes());
         hasher.update(&[0]);
         hasher.update(&layout_generation.to_le_bytes());
-        hasher.update(&offset.to_le_bytes());
-        hasher.update(&length.to_le_bytes());
-        self.cache_dir
-            .join(format!("{}.bin", hex::encode(hasher.finalize().as_bytes())))
+        hex::encode(hasher.finalize().as_bytes())
+    }
+
+    fn read_covering_range(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let prefix = format!(
+            "{}-",
+            self.cache_key_prefix(snapshot_id, file_object_id, layout_generation)
+        );
+        for entry in fs::read_dir(&self.cache_dir)? {
+            let path = entry?.path();
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(encoded) = file_name.strip_suffix(".bin") else {
+                continue;
+            };
+            let Some(encoded) = encoded.strip_prefix(&prefix) else {
+                continue;
+            };
+            let mut parts = encoded.split('-');
+            let Some(cached_offset) = parts.next().and_then(|value| value.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let Some(cached_length) = parts.next().and_then(|value| value.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if parts.next().is_some() {
+                continue;
+            }
+            let cached_end = cached_offset.saturating_add(cached_length);
+            let requested_end = offset.saturating_add(length);
+            if cached_offset > offset || cached_end < requested_end {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            let plaintext = self.decrypt_blob(&bytes)?;
+            if plaintext.len() != cached_length {
+                continue;
+            }
+            let start = offset - cached_offset;
+            let end = start + length;
+            return Ok(Some(plaintext[start..end].to_vec()));
+        }
+        Ok(None)
     }
 
     fn encrypt_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
