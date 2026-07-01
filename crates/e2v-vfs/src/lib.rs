@@ -403,14 +403,12 @@ impl ReadOnlyVfs {
         {
             let start = offset.min(cached.len());
             let end = offset.saturating_add(length).min(cached.len());
+            let requested = cached[start..end].to_vec();
             self.replace_open_file_cache(
                 opened_file,
-                Some(CachedRange {
-                    offset: 0,
-                    bytes: cached.clone(),
-                }),
+                self.cacheable_plaintext_range(offset, requested.clone()),
             );
-            return Ok(cached[start..end].to_vec());
+            return Ok(requested);
         }
 
         if let Some(cache) = &self.encrypted_range_cache
