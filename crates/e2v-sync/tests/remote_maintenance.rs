@@ -1980,6 +1980,175 @@ fn gc_dry_run_allows_expired_unpublished_local_snapshot_chain_to_be_collected() 
     );
 }
 
+#[test]
+fn gc_dry_run_reports_unreferenced_pack_index_segments_after_compaction() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let remote = MemoryBackend::new();
+
+    for version in 0..5usize {
+        fs::write(repo_root.join("rolling.txt"), format!("rolling-{version}")).unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: format!("gc-pack-index-bound-{version}"),
+            })
+            .unwrap();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: format!("gc-pack-index-bound-op-{version}"),
+            },
+        )
+        .unwrap();
+    }
+
+    let root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let referenced_segments = root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    let unreferenced_segments = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .chain(remote.list_physical("pack-index/segments/").unwrap())
+        .filter(|path| !referenced_segments.contains(path))
+        .collect::<Vec<_>>();
+    assert!(
+        !unreferenced_segments.is_empty(),
+        "expected compaction to leave older pack index segments behind for gc to collect"
+    );
+
+    let report = gc_dry_run(
+        &remote,
+        GcDryRunOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap();
+
+    for segment_path in &unreferenced_segments {
+        assert!(
+            report.unreachable_physical_refs.contains(segment_path),
+            "gc dry-run should report unreferenced pack index segment {segment_path}, saw {:?}",
+            report.unreachable_physical_refs
+        );
+    }
+}
+
+#[test]
+fn gc_execute_deletes_unreferenced_pack_index_segments_after_compaction() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let remote = MemoryBackend::new();
+
+    for version in 0..5usize {
+        fs::write(repo_root.join("rolling.txt"), format!("rolling-{version}")).unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: format!("gc-pack-index-execute-{version}"),
+            })
+            .unwrap();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: format!("gc-pack-index-execute-op-{version}"),
+            },
+        )
+        .unwrap();
+    }
+
+    let root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let referenced_segments = root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    let unreferenced_segments = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .chain(remote.list_physical("pack-index/segments/").unwrap())
+        .filter(|path| !referenced_segments.contains(path))
+        .collect::<Vec<_>>();
+    assert!(
+        !unreferenced_segments.is_empty(),
+        "expected compaction to leave older pack index segments behind for gc execute to collect"
+    );
+
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+    for segment_path in &unreferenced_segments {
+        remote
+            .override_physical_modified_time_for_test(segment_path, old_time)
+            .unwrap();
+    }
+
+    let result = gc_execute(
+        &remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    )
+    .unwrap();
+
+    for segment_path in &unreferenced_segments {
+        assert!(
+            result.deleted_physical_refs.contains(segment_path),
+            "gc execute should delete unreferenced pack index segment {segment_path}, saw {:?}",
+            result.deleted_physical_refs
+        );
+        assert!(
+            !remote.exists_physical(segment_path),
+            "gc execute should remove unreferenced pack index segment {segment_path}"
+        );
+    }
+}
+
 fn upload_local_objects_to_remote(
     remote: &MemoryBackend,
     repo_root: &std::path::Path,

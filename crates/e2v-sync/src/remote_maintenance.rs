@@ -16,7 +16,9 @@ use crate::fetch::{
 };
 use crate::object_type::candidate_object_types;
 use crate::pack::PackedObjectLocation;
-use crate::pack_index::load_remote_pack_locations_with_local_cache;
+use crate::pack_index::{
+    load_remote_pack_index_segment_paths, load_remote_pack_locations_with_local_cache,
+};
 use crate::remote_markers::{
     INTENT_EXPIRY_HOURS, marker_is_fresh_at, observe_remote_now_with_probe,
 };
@@ -475,12 +477,14 @@ pub fn gc_dry_run<R: RemoteBackend>(
         &mut reachable_object_ids,
     )?;
     persist_cached_pack_data(&control_dir, &pack_cache)?;
+    let pack_index_segment_paths = load_remote_pack_index_segment_paths(remote, Some(&secrets))?;
     let active_intent_paths = list_active_intent_paths(remote)?;
     let mut unreachable_physical_refs = collect_unreachable_physical_refs_with_spill(
         remote,
         &remote_loose_object_ids,
         &pack_locations,
         &reachable_object_ids,
+        &pack_index_segment_paths,
     )?;
     unreachable_physical_refs.sort();
 
@@ -1041,6 +1045,7 @@ fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
     remote_loose_object_ids: &BTreeSet<String>,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
     reachable: &GcReachabilityStore,
+    pack_index_segment_paths: &[String],
 ) -> Result<Vec<String>> {
     reachable.clear_physical_refs()?;
     for object_id in remote_loose_object_ids {
@@ -1052,6 +1057,9 @@ fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
         if reachable.contains_object_id(object_id)? {
             reachable.insert_physical_ref(&location.physical_ref().container_id)?;
         }
+    }
+    for segment_path in pack_index_segment_paths {
+        reachable.insert_physical_ref(segment_path)?;
     }
 
     let mut candidates = remote
@@ -1065,6 +1073,8 @@ fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
         })
         .collect::<Vec<_>>();
     candidates.extend(remote.list_physical("packs/data/")?);
+    candidates.extend(remote.list_physical("packs/index/")?);
+    candidates.extend(remote.list_physical("pack-index/segments/")?);
 
     let mut unreachable = Vec::new();
     for path in candidates {
@@ -1286,6 +1296,7 @@ mod tests {
             &remote_loose_object_ids,
             &pack_locations,
             &store,
+            &[],
         )
         .unwrap();
 

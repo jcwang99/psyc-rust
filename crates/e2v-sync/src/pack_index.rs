@@ -110,6 +110,18 @@ pub fn load_remote_pack_index_root_bytes<B: BlobStore>(remote: &B) -> Result<Opt
     Ok(Some(remote.get_physical(PACK_INDEX_ROOT_PATH)?))
 }
 
+pub(crate) fn load_remote_pack_index_segment_paths<B: BlobStore>(
+    remote: &B,
+    secrets: Option<&RepoSecrets>,
+) -> Result<Vec<String>> {
+    let Some(root_bytes) = load_remote_pack_index_root_bytes(remote)? else {
+        return Ok(Vec::new());
+    };
+    let root = decode_pack_index_root_bytes(&root_bytes, secrets)?;
+    validate_pack_index_root(&root)?;
+    Ok(root.segments)
+}
+
 pub fn next_pack_index_segment_paths<B: BlobStore>(
     remote: &B,
     newly_published_segments: &[String],
