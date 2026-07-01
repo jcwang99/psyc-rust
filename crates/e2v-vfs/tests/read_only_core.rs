@@ -774,6 +774,68 @@ fn encrypted_disk_cache_path_conflicts_do_not_break_repository_reads() {
 }
 
 #[test]
+fn encrypted_disk_cache_prunes_stale_range_index_entries_after_cover_hits() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root.clone(), snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir.clone())
+            .with_plaintext_memory_cache_budget_bytes(0),
+    )
+    .unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let first = vfs.read(&handle, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(first).unwrap(), "lph");
+    let stale_range_path = fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("bin"))
+        .expect("expected first cached range file");
+
+    let full = vfs.read(&handle, 0, 5).unwrap();
+    assert_eq!(String::from_utf8(full).unwrap(), "alpha");
+
+    let range_index_path = fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("ranges"))
+        .expect("expected encrypted cache range index");
+    let before_len = fs::metadata(&range_index_path).unwrap().len();
+
+    fs::remove_file(&stale_range_path).unwrap();
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(handle.snapshot_id()).unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    for chunk_id in file.debug_chunk_ids() {
+        let chunk_path = repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{chunk_id}.json"));
+        let mut bytes = fs::read(&chunk_path).unwrap();
+        let last_index = bytes.len() - 1;
+        bytes[last_index] ^= 0x01;
+        fs::write(chunk_path, bytes).unwrap();
+    }
+
+    let reopened = vfs.open_file("tracked.txt").unwrap();
+    let reread = vfs.read(&reopened, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(reread).unwrap(), "lph");
+
+    let after_len = fs::metadata(&range_index_path).unwrap().len();
+    assert!(
+        after_len < before_len,
+        "expected stale range index entry to be pruned after cover hit: before={before_len} after={after_len}"
+    );
+}
+
+#[test]
 fn prefix_reads_do_not_require_unrelated_later_chunks_to_authenticate() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

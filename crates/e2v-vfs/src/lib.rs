@@ -676,7 +676,9 @@ impl EncryptedRangeCache {
         offset: usize,
         length: usize,
     ) -> Result<Option<Vec<u8>>> {
-        for candidate in self.range_index_entries(snapshot_id, file_object_id, layout_generation)? {
+        let mut candidates = self.range_index_entries(snapshot_id, file_object_id, layout_generation)?;
+        let mut stale_entries = Vec::new();
+        for candidate in candidates.iter().cloned() {
             let path = self.cache_path(
                 snapshot_id,
                 file_object_id,
@@ -686,16 +688,23 @@ impl EncryptedRangeCache {
             );
             let bytes = match fs::read(&path) {
                 Ok(bytes) => bytes,
-                Err(error) if Self::should_treat_as_cache_miss(&error) => continue,
+                Err(error) if Self::should_treat_as_cache_miss(&error) => {
+                    stale_entries.push(candidate);
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
             let (cached_offset, plaintext) = match self.decrypt_blob(&bytes) {
                 Ok(decoded) => decoded,
-                Err(_) => continue,
+                Err(_) => {
+                    stale_entries.push(candidate);
+                    continue;
+                }
             };
             let cached_length = plaintext.len();
             if cached_offset != candidate.offset || cached_length != candidate.length
             {
+                stale_entries.push(candidate);
                 continue;
             }
             let cached_end = cached_offset.saturating_add(cached_length);
@@ -703,9 +712,27 @@ impl EncryptedRangeCache {
             if cached_offset > offset || cached_end < requested_end {
                 continue;
             }
+            if !stale_entries.is_empty() {
+                candidates.retain(|entry| !stale_entries.contains(entry));
+                self.write_range_index_entries(
+                    snapshot_id,
+                    file_object_id,
+                    layout_generation,
+                    &candidates,
+                )?;
+            }
             let start = offset - cached_offset;
             let end = start + length;
             return Ok(Some(plaintext[start..end].to_vec()));
+        }
+        if !stale_entries.is_empty() {
+            candidates.retain(|entry| !stale_entries.contains(entry));
+            self.write_range_index_entries(
+                snapshot_id,
+                file_object_id,
+                layout_generation,
+                &candidates,
+            )?;
         }
         Ok(None)
     }
@@ -746,12 +773,22 @@ impl EncryptedRangeCache {
         layout_generation: u64,
         new_entry: RangeIndexEntry,
     ) -> Result<()> {
-        let path = self.range_index_path(snapshot_id, file_object_id, layout_generation);
         let mut entries = self.range_index_entries(snapshot_id, file_object_id, layout_generation)?;
         if !entries.contains(&new_entry) {
             entries.push(new_entry);
         }
-        let encoded = Self::encode_range_index_entries(&entries)?;
+        self.write_range_index_entries(snapshot_id, file_object_id, layout_generation, &entries)
+    }
+
+    fn write_range_index_entries(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+        entries: &[RangeIndexEntry],
+    ) -> Result<()> {
+        let path = self.range_index_path(snapshot_id, file_object_id, layout_generation);
+        let encoded = Self::encode_range_index_entries(entries)?;
         let ciphertext = self.encrypt_blob(0, &encoded)?;
         fs::write(path, ciphertext)?;
         Ok(())
