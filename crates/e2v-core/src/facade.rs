@@ -1509,6 +1509,19 @@ impl ReadService {
         }
     }
 
+    pub fn derive_vfs_cache_key(&self) -> Result<[u8; 32]> {
+        let control_dir = self.repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let mut hasher = Hasher::new();
+        hasher.update(&repo_secrets.repo_path_index_key);
+        hasher.update(&[0]);
+        hasher.update(repo_secrets.repo_id.as_bytes());
+        hasher.update(b"\0e2v-vfs-range-cache-key");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&hasher.finalize().as_bytes()[..32]);
+        Ok(key)
+    }
+
     pub fn open_snapshot(&self, snapshot_id: &str) -> Result<SnapshotHandle> {
         validate_object_id_value(snapshot_id).context("invalid snapshot id")?;
         let repo_state = RepositoryFacade::new().open(&self.repo_root)?;

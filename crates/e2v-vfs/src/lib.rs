@@ -28,6 +28,8 @@ pub use windows::{
     WinfspRuntimePaths, WinfspVolumeParams,
 };
 
+const DEFAULT_PLAINTEXT_MEMORY_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePolicy {
     KernelCacheWithInvalidation,
@@ -100,6 +102,7 @@ pub struct VfsMountConfig {
     mode: MountMode,
     platform_capabilities: PlatformCapabilities,
     encrypted_disk_cache_dir: Option<PathBuf>,
+    plaintext_memory_cache_budget_bytes: usize,
 }
 
 impl VfsMountConfig {
@@ -109,6 +112,7 @@ impl VfsMountConfig {
             mode: MountMode::SnapshotPinned { snapshot_id },
             platform_capabilities: PlatformCapabilities::reliable_invalidation(),
             encrypted_disk_cache_dir: None,
+            plaintext_memory_cache_budget_bytes: DEFAULT_PLAINTEXT_MEMORY_CACHE_BUDGET_BYTES,
         }
     }
 
@@ -118,6 +122,7 @@ impl VfsMountConfig {
             mode: MountMode::LiveBranch { branch_token_hex },
             platform_capabilities: PlatformCapabilities::reliable_invalidation(),
             encrypted_disk_cache_dir: None,
+            plaintext_memory_cache_budget_bytes: DEFAULT_PLAINTEXT_MEMORY_CACHE_BUDGET_BYTES,
         }
     }
 
@@ -131,6 +136,14 @@ impl VfsMountConfig {
 
     pub fn with_encrypted_disk_cache_dir(mut self, encrypted_disk_cache_dir: PathBuf) -> Self {
         self.encrypted_disk_cache_dir = Some(encrypted_disk_cache_dir);
+        self
+    }
+
+    pub fn with_plaintext_memory_cache_budget_bytes(
+        mut self,
+        plaintext_memory_cache_budget_bytes: usize,
+    ) -> Self {
+        self.plaintext_memory_cache_budget_bytes = plaintext_memory_cache_budget_bytes;
         self
     }
 }
@@ -214,13 +227,27 @@ pub struct ReadOnlyVfs {
     mode: MountMode,
     cache_policy: CachePolicy,
     plaintext_cache: Arc<Mutex<PlaintextCache>>,
+    plaintext_memory_cache_budget_bytes: usize,
     encrypted_range_cache: Option<EncryptedRangeCache>,
     read_service: ReadService,
     namespace_snapshot: SnapshotHandle,
 }
 
 type PlaintextCacheKey = (String, String, u64);
-type PlaintextCache = HashMap<PlaintextCacheKey, Vec<u8>>;
+
+#[derive(Debug)]
+struct PlaintextCache {
+    budget_bytes: usize,
+    total_bytes: usize,
+    next_access_order: u64,
+    entries: HashMap<PlaintextCacheKey, PlaintextCacheEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct PlaintextCacheEntry {
+    bytes: Vec<u8>,
+    last_access_order: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedRange {
@@ -263,7 +290,7 @@ impl ReadOnlyVfs {
         let encrypted_range_cache = config
             .encrypted_disk_cache_dir
             .as_ref()
-            .map(|cache_dir| EncryptedRangeCache::new(cache_dir.clone(), &config.repo_root))
+            .map(|cache_dir| EncryptedRangeCache::new(cache_dir.clone(), &read_service))
             .transpose()?;
         let cache_policy = match (
             &mode,
@@ -285,7 +312,10 @@ impl ReadOnlyVfs {
         Ok(Self {
             mode,
             cache_policy,
-            plaintext_cache: Arc::new(Mutex::new(HashMap::new())),
+            plaintext_cache: Arc::new(Mutex::new(PlaintextCache::new(
+                config.plaintext_memory_cache_budget_bytes,
+            ))),
+            plaintext_memory_cache_budget_bytes: config.plaintext_memory_cache_budget_bytes,
             encrypted_range_cache,
             read_service,
             namespace_snapshot,
@@ -370,14 +400,16 @@ impl ReadOnlyVfs {
             .lock()
             .unwrap()
             .get(&cache_key)
-            .cloned()
         {
             let start = offset.min(cached.len());
             let end = offset.saturating_add(length).min(cached.len());
-            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
-                offset: 0,
-                bytes: cached.clone(),
-            });
+            self.replace_open_file_cache(
+                opened_file,
+                Some(CachedRange {
+                    offset: 0,
+                    bytes: cached.clone(),
+                }),
+            );
             return Ok(cached[start..end].to_vec());
         }
 
@@ -390,10 +422,13 @@ impl ReadOnlyVfs {
                 length,
             )?
         {
-            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
-                offset,
-                bytes: cached.clone(),
-            });
+            self.replace_open_file_cache(
+                opened_file,
+                Some(CachedRange {
+                    offset,
+                    bytes: cached.clone(),
+                }),
+            );
             return Ok(cached);
         }
 
@@ -411,31 +446,31 @@ impl ReadOnlyVfs {
         }
         let file_size = opened_file.file.file_size() as usize;
         if offset == 0 && offset.saturating_add(bytes.len()) >= file_size {
-            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
-                offset: 0,
-                bytes: bytes.clone(),
-            });
-            self.plaintext_cache
-                .lock()
-                .unwrap()
-                .insert(cache_key, bytes.clone());
+            let cacheable = self.cacheable_plaintext_range(0, bytes.clone());
+            self.replace_open_file_cache(opened_file, cacheable.clone());
+            if let Some(cacheable) = cacheable {
+                self.plaintext_cache
+                    .lock()
+                    .unwrap()
+                    .insert(cache_key, cacheable.bytes);
+            }
         } else if offset == 0 && offset.saturating_add(length) >= file_size {
             let full = self
                 .read_service
                 .read_range(&opened_file.file, 0, file_size)?;
-            self.plaintext_cache
-                .lock()
-                .unwrap()
-                .insert(cache_key, full.clone());
-            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
-                offset: 0,
-                bytes: full,
-            });
+            let cacheable = self.cacheable_plaintext_range(0, full);
+            if let Some(cacheable) = cacheable.clone() {
+                self.plaintext_cache
+                    .lock()
+                    .unwrap()
+                    .insert(cache_key, cacheable.bytes.clone());
+            }
+            self.replace_open_file_cache(opened_file, cacheable);
         } else {
-            *opened_file.plaintext_cache.lock().unwrap() = Some(CachedRange {
-                offset,
-                bytes: bytes.clone(),
-            });
+            self.replace_open_file_cache(
+                opened_file,
+                self.cacheable_plaintext_range(offset, bytes.clone()),
+            );
         }
         Ok(bytes)
     }
@@ -475,6 +510,17 @@ impl ReadOnlyVfs {
             }
         }
     }
+
+    fn cacheable_plaintext_range(&self, offset: usize, bytes: Vec<u8>) -> Option<CachedRange> {
+        (bytes.len() <= self.plaintext_memory_cache_budget_bytes).then_some(CachedRange {
+            offset,
+            bytes,
+        })
+    }
+
+    fn replace_open_file_cache(&self, opened_file: &OpenedFile, cached_range: Option<CachedRange>) {
+        *opened_file.plaintext_cache.lock().unwrap() = cached_range;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -484,13 +530,9 @@ struct EncryptedRangeCache {
 }
 
 impl EncryptedRangeCache {
-    fn new(cache_dir: PathBuf, repo_root: &std::path::Path) -> Result<Self> {
+    fn new(cache_dir: PathBuf, read_service: &ReadService) -> Result<Self> {
         fs::create_dir_all(&cache_dir)?;
-        let mut hasher = Hasher::new();
-        hasher.update(repo_root.as_os_str().to_string_lossy().as_bytes());
-        hasher.update(b"\0e2v-vfs-range-cache-key");
-        let mut cipher_key = [0u8; 32];
-        cipher_key.copy_from_slice(&hasher.finalize().as_bytes()[..32]);
+        let cipher_key = read_service.derive_vfs_cache_key()?;
         Ok(Self {
             cache_dir,
             cipher_key,
@@ -583,6 +625,67 @@ impl EncryptedRangeCache {
         cipher
             .decrypt(XNonce::from_slice(nonce), ciphertext)
             .map_err(|_| anyhow::anyhow!("failed to decrypt VFS disk cache entry"))
+    }
+}
+
+impl PlaintextCache {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            total_bytes: 0,
+            next_access_order: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &PlaintextCacheKey) -> Option<Vec<u8>> {
+        let access_order = self.next_access_order();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_access_order = access_order;
+        Some(entry.bytes.clone())
+    }
+
+    fn insert(&mut self, key: PlaintextCacheKey, bytes: Vec<u8>) {
+        if self.budget_bytes == 0 || bytes.len() > self.budget_bytes {
+            return;
+        }
+
+        if let Some(previous) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.bytes.len());
+        }
+
+        let len = bytes.len();
+        let access_order = self.next_access_order();
+        self.entries.insert(
+            key,
+            PlaintextCacheEntry {
+                bytes,
+                last_access_order: access_order,
+            },
+        );
+        self.total_bytes = self.total_bytes.saturating_add(len);
+        self.evict_if_needed();
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.total_bytes > self.budget_bytes {
+            let Some((oldest_key, oldest_len)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access_order)
+                .map(|(key, entry)| (key.clone(), entry.bytes.len()))
+            else {
+                break;
+            };
+            self.entries.remove(&oldest_key);
+            self.total_bytes = self.total_bytes.saturating_sub(oldest_len);
+        }
+    }
+
+    fn next_access_order(&mut self) -> u64 {
+        let current = self.next_access_order;
+        self.next_access_order = self.next_access_order.saturating_add(1);
+        current
     }
 }
 

@@ -237,6 +237,172 @@ fn encrypted_disk_cache_hits_are_promoted_into_open_file_memory_cache() {
 }
 
 #[test]
+fn encrypted_disk_cache_remains_readable_after_repo_moves_to_a_new_path() {
+    let temp = tempdir().unwrap();
+    let original_repo_root = temp.path().join("repo-original");
+    let moved_repo_root = temp.path().join("repo-moved");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&original_repo_root).unwrap();
+    init_repo(&original_repo_root);
+
+    let snapshot_id = commit_message(&original_repo_root, "first", "alpha");
+    {
+        let vfs = ReadOnlyVfs::mount_snapshot(
+            VfsMountConfig::snapshot(original_repo_root.clone(), snapshot_id.clone())
+                .with_encrypted_disk_cache_dir(cache_dir.clone()),
+        )
+        .unwrap();
+        let handle = vfs.open_file("tracked.txt").unwrap();
+        let first = vfs.read(&handle, 1, 3).unwrap();
+        assert_eq!(String::from_utf8(first).unwrap(), "lph");
+    }
+
+    fs::rename(&original_repo_root, &moved_repo_root).unwrap();
+
+    let read_service = RepositoryFacade::new().read_service(&moved_repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    for chunk_id in file.debug_chunk_ids() {
+        let chunk_path = moved_repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{chunk_id}.json"));
+        let mut bytes = fs::read(&chunk_path).unwrap();
+        let last_index = bytes.len() - 1;
+        bytes[last_index] ^= 0x01;
+        fs::write(chunk_path, bytes).unwrap();
+    }
+
+    let moved_vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(moved_repo_root, snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir),
+    )
+    .unwrap();
+    let reopened = moved_vfs.open_file("tracked.txt").unwrap();
+    let bytes = moved_vfs.read(&reopened, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "lph");
+}
+
+#[test]
+fn oversized_full_file_reads_are_not_retained_in_plaintext_memory_cache() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let large_bytes = vec![b'a'; 2 * 1024 * 1024];
+    fs::write(repo_root.join("large.bin"), &large_bytes).unwrap();
+
+    let snapshot_id = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "large".to_string(),
+        })
+        .unwrap()
+        .snapshot_id;
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root.clone(), snapshot_id)
+            .with_plaintext_memory_cache_budget_bytes(1024 * 1024),
+    )
+    .unwrap();
+
+    let handle = vfs.open_file("large.bin").unwrap();
+    let first = vfs.read(&handle, 0, large_bytes.len()).unwrap();
+    assert_eq!(first, large_bytes);
+    assert!(
+        handle.cached_plaintext_for_test().is_none(),
+        "oversized full-file read should not remain in plaintext handle cache"
+    );
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(handle.snapshot_id()).unwrap();
+    let file = read_service.open_file(&snapshot, "large.bin").unwrap();
+    for chunk_id in file.debug_chunk_ids() {
+        let chunk_path = repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{chunk_id}.json"));
+        let mut bytes = fs::read(&chunk_path).unwrap();
+        let last_index = bytes.len() - 1;
+        bytes[last_index] ^= 0x01;
+        fs::write(chunk_path, bytes).unwrap();
+    }
+
+    let reopened = vfs.open_file("large.bin").unwrap();
+    let error = vfs.read(&reopened, 0, 64 * 1024).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("authentication failed"),
+        "expected oversized read to miss plaintext cache and surface object corruption, got: {error:#}"
+    );
+}
+
+#[test]
+fn plaintext_memory_cache_evicts_older_entries_when_budget_is_exceeded() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let first_bytes = vec![b'a'; 700 * 1024];
+    let second_bytes = vec![b'b'; 700 * 1024];
+    fs::write(repo_root.join("first.bin"), &first_bytes).unwrap();
+    fs::write(repo_root.join("second.bin"), &second_bytes).unwrap();
+
+    let snapshot_id = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap()
+        .snapshot_id;
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root.clone(), snapshot_id)
+            .with_plaintext_memory_cache_budget_bytes(1024 * 1024),
+    )
+    .unwrap();
+
+    let first_handle = vfs.open_file("first.bin").unwrap();
+    let first = vfs.read(&first_handle, 0, first_bytes.len()).unwrap();
+    assert_eq!(first, first_bytes);
+
+    let second_handle = vfs.open_file("second.bin").unwrap();
+    let second = vfs.read(&second_handle, 0, second_bytes.len()).unwrap();
+    assert_eq!(second, second_bytes);
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(first_handle.snapshot_id()).unwrap();
+    for (path, expected_name) in [("first.bin", b'a'), ("second.bin", b'b')] {
+        let file = read_service.open_file(&snapshot, path).unwrap();
+        for chunk_id in file.debug_chunk_ids() {
+            let chunk_path = repo_root
+                .join(".e2v")
+                .join("objects")
+                .join(format!("{chunk_id}.json"));
+            let mut bytes = fs::read(&chunk_path).unwrap();
+            let last_index = bytes.len() - 1;
+            bytes[last_index] ^= 0x01;
+            fs::write(chunk_path, bytes).unwrap();
+        }
+        assert!(expected_name == b'a' || expected_name == b'b');
+    }
+
+    let reopened_first = vfs.open_file("first.bin").unwrap();
+    let first_error = vfs.read(&reopened_first, 0, 64 * 1024).unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("authentication failed"),
+        "expected first cached file to be evicted once budget is exceeded, got: {first_error:#}"
+    );
+
+    let reopened_second = vfs.open_file("second.bin").unwrap();
+    let second_bytes_after = vfs.read(&reopened_second, 0, second_bytes.len()).unwrap();
+    assert_eq!(second_bytes_after, second_bytes);
+}
+
+#[test]
 fn prefix_reads_do_not_require_unrelated_later_chunks_to_authenticate() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

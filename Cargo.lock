@@ -660,6 +660,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "e2v-api",
  "e2v-core",
  "e2v-store",
  "e2v-sync",

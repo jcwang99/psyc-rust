@@ -1,9 +1,8 @@
-mod remote_registry;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use e2v_api::Sdk;
 use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
 use e2v_store::{BackendCapability, RemoteBackend};
@@ -218,6 +217,7 @@ pub fn run_from_env() -> Result<()> {
 
 fn execute(cli: Cli) -> Result<String> {
     let facade = RepositoryFacade::new();
+    let sdk = Sdk::new();
     match cli.command {
         Command::Branch { command, repo } => match command {
             BranchCommand::List => {
@@ -361,14 +361,14 @@ fn execute(cli: Cli) -> Result<String> {
         },
         Command::Remote { command, repo } => match command {
             RemoteCommand::Add { name, url } => {
-                let stored = remote_registry::add_remote(&repo, &name, &url)?;
+                let stored = sdk.add_remote(&repo, &name, &url)?;
                 Ok(format!("added remote {} -> {}\n", stored.name, stored.spec))
             }
         },
         Command::Verify { command, repo } => match command {
             VerifyCommand::Remote { sample_percent } => {
                 let sample_percent = parse_percent_arg(&sample_percent)?;
-                let remote_spec = remote_registry::load_default_remote_spec(&repo)?;
+                let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
                 let result = remote_spec.with_backend(|remote| match remote {
                     RemoteBackendRef::LocalFolder(remote) => verify_remote(
                         remote,
@@ -404,7 +404,7 @@ fn execute(cli: Cli) -> Result<String> {
             confirm_remote_rollback,
             password,
         } => {
-            let remote_spec = remote_registry::load_default_remote_spec(&repo)?;
+            let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
             if force_accept_remote_rollback {
                 anyhow::ensure!(
                     confirm_remote_rollback,
@@ -455,7 +455,7 @@ fn execute(cli: Cli) -> Result<String> {
             }
         }
         Command::Gc { command, repo } => {
-            let remote_spec = remote_registry::load_default_remote_spec(&repo)?;
+            let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
             match command {
                 GcCommand::DryRun => {
                     let report = remote_spec.with_backend(|remote| match remote {
@@ -511,10 +511,10 @@ fn execute(cli: Cli) -> Result<String> {
             }
         }
         Command::Doctor { repo, bundle } => {
-            let stored_remote = remote_registry::load_default_remote(&repo)?;
+            let stored_remote = sdk.load_default_remote(&repo)?;
             let repo_id = read_repo_id(&repo)?;
             let trusted_state = load_trusted_remote_state_for_repo(&repo_id)?;
-            let remote_spec = remote_registry::load_default_remote_spec(&repo)?;
+            let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
             let (remote_kind, gc_execute_supported, gc_execute_blockers) = remote_spec
                 .with_backend(|remote| {
                     let capability = remote_capability(&remote);
@@ -631,6 +631,11 @@ fn redact_remote_spec(spec: &str) -> String {
         return format!("{}://<redacted>", url.scheme());
     }
     "<redacted>".to_string()
+}
+
+fn parse_default_remote_spec(sdk: &Sdk, repo_root: &std::path::Path) -> Result<e2v_sync::RemoteSpec> {
+    let stored = sdk.load_default_remote(repo_root)?;
+    e2v_sync::RemoteSpec::parse(&stored.spec)
 }
 
 fn format_mount_summary(summary: &MountLaunchSummary) -> String {
