@@ -555,6 +555,29 @@ fn encrypted_disk_cache_retains_multiple_private_ranges_for_one_file() {
 }
 
 #[test]
+fn encrypted_disk_cache_ignores_unrelated_subdirectories_when_cold() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(cache_dir.join("scratch")).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root, snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir)
+            .with_plaintext_memory_cache_budget_bytes(0),
+    )
+    .unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let bytes = vfs.read(&handle, 1, 3).unwrap();
+
+    assert_eq!(String::from_utf8(bytes).unwrap(), "lph");
+}
+
+#[test]
 fn prefix_reads_do_not_require_unrelated_later_chunks_to_authenticate() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

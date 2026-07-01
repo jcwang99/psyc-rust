@@ -651,7 +651,11 @@ impl EncryptedRangeCache {
         length: usize,
     ) -> Result<Option<Vec<u8>>> {
         for entry in fs::read_dir(&self.cache_dir)? {
-            let path = entry?.path();
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
             let bytes = fs::read(&path)?;
             let (cached_offset, plaintext) = match self.decrypt_blob(&bytes) {
                 Ok(decoded) => decoded,
