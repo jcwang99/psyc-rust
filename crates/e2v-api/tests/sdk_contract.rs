@@ -619,3 +619,29 @@ fn sdk_can_verify_repair_accept_rollback_and_gc_default_remote() {
         .unwrap();
     assert!(gc_execute.deleted_physical_refs.is_empty());
 }
+
+#[test]
+fn sdk_default_remote_workflows_also_support_webdav_specs() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    sdk.add_remote(
+        &repo_root,
+        "origin",
+        "webdav+https://alice:secret@example.com/repo",
+    )
+    .unwrap();
+
+    let loaded = sdk.load_default_remote(&repo_root).unwrap();
+    assert_eq!(loaded.name, "origin");
+    assert_eq!(loaded.spec, "webdav+https://alice:secret@example.com/repo");
+}

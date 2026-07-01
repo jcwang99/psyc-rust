@@ -19,6 +19,15 @@ use serde::{Deserialize, Serialize};
 const REMOTES_DIR: &str = ".e2v/remotes";
 const DEFAULT_REMOTE_PATH: &str = ".e2v/remotes/default.json";
 
+macro_rules! with_remote_backend {
+    ($remote_spec:expr, |$backend:ident| $body:expr) => {
+        $remote_spec.with_backend(|remote| match remote {
+            e2v_sync::RemoteBackendRef::LocalFolder($backend) => $body,
+            e2v_sync::RemoteBackendRef::Webdav($backend) => $body,
+        })
+    };
+}
+
 pub type SdkResult<T> = std::result::Result<T, SdkError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -587,77 +596,49 @@ impl Sdk {
 
     pub fn push_default_remote(&self, request: PushRequest) -> SdkResult<PushResponse> {
         let remote_spec = load_default_remote_spec(&request.repo_root)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => e2v_sync::push_head(
-                    &self.facade,
-                    backend,
-                    PushOptions {
-                        repo_root: request.repo_root,
-                        branch_token: request.branch_token,
-                        operation_id: request.operation_id,
-                    },
-                ),
-                e2v_sync::RemoteBackendRef::Webdav(backend) => e2v_sync::push_head(
-                    &self.facade,
-                    backend,
-                    PushOptions {
-                        repo_root: request.repo_root,
-                        branch_token: request.branch_token,
-                        operation_id: request.operation_id,
-                    },
-                ),
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::push_head(
+                &self.facade,
+                backend,
+                PushOptions {
+                    repo_root: request.repo_root,
+                    branch_token: request.branch_token,
+                    operation_id: request.operation_id,
+                },
+            )
+        })
             .map(push_response_from_result)
             .map_err(map_error)
     }
 
     pub fn fetch_default_remote(&self, request: FetchRequest) -> SdkResult<FetchResponse> {
         let remote_spec = load_default_remote_spec(&request.repo_root)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => e2v_sync::fetch_remote(
-                    backend,
-                    FetchOptions {
-                        repo_root: request.repo_root,
-                        branch_token: request.branch_token,
-                        password: request.password,
-                    },
-                ),
-                e2v_sync::RemoteBackendRef::Webdav(backend) => e2v_sync::fetch_remote(
-                    backend,
-                    FetchOptions {
-                        repo_root: request.repo_root,
-                        branch_token: request.branch_token,
-                        password: request.password,
-                    },
-                ),
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::fetch_remote(
+                backend,
+                FetchOptions {
+                    repo_root: request.repo_root,
+                    branch_token: request.branch_token,
+                    password: request.password,
+                },
+            )
+        })
             .map(fetch_response_from_result)
             .map_err(map_error)
     }
 
     pub fn clone_remote(&self, request: CloneRequest) -> SdkResult<CloneResponse> {
         let remote_spec = RemoteSpec::parse(&request.remote_spec).map_err(map_error)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => e2v_sync::clone_remote(
-                    backend,
-                    CloneOptions {
-                        repo_root: request.target_repo_root,
-                        password: request.password,
-                        branch_token: request.branch_token,
-                    },
-                ),
-                e2v_sync::RemoteBackendRef::Webdav(backend) => e2v_sync::clone_remote(
-                    backend,
-                    CloneOptions {
-                        repo_root: request.target_repo_root,
-                        password: request.password,
-                        branch_token: request.branch_token,
-                    },
-                ),
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::clone_remote(
+                backend,
+                CloneOptions {
+                    repo_root: request.target_repo_root,
+                    password: request.password,
+                    branch_token: request.branch_token,
+                },
+            )
+        })
             .map(clone_response_from_result)
             .map_err(map_error)
     }
@@ -667,23 +648,15 @@ impl Sdk {
         request: VerifyRemoteRequest,
     ) -> SdkResult<VerifyRemoteResponse> {
         let remote_spec = load_default_remote_spec(&request.repo_root)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => e2v_sync::verify_remote(
-                    backend,
-                    VerifyRemoteOptions {
-                        repo_root: request.repo_root,
-                        sample_percent: request.sample_percent,
-                    },
-                ),
-                e2v_sync::RemoteBackendRef::Webdav(backend) => e2v_sync::verify_remote(
-                    backend,
-                    VerifyRemoteOptions {
-                        repo_root: request.repo_root,
-                        sample_percent: request.sample_percent,
-                    },
-                ),
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::verify_remote(
+                backend,
+                VerifyRemoteOptions {
+                    repo_root: request.repo_root,
+                    sample_percent: request.sample_percent,
+                },
+            )
+        })
             .map(verify_remote_response_from_result)
             .map_err(map_error)
     }
@@ -694,23 +667,14 @@ impl Sdk {
     ) -> SdkResult<RepairRemoteResponse> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let remote_spec = load_default_remote_spec(&repo_root)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => {
-                    e2v_sync::repair_remote(
-                        backend,
-                        RepairRemoteOptions {
-                            repo_root: repo_root.clone(),
-                        },
-                    )
-                }
-                e2v_sync::RemoteBackendRef::Webdav(backend) => e2v_sync::repair_remote(
-                    backend,
-                    RepairRemoteOptions {
-                        repo_root: repo_root.clone(),
-                    },
-                ),
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::repair_remote(
+                backend,
+                RepairRemoteOptions {
+                    repo_root: repo_root.clone(),
+                },
+            )
+        })
             .map(repair_remote_response_from_result)
             .map_err(map_error)
     }
@@ -722,27 +686,15 @@ impl Sdk {
     ) -> SdkResult<RepairRemoteResponse> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let remote_spec = load_default_remote_spec(&repo_root)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => {
-                    e2v_sync::force_accept_remote_rollback(
-                        backend,
-                        RepairRemoteOptions {
-                            repo_root: repo_root.clone(),
-                        },
-                        password,
-                    )
-                }
-                e2v_sync::RemoteBackendRef::Webdav(backend) => {
-                    e2v_sync::force_accept_remote_rollback(
-                        backend,
-                        RepairRemoteOptions {
-                            repo_root: repo_root.clone(),
-                        },
-                        password,
-                    )
-                }
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::force_accept_remote_rollback(
+                backend,
+                RepairRemoteOptions {
+                    repo_root: repo_root.clone(),
+                },
+                password,
+            )
+        })
             .map(repair_remote_response_from_result)
             .map_err(map_error)
     }
@@ -753,21 +705,14 @@ impl Sdk {
     ) -> SdkResult<GcDryRunResponse> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let remote_spec = load_default_remote_spec(&repo_root)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => e2v_sync::gc_dry_run(
-                    backend,
-                    GcDryRunOptions {
-                        repo_root: repo_root.clone(),
-                    },
-                ),
-                e2v_sync::RemoteBackendRef::Webdav(backend) => e2v_sync::gc_dry_run(
-                    backend,
-                    GcDryRunOptions {
-                        repo_root: repo_root.clone(),
-                    },
-                ),
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::gc_dry_run(
+                backend,
+                GcDryRunOptions {
+                    repo_root: repo_root.clone(),
+                },
+            )
+        })
             .map(gc_dry_run_response_from_result)
             .map_err(map_error)
     }
@@ -777,27 +722,17 @@ impl Sdk {
         request: GcExecuteRequest,
     ) -> SdkResult<GcExecuteResponse> {
         let remote_spec = load_default_remote_spec(&request.repo_root)?;
-        remote_spec
-            .with_backend(|remote| match remote {
-                e2v_sync::RemoteBackendRef::LocalFolder(backend) => e2v_sync::gc_execute(
-                    backend,
-                    GcExecuteOptions {
-                        repo_root: request.repo_root.clone(),
-                        grace_period_days: request.grace_period_days,
-                        allow_single_writer_maintenance_window: request
-                            .allow_single_writer_maintenance_window,
-                    },
-                ),
-                e2v_sync::RemoteBackendRef::Webdav(backend) => e2v_sync::gc_execute(
-                    backend,
-                    GcExecuteOptions {
-                        repo_root: request.repo_root.clone(),
-                        grace_period_days: request.grace_period_days,
-                        allow_single_writer_maintenance_window: request
-                            .allow_single_writer_maintenance_window,
-                    },
-                ),
-            })
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::gc_execute(
+                backend,
+                GcExecuteOptions {
+                    repo_root: request.repo_root.clone(),
+                    grace_period_days: request.grace_period_days,
+                    allow_single_writer_maintenance_window: request
+                        .allow_single_writer_maintenance_window,
+                },
+            )
+        })
             .map(gc_execute_response_from_result)
             .map_err(map_error)
     }
