@@ -1599,7 +1599,7 @@ fn push_uploads_reachable_objects_and_publishes_remote_ref() {
         .unwrap()
         .unwrap();
     assert!(!stored_ref.value.bytes.is_empty());
-    assert!(remote.list_physical("objects/").unwrap().len() > 0);
+    assert!(!remote.list_physical("objects/").unwrap().is_empty());
     assert_eq!(
         remote.read_layout_root().unwrap().generation,
         state.layout_generation

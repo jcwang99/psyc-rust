@@ -135,6 +135,27 @@ struct RemoteFileShardObject {
     chunk_lengths: Vec<u64>,
 }
 
+struct RemoteReachabilityContext<'a, R: RemoteBackend> {
+    remote: &'a R,
+    remote_loose_object_ids: &'a BTreeSet<String>,
+    pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
+    validation_root: &'a RemoteValidationRoot,
+    object_store: &'a DirectLayoutObjectStore,
+    pack_cache: &'a mut BTreeMap<String, Vec<u8>>,
+    reachable_object_ids: &'a mut Vec<String>,
+    seen: &'a mut HashSet<String>,
+}
+
+struct RemoteFetchValidationInputs<'a> {
+    repo_root: &'a Path,
+    control_plane: &'a RemoteControlPlane,
+    password: Option<&'a str>,
+    device_validation_secrets: Option<&'a RepoSecrets>,
+    default_ref_bytes: &'a [u8],
+    remote_loose_object_ids: &'a BTreeSet<String>,
+    pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
+}
+
 #[derive(Debug)]
 pub(crate) struct RemoteValidationRoot {
     pub(crate) path: PathBuf,
@@ -283,13 +304,15 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
         ) {
         Some(prepare_remote_fetch_plan(
             remote,
-            &options.repo_root,
-            &control_plane,
-            options.password.as_deref(),
-            remote_current_device_secrets.as_ref(),
-            &stored_ref_bytes,
-            &remote_loose_object_ids,
-            &pack_locations,
+            RemoteFetchValidationInputs {
+                repo_root: &options.repo_root,
+                control_plane: &control_plane,
+                password: options.password.as_deref(),
+                device_validation_secrets: remote_current_device_secrets.as_ref(),
+                default_ref_bytes: &stored_ref_bytes,
+                remote_loose_object_ids: &remote_loose_object_ids,
+                pack_locations: &pack_locations,
+            },
         )?)
     } else {
         None
@@ -397,12 +420,11 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
                             &mut pack_cache,
                             Some(&control_dir),
                             object_id,
-                        )? {
-                            if !local_object_matches_bytes(&options.repo_root, object_id, &bytes) {
-                                anyhow::bail!(
-                                    "cannot replace locked local object {object_id} with unverified remote bytes; unlock repository first"
-                                );
-                            }
+                        )? && !local_object_matches_bytes(&options.repo_root, object_id, &bytes)
+                        {
+                            anyhow::bail!(
+                                "cannot replace locked local object {object_id} with unverified remote bytes; unlock repository first"
+                            );
                         }
                         continue;
                     }
@@ -500,31 +522,29 @@ fn local_keyring_is_newer_than_remote(
 
 fn prepare_remote_fetch_plan<R: RemoteBackend>(
     remote: &R,
-    repo_root: &Path,
-    control_plane: &RemoteControlPlane,
-    password: Option<&str>,
-    device_validation_secrets: Option<&RepoSecrets>,
-    default_ref_bytes: &[u8],
-    remote_loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    inputs: RemoteFetchValidationInputs<'_>,
 ) -> Result<RemoteFetchPlan> {
     let validation_root = RemoteValidationRoot {
-        path: next_validation_root(repo_root)?,
+        path: next_validation_root(inputs.repo_root)?,
     };
-    write_remote_control_plane_to_validation_root(&validation_root, control_plane)?;
+    write_remote_control_plane_to_validation_root(&validation_root, inputs.control_plane)?;
     let validation_secrets =
-        load_remote_validation_secrets(&validation_root, password, device_validation_secrets)?;
+        load_remote_validation_secrets(
+            &validation_root,
+            inputs.password,
+            inputs.device_validation_secrets,
+        )?;
     let mut pack_cache = BTreeMap::new();
     let (_, head_snapshot_id) = e2v_core::sync_support::decode_default_ref_record(
         &validation_root.path,
-        default_ref_bytes,
+        inputs.default_ref_bytes,
     )?;
     let reachable_object_ids = match head_snapshot_id.as_deref() {
         Some(head_snapshot_id) => {
             let reachable_object_ids = collect_remote_reachable_object_ids(
                 remote,
-                remote_loose_object_ids,
-                pack_locations,
+                inputs.remote_loose_object_ids,
+                inputs.pack_locations,
                 &validation_root,
                 &validation_secrets,
                 &mut pack_cache,
@@ -532,8 +552,8 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
             )?;
             materialize_remote_objects_into_validation_root(
                 remote,
-                remote_loose_object_ids,
-                pack_locations,
+                inputs.remote_loose_object_ids,
+                inputs.pack_locations,
                 &validation_root,
                 &mut pack_cache,
                 &reachable_object_ids,
@@ -543,7 +563,7 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
                 validation_secrets,
                 head_snapshot_id,
             )?;
-            persist_cached_pack_data(repo_root.join(".e2v"), &pack_cache)?;
+            persist_cached_pack_data(inputs.repo_root.join(".e2v"), &pack_cache)?;
             reachable_object_ids
         }
         None => Vec::new(),
@@ -797,7 +817,7 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
         path: next_validation_root(repo_root)?,
     };
     let validation_control = validation_root.control_dir();
-    let result = (|| -> Result<()> {
+    (|| -> Result<()> {
         std::fs::create_dir_all(validation_control.join("objects"))?;
         std::fs::create_dir_all(validation_control.join("keyring"))?;
         std::fs::create_dir_all(validation_control.join("refs"))?;
@@ -823,8 +843,7 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
         std::fs::write(&target_path, &bytes)?;
         let _ = store.get_object(object_id, expected_type)?;
         Ok(())
-    })();
-    result
+    })()
 }
 
 fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
@@ -851,7 +870,7 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
     };
     let validation_control = validation_root.control_dir();
     let mut pack_cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let result = (|| -> Result<()> {
+    (|| -> Result<()> {
         std::fs::create_dir_all(validation_control.join("objects"))?;
         std::fs::create_dir_all(validation_control.join("keyring"))?;
         std::fs::create_dir_all(validation_control.join("refs"))?;
@@ -892,8 +911,7 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
             snapshot_id,
         )?;
         Ok(())
-    })();
-    result
+    })()
 }
 
 pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
@@ -1292,34 +1310,41 @@ pub(crate) fn collect_remote_reachable_object_ids<R: RemoteBackend>(
         DirectLayoutObjectStore::new(validation_root.control_dir(), validation_secrets.clone());
     let mut reachable_object_ids = Vec::new();
     let mut seen = HashSet::new();
+    let mut context = RemoteReachabilityContext {
+        remote,
+        remote_loose_object_ids,
+        pack_locations,
+        validation_root,
+        object_store: &object_store,
+        pack_cache,
+        reachable_object_ids: &mut reachable_object_ids,
+        seen: &mut seen,
+    };
     let mut pending_snapshots = vec![head_snapshot_id.to_string()];
 
     while let Some(snapshot_id) = pending_snapshots.pop() {
         fetch_remote_object_into_validation_root(
-            remote,
-            remote_loose_object_ids,
-            pack_locations,
-            validation_root,
-            pack_cache,
+            context.remote,
+            context.remote_loose_object_ids,
+            context.pack_locations,
+            context.validation_root,
+            context.pack_cache,
             &snapshot_id,
         )?;
-        if !push_reachable_id(&mut reachable_object_ids, &mut seen, snapshot_id.clone()) {
+        if !push_reachable_id(
+            context.reachable_object_ids,
+            context.seen,
+            snapshot_id.clone(),
+        ) {
             continue;
         }
-        let snapshot: RemoteSnapshotObject =
-            read_remote_validation_object(&object_store, &snapshot_id, "snapshot")?;
-        validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
-        collect_remote_tree_object_ids(
-            remote,
-            remote_loose_object_ids,
-            pack_locations,
-            validation_root,
-            &object_store,
-            pack_cache,
-            &snapshot.root_tree_id,
-            &mut reachable_object_ids,
-            &mut seen,
+        let snapshot: RemoteSnapshotObject = read_remote_validation_object(
+            context.object_store,
+            &snapshot_id,
+            "snapshot",
         )?;
+        validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
+        collect_remote_tree_object_ids(&mut context, &snapshot.root_tree_id)?;
         if let Some(parent_snapshot_id) = snapshot.parent_snapshot_id {
             validate_object_id_value(&parent_snapshot_id)
                 .with_context(|| format!("invalid parent snapshot id in snapshot {snapshot_id}"))?;
@@ -1331,78 +1356,55 @@ pub(crate) fn collect_remote_reachable_object_ids<R: RemoteBackend>(
 }
 
 fn collect_remote_tree_object_ids<R: RemoteBackend>(
-    remote: &R,
-    remote_loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    validation_root: &RemoteValidationRoot,
-    object_store: &DirectLayoutObjectStore,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    context: &mut RemoteReachabilityContext<'_, R>,
     tree_id: &str,
-    reachable_object_ids: &mut Vec<String>,
-    seen: &mut HashSet<String>,
 ) -> Result<()> {
     fetch_remote_object_into_validation_root(
-        remote,
-        remote_loose_object_ids,
-        pack_locations,
-        validation_root,
-        pack_cache,
+        context.remote,
+        context.remote_loose_object_ids,
+        context.pack_locations,
+        context.validation_root,
+        context.pack_cache,
         tree_id,
     )?;
-    if !push_reachable_id(reachable_object_ids, seen, tree_id.to_string()) {
+    if !push_reachable_id(context.reachable_object_ids, context.seen, tree_id.to_string()) {
         return Ok(());
     }
 
-    match read_remote_validation_object::<RemoteTreeObject>(object_store, tree_id, "tree") {
+    match read_remote_validation_object::<RemoteTreeObject>(context.object_store, tree_id, "tree") {
         Ok(tree) => {
             validate_manifest_schema_version("tree", tree.schema_version)?;
-            collect_remote_tree_entries(
-                remote,
-                remote_loose_object_ids,
-                pack_locations,
-                validation_root,
-                object_store,
-                pack_cache,
-                tree.entries,
-                reachable_object_ids,
-                seen,
-            )
+            collect_remote_tree_entries(context, tree.entries)
         }
         Err(error) => {
             if !error.to_string().contains("object type mismatch") {
                 return Err(error);
             }
             let directory_root: RemoteDirectoryRootObject =
-                read_remote_validation_object(object_store, tree_id, "directory_root")?;
+                read_remote_validation_object(context.object_store, tree_id, "directory_root")?;
             validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
             for shard_id in directory_root.shards {
                 validate_object_id_value(&shard_id)
                     .with_context(|| format!("invalid shard id in directory root {tree_id}"))?;
                 fetch_remote_object_into_validation_root(
-                    remote,
-                    remote_loose_object_ids,
-                    pack_locations,
-                    validation_root,
-                    pack_cache,
+                    context.remote,
+                    context.remote_loose_object_ids,
+                    context.pack_locations,
+                    context.validation_root,
+                    context.pack_cache,
                     &shard_id,
                 )?;
-                if !push_reachable_id(reachable_object_ids, seen, shard_id.clone()) {
+                if !push_reachable_id(
+                    context.reachable_object_ids,
+                    context.seen,
+                    shard_id.clone(),
+                ) {
                     continue;
                 }
                 let shard: RemoteTreeShardObject =
-                    read_remote_validation_object(object_store, &shard_id, "tree_shard")?;
+                    read_remote_validation_object(context.object_store, &shard_id, "tree_shard")?;
                 validate_manifest_schema_version("tree_shard", shard.schema_version)?;
-                collect_remote_tree_entries(
-                    remote,
-                    remote_loose_object_ids,
-                    pack_locations,
-                    validation_root,
-                    object_store,
-                    pack_cache,
-                    shard.entries,
-                    reachable_object_ids,
-                    seen,
-                )?;
+                collect_remote_tree_entries(context, shard.entries)?;
             }
             Ok(())
         }
@@ -1410,15 +1412,8 @@ fn collect_remote_tree_object_ids<R: RemoteBackend>(
 }
 
 fn collect_remote_tree_entries<R: RemoteBackend>(
-    remote: &R,
-    remote_loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    validation_root: &RemoteValidationRoot,
-    object_store: &DirectLayoutObjectStore,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    context: &mut RemoteReachabilityContext<'_, R>,
     entries: Vec<RemoteTreeEntry>,
-    reachable_object_ids: &mut Vec<String>,
-    seen: &mut HashSet<String>,
 ) -> Result<()> {
     for entry in entries {
         validate_object_id_value(&entry.object_id).with_context(|| {
@@ -1428,28 +1423,8 @@ fn collect_remote_tree_entries<R: RemoteBackend>(
             )
         })?;
         match entry.kind.as_str() {
-            "tree" => collect_remote_tree_object_ids(
-                remote,
-                remote_loose_object_ids,
-                pack_locations,
-                validation_root,
-                object_store,
-                pack_cache,
-                &entry.object_id,
-                reachable_object_ids,
-                seen,
-            )?,
-            "file" => collect_remote_file_object_ids(
-                remote,
-                remote_loose_object_ids,
-                pack_locations,
-                validation_root,
-                object_store,
-                pack_cache,
-                &entry.object_id,
-                reachable_object_ids,
-                seen,
-            )?,
+            "tree" => collect_remote_tree_object_ids(context, &entry.object_id)?,
+            "file" => collect_remote_file_object_ids(context, &entry.object_id)?,
             other => anyhow::bail!("unknown remote tree entry kind {other}"),
         }
     }
@@ -1457,56 +1432,54 @@ fn collect_remote_tree_entries<R: RemoteBackend>(
 }
 
 fn collect_remote_file_object_ids<R: RemoteBackend>(
-    remote: &R,
-    remote_loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    validation_root: &RemoteValidationRoot,
-    object_store: &DirectLayoutObjectStore,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    context: &mut RemoteReachabilityContext<'_, R>,
     file_id: &str,
-    reachable_object_ids: &mut Vec<String>,
-    seen: &mut HashSet<String>,
 ) -> Result<()> {
     fetch_remote_object_into_validation_root(
-        remote,
-        remote_loose_object_ids,
-        pack_locations,
-        validation_root,
-        pack_cache,
+        context.remote,
+        context.remote_loose_object_ids,
+        context.pack_locations,
+        context.validation_root,
+        context.pack_cache,
         file_id,
     )?;
-    if !push_reachable_id(reachable_object_ids, seen, file_id.to_string()) {
+    if !push_reachable_id(context.reachable_object_ids, context.seen, file_id.to_string()) {
         return Ok(());
     }
 
-    let file: RemoteFileObject = read_remote_validation_object(object_store, file_id, "file")?;
+    let file: RemoteFileObject =
+        read_remote_validation_object(context.object_store, file_id, "file")?;
     validate_manifest_schema_version("file", file.schema_version)?;
     for chunk_id in file.chunks {
         validate_object_id_value(&chunk_id)
             .with_context(|| format!("invalid chunk id in file {file_id}"))?;
-        push_reachable_id(reachable_object_ids, seen, chunk_id);
+        push_reachable_id(context.reachable_object_ids, context.seen, chunk_id);
     }
     for shard_id in file.shard_ids {
         validate_object_id_value(&shard_id)
             .with_context(|| format!("invalid file shard id in file {file_id}"))?;
         fetch_remote_object_into_validation_root(
-            remote,
-            remote_loose_object_ids,
-            pack_locations,
-            validation_root,
-            pack_cache,
+            context.remote,
+            context.remote_loose_object_ids,
+            context.pack_locations,
+            context.validation_root,
+            context.pack_cache,
             &shard_id,
         )?;
-        if !push_reachable_id(reachable_object_ids, seen, shard_id.clone()) {
+        if !push_reachable_id(
+            context.reachable_object_ids,
+            context.seen,
+            shard_id.clone(),
+        ) {
             continue;
         }
         let shard: RemoteFileShardObject =
-            read_remote_validation_object(object_store, &shard_id, "file_shard")?;
+            read_remote_validation_object(context.object_store, &shard_id, "file_shard")?;
         validate_manifest_schema_version("file_shard", shard.schema_version)?;
         for chunk_id in shard.chunks {
             validate_object_id_value(&chunk_id)
                 .with_context(|| format!("invalid chunk id in file shard for {file_id}"))?;
-            push_reachable_id(reachable_object_ids, seen, chunk_id);
+            push_reachable_id(context.reachable_object_ids, context.seen, chunk_id);
         }
     }
     Ok(())

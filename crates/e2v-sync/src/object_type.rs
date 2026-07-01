@@ -10,19 +10,19 @@ pub const OBJECT_TYPE_CANDIDATES: [&str; 7] = [
 
 pub fn candidate_object_types(hint: Option<&str>) -> Vec<&'static str> {
     let mut candidates = Vec::with_capacity(OBJECT_TYPE_CANDIDATES.len());
-    if let Some(hint) = hint {
-        if OBJECT_TYPE_CANDIDATES.contains(&hint) {
-            candidates.push(match hint {
-                "snapshot" => "snapshot",
-                "tree" => "tree",
-                "file" => "file",
-                "chunk" => "chunk",
-                "directory_root" => "directory_root",
-                "tree_shard" => "tree_shard",
-                "file_shard" => "file_shard",
-                _ => unreachable!(),
-            });
-        }
+    if let Some(hint) = hint
+        && OBJECT_TYPE_CANDIDATES.contains(&hint)
+    {
+        candidates.push(match hint {
+            "snapshot" => "snapshot",
+            "tree" => "tree",
+            "file" => "file",
+            "chunk" => "chunk",
+            "directory_root" => "directory_root",
+            "tree_shard" => "tree_shard",
+            "file_shard" => "file_shard",
+            _ => unreachable!(),
+        });
     }
     for object_type in OBJECT_TYPE_CANDIDATES {
         if !candidates.contains(&object_type) {

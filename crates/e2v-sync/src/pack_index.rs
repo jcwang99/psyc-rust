@@ -162,7 +162,6 @@ pub fn load_remote_operation_pack_locations_with_secrets<B: BlobStore>(
     Ok(locations)
 }
 
-#[must_use]
 pub fn load_cached_pack_physical_ref_for_object_id(
     control_dir: &Path,
     object_id: &str,

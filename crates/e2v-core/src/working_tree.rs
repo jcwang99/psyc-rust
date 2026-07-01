@@ -103,12 +103,11 @@ impl WorkingTree {
     pub fn open_stable_file(&self, path: &Path) -> Result<Vec<u8>> {
         let policy = self.stable_read_policy();
         let before = self.capture_metadata(path)?;
-        if should_prefer_snapshot(&before, std::time::SystemTime::now()) {
-            if let Some(snapshot_reader) = &self.snapshot_reader {
-                if let Ok(bytes) = snapshot_reader.read(path) {
-                    return Ok(bytes);
-                }
-            }
+        if should_prefer_snapshot(&before, std::time::SystemTime::now())
+            && let Some(snapshot_reader) = &self.snapshot_reader
+            && let Ok(bytes) = snapshot_reader.read(path)
+        {
+            return Ok(bytes);
         }
         if is_volatile_source(&before, std::time::SystemTime::now()) {
             return read_volatile_with_retry(
@@ -921,7 +920,7 @@ mod tests {
     fn observed_checkout_name_accepts_unicode_equivalent_directory_entry() {
         let working_tree = WorkingTree::new("D:\\dummy");
         let observed = working_tree
-            .select_observed_checkout_name("é.txt", &[format!("e\u{301}.txt")])
+            .select_observed_checkout_name("é.txt", &["e\u{301}.txt".to_string()])
             .unwrap();
 
         assert_eq!(observed, "e\u{301}.txt");
@@ -1284,23 +1283,14 @@ mod tests {
         let error = super::read_volatile_with_retry(
             || {
                 calls += 1;
-                if calls == 1 {
-                    Ok((
-                        stable.clone(),
-                        b"stable".to_vec(),
-                        stable.clone(),
-                        b"stable".to_vec(),
-                        changed.clone(),
-                    ))
-                } else {
-                    Ok((
-                        stable.clone(),
-                        b"stable".to_vec(),
-                        stable.clone(),
-                        b"stable".to_vec(),
-                        changed.clone(),
-                    ))
-                }
+                let _ = calls == 1;
+                Ok((
+                    stable.clone(),
+                    b"stable".to_vec(),
+                    stable.clone(),
+                    b"stable".to_vec(),
+                    changed.clone(),
+                ))
             },
             1,
             std::path::Path::new("demo.txt"),
@@ -1363,7 +1353,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
-        let decomposed = format!("e\u{301}.txt");
+        let decomposed = "e\u{301}.txt".to_string();
         std::fs::write(root.join(&decomposed), b"hello").unwrap();
         let working_tree = WorkingTree::new(&root);
 

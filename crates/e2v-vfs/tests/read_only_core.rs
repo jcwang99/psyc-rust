@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
@@ -26,11 +26,11 @@ fn init_repo(repo_root: &std::path::Path) {
         .unwrap();
 }
 
-fn commit_message(repo_root: &PathBuf, message: &str, body: &str) -> String {
+fn commit_message(repo_root: &Path, message: &str, body: &str) -> String {
     fs::write(repo_root.join("tracked.txt"), body).unwrap();
     RepositoryFacade::new()
         .commit(CommitOptions {
-            repo_root: repo_root.clone(),
+            repo_root: repo_root.to_path_buf(),
             message: message.to_string(),
         })
         .unwrap()
@@ -76,6 +76,39 @@ fn opening_same_file_in_same_snapshot_reuses_stable_inode_id() {
 
     assert!(first.inode_id() > 0);
     assert_eq!(first.inode_id(), second.inode_id());
+}
+
+#[test]
+fn mount_snapshot_rejects_live_branch_mode_config() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    commit_message(&repo_root, "first", "alpha");
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+
+    let error = ReadOnlyVfs::mount_snapshot(VfsMountConfig::live_branch(repo_root, branch_token))
+        .unwrap_err();
+    assert!(error.to_string().contains("snapshot"));
+}
+
+#[test]
+fn mount_live_branch_rejects_snapshot_mode_config() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+
+    let error = ReadOnlyVfs::mount_live_branch(VfsMountConfig::snapshot(repo_root, snapshot_id))
+        .unwrap_err();
+    assert!(error.to_string().contains("live branch"));
 }
 
 #[test]
@@ -347,7 +380,7 @@ fn snapshot_vfs_normalizes_decomposed_unicode_file_paths_to_one_logical_identity
     fs::create_dir_all(&repo_root).unwrap();
     init_repo(&repo_root);
 
-    let decomposed = format!("e\u{301}.txt");
+    let decomposed = "e\u{301}.txt".to_string();
     fs::write(repo_root.join(&decomposed), "hello unicode").unwrap();
     let snapshot_id = RepositoryFacade::new()
         .commit(CommitOptions {
@@ -2122,7 +2155,7 @@ fn linux_mount_adapter_exposes_a_future_fuse_boundary() {
             .with_platform_capabilities(PlatformCapabilities::no_reliable_invalidation()),
         PathBuf::from("/mnt/e2v"),
     );
-    let adapter = LinuxMountAdapter::default();
+    let adapter = LinuxMountAdapter;
     let summary = adapter.launch(request).unwrap();
 
     assert_eq!(adapter.platform_family(), PlatformFamily::LinuxFuse);
@@ -2147,7 +2180,7 @@ fn macos_mount_adapter_exposes_a_future_fuse_boundary() {
         VfsMountConfig::snapshot(repo_root, snapshot_id),
         PathBuf::from("/Volumes/e2v"),
     );
-    let adapter = MacosMountAdapter::default();
+    let adapter = MacosMountAdapter;
     let summary = adapter.launch(request).unwrap();
 
     assert_eq!(adapter.platform_family(), PlatformFamily::MacosFuse);
@@ -2176,7 +2209,7 @@ fn windows_mount_adapter_exposes_a_winfsp_boundary() {
         VfsMountConfig::snapshot(repo_root, snapshot_id),
         PathBuf::from("W:"),
     );
-    let adapter = WindowsMountAdapter::default();
+    let adapter = WindowsMountAdapter;
     let summary = adapter.launch(request).unwrap();
 
     assert_eq!(adapter.platform_family(), PlatformFamily::WindowsWinfsp);

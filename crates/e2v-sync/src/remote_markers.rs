@@ -116,12 +116,12 @@ pub(crate) fn renew_writer_lease_marker(
 }
 
 pub(crate) fn system_time_to_unix_ms(value: SystemTime) -> Result<u64> {
-    Ok(value
+    value
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?
         .as_millis()
         .try_into()
-        .context("remote observed timestamp overflow")?)
+        .context("remote observed timestamp overflow")
 }
 
 pub(crate) fn remote_observed_at_unix_ms<R: RemoteBackend>(remote: &R, path: &str) -> Result<u64> {

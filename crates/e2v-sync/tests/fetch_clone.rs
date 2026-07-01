@@ -5232,7 +5232,13 @@ fn revoked_device_cannot_fetch_future_remote_head() {
     .unwrap();
 
     facade
-        .share_revoke_device(&source_repo_root, &device.device_id)
+        .share_revoke_device(
+            &source_repo_root,
+            e2v_core::ShareRevokeDeviceOptions {
+                device_id: device.device_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
         .unwrap();
     fs::write(source_repo_root.join("hello.txt"), b"after revoke").unwrap();
     facade

@@ -21,7 +21,7 @@ use crate::chunker::FastCdcChunker;
 use crate::keyring::{
     KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_password,
     cache_unlocked_secrets, generate_local_device_credential, open_repo_secrets,
-    read_cached_password, read_current_keyring_state, read_local_device_credential,
+    read_current_keyring_state, read_local_device_credential,
     seal_repo_secrets, seal_repo_secrets_for_device, unlock_repo_secrets,
     unlock_repo_secrets_from_generation_file,
     unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
@@ -245,6 +245,18 @@ pub struct ShareInviteDeviceOptions {
 pub struct ShareAcceptDeviceOptions {
     pub invite_bytes: Vec<u8>,
     pub local_device_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRevokeDeviceOptions {
+    pub device_id: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRevokeMemberOptions {
+    pub actor_id: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -629,14 +641,7 @@ impl RepositoryFacade {
         let control_dir = repo_root.join(CONTROL_DIR);
 
         let layout_root = validate_layout_root(&control_dir)?;
-        let repo_secrets = match open_repo_secrets(&control_dir) {
-            Ok(secrets) => secrets,
-            Err(_) => {
-                let secrets = unlock_repo_secrets_with_local_device(&control_dir)?;
-                cache_unlocked_secrets(&control_dir, &secrets);
-                secrets
-            }
-        };
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
         ensure!(
             !default_ref.branch_name.trim().is_empty(),
@@ -667,7 +672,7 @@ impl RepositoryFacade {
             repo_root.display()
         );
 
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let mut default_ref = read_current_ref(&control_dir)?;
         let mut committed_files = 0usize;
         let mut new_bytes = 0u64;
@@ -686,7 +691,6 @@ impl RepositoryFacade {
         let tree_id = build_tree_object(
             &object_store,
             &working_tree,
-            &repo_root,
             &repo_root,
             &mut committed_files,
             &mut new_bytes,
@@ -785,7 +789,7 @@ impl RepositoryFacade {
         );
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let current_ref = read_current_ref(&control_dir)?;
         let token_hex = derive_branch_token(&repo_secrets.repo_ref_key, branch_name);
         if current_ref.ref_token_hex == token_hex {
@@ -811,7 +815,7 @@ impl RepositoryFacade {
     pub fn list_branches(&self, repo_root: impl AsRef<Path>) -> Result<Vec<BranchSummary>> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let current_ref = read_current_ref(&control_dir)?;
         let mut branches = read_all_branch_refs(&control_dir, &repo_secrets)?;
         ensure!(
@@ -880,7 +884,7 @@ impl RepositoryFacade {
             "bootstrap-device".to_string(),
         )?;
         let branch = self.open(&repo_root)?.branch;
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let bootstrap_generation = keyring.generation + 1;
         let bootstrap_generation_file = format!(
             "keyring.{}.bootstrap-{}",
@@ -985,7 +989,7 @@ impl RepositoryFacade {
             options.device_label.clone(),
         )?;
         let branch = self.open(&repo_root)?.branch;
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let bootstrap_generation = keyring.generation + 1;
         let bootstrap_generation_file = format!(
             "keyring.{}.bootstrap-{}",
@@ -1058,24 +1062,32 @@ impl RepositoryFacade {
         self.accept_share_device(repo_root, &invite, &options.local_device_label, false)
     }
 
-    pub fn share_revoke_device(&self, repo_root: impl AsRef<Path>, device_id: &str) -> Result<()> {
+    pub fn share_revoke_device(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: ShareRevokeDeviceOptions,
+    ) -> Result<()> {
         ensure!(
-            !device_id.trim().is_empty(),
+            !options.device_id.trim().is_empty(),
             "share device id must not be empty"
+        );
+        ensure!(
+            !options.password.trim().is_empty(),
+            "share revoke device password must not be empty"
         );
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
         ensure_local_share_admin(&control_dir)?;
-        let mut repo_secrets = open_repo_secrets(&control_dir)?;
-        let password = read_cached_password(&control_dir)?;
+        let mut repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let password = options.password;
         let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
         let current_state: KeyringState =
             read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
         let target_device = current_state
             .devices
             .iter()
-            .find(|device| device.device_id == device_id)
-            .with_context(|| format!("share device not found: {device_id}"))?;
+            .find(|device| device.device_id == options.device_id)
+            .with_context(|| format!("share device not found: {}", options.device_id))?;
         ensure!(
             current_state.actors.iter().all(
                 |actor| actor.actor_id != target_device.actor_id || actor.role != "owner_admin"
@@ -1101,7 +1113,7 @@ impl RepositoryFacade {
             .iter()
             .cloned()
             .map(|mut device| {
-                if device.device_id == device_id {
+                if device.device_id == options.device_id {
                     device.status = "revoked".to_string();
                 }
                 device
@@ -1122,7 +1134,7 @@ impl RepositoryFacade {
         };
         next_state
             .envelopes
-            .retain(|envelope| envelope.device_id != device_id);
+            .retain(|envelope| envelope.device_id != options.device_id);
 
         let next_pointer = KeyringPointer {
             generation: next_generation,
@@ -1139,16 +1151,24 @@ impl RepositoryFacade {
         Ok(())
     }
 
-    pub fn share_revoke_member(&self, repo_root: impl AsRef<Path>, actor_id: &str) -> Result<()> {
+    pub fn share_revoke_member(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: ShareRevokeMemberOptions,
+    ) -> Result<()> {
         ensure!(
-            !actor_id.trim().is_empty(),
+            !options.actor_id.trim().is_empty(),
             "share actor id must not be empty"
+        );
+        ensure!(
+            !options.password.trim().is_empty(),
+            "share revoke member password must not be empty"
         );
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
         ensure_local_share_admin(&control_dir)?;
-        let mut repo_secrets = open_repo_secrets(&control_dir)?;
-        let password = read_cached_password(&control_dir)?;
+        let mut repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let password = options.password;
         let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
         let current_state: KeyringState =
             read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
@@ -1156,14 +1176,15 @@ impl RepositoryFacade {
             current_state
                 .actors
                 .iter()
-                .any(|actor| actor.actor_id == actor_id),
-            "share actor not found: {actor_id}"
+                .any(|actor| actor.actor_id == options.actor_id),
+            "share actor not found: {}",
+            options.actor_id
         );
         ensure!(
             current_state
                 .actors
                 .iter()
-                .all(|actor| actor.actor_id != actor_id || actor.role != "owner_admin"),
+                .all(|actor| actor.actor_id != options.actor_id || actor.role != "owner_admin"),
             "cannot revoke owner-admin actor"
         );
 
@@ -1185,7 +1206,7 @@ impl RepositoryFacade {
             .iter()
             .cloned()
             .map(|mut device| {
-                if device.actor_id == actor_id {
+                if device.actor_id == options.actor_id {
                     device.status = "revoked".to_string();
                 }
                 device
@@ -1207,7 +1228,7 @@ impl RepositoryFacade {
         };
         next_state
             .envelopes
-            .retain(|envelope| envelope.actor_id != actor_id);
+            .retain(|envelope| envelope.actor_id != options.actor_id);
 
         let next_pointer = KeyringPointer {
             generation: next_generation,
@@ -1246,7 +1267,7 @@ impl RepositoryFacade {
             });
         }
 
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         ensure!(
             repo_secrets.repo_id == invite.repo_id,
             "share invite bundle targets a different repository"
@@ -1344,7 +1365,7 @@ impl RepositoryFacade {
         );
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let current_ref = read_current_ref(&control_dir)?;
         let token_hex = derive_branch_token(&repo_secrets.repo_ref_key, branch_name);
         if current_ref.ref_token_hex == token_hex {
@@ -1368,7 +1389,7 @@ impl RepositoryFacade {
         );
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let current_ref = read_current_ref(&control_dir)?;
         let token_hex = derive_branch_token(&repo_secrets.repo_ref_key, branch_name);
         let target_ref = if current_ref.ref_token_hex == token_hex {
@@ -1464,7 +1485,7 @@ impl RepositoryFacade {
         let repo_root = _repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
         let _repo_state = self.open(&repo_root)?;
-        let repo_secrets = open_repo_secrets(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
         if let Some(snapshot_id) = default_ref.head_snapshot_id.as_deref() {
             let object_store = open_object_store(&control_dir)?;
@@ -2195,6 +2216,17 @@ fn open_object_store(control_dir: &Path) -> Result<DirectLayoutObjectStore> {
     Ok(open_object_store_with_secrets(control_dir, secrets))
 }
 
+fn open_or_unlock_repo_secrets_with_local_device(control_dir: &Path) -> Result<RepoSecrets> {
+    match open_repo_secrets(control_dir) {
+        Ok(secrets) => Ok(secrets),
+        Err(_) => {
+            let secrets = unlock_repo_secrets_with_local_device(control_dir)?;
+            cache_unlocked_secrets(control_dir, &secrets);
+            Ok(secrets)
+        }
+    }
+}
+
 fn open_object_store_with_secrets(
     control_dir: &Path,
     secrets: RepoSecrets,
@@ -2496,7 +2528,6 @@ fn build_tree_object(
     object_store: &DirectLayoutObjectStore,
     working_tree: &WorkingTree,
     current_dir: &Path,
-    repo_root: &Path,
     committed_files: &mut usize,
     new_bytes: &mut u64,
     reused_bytes: &mut u64,
@@ -2511,7 +2542,6 @@ fn build_tree_object(
                 object_store,
                 working_tree,
                 &entry.path,
-                repo_root,
                 committed_files,
                 new_bytes,
                 reused_bytes,
@@ -3195,7 +3225,7 @@ mod facade_tests {
         let (_repo_root, store) = init_repo("repo");
         let failing_path = PathBuf::from("C:\\virtual\\bad.txt");
         let ok_path = PathBuf::from("C:\\virtual\\good.txt");
-        let entries = vec![
+        let entries = [
             WorkingTreeEntry {
                 name: "bad.txt".to_string(),
                 path: failing_path.clone(),

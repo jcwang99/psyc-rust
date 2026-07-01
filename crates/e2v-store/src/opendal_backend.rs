@@ -142,6 +142,12 @@ pub struct S3CompatibleMockBackend {
     capability: BackendCapability,
 }
 
+impl Default for S3CompatibleMockBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl S3CompatibleMockBackend {
     pub fn new() -> Self {
         Self {
@@ -309,8 +315,10 @@ impl BlobStore for OpendalMemoryBackend {
     }
 
     fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
-        let mut opts = opendal::options::WriteOptions::default();
-        opts.if_not_exists = true;
+        let opts = opendal::options::WriteOptions {
+            if_not_exists: true,
+            ..Default::default()
+        };
         match self
             .operator
             .write_options(relative_path, bytes.to_vec(), opts)
@@ -382,8 +390,10 @@ impl BlobStore for OpendalWebdavBackend {
     }
 
     fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
-        let mut opts = opendal::options::WriteOptions::default();
-        opts.if_not_exists = true;
+        let opts = opendal::options::WriteOptions {
+            if_not_exists: true,
+            ..Default::default()
+        };
         match self
             .operator
             .write_options(relative_path, bytes.to_vec(), opts)

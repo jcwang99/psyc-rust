@@ -213,11 +213,14 @@ pub struct VfsNodeMetadata {
 pub struct ReadOnlyVfs {
     mode: MountMode,
     cache_policy: CachePolicy,
-    plaintext_cache: Arc<Mutex<HashMap<(String, String, u64), Vec<u8>>>>,
+    plaintext_cache: Arc<Mutex<PlaintextCache>>,
     encrypted_range_cache: Option<EncryptedRangeCache>,
     read_service: ReadService,
     namespace_snapshot: SnapshotHandle,
 }
+
+type PlaintextCacheKey = (String, String, u64);
+type PlaintextCache = HashMap<PlaintextCacheKey, Vec<u8>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountLaunchSummary {
@@ -231,41 +234,24 @@ pub struct MountLaunchSummary {
 
 impl ReadOnlyVfs {
     pub fn mount_snapshot(config: VfsMountConfig) -> Result<Self> {
-        let mode = config.mode.clone();
-        let read_service = ReadService::new(&config.repo_root);
-        let encrypted_range_cache = config
-            .encrypted_disk_cache_dir
-            .as_ref()
-            .map(|cache_dir| EncryptedRangeCache::new(cache_dir.clone(), &config.repo_root))
-            .transpose()?;
-        let cache_policy = match (
-            &mode,
-            config
-                .platform_capabilities
-                .supports_live_branch_kernel_cache(),
-        ) {
-            (MountMode::LiveBranch { .. }, false) => CachePolicy::DirectIoFallback,
-            _ => CachePolicy::KernelCacheWithInvalidation,
-        };
-        let namespace_snapshot = match config.mode {
-            MountMode::SnapshotPinned { snapshot_id } => {
-                read_service.open_snapshot(&snapshot_id)?
+        match config.mode {
+            MountMode::SnapshotPinned { .. } => Self::mount(config),
+            MountMode::LiveBranch { .. } => {
+                anyhow::bail!("snapshot mounts require snapshot mode configuration")
             }
-            MountMode::LiveBranch { branch_token_hex } => {
-                read_service.resolve_branch(&branch_token_hex)?
-            }
-        };
-        Ok(Self {
-            mode,
-            cache_policy,
-            plaintext_cache: Arc::new(Mutex::new(HashMap::new())),
-            encrypted_range_cache,
-            read_service,
-            namespace_snapshot,
-        })
+        }
     }
 
     pub fn mount_live_branch(config: VfsMountConfig) -> Result<Self> {
+        match config.mode {
+            MountMode::LiveBranch { .. } => Self::mount(config),
+            MountMode::SnapshotPinned { .. } => {
+                anyhow::bail!("live branch mounts require live branch mode configuration")
+            }
+        }
+    }
+
+    fn mount(config: VfsMountConfig) -> Result<Self> {
         let mode = config.mode.clone();
         let read_service = ReadService::new(&config.repo_root);
         let encrypted_range_cache = config
@@ -388,16 +374,16 @@ impl ReadOnlyVfs {
             return Ok(cached[start..end].to_vec());
         }
 
-        if let Some(cache) = &self.encrypted_range_cache {
-            if let Some(cached) = cache.read_range(
+        if let Some(cache) = &self.encrypted_range_cache
+            && let Some(cached) = cache.read_range(
                 opened_file.snapshot_id(),
                 opened_file.file_object_id(),
                 opened_file.layout_generation(),
                 offset,
                 length,
-            )? {
-                return Ok(cached);
-            }
+            )?
+        {
+            return Ok(cached);
         }
 
         let bytes = self

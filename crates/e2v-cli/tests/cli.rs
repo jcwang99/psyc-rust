@@ -360,6 +360,8 @@ fn share_member_round_trip_via_bundle_file() {
         "revoke-member",
         "--actor",
         &actor_id,
+        "--password",
+        "correct horse battery staple",
     ])
     .unwrap();
     assert!(revoke_output.contains("revoked"));
@@ -450,9 +452,97 @@ fn share_device_round_trip_via_bundle_file() {
         "revoke-device",
         "--device",
         &device_id,
+        "--password",
+        "correct horse battery staple",
     ])
     .unwrap();
     assert!(revoke_output.contains("revoked"));
+}
+
+#[test]
+fn share_revoke_member_still_works_after_cache_clear_when_password_is_explicit() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let bundle_path = temp.path().join("invite.e2vshare");
+
+    e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "invite-member",
+        "--name",
+        "Alice",
+        "--out",
+        bundle_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "accept-member",
+        "--bundle",
+        bundle_path.to_str().unwrap(),
+        "--label",
+        "alice-laptop",
+    ])
+    .unwrap();
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+
+    let listing = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "list",
+    ])
+    .unwrap();
+    let actor_id = listing
+        .lines()
+        .find_map(|line| {
+            if line.contains("writer_member") {
+                line.split_whitespace()
+                    .next()
+                    .map(|value| value.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "share",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "revoke-member",
+        "--actor",
+        &actor_id,
+        "--password",
+        "correct horse battery staple",
+    ])
+    .unwrap();
+
+    assert!(output.contains("revoked"));
 }
 
 #[test]

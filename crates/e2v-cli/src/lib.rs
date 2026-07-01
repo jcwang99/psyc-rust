@@ -124,10 +124,14 @@ enum ShareCommand {
     RevokeMember {
         #[arg(long = "actor")]
         actor: String,
+        #[arg(long = "password")]
+        password: String,
     },
     RevokeDevice {
         #[arg(long = "device")]
         device: String,
+        #[arg(long = "password")]
+        password: String,
     },
 }
 
@@ -337,12 +341,21 @@ fn execute(cli: Cli) -> Result<String> {
                     accepted.actor_id, accepted.device_id, accepted.role
                 ))
             }
-            ShareCommand::RevokeMember { actor } => {
-                facade.share_revoke_member(&repo, &actor)?;
+            ShareCommand::RevokeMember { actor, password } => {
+                facade.share_revoke_member(
+                    &repo,
+                    e2v_core::ShareRevokeMemberOptions { actor_id: actor.clone(), password },
+                )?;
                 Ok(format!("revoked member {actor}\n"))
             }
-            ShareCommand::RevokeDevice { device } => {
-                facade.share_revoke_device(&repo, &device)?;
+            ShareCommand::RevokeDevice { device, password } => {
+                facade.share_revoke_device(
+                    &repo,
+                    e2v_core::ShareRevokeDeviceOptions {
+                        device_id: device.clone(),
+                        password,
+                    },
+                )?;
                 Ok(format!("revoked device {device}\n"))
             }
         },

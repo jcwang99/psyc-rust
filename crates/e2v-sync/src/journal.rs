@@ -172,7 +172,7 @@ impl OperationJournal {
     }
 
     pub fn pending_objects(&self, operation_id: &OperationId) -> Result<Vec<ObjectUploadRecord>> {
-        Ok(self.latest_records(operation_id)?)
+        self.latest_records(operation_id)
     }
 
     pub fn pending_object_batch(

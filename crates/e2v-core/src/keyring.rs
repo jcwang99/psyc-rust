@@ -146,16 +146,6 @@ pub fn cache_unlocked_password(control_dir: &Path, password: &str) {
     cache.insert(control_dir.to_path_buf(), password.to_string());
 }
 
-pub fn read_cached_password(control_dir: &Path) -> Result<String> {
-    let cache = UNLOCKED_PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()));
-    cache
-        .lock()
-        .unwrap()
-        .get(control_dir)
-        .cloned()
-        .context("repository password cache is unavailable; unlock with password first")
-}
-
 pub fn clear_unlocked_keyring_cache(control_dir: &Path) {
     if let Some(cache) = UNLOCKED_KEYRINGS.get() {
         cache.lock().unwrap().remove(control_dir);
@@ -225,7 +215,7 @@ fn unlock_repo_secrets_from_state(keyring: &KeyringState, password: &str) -> Res
         .iter()
         .find(|envelope| envelope.kind == "password")
         .context("keyring has no password envelope")?;
-    let sealed = decrypt_password_envelope(&keyring, password_envelope, password)?;
+    let sealed = decrypt_password_envelope(keyring, password_envelope, password)?;
     let secrets = RepoSecrets {
         repo_id: keyring.repo_id.clone(),
         active_epoch: keyring.active_epoch,
@@ -614,18 +604,15 @@ fn decode_epoch_keys(
     sealed: &SealedRepoSecrets,
     active_epoch: u32,
 ) -> Result<BTreeMap<u32, EpochSecrets>> {
+    ensure!(
+        !sealed.epoch_manifest_enc_keys_hex.is_empty(),
+        "missing epoch manifest encryption keys"
+    );
+    ensure!(
+        !sealed.epoch_nonce_keys_hex.is_empty(),
+        "missing epoch nonce keys"
+    );
     let mut epoch_keys = BTreeMap::new();
-    if sealed.epoch_manifest_enc_keys_hex.is_empty() || sealed.epoch_nonce_keys_hex.is_empty() {
-        epoch_keys.insert(
-            active_epoch,
-            EpochSecrets {
-                manifest_enc_key: decode_hex_key(&sealed.repo_manifest_enc_key_hex)?,
-                nonce_key: decode_hex_key(&sealed.repo_nonce_key_hex)?,
-            },
-        );
-        return Ok(epoch_keys);
-    }
-
     for (epoch, manifest_enc_key_hex) in &sealed.epoch_manifest_enc_keys_hex {
         let nonce_key_hex = sealed
             .epoch_nonce_keys_hex
@@ -697,4 +684,58 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
     let bytes =
         std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_key(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
+    fn sample_sealed_repo_secrets() -> SealedRepoSecrets {
+        SealedRepoSecrets {
+            repo_dedup_key_hex: hex_key(1),
+            repo_ref_key_hex: hex_key(2),
+            repo_manifest_enc_key_hex: hex_key(3),
+            repo_nonce_key_hex: hex_key(4),
+            repo_path_index_key_hex: hex_key(5),
+            epoch_manifest_enc_keys_hex: BTreeMap::from([
+                (1, hex_key(6)),
+                (2, hex_key(7)),
+            ]),
+            epoch_nonce_keys_hex: BTreeMap::from([
+                (1, hex_key(8)),
+                (2, hex_key(9)),
+            ]),
+        }
+    }
+
+    #[test]
+    fn decode_epoch_keys_requires_latest_epoch_maps() {
+        let mut sealed = sample_sealed_repo_secrets();
+        sealed.epoch_manifest_enc_keys_hex.clear();
+
+        let error = decode_epoch_keys(&sealed, 2).unwrap_err();
+
+        assert!(
+            error.to_string().contains("epoch manifest")
+                || error.to_string().contains("missing epoch"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn decode_epoch_keys_reads_latest_epoch_maps() {
+        let sealed = sample_sealed_repo_secrets();
+
+        let decoded = decode_epoch_keys(&sealed, 2).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[&1].manifest_enc_key, [6u8; 32]);
+        assert_eq!(decoded[&1].nonce_key, [8u8; 32]);
+        assert_eq!(decoded[&2].manifest_enc_key, [7u8; 32]);
+        assert_eq!(decoded[&2].nonce_key, [9u8; 32]);
+    }
 }

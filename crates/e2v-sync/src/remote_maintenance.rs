@@ -72,6 +72,16 @@ pub struct GcExecuteCapabilityStatus {
     pub blockers: Vec<&'static str>,
 }
 
+struct MaintenanceReachabilityContext<'a, R: RemoteBackend> {
+    remote: &'a R,
+    repo_root: &'a std::path::Path,
+    remote_loose_object_ids: &'a BTreeSet<String>,
+    pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
+    validation_root: &'a RemoteValidationRoot,
+    validation_secrets: &'a e2v_store::RepoSecrets,
+    pack_cache: &'a mut BTreeMap<String, Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GcDeleteJournal {
     grace_period_days: u64,
@@ -343,14 +353,17 @@ pub fn gc_dry_run<R: RemoteBackend>(
         &secrets,
         &mut pack_cache,
     )?;
-    reachable_object_ids.extend(collect_recent_unpublished_local_reachable_object_ids(
+    let mut maintenance_context = MaintenanceReachabilityContext {
         remote,
-        &options.repo_root,
-        &remote_loose_object_ids,
-        &pack_locations,
-        &validation_root,
-        &secrets,
-        &mut pack_cache,
+        repo_root: &options.repo_root,
+        remote_loose_object_ids: &remote_loose_object_ids,
+        pack_locations: &pack_locations,
+        validation_root: &validation_root,
+        validation_secrets: &secrets,
+        pack_cache: &mut pack_cache,
+    };
+    reachable_object_ids.extend(collect_recent_unpublished_local_reachable_object_ids(
+        &mut maintenance_context,
         &reachable_object_ids,
     )?);
     let active_intent_paths = list_active_intent_paths(remote)?;
@@ -769,18 +782,12 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
 }
 
 fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
-    remote: &R,
-    repo_root: &std::path::Path,
-    remote_loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    validation_root: &RemoteValidationRoot,
-    validation_secrets: &e2v_store::RepoSecrets,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    context: &mut MaintenanceReachabilityContext<'_, R>,
     remote_reachable_object_ids: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
     let facade = RepositoryFacade::new();
     let mut candidate_head_snapshot_ids = facade
-        .list_branches(repo_root)?
+        .list_branches(context.repo_root)?
         .into_iter()
         .filter_map(|branch| branch.head_snapshot_id)
         .filter(|snapshot_id| !remote_reachable_object_ids.contains(snapshot_id))
@@ -792,7 +799,11 @@ fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
     let candidate_paths = candidate_head_snapshot_ids
         .iter()
         .filter_map(|snapshot_id| {
-            remote_physical_path_for_object(remote_loose_object_ids, pack_locations, snapshot_id)
+            remote_physical_path_for_object(
+                context.remote_loose_object_ids,
+                context.pack_locations,
+                snapshot_id,
+            )
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -802,17 +813,21 @@ fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
     }
 
     let unpublished_safe_horizon = observed_remote_safe_horizon(
-        remote,
+        context.remote,
         UNPUBLISHED_SNAPSHOT_GRACE_PERIOD_DAYS,
         &candidate_paths,
     )?;
     candidate_head_snapshot_ids.retain(|snapshot_id| {
         let Some(path) =
-            remote_physical_path_for_object(remote_loose_object_ids, pack_locations, snapshot_id)
+            remote_physical_path_for_object(
+                context.remote_loose_object_ids,
+                context.pack_locations,
+                snapshot_id,
+            )
         else {
             return false;
         };
-        !physical_ref_is_older_than_horizon(remote, &path, unpublished_safe_horizon)
+        !physical_ref_is_older_than_horizon(context.remote, &path, unpublished_safe_horizon)
             .unwrap_or(false)
     });
     if candidate_head_snapshot_ids.is_empty() {
@@ -822,12 +837,12 @@ fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
     let mut protected_object_ids = BTreeSet::new();
     for snapshot_id in candidate_head_snapshot_ids {
         let reachable = collect_remote_reachable_object_ids(
-            remote,
-            remote_loose_object_ids,
-            pack_locations,
-            validation_root,
-            validation_secrets,
-            pack_cache,
+            context.remote,
+            context.remote_loose_object_ids,
+            context.pack_locations,
+            context.validation_root,
+            context.validation_secrets,
+            context.pack_cache,
             &snapshot_id,
         )
         .with_context(|| {

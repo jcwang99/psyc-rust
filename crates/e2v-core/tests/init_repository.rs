@@ -213,6 +213,48 @@ fn keyring_generation_does_not_store_plaintext_repo_keys() {
 }
 
 #[test]
+fn init_persists_active_epoch_key_maps_in_latest_keyring_format() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let keyring = read_current_keyring_json(&repo_root);
+    let active_epoch = keyring["active_epoch"].as_u64().unwrap().to_string();
+    let epochs = keyring["epochs"].as_array().unwrap();
+
+    assert_eq!(keyring["generation"].as_u64(), Some(2));
+    assert!(epochs.iter().any(|epoch| {
+        epoch["epoch"].as_u64() == Some(1) && epoch["status"].as_str() == Some("retired")
+    }));
+    assert!(epochs.iter().any(|epoch| {
+        epoch["epoch"].as_u64() == Some(2) && epoch["status"].as_str() == Some("active")
+    }));
+
+    let secrets = e2v_core::sync_support::unlock_repo_secrets_for_sync(
+        repo_root.join(".e2v"),
+        "correct horse battery staple",
+    )
+    .unwrap();
+    assert!(
+        secrets.epoch_keys.contains_key(&1),
+        "latest keyring should retain prior epoch keys after rotation"
+    );
+    assert!(
+        secrets.epoch_keys.contains_key(
+            &active_epoch
+                .parse::<u32>()
+                .expect("active epoch should fit in u32")
+        ),
+        "latest keyring should include active epoch keys"
+    );
+}
+
+#[test]
 fn wrong_password_cannot_unlock_keyring() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -549,6 +591,80 @@ fn local_device_unlock_survives_epoch_rotation() {
     let reopened = e2v_core::testing::unlock_with_local_device_for_test(&repo_root).unwrap();
 
     assert_eq!(reopened, created);
+}
+
+#[test]
+fn commit_restores_access_via_local_device_after_cache_clear() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "fresh-process commit".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+
+    assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+}
+
+#[test]
+fn create_branch_restores_access_via_local_device_after_cache_clear() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let branch = facade.create_branch(&repo_root, "feature/latest").unwrap();
+    let branches = facade.list_branches(&repo_root).unwrap();
+
+    assert_eq!(branch.name, "feature/latest");
+    assert!(
+        branches
+            .iter()
+            .any(|entry| entry.name == "feature/latest" && !entry.is_current)
+    );
+}
+
+#[test]
+fn list_checkout_and_delete_branch_restore_access_via_local_device_after_cache_clear() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    facade.create_branch(&repo_root, "feature/latest").unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let listed = facade.list_branches(&repo_root).unwrap();
+    assert!(listed.iter().any(|entry| entry.name == "feature/latest"));
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let checked_out = facade.checkout_branch(&repo_root, "feature/latest").unwrap();
+    assert_eq!(checked_out.branch.name, "feature/latest");
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    facade.checkout_branch(&repo_root, "main").unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    facade.delete_branch(&repo_root, "feature/latest").unwrap();
+
+    let remaining = facade.list_branches(&repo_root).unwrap();
+    assert!(!remaining.iter().any(|entry| entry.name == "feature/latest"));
 }
 
 #[test]
@@ -1212,7 +1328,7 @@ fn read_service_normalizes_decomposed_unicode_paths() {
 
     let facade = RepositoryFacade::new();
     facade.init(init_options(&repo_root)).unwrap();
-    let decomposed = format!("e\u{301}.txt");
+    let decomposed = "e\u{301}.txt".to_string();
     fs::write(repo_root.join(&decomposed), "hello unicode").unwrap();
 
     let commit = facade
@@ -1238,7 +1354,7 @@ fn unicode_name_scan_checkout_scan_is_idempotent() {
 
     let facade = RepositoryFacade::new();
     facade.init(init_options(&repo_root)).unwrap();
-    let decomposed = format!("e\u{301}.txt");
+    let decomposed = "e\u{301}.txt".to_string();
     fs::write(repo_root.join(&decomposed), "hello unicode").unwrap();
 
     let commit = facade
@@ -4217,7 +4333,13 @@ fn share_revoke_member_advances_active_epoch_and_removes_member_envelope() {
     .unwrap();
 
     facade
-        .share_revoke_member(&repo_root, &invite.actor_id)
+        .share_revoke_member(
+            &repo_root,
+            e2v_core::ShareRevokeMemberOptions {
+                actor_id: invite.actor_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
         .unwrap();
 
     let after = read_current_keyring_json(&repo_root);
@@ -4242,6 +4364,70 @@ fn share_revoke_member_advances_active_epoch_and_removes_member_envelope() {
             .all(|device| device["status"].as_str() == Some("revoked"))
     );
     assert!(!keyring_contains_actor_envelope(&after, &invite.actor_id));
+}
+
+#[test]
+fn share_revoke_member_accepts_explicit_password_after_cache_clear_in_latest_flow() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    let owner_credential_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    facade
+        .share_accept_member(
+            &repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    facade
+        .share_revoke_member(
+            &repo_root,
+            e2v_core::ShareRevokeMemberOptions {
+                actor_id: invite.actor_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .unwrap();
+
+    let after = read_current_keyring_json(&repo_root);
+    assert!(
+        after["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|device| device["actor_id"].as_str() == Some(invite.actor_id.as_str()))
+            .all(|device| device["status"].as_str() == Some("revoked"))
+    );
 }
 
 #[test]
@@ -4302,7 +4488,13 @@ fn share_revoke_member_blocks_local_device_unlock_after_revocation() {
     .unwrap();
 
     facade
-        .share_revoke_member(&owner_root, &invite.actor_id)
+        .share_revoke_member(
+            &owner_root,
+            e2v_core::ShareRevokeMemberOptions {
+                actor_id: invite.actor_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
         .unwrap();
 
     fs::write(
@@ -4481,7 +4673,13 @@ fn share_revoke_device_advances_epoch_and_only_revokes_target_device() {
     .unwrap();
 
     facade
-        .share_revoke_device(&repo_root, &accepted_device.device_id)
+        .share_revoke_device(
+            &repo_root,
+            e2v_core::ShareRevokeDeviceOptions {
+                device_id: accepted_device.device_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
         .unwrap();
 
     let after = read_current_keyring_json(&repo_root);
@@ -4558,7 +4756,13 @@ fn writer_member_cannot_issue_share_admin_operations() {
     );
 
     let revoke_error = facade
-        .share_revoke_member(&repo_root, &accepted_member.actor_id)
+        .share_revoke_member(
+            &repo_root,
+            e2v_core::ShareRevokeMemberOptions {
+                actor_id: accepted_member.actor_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
         .unwrap_err();
     assert!(
         revoke_error.to_string().contains("owner-admin")

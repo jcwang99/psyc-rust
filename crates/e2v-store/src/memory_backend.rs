@@ -24,6 +24,12 @@ pub struct MemoryBackend {
     capability: BackendCapability,
 }
 
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryBackend {
     pub fn new() -> Self {
         let layout_root = LayoutRoot {

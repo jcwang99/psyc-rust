@@ -286,41 +286,50 @@ fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
     Ok(inventory.as_ref().expect("inventory initialized"))
 }
 
-fn remote_object_authenticates_for_resume<R: RemoteBackend>(
-    repo_root: &Path,
-    remote: &R,
-    current_operation_pack_locations: &BTreeMap<String, PackedObjectLocation>,
+struct ResumeRemoteAuthContext<'a, R: RemoteBackend> {
+    repo_root: &'a Path,
+    remote: &'a R,
+    current_operation_pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
     allow_full_inventory_lookup: bool,
-    remote_inventory_cache: &mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    remote_inventory_cache:
+        &'a mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
+    pack_cache: &'a mut BTreeMap<String, Vec<u8>>,
+}
+
+fn remote_object_authenticates_for_resume<R: RemoteBackend>(
+    context: &mut ResumeRemoteAuthContext<'_, R>,
     object_id: &str,
     expected_type: &str,
 ) -> Result<bool> {
     if remote_object_authenticates_for_repo(
-        repo_root,
-        remote,
-        current_operation_pack_locations,
-        pack_cache,
+        context.repo_root,
+        context.remote,
+        context.current_operation_pack_locations,
+        context.pack_cache,
         object_id,
         expected_type,
     ) {
         return Ok(true);
     }
 
-    if !allow_full_inventory_lookup {
+    if !context.allow_full_inventory_lookup {
         return Ok(false);
     }
 
-    let control_dir = repo_root.join(".e2v");
+    let control_dir = context.repo_root.join(".e2v");
     let (remote_loose_object_ids, remote_pack_locations) =
-        ensure_remote_object_inventory_loaded(&control_dir, remote, remote_inventory_cache)?;
+        ensure_remote_object_inventory_loaded(
+            &control_dir,
+            context.remote,
+            context.remote_inventory_cache,
+        )?;
     Ok(
         inventory_has_object(remote_loose_object_ids, remote_pack_locations, object_id)
             && remote_object_authenticates_for_repo(
-                repo_root,
-                remote,
+                context.repo_root,
+                context.remote,
                 remote_pack_locations,
-                pack_cache,
+                context.pack_cache,
                 object_id,
                 expected_type,
             ),
@@ -352,12 +361,7 @@ fn verify_remote_reachable_objects(
 }
 
 fn verify_remote_reachable_objects_for_resume<R: RemoteBackend>(
-    repo_root: &Path,
-    remote: &R,
-    current_operation_pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    allow_full_inventory_lookup: bool,
-    remote_inventory_cache: &mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
+    context: &mut ResumeRemoteAuthContext<'_, R>,
     snapshot_id: &str,
     object_ids: &[String],
 ) -> Result<()> {
@@ -365,19 +369,10 @@ fn verify_remote_reachable_objects_for_resume<R: RemoteBackend>(
         let expected_type = if object_id == snapshot_id {
             "snapshot"
         } else {
-            infer_object_type_for_resume_candidate(repo_root, object_id)
+            infer_object_type_for_resume_candidate(context.repo_root, object_id)
         };
         anyhow::ensure!(
-            remote_object_authenticates_for_resume(
-                repo_root,
-                remote,
-                current_operation_pack_locations,
-                allow_full_inventory_lookup,
-                remote_inventory_cache,
-                pack_cache,
-                object_id,
-                expected_type,
-            )?,
+            remote_object_authenticates_for_resume(context, object_id, expected_type)?,
             "pre-commit verify failed: reachable object missing from remote: {object_id}"
         );
     }
@@ -421,39 +416,38 @@ where
     for object_id in object_ids {
         validate_object_id_value(object_id)?;
         let bytes = std::fs::read(local_object_path(repo_root, object_id))?;
-        if let Some(builder) = pack_builder.as_mut() {
-            if bytes.len() <= SMALL_OBJECT_MAX_BYTES {
-                builder.push_object(object_id.clone(), &bytes);
-                packed_object_ids.push(object_id.clone());
-                continue;
-            }
+        if let Some(builder) = pack_builder.as_mut()
+            && bytes.len() <= SMALL_OBJECT_MAX_BYTES
+        {
+            builder.push_object(object_id.clone(), &bytes);
+            packed_object_ids.push(object_id.clone());
+            continue;
         }
 
         remote.put_physical(&format!("objects/{object_id}.json"), &bytes)?;
         on_uploaded(object_id)?;
     }
 
-    if let Some(builder) = pack_builder {
-        if !packed_object_ids.is_empty() {
-            let (index, payload) = builder.finish();
-            let (_, data_path, index_path) = pack_paths(&operation_id.value, *pack_batch_index)?;
-            let secrets =
-                sync_support::open_or_unlock_repo_secrets_for_sync(repo_root.join(".e2v"))?;
-            remote.put_physical(&data_path, &payload)?;
-            remote.put_physical(
+    if let Some(builder) = pack_builder
+        && !packed_object_ids.is_empty()
+    {
+        let (index, payload) = builder.finish();
+        let (_, data_path, index_path) = pack_paths(&operation_id.value, *pack_batch_index)?;
+        let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(repo_root.join(".e2v"))?;
+        remote.put_physical(&data_path, &payload)?;
+        remote.put_physical(
+            &index_path,
+            &encode_pack_index_segment_bytes_for_sync(
+                &secrets,
                 &index_path,
-                &encode_pack_index_segment_bytes_for_sync(
-                    &secrets,
-                    &index_path,
-                    &serde_json::to_vec_pretty(&index)?,
-                )?,
-            )?;
-            *pack_batch_index += 1;
-            for object_id in &packed_object_ids {
-                on_uploaded(object_id)?;
-            }
-            return Ok(Some(index_path));
+                &serde_json::to_vec_pretty(&index)?,
+            )?,
+        )?;
+        *pack_batch_index += 1;
+        for object_id in &packed_object_ids {
+            on_uploaded(object_id)?;
         }
+        return Ok(Some(index_path));
     }
 
     Ok(None)
@@ -574,14 +568,14 @@ fn publish_remote_keyring_pointer<R: RemoteBackend>(
         .context("local keyring state is missing repo_id")?
         .to_string();
     let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
-    if let Some(current) = remote.read_ref(&pointer_token)? {
-        if current.value.bytes == bytes {
-            ensure!(
-                generation >= 1,
-                "invalid local keyring pointer generation {generation}"
-            );
-            return Ok(bytes);
-        }
+    if let Some(current) = remote.read_ref(&pointer_token)?
+        && current.value.bytes == bytes
+    {
+        ensure!(
+            generation >= 1,
+            "invalid local keyring pointer generation {generation}"
+        );
+        return Ok(bytes);
     }
     let expected = remote
         .read_ref(&pointer_token)?
@@ -920,6 +914,14 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
     let mut remote_inventory = None;
     let mut remote_pack_cache = BTreeMap::new();
+    let mut resume_remote_auth = ResumeRemoteAuthContext {
+        repo_root: &options.repo_root,
+        remote,
+        current_operation_pack_locations: &remote_pack_locations,
+        allow_full_inventory_lookup: false,
+        remote_inventory_cache: &mut remote_inventory,
+        pack_cache: &mut remote_pack_cache,
+    };
     let mut published_pack_index_segments = Vec::new();
     let mut pending_cursor = Some(0usize);
     while let Some(cursor) = pending_cursor {
@@ -932,12 +934,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             }
             saw_journal_objects = true;
             if remote_object_authenticates_for_resume(
-                &options.repo_root,
-                remote,
-                &remote_pack_locations,
-                false,
-                &mut remote_inventory,
-                &mut remote_pack_cache,
+                &mut resume_remote_auth,
                 &record.object_id,
                 infer_object_type_for_resume_candidate(&options.repo_root, &record.object_id),
             )? {
@@ -958,6 +955,14 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
         remote_inventory = None;
         remote_pack_cache.clear();
+        resume_remote_auth = ResumeRemoteAuthContext {
+            repo_root: &options.repo_root,
+            remote,
+            current_operation_pack_locations: &remote_pack_locations,
+            allow_full_inventory_lookup: false,
+            remote_inventory_cache: &mut remote_inventory,
+            pack_cache: &mut remote_pack_cache,
+        };
         pending_cursor = batch.next_cursor;
     }
 
@@ -1086,13 +1091,16 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     let manifest_store = ManifestStore::new(&options.repo_root);
     let reachable_object_ids =
         manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
-    verify_remote_reachable_objects_for_resume(
-        &options.repo_root,
+    let mut precommit_remote_auth = ResumeRemoteAuthContext {
+        repo_root: &options.repo_root,
         remote,
-        &remote_pack_locations,
-        false,
-        &mut remote_inventory,
-        &mut remote_pack_cache,
+        current_operation_pack_locations: &remote_pack_locations,
+        allow_full_inventory_lookup: false,
+        remote_inventory_cache: &mut remote_inventory,
+        pack_cache: &mut remote_pack_cache,
+    };
+    verify_remote_reachable_objects_for_resume(
+        &mut precommit_remote_auth,
         &snapshot.snapshot_id,
         &reachable_object_ids,
     )?;

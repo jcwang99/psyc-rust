@@ -399,7 +399,7 @@ fn build_file_response(
             }
         };
         let bytes = read_service
-            .read_range(&file, start, end - start + 1)
+            .read_range(file, start, end - start + 1)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
