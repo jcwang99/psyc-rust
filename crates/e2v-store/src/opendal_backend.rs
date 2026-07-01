@@ -407,10 +407,19 @@ impl BlobStore for OpendalMemoryBackend {
         offset: usize,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let bytes = self.get_physical(relative_path)?;
-        anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
-        let end = offset.saturating_add(length).min(bytes.len());
-        Ok(bytes[offset..end].to_vec())
+        let total_length = self.stat_physical(relative_path)?.length as usize;
+        anyhow::ensure!(offset <= total_length, "range offset out of bounds");
+        let end = offset.saturating_add(length).min(total_length);
+        Ok(self
+            .operator
+            .read_options(
+                relative_path,
+                opendal::options::ReadOptions {
+                    range: (offset as u64..end as u64).into(),
+                    ..Default::default()
+                },
+            )?
+            .to_vec())
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
@@ -482,10 +491,19 @@ impl BlobStore for OpendalWebdavBackend {
         offset: usize,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let bytes = self.get_physical(relative_path)?;
-        anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
-        let end = offset.saturating_add(length).min(bytes.len());
-        Ok(bytes[offset..end].to_vec())
+        let total_length = self.stat_physical(relative_path)?.length as usize;
+        anyhow::ensure!(offset <= total_length, "range offset out of bounds");
+        let end = offset.saturating_add(length).min(total_length);
+        Ok(self
+            .operator
+            .read_options(
+                relative_path,
+                opendal::options::ReadOptions {
+                    range: (offset as u64..end as u64).into(),
+                    ..Default::default()
+                },
+            )?
+            .to_vec())
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
@@ -887,10 +905,19 @@ impl BlobStore for OpendalS3Backend {
         offset: usize,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let bytes = self.get_physical(relative_path)?;
-        anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
-        let end = offset.saturating_add(length).min(bytes.len());
-        Ok(bytes[offset..end].to_vec())
+        let total_length = self.stat_physical(relative_path)?.length as usize;
+        anyhow::ensure!(offset <= total_length, "range offset out of bounds");
+        let end = offset.saturating_add(length).min(total_length);
+        Ok(self
+            .operator
+            .read_options(
+                relative_path,
+                opendal::options::ReadOptions {
+                    range: (offset as u64..end as u64).into(),
+                    ..Default::default()
+                },
+            )?
+            .to_vec())
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
@@ -1068,6 +1095,13 @@ impl RemoteBackend for crate::memory_backend::MemoryBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
+
+    use opendal::raw::oio;
+    use opendal::raw::{Access, AccessorInfo, OpRead, OpStat, RpRead, RpStat};
+    use opendal::{Buffer, Capability, EntryMode, Metadata, Operator};
+
     use super::*;
     use crate::WriterMode;
 
@@ -1273,5 +1307,83 @@ mod tests {
         assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
         assert_eq!(backend.capability().push_write_mode(), WriterMode::ReadOnly);
         assert!(!backend.capability().supports_safe_single_writer_push());
+    }
+
+    #[derive(Debug, Clone)]
+    struct RangeRecordingService {
+        content: Arc<Vec<u8>>,
+        observed_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+        info: Arc<AccessorInfo>,
+    }
+
+    impl RangeRecordingService {
+        fn new(content: Vec<u8>) -> Self {
+            let info = AccessorInfo::default();
+            info.set_scheme("memory");
+            info.set_native_capability(Capability {
+                read: true,
+                stat: true,
+                ..Default::default()
+            });
+            Self {
+                content: Arc::new(content),
+                observed_ranges: Arc::new(Mutex::new(Vec::new())),
+                info: Arc::new(info),
+            }
+        }
+
+        fn observed_ranges(&self) -> Vec<Range<u64>> {
+            self.observed_ranges.lock().unwrap().clone()
+        }
+    }
+
+    impl Access for RangeRecordingService {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+
+        fn info(&self) -> Arc<AccessorInfo> {
+            self.info.clone()
+        }
+
+        async fn stat(&self, _: &str, _: OpStat) -> opendal::Result<RpStat> {
+            Ok(RpStat::new(
+                Metadata::new(EntryMode::FILE).with_content_length(self.content.len() as u64),
+            ))
+        }
+
+        async fn read(&self, _: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            let requested = args.range();
+            let start = requested.offset().min(self.content.len() as u64);
+            let size = requested
+                .size()
+                .unwrap_or(self.content.len() as u64 - start)
+                .min(self.content.len() as u64 - start);
+            let end = start.saturating_add(size);
+            self.observed_ranges.lock().unwrap().push(start..end);
+
+            let slice = self.content[start as usize..end as usize].to_vec();
+            let metadata =
+                Metadata::new(EntryMode::FILE).with_content_length(self.content.len() as u64);
+            Ok((RpRead::new(metadata), Box::new(Buffer::from(slice))))
+        }
+    }
+
+    #[test]
+    fn opendal_memory_backend_range_reads_use_backend_ranges_instead_of_full_object_reads() {
+        let service = RangeRecordingService::new((0u8..=15).collect());
+        let _guard = OPENDAL_RUNTIME.enter();
+        let operator = opendal::blocking::Operator::new(
+            Operator::from_inner(Arc::new(service.clone())),
+        )
+        .unwrap();
+        let backend = OpendalMemoryBackend::from_operator(operator);
+
+        let bytes = backend.get_physical_range("objects/demo.bin", 4, 5).unwrap();
+
+        assert_eq!(bytes, vec![4, 5, 6, 7, 8]);
+        assert_eq!(service.observed_ranges(), vec![4..9]);
     }
 }
