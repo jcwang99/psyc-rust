@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/e2v-api",
     "crates/e2v-cli",
     "crates/e2v-core",
     "crates/e2v-store",
