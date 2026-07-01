@@ -1,9 +1,15 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
 use tempfile::tempdir;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 #[cfg(windows)]
 use e2v_vfs::WindowsMountAdapter;
@@ -15,6 +21,67 @@ use e2v_vfs::{
     WinfspOpenRequest, WinfspRuntimeLibrary, WinfspRuntimePaths, WinfspVolumeParams,
     try_mount_snapshot_on_current_platform,
 };
+
+enum UnreadableCacheEntryGuard {
+    #[cfg(unix)]
+    Permissions { path: PathBuf, original_mode: u32 },
+    #[cfg(windows)]
+    Locked { _file: std::fs::File },
+    #[cfg(not(any(unix, windows)))]
+    Noop,
+}
+
+impl Drop for UnreadableCacheEntryGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Self::Permissions {
+            path,
+            original_mode,
+        } = self
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(*original_mode);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+    }
+}
+
+fn make_unreadable_cache_entry(path: &Path) -> UnreadableCacheEntryGuard {
+    #[cfg(unix)]
+    {
+        fs::write(path, b"foreign").unwrap();
+        let metadata = fs::metadata(path).unwrap();
+        let original_mode = metadata.permissions().mode();
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0);
+        fs::set_permissions(path, permissions).unwrap();
+        UnreadableCacheEntryGuard::Permissions {
+            path: path.to_path_buf(),
+            original_mode,
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap();
+        file.write_all(b"foreign").unwrap();
+        file.flush().unwrap();
+        UnreadableCacheEntryGuard::Locked { _file: file }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::write(path, b"foreign").unwrap();
+        UnreadableCacheEntryGuard::Noop
+    }
+}
 
 fn init_repo(repo_root: &std::path::Path) {
     RepositoryFacade::new()
@@ -582,6 +649,30 @@ fn encrypted_disk_cache_ignores_unrelated_subdirectories_when_cold() {
     let cache_dir = temp.path().join("encrypted-cache");
     fs::create_dir_all(&repo_root).unwrap();
     fs::create_dir_all(cache_dir.join("scratch")).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root, snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir)
+            .with_plaintext_memory_cache_budget_bytes(0),
+    )
+    .unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let bytes = vfs.read(&handle, 1, 3).unwrap();
+
+    assert_eq!(String::from_utf8(bytes).unwrap(), "lph");
+}
+
+#[test]
+fn encrypted_disk_cache_ignores_unrelated_unreadable_files_when_cold() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+    let _guard = make_unreadable_cache_entry(&cache_dir.join("foreign.bin"));
     init_repo(&repo_root);
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");

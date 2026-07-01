@@ -528,6 +528,12 @@ struct EncryptedRangeCache {
     cipher_key: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RangeIndexEntry {
+    offset: usize,
+    length: usize,
+}
+
 impl EncryptedRangeCache {
     fn new(cache_dir: PathBuf, read_service: &ReadService) -> Result<Self> {
         fs::create_dir_all(&cache_dir)?;
@@ -606,6 +612,15 @@ impl EncryptedRangeCache {
         );
         let ciphertext = self.encrypt_blob(offset, plaintext)?;
         fs::write(cache_path, ciphertext)?;
+        let _ = self.record_range_index_entry(
+            snapshot_id,
+            file_object_id,
+            layout_generation,
+            RangeIndexEntry {
+                offset,
+                length: plaintext.len(),
+            },
+        );
         Ok(())
     }
 
@@ -661,32 +676,25 @@ impl EncryptedRangeCache {
         offset: usize,
         length: usize,
     ) -> Result<Option<Vec<u8>>> {
-        for entry in fs::read_dir(&self.cache_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let bytes = fs::read(&path)?;
+        for candidate in self.range_index_entries(snapshot_id, file_object_id, layout_generation)? {
+            let path = self.cache_path(
+                snapshot_id,
+                file_object_id,
+                layout_generation,
+                candidate.offset,
+                candidate.length,
+            );
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if Self::should_treat_as_cache_miss(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
             let (cached_offset, plaintext) = match self.decrypt_blob(&bytes) {
                 Ok(decoded) => decoded,
                 Err(_) => continue,
             };
-            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            let Some(encoded) = file_name.strip_suffix(".bin") else {
-                continue;
-            };
             let cached_length = plaintext.len();
-            if encoded
-                != self.cache_entry_key(
-                    snapshot_id,
-                    file_object_id,
-                    layout_generation,
-                    cached_offset,
-                    cached_length,
-                )
+            if cached_offset != candidate.offset || cached_length != candidate.length
             {
                 continue;
             }
@@ -700,6 +708,103 @@ impl EncryptedRangeCache {
             return Ok(Some(plaintext[start..end].to_vec()));
         }
         Ok(None)
+    }
+
+    fn range_index_path(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+    ) -> PathBuf {
+        let prefix = self.cache_key_prefix(snapshot_id, file_object_id, layout_generation);
+        self.cache_dir.join(format!("{prefix}.ranges"))
+    }
+
+    fn range_index_entries(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+    ) -> Result<Vec<RangeIndexEntry>> {
+        let path = self.range_index_path(snapshot_id, file_object_id, layout_generation);
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if Self::should_treat_as_cache_miss(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        Self::decode_range_index_entries(&bytes)
+    }
+
+    fn record_range_index_entry(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+        new_entry: RangeIndexEntry,
+    ) -> Result<()> {
+        let path = self.range_index_path(snapshot_id, file_object_id, layout_generation);
+        let mut entries = self.range_index_entries(snapshot_id, file_object_id, layout_generation)?;
+        if !entries.contains(&new_entry) {
+            entries.push(new_entry);
+        }
+        let encoded = Self::encode_range_index_entries(&entries)?;
+        fs::write(path, encoded)?;
+        Ok(())
+    }
+
+    fn encode_range_index_entries(entries: &[RangeIndexEntry]) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(8 + entries.len() * 16);
+        let count = u64::try_from(entries.len())
+            .map_err(|_| anyhow::anyhow!("too many VFS cache range index entries"))?;
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for entry in entries {
+            let offset = u64::try_from(entry.offset)
+                .map_err(|_| anyhow::anyhow!("VFS cache range index offset is too large"))?;
+            let length = u64::try_from(entry.length)
+                .map_err(|_| anyhow::anyhow!("VFS cache range index length is too large"))?;
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(&length.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    fn decode_range_index_entries(bytes: &[u8]) -> Result<Vec<RangeIndexEntry>> {
+        anyhow::ensure!(
+            bytes.len() >= 8,
+            "encrypted VFS disk cache range index is truncated"
+        );
+        let mut count_bytes = [0u8; 8];
+        count_bytes.copy_from_slice(&bytes[..8]);
+        let count = usize::try_from(u64::from_le_bytes(count_bytes))
+            .map_err(|_| anyhow::anyhow!("encrypted VFS disk cache range index count is too large"))?;
+        let expected_len = 8usize
+            .checked_add(
+                count
+                    .checked_mul(16)
+                    .ok_or_else(|| anyhow::anyhow!("encrypted VFS disk cache range index is too large"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("encrypted VFS disk cache range index is too large"))?;
+        anyhow::ensure!(
+            bytes.len() == expected_len,
+            "encrypted VFS disk cache range index is malformed"
+        );
+        let mut entries = Vec::with_capacity(count);
+        let mut cursor = 8;
+        for _ in 0..count {
+            let mut offset_bytes = [0u8; 8];
+            offset_bytes.copy_from_slice(&bytes[cursor..cursor + 8]);
+            cursor += 8;
+            let mut length_bytes = [0u8; 8];
+            length_bytes.copy_from_slice(&bytes[cursor..cursor + 8]);
+            cursor += 8;
+            entries.push(RangeIndexEntry {
+                offset: usize::try_from(u64::from_le_bytes(offset_bytes))
+                    .map_err(|_| anyhow::anyhow!("encrypted VFS disk cache range index offset is too large"))?,
+                length: usize::try_from(u64::from_le_bytes(length_bytes))
+                    .map_err(|_| anyhow::anyhow!("encrypted VFS disk cache range index length is too large"))?,
+            });
+        }
+        Ok(entries)
     }
 
     fn encrypt_blob(&self, offset: usize, plaintext: &[u8]) -> Result<Vec<u8>> {
