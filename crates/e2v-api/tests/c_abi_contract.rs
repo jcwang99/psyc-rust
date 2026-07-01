@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use e2v_api::{
@@ -52,6 +52,74 @@ fn new_sdk_handle() -> *mut c_abi::e2v_sdk_t {
     assert!(!sdk.is_null());
     assert!(error.is_null());
     sdk
+}
+
+fn error_message_from_ptr(error: *mut c_abi::e2v_error_t) -> String {
+    assert!(!error.is_null());
+    let mut message = c_abi::e2v_string_t::default();
+    let code = unsafe { c_abi::e2v_error_message(error, &mut message) };
+    assert_eq!(code, c_abi::E2V_OK);
+    read_owned_string(&mut message)
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+fn compile_ffi_smoke_program(workspace_root: &Path) -> PathBuf {
+    let build_status = Command::new("cargo")
+        .args(["build", "-p", "e2v-api", "--release"])
+        .current_dir(workspace_root)
+        .status()
+        .unwrap();
+    assert!(build_status.success());
+
+    let compile_script = workspace_root.join("target").join("ffi-smoke-build.cmd");
+    fs::write(
+        &compile_script,
+        "@echo off\r\ncall \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul\r\ncl /nologo /MD /Fo:target\\ffi_smoke.obj /I crates\\e2v-api\\include crates\\e2v-api\\tests\\ffi_smoke.c /link /OUT:target\\ffi-smoke.exe target\\release\\e2v_api.dll.lib\r\n",
+    )
+    .unwrap();
+
+    let compile_status = Command::new("cmd")
+        .args(["/c", compile_script.to_string_lossy().as_ref()])
+        .current_dir(workspace_root)
+        .status()
+        .unwrap();
+    assert!(compile_status.success());
+
+    workspace_root.join("target").join("ffi-smoke.exe")
+}
+
+fn remove_legacy_ffi_smoke_roots() {
+    let temp_root = std::env::temp_dir();
+    if let Ok(entries) = fs::read_dir(&temp_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if name.starts_with("e2v-ffi-smoke-") {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    for _ in 0..5 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -968,6 +1036,30 @@ fn c_abi_can_register_remote_and_run_sync_maintenance_flows() {
                 &mut error,
             )
         },
+        c_abi::E2V_INVALID_ARGUMENT
+    );
+    assert_eq!(unsafe { c_abi::e2v_error_code(error) }, c_abi::E2V_INVALID_ARGUMENT);
+    let maintenance_error = error_message_from_ptr(error);
+    assert!(
+        maintenance_error.contains("maintenance window"),
+        "unexpected error: {maintenance_error}"
+    );
+    unsafe {
+        c_abi::e2v_error_free(error);
+    }
+    error = std::ptr::null_mut();
+
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_gc_default_remote_execute_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                30,
+                true,
+                &mut gc_execute_json,
+                &mut error,
+            )
+        },
         c_abi::E2V_OK
     );
     let gc_execute: e2v_api::GcExecuteResponse =
@@ -985,31 +1077,35 @@ fn c_abi_header_matches_generated_contract() {
 }
 
 #[test]
+fn c_abi_smoke_program_honors_forced_repo_root_override() {
+    let workspace_root = workspace_root();
+    let smoke_exe = compile_ffi_smoke_program(&workspace_root);
+    let forced_root = workspace_root.join("target").join("ffi-smoke-forced-root");
+    remove_dir_if_exists(&forced_root);
+    fs::create_dir_all(&forced_root).unwrap();
+    fs::write(forced_root.join("stale.txt"), "stale").unwrap();
+    remove_legacy_ffi_smoke_roots();
+
+    let run_status = Command::new(smoke_exe)
+        .current_dir(&workspace_root)
+        .env(
+            "E2V_FFI_SMOKE_REPO_ROOT",
+            forced_root.to_string_lossy().to_string(),
+        )
+        .status()
+        .unwrap();
+
+    assert!(run_status.success());
+    assert!(forced_root.join(".e2v").exists());
+}
+
+#[test]
 fn c_abi_smoke_program_compiles_links_and_runs() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let workspace_root = workspace_root();
+    let smoke_exe = compile_ffi_smoke_program(&workspace_root);
+    remove_legacy_ffi_smoke_roots();
 
-    let build_status = Command::new("cargo")
-        .args(["build", "-p", "e2v-api", "--release"])
-        .current_dir(&workspace_root)
-        .status()
-        .unwrap();
-    assert!(build_status.success());
-
-    let compile_script = workspace_root.join("target").join("ffi-smoke-build.cmd");
-    fs::write(
-        &compile_script,
-        "@echo off\r\ncall \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul\r\ncl /nologo /MD /Fo:target\\ffi_smoke.obj /I crates\\e2v-api\\include crates\\e2v-api\\tests\\ffi_smoke.c /link /OUT:target\\ffi-smoke.exe target\\release\\e2v_api.dll.lib\r\n",
-    )
-    .unwrap();
-
-    let compile_status = Command::new("cmd")
-        .args(["/c", compile_script.to_string_lossy().as_ref()])
-        .current_dir(&workspace_root)
-        .status()
-        .unwrap();
-    assert!(compile_status.success());
-
-    let run_status = Command::new(workspace_root.join("target").join("ffi-smoke.exe"))
+    let run_status = Command::new(smoke_exe)
         .current_dir(&workspace_root)
         .status()
         .unwrap();

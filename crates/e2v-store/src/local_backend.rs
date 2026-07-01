@@ -49,7 +49,7 @@ impl LocalFolderBackend {
 
     fn capability() -> BackendCapability {
         BackendCapability {
-            supports_conditional_put: true,
+            supports_conditional_put: false,
             supports_range_read: true,
             supports_atomic_rename: true,
             supports_paged_list: true,
@@ -59,7 +59,7 @@ impl LocalFolderBackend {
             supports_transaction_markers: true,
             supports_reliable_remote_time: true,
             supports_object_generation_or_etag: true,
-            supports_layout_root_cas: true,
+            supports_layout_root_cas: false,
             supports_oblivious_access_schedule: false,
         }
     }
@@ -346,6 +346,9 @@ impl RemoteBackend for LocalFolderBackend {
 mod tests {
     use std::fs;
 
+    use crate::capability::WriterMode;
+    use crate::opendal_backend::RemoteBackend;
+
     use tempfile::tempdir;
 
     use super::{BlobStore, LocalFolderBackend};
@@ -483,5 +486,15 @@ mod tests {
             error.to_string().contains("path traversal") || error.to_string().contains("separator"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn local_folder_backend_defaults_to_safe_single_writer_capability() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+
+        assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
+        assert_eq!(backend.capability().push_write_mode(), WriterMode::SingleWriter);
+        assert!(backend.capability().supports_safe_single_writer_push());
     }
 }

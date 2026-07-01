@@ -1083,6 +1083,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("unsupported remote url scheme")
         || lower.contains("path traversal")
         || lower.contains("must not be empty")
+        || lower.contains("maintenance window")
         || lower.contains("invalid")
         || lower.contains("bad request")
     {

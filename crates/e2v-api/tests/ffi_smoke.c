@@ -22,6 +22,96 @@ static void fail_with_error(e2v_error_t *error) {
     exit(1);
 }
 
+static int path_exists(const char *path) {
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static int remove_tree_recursive(const char *path) {
+    DWORD attributes = GetFileAttributesA(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return 1;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+        return DeleteFileA(path) != 0;
+    }
+
+    {
+        char pattern[MAX_PATH];
+        WIN32_FIND_DATAA entry;
+        HANDLE find_handle;
+        if (snprintf(pattern, sizeof(pattern), "%s\\*", path) < 0 ||
+            strlen(pattern) >= sizeof(pattern)) {
+            return 0;
+        }
+        find_handle = FindFirstFileA(pattern, &entry);
+        if (find_handle != INVALID_HANDLE_VALUE) {
+            do {
+                char child[MAX_PATH];
+                if (strcmp(entry.cFileName, ".") == 0 || strcmp(entry.cFileName, "..") == 0) {
+                    continue;
+                }
+                if (snprintf(child, sizeof(child), "%s\\%s", path, entry.cFileName) < 0 ||
+                    strlen(child) >= sizeof(child)) {
+                    FindClose(find_handle);
+                    return 0;
+                }
+                if (!remove_tree_recursive(child)) {
+                    FindClose(find_handle);
+                    return 0;
+                }
+            } while (FindNextFileA(find_handle, &entry) != 0);
+            FindClose(find_handle);
+        }
+    }
+
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+    return RemoveDirectoryA(path) != 0;
+}
+
+static int resolve_repo_root(char repo_root[MAX_PATH]) {
+    DWORD env_len =
+        GetEnvironmentVariableA("E2V_FFI_SMOKE_REPO_ROOT", repo_root, MAX_PATH);
+    if (env_len > 0 && env_len < MAX_PATH) {
+        return 1;
+    }
+    if (env_len >= MAX_PATH) {
+        fprintf(stderr, "E2V_FFI_SMOKE_REPO_ROOT is too long for ffi smoke\n");
+        return 0;
+    }
+
+    {
+        char temp_root[MAX_PATH];
+        DWORD temp_len = GetTempPathA(MAX_PATH, temp_root);
+        if (temp_len == 0 || temp_len >= MAX_PATH) {
+            fprintf(stderr, "failed to get temp path for ffi smoke\n");
+            return 0;
+        }
+        if (GetTempFileNameA(temp_root, "e2v", 0, repo_root) == 0) {
+            fprintf(stderr, "failed to reserve temp repo path for ffi smoke\n");
+            return 0;
+        }
+        if (!DeleteFileA(repo_root)) {
+            fprintf(stderr, "failed to convert temp file path into repo root for ffi smoke\n");
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int prepare_repo_root(const char *repo_root) {
+    if (path_exists(repo_root) && !remove_tree_recursive(repo_root)) {
+        fprintf(stderr, "failed to clear existing ffi smoke repo root\n");
+        return 0;
+    }
+    if (!CreateDirectoryA(repo_root, NULL)) {
+        fprintf(stderr, "failed to create ffi smoke repo root\n");
+        return 0;
+    }
+    return 1;
+}
+
 int main(void) {
     e2v_sdk_t *sdk = NULL;
     e2v_error_t *error = NULL;
@@ -31,21 +121,12 @@ int main(void) {
     e2v_file_view_t *file = NULL;
     e2v_bytes_t bytes = {0};
     char repo_root[MAX_PATH];
-    DWORD temp_len = GetTempPathA(MAX_PATH, repo_root);
-    if (temp_len == 0 || temp_len >= MAX_PATH) {
-        fprintf(stderr, "failed to get temp path for ffi smoke\n");
+    if (!resolve_repo_root(repo_root)) {
         return 1;
     }
-    {
-        char unique_dir[64];
-        snprintf(unique_dir, sizeof(unique_dir), "e2v-ffi-smoke-%lu", GetCurrentProcessId());
-        if (strlen(repo_root) + strlen(unique_dir) + 2 >= MAX_PATH) {
-            fprintf(stderr, "temp path too long for ffi smoke\n");
-            return 1;
-        }
-        strcat(repo_root, unique_dir);
+    if (!prepare_repo_root(repo_root)) {
+        return 1;
     }
-    CreateDirectoryA(repo_root, NULL);
 
     if (e2v_sdk_new(&sdk, &error) != E2V_OK) {
         fail_with_error(error);

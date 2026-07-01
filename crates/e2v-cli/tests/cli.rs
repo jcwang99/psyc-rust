@@ -666,12 +666,28 @@ fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
             .unwrap();
     assert!(repair_output.contains("repaired 0"));
 
+    let gc_error = e2v_cli::run_cli_for_test([
+        "e2v",
+        "gc",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "--execute",
+        "--grace-period",
+        "30",
+    ])
+    .unwrap_err();
+    assert!(
+        gc_error.to_string().contains("maintenance window"),
+        "unexpected error: {gc_error:#}"
+    );
+
     let gc_output = e2v_cli::run_cli_for_test([
         "e2v",
         "gc",
         "--repo",
         repo_root.to_str().unwrap(),
         "--execute",
+        "--confirm-single-writer-maintenance-window",
         "--grace-period",
         "30",
     ])
@@ -1082,7 +1098,7 @@ fn gc_execute_command_uses_default_file_remote() {
 }
 
 #[test]
-fn gc_execute_command_without_confirmation_still_allows_multi_writer_file_remote() {
+fn gc_execute_command_requires_confirmation_for_single_writer_file_remote() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     let remote_root = temp.path().join("remote");
@@ -1121,7 +1137,7 @@ fn gc_execute_command_without_confirmation_still_allows_multi_writer_file_remote
     ])
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let error = e2v_cli::run_cli_for_test([
         "e2v",
         "gc",
         "--repo",
@@ -1130,9 +1146,12 @@ fn gc_execute_command_without_confirmation_still_allows_multi_writer_file_remote
         "--grace-period",
         "30d",
     ])
-    .unwrap();
+    .unwrap_err();
 
-    assert!(output.contains("deleted 0 physical refs"));
+    assert!(
+        error.to_string().contains("maintenance window"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]

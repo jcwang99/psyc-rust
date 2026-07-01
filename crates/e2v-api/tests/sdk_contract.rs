@@ -756,11 +756,24 @@ fn sdk_can_verify_repair_accept_rollback_and_gc_default_remote() {
     let gc_report = sdk.gc_default_remote_dry_run(&repo_root).unwrap();
     assert!(gc_report.unreachable_physical_refs.is_empty());
 
-    let gc_execute = sdk
+    let gc_error = sdk
         .gc_default_remote_execute(e2v_api::GcExecuteRequest {
             repo_root: repo_root.clone(),
             grace_period_days: 30,
             allow_single_writer_maintenance_window: false,
+        })
+        .unwrap_err();
+    assert_eq!(gc_error.code(), SdkErrorCode::InvalidArgument);
+    assert!(
+        gc_error.message().contains("maintenance window"),
+        "unexpected error: {gc_error:?}"
+    );
+
+    let gc_execute = sdk
+        .gc_default_remote_execute(e2v_api::GcExecuteRequest {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
         })
         .unwrap();
     assert!(gc_execute.deleted_physical_refs.is_empty());
@@ -840,13 +853,29 @@ fn sdk_can_run_maintenance_with_explicit_remote_spec_without_default_remote_regi
     let gc_report = sdk.gc_remote_dry_run(&remote_spec, &repo_root).unwrap();
     assert!(gc_report.unreachable_physical_refs.is_empty());
 
-    let gc_execute = sdk
+    let gc_error = sdk
         .gc_remote_execute(
             &remote_spec,
             e2v_api::GcExecuteRequest {
                 repo_root: repo_root.clone(),
                 grace_period_days: 30,
                 allow_single_writer_maintenance_window: false,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(gc_error.code(), SdkErrorCode::InvalidArgument);
+    assert!(
+        gc_error.message().contains("maintenance window"),
+        "unexpected error: {gc_error:?}"
+    );
+
+    let gc_execute = sdk
+        .gc_remote_execute(
+            &remote_spec,
+            e2v_api::GcExecuteRequest {
+                repo_root: repo_root.clone(),
+                grace_period_days: 30,
+                allow_single_writer_maintenance_window: true,
             },
         )
         .unwrap();
