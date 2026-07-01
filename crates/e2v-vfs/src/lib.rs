@@ -559,9 +559,17 @@ impl EncryptedRangeCache {
             offset,
             length,
         );
+        let requested_entry = RangeIndexEntry { offset, length };
         let bytes = match fs::read(&cache_path) {
             Ok(bytes) => bytes,
             Err(error) if Self::should_treat_as_cache_miss(&error) => {
+                self.best_effort_prune_range_entries(
+                    snapshot_id,
+                    file_object_id,
+                    layout_generation,
+                    std::slice::from_ref(&requested_entry),
+                    None,
+                );
                 return self.read_covering_range(
                     snapshot_id,
                     file_object_id,
@@ -572,8 +580,33 @@ impl EncryptedRangeCache {
             }
             Err(error) => return Err(error.into()),
         };
-        let (cached_offset, plaintext) = self.decrypt_blob(&bytes)?;
+        let (cached_offset, plaintext) = match self.decrypt_blob(&bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.best_effort_prune_range_entries(
+                    snapshot_id,
+                    file_object_id,
+                    layout_generation,
+                    std::slice::from_ref(&requested_entry),
+                    None,
+                );
+                return self.read_covering_range(
+                    snapshot_id,
+                    file_object_id,
+                    layout_generation,
+                    offset,
+                    length,
+                );
+            }
+        };
         if cached_offset != offset || plaintext.len() != length {
+            self.best_effort_prune_range_entries(
+                snapshot_id,
+                file_object_id,
+                layout_generation,
+                std::slice::from_ref(&requested_entry),
+                None,
+            );
             return self.read_covering_range(
                 snapshot_id,
                 file_object_id,
@@ -714,12 +747,13 @@ impl EncryptedRangeCache {
             }
             if !stale_entries.is_empty() {
                 candidates.retain(|entry| !stale_entries.contains(entry));
-                self.write_range_index_entries(
+                self.best_effort_prune_range_entries(
                     snapshot_id,
                     file_object_id,
                     layout_generation,
-                    &candidates,
-                )?;
+                    &stale_entries,
+                    Some(&candidates),
+                );
             }
             let start = offset - cached_offset;
             let end = start + length;
@@ -727,12 +761,13 @@ impl EncryptedRangeCache {
         }
         if !stale_entries.is_empty() {
             candidates.retain(|entry| !stale_entries.contains(entry));
-            self.write_range_index_entries(
+            self.best_effort_prune_range_entries(
                 snapshot_id,
                 file_object_id,
                 layout_generation,
-                &candidates,
-            )?;
+                &stale_entries,
+                Some(&candidates),
+            );
         }
         Ok(None)
     }
@@ -792,6 +827,49 @@ impl EncryptedRangeCache {
         let ciphertext = self.encrypt_blob(0, &encoded)?;
         fs::write(path, ciphertext)?;
         Ok(())
+    }
+
+    fn best_effort_prune_range_entries(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+        stale_entries: &[RangeIndexEntry],
+        retained_entries: Option<&[RangeIndexEntry]>,
+    ) {
+        for entry in stale_entries {
+            let path = self.cache_path(
+                snapshot_id,
+                file_object_id,
+                layout_generation,
+                entry.offset,
+                entry.length,
+            );
+            let _ = fs::remove_file(path);
+        }
+
+        let remaining = if let Some(entries) = retained_entries {
+            entries.to_vec()
+        } else {
+            let Ok(mut entries) = self.range_index_entries(snapshot_id, file_object_id, layout_generation)
+            else {
+                return;
+            };
+            entries.retain(|entry| !stale_entries.contains(entry));
+            entries
+        };
+
+        let index_path = self.range_index_path(snapshot_id, file_object_id, layout_generation);
+        if remaining.is_empty() {
+            let _ = fs::remove_file(index_path);
+        } else {
+            let _ = self.write_range_index_entries(
+                snapshot_id,
+                file_object_id,
+                layout_generation,
+                &remaining,
+            );
+        }
     }
 
     fn encode_range_index_entries(entries: &[RangeIndexEntry]) -> Result<Vec<u8>> {
