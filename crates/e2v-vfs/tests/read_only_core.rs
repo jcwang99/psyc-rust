@@ -602,6 +602,48 @@ fn encrypted_disk_cache_file_names_do_not_expose_requested_offsets() {
 }
 
 #[test]
+fn encrypted_disk_cache_range_indexes_do_not_store_plaintext_offsets() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root, snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir.clone())
+            .with_plaintext_memory_cache_budget_bytes(0),
+    )
+    .unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let bytes = vfs.read(&handle, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "lph");
+
+    let range_index_path = fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("ranges"))
+        .expect("expected encrypted cache range index");
+    let stored = fs::read(&range_index_path).unwrap();
+
+    let mut expected_plaintext = Vec::new();
+    expected_plaintext.extend_from_slice(&1u64.to_le_bytes());
+    expected_plaintext.extend_from_slice(&1u64.to_le_bytes());
+    expected_plaintext.extend_from_slice(&3u64.to_le_bytes());
+
+    assert_ne!(
+        stored, expected_plaintext,
+        "range index should not store plaintext offset/length tuples: {range_index_path:?}"
+    );
+    assert!(
+        stored.len() > expected_plaintext.len(),
+        "encrypted range index should include confidentiality overhead"
+    );
+}
+
+#[test]
 fn encrypted_disk_cache_retains_multiple_private_ranges_for_one_file() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

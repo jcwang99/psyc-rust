@@ -732,7 +732,11 @@ impl EncryptedRangeCache {
             Err(error) if Self::should_treat_as_cache_miss(&error) => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        Self::decode_range_index_entries(&bytes)
+        let (_, plaintext) = match self.decrypt_blob(&bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => return Ok(Vec::new()),
+        };
+        Self::decode_range_index_entries(&plaintext)
     }
 
     fn record_range_index_entry(
@@ -748,7 +752,8 @@ impl EncryptedRangeCache {
             entries.push(new_entry);
         }
         let encoded = Self::encode_range_index_entries(&entries)?;
-        fs::write(path, encoded)?;
+        let ciphertext = self.encrypt_blob(0, &encoded)?;
+        fs::write(path, ciphertext)?;
         Ok(())
     }
 
