@@ -1038,6 +1038,122 @@ impl e2v_store::RemoteBackend for PackIndexRootChangesBeforeDeleteBackend {
 }
 
 #[derive(Clone, Debug)]
+struct LayoutRootBytesChangeBeforeDeleteBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    listed_active_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mutated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    replacement_layout_root_bytes: Vec<u8>,
+}
+
+impl LayoutRootBytesChangeBeforeDeleteBackend {
+    fn new(inner: MemoryBackend, replacement_layout_root_bytes: Vec<u8>) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            listed_active_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mutated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            replacement_layout_root_bytes,
+        }
+    }
+}
+
+impl BlobStore for LayoutRootBytesChangeBeforeDeleteBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        if prefix == "transactions/active/" {
+            let saw_first = self
+                .listed_active_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            if saw_first
+                && !self
+                    .mutated
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.inner
+                    .put_physical("layout_root.json", &self.replacement_layout_root_bytes)?;
+            }
+        }
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for LayoutRootBytesChangeBeforeDeleteBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for LayoutRootBytesChangeBeforeDeleteBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for LayoutRootBytesChangeBeforeDeleteBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Clone, Debug)]
 struct FailOnceOnDeleteBackend {
     inner: MemoryBackend,
     capability: BackendCapability,
@@ -2356,6 +2472,81 @@ fn gc_execute_aborts_when_pack_index_root_changes_after_dry_run() {
     assert!(
         remote.exists_physical(&resurrected_segment),
         "gc execute should not delete a pack index segment that became reachable again"
+    );
+}
+
+#[test]
+fn gc_execute_aborts_when_layout_root_bytes_change_after_dry_run() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-gc-layout-root-race".to_string(),
+        },
+    )
+    .unwrap();
+
+    let stray_object_path =
+        "objects/abababababababababababababababababababababababababababababababab.json";
+    remote
+        .put_physical(stray_object_path, br#"{"garbage":true}"#)
+        .unwrap();
+    remote
+        .override_physical_modified_time_for_test(
+            stray_object_path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+        )
+        .unwrap();
+
+    let mut replacement_root: serde_json::Value =
+        serde_json::from_slice(&remote.get_physical("layout_root.json").unwrap()).unwrap();
+    replacement_root["mapping_policy"] = serde_json::Value::String("loose-mutated".to_string());
+    let replacement_layout_root_bytes = serde_json::to_vec_pretty(&replacement_root).unwrap();
+    let raced_remote = LayoutRootBytesChangeBeforeDeleteBackend::new(
+        remote.clone(),
+        replacement_layout_root_bytes,
+    );
+
+    let error = gc_execute(
+        &raced_remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("changed during execution"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        remote.exists_physical(stray_object_path),
+        "gc execute should not delete candidates after layout root bytes changed"
     );
 }
 
