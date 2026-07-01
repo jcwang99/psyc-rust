@@ -603,10 +603,11 @@ impl EncryptedRangeCache {
         snapshot_id: &str,
         file_object_id: &str,
         layout_generation: u64,
-        _offset: usize,
-        _length: usize,
+        offset: usize,
+        length: usize,
     ) -> PathBuf {
-        let prefix = self.cache_key_prefix(snapshot_id, file_object_id, layout_generation);
+        let prefix =
+            self.cache_entry_key(snapshot_id, file_object_id, layout_generation, offset, length);
         self.cache_dir.join(format!("{prefix}.bin"))
     }
 
@@ -625,6 +626,22 @@ impl EncryptedRangeCache {
         hex::encode(hasher.finalize().as_bytes())
     }
 
+    fn cache_entry_key(
+        &self,
+        snapshot_id: &str,
+        file_object_id: &str,
+        layout_generation: u64,
+        offset: usize,
+        length: usize,
+    ) -> String {
+        let prefix = self.cache_key_prefix(snapshot_id, file_object_id, layout_generation);
+        let mut hasher = Hasher::new();
+        hasher.update(prefix.as_bytes());
+        hasher.update(&offset.to_le_bytes());
+        hasher.update(&length.to_le_bytes());
+        hex::encode(hasher.finalize().as_bytes())
+    }
+
     fn read_covering_range(
         &self,
         snapshot_id: &str,
@@ -633,24 +650,31 @@ impl EncryptedRangeCache {
         offset: usize,
         length: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let prefix = self.cache_key_prefix(snapshot_id, file_object_id, layout_generation);
         for entry in fs::read_dir(&self.cache_dir)? {
             let path = entry?.path();
+            let bytes = fs::read(&path)?;
+            let (cached_offset, plaintext) = match self.decrypt_blob(&bytes) {
+                Ok(decoded) => decoded,
+                Err(_) => continue,
+            };
             let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
                 continue;
             };
             let Some(encoded) = file_name.strip_suffix(".bin") else {
                 continue;
             };
-            if encoded != prefix {
+            let cached_length = plaintext.len();
+            if encoded
+                != self.cache_entry_key(
+                    snapshot_id,
+                    file_object_id,
+                    layout_generation,
+                    cached_offset,
+                    cached_length,
+                )
+            {
                 continue;
             }
-            let bytes = fs::read(&path)?;
-            let (cached_offset, plaintext) = match self.decrypt_blob(&bytes) {
-                Ok(decoded) => decoded,
-                Err(_) => continue,
-            };
-            let cached_length = plaintext.len();
             let cached_end = cached_offset.saturating_add(cached_length);
             let requested_end = offset.saturating_add(length);
             if cached_offset > offset || cached_end < requested_end {
