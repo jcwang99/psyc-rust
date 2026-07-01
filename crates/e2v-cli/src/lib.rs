@@ -2,7 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use e2v_api::{GcExecuteRequest, Sdk, VerifyRemoteRequest};
+use e2v_api::{
+    GcExecuteRequest, Sdk, ShareAcceptDeviceRequest, ShareAcceptMemberRequest,
+    ShareInviteDeviceRequest, ShareInviteMemberRequest, ShareRevokeDeviceRequest,
+    ShareRevokeMemberRequest, VerifyRemoteRequest,
+};
 use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
 use e2v_store::{BackendCapability, RemoteBackend};
@@ -218,7 +222,7 @@ fn execute(cli: Cli) -> Result<String> {
     match cli.command {
         Command::Branch { command, repo } => match command {
             BranchCommand::List => {
-                let branches = facade.list_branches(repo)?;
+                let branches = sdk.list_branches(&repo)?;
                 Ok(branches
                     .into_iter()
                     .map(|branch| {
@@ -231,15 +235,15 @@ fn execute(cli: Cli) -> Result<String> {
                     .collect())
             }
             BranchCommand::Create { name } => {
-                let branch = facade.create_branch(repo, &name)?;
+                let branch = sdk.create_branch(&repo, &name)?;
                 Ok(format!("created branch {}\n", branch.name))
             }
             BranchCommand::Checkout { name } => {
-                let state = facade.checkout_branch(repo, &name)?;
+                let state = sdk.checkout_branch(&repo, &name)?;
                 Ok(format!("checked out {}\n", state.branch.name))
             }
             BranchCommand::Delete { name } => {
-                facade.delete_branch(repo, &name)?;
+                sdk.delete_branch(&repo, &name)?;
                 Ok(format!("deleted branch {name}\n"))
             }
         },
@@ -267,7 +271,7 @@ fn execute(cli: Cli) -> Result<String> {
         }
         Command::Share { command, repo } => match command {
             ShareCommand::List => {
-                let listing = facade.share_list(&repo)?;
+                let listing = sdk.share_list(&repo)?;
                 let mut output = String::new();
                 for actor in listing.actors {
                     output.push_str(&format!(
@@ -284,9 +288,9 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(output)
             }
             ShareCommand::InviteMember { name, out } => {
-                let invite = facade.share_invite_member(
+                let invite = sdk.share_invite_member(
                     &repo,
-                    e2v_core::ShareInviteMemberOptions { display_name: name },
+                    ShareInviteMemberRequest { display_name: name },
                 )?;
                 std::fs::write(&out, &invite.bundle_bytes)?;
                 Ok(format!(
@@ -297,9 +301,9 @@ fn execute(cli: Cli) -> Result<String> {
             }
             ShareCommand::AcceptMember { bundle, label } => {
                 let invite_bytes = std::fs::read(&bundle)?;
-                let accepted = facade.share_accept_member(
+                let accepted = sdk.share_accept_member(
                     &repo,
-                    e2v_core::ShareAcceptMemberOptions {
+                    ShareAcceptMemberRequest {
                         invite_bytes,
                         local_device_label: label,
                     },
@@ -310,9 +314,9 @@ fn execute(cli: Cli) -> Result<String> {
                 ))
             }
             ShareCommand::InviteDevice { actor, label, out } => {
-                let invite = facade.share_invite_device(
+                let invite = sdk.share_invite_device(
                     &repo,
-                    e2v_core::ShareInviteDeviceOptions {
+                    ShareInviteDeviceRequest {
                         actor_id: actor,
                         device_label: label,
                     },
@@ -326,9 +330,9 @@ fn execute(cli: Cli) -> Result<String> {
             }
             ShareCommand::AcceptDevice { bundle, label } => {
                 let invite_bytes = std::fs::read(&bundle)?;
-                let accepted = facade.share_accept_device(
+                let accepted = sdk.share_accept_device(
                     &repo,
-                    e2v_core::ShareAcceptDeviceOptions {
+                    ShareAcceptDeviceRequest {
                         invite_bytes,
                         local_device_label: label,
                     },
@@ -339,16 +343,19 @@ fn execute(cli: Cli) -> Result<String> {
                 ))
             }
             ShareCommand::RevokeMember { actor, password } => {
-                facade.share_revoke_member(
+                sdk.share_revoke_member(
                     &repo,
-                    e2v_core::ShareRevokeMemberOptions { actor_id: actor.clone(), password },
+                    ShareRevokeMemberRequest {
+                        actor_id: actor.clone(),
+                        password,
+                    },
                 )?;
                 Ok(format!("revoked member {actor}\n"))
             }
             ShareCommand::RevokeDevice { device, password } => {
-                facade.share_revoke_device(
+                sdk.share_revoke_device(
                     &repo,
-                    e2v_core::ShareRevokeDeviceOptions {
+                    ShareRevokeDeviceRequest {
                         device_id: device.clone(),
                         password,
                     },

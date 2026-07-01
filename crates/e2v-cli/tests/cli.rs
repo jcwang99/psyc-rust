@@ -716,6 +716,54 @@ fn maintenance_commands_delegate_through_the_sdk_boundary() {
 }
 
 #[test]
+fn branch_and_share_commands_delegate_through_the_sdk_boundary() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for legacy_call in [
+        "facade.list_branches(",
+        "facade.create_branch(",
+        "facade.checkout_branch(",
+        "facade.delete_branch(",
+        "facade.share_list(",
+        "facade.share_invite_member(",
+        "facade.share_accept_member(",
+        "facade.share_invite_device(",
+        "facade.share_accept_device(",
+        "facade.share_revoke_member(",
+        "facade.share_revoke_device(",
+    ] {
+        assert!(
+            !source.contains(legacy_call),
+            "expected CLI branch/share commands to delegate through e2v_api::Sdk instead of {legacy_call}"
+        );
+    }
+
+    for sdk_call in [
+        "sdk.list_branches(",
+        "sdk.create_branch(",
+        "sdk.checkout_branch(",
+        "sdk.delete_branch(",
+        "sdk.share_list(",
+        "sdk.share_invite_member(",
+        "sdk.share_accept_member(",
+        "sdk.share_invite_device(",
+        "sdk.share_accept_device(",
+        "sdk.share_revoke_member(",
+        "sdk.share_revoke_device(",
+    ] {
+        assert!(
+            source.contains(sdk_call),
+            "expected CLI branch/share commands to use SDK call {sdk_call}"
+        );
+    }
+}
+
+#[test]
 fn repair_command_uses_default_file_remote() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
