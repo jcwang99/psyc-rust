@@ -922,6 +922,122 @@ impl e2v_store::RemoteBackend for LeaseAppearsBeforeDeleteBackend {
 }
 
 #[derive(Clone, Debug)]
+struct PackIndexRootChangesBeforeDeleteBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    listed_active_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mutated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    replacement_root_bytes: Vec<u8>,
+}
+
+impl PackIndexRootChangesBeforeDeleteBackend {
+    fn new(inner: MemoryBackend, replacement_root_bytes: Vec<u8>) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            listed_active_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mutated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            replacement_root_bytes,
+        }
+    }
+}
+
+impl BlobStore for PackIndexRootChangesBeforeDeleteBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        if prefix == "transactions/active/" {
+            let saw_first = self
+                .listed_active_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            if saw_first
+                && !self
+                    .mutated
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.inner
+                    .put_physical("pack-index/root.json", &self.replacement_root_bytes)?;
+            }
+        }
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for PackIndexRootChangesBeforeDeleteBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for PackIndexRootChangesBeforeDeleteBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for PackIndexRootChangesBeforeDeleteBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Clone, Debug)]
 struct FailOnceOnDeleteBackend {
     inner: MemoryBackend,
     capability: BackendCapability,
@@ -2147,6 +2263,100 @@ fn gc_execute_deletes_unreferenced_pack_index_segments_after_compaction() {
             "gc execute should remove unreferenced pack index segment {segment_path}"
         );
     }
+}
+
+#[test]
+fn gc_execute_aborts_when_pack_index_root_changes_after_dry_run() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let remote = MemoryBackend::new();
+
+    for version in 0..5usize {
+        fs::write(repo_root.join("rolling.txt"), format!("rolling-{version}")).unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: format!("gc-pack-index-race-{version}"),
+            })
+            .unwrap();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: format!("gc-pack-index-race-op-{version}"),
+            },
+        )
+        .unwrap();
+    }
+
+    let mut root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let referenced_segments = root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    let unreferenced_segments = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .chain(remote.list_physical("pack-index/segments/").unwrap())
+        .filter(|path| !referenced_segments.contains(path))
+        .collect::<Vec<_>>();
+    let resurrected_segment = unreferenced_segments
+        .first()
+        .cloned()
+        .expect("expected an obsolete pack index segment after compaction");
+
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+    remote
+        .override_physical_modified_time_for_test(&resurrected_segment, old_time)
+        .unwrap();
+
+    let root_segments = root["segments"].as_array_mut().unwrap();
+    root_segments.push(serde_json::Value::String(resurrected_segment.clone()));
+    let replacement_root_bytes =
+        e2v_sync::testing::encode_pack_index_root_value_for_test(&repo_root.join(".e2v"), &root)
+            .unwrap();
+    let raced_remote =
+        PackIndexRootChangesBeforeDeleteBackend::new(remote.clone(), replacement_root_bytes);
+
+    let error = gc_execute(
+        &raced_remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("changed during execution"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        remote.exists_physical(&resurrected_segment),
+        "gc execute should not delete a pack index segment that became reachable again"
+    );
 }
 
 fn upload_local_objects_to_remote(

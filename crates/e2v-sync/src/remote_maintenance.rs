@@ -869,6 +869,7 @@ struct GcFenceState {
     active_intent_paths: Vec<String>,
     active_lease_paths: Vec<String>,
     layout_root_generation: u64,
+    pack_index_root_bytes: Option<Vec<u8>>,
 }
 
 fn gc_delete_journal_path(repo_root: &std::path::Path) -> PathBuf {
@@ -1114,11 +1115,17 @@ fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> 
     let active_intent_paths = list_active_intent_paths(remote)?;
     let active_lease_paths = list_active_lease_paths(remote)?;
     let layout_root_generation = remote.read_layout_root()?.generation;
+    let pack_index_root_bytes = if remote.exists_physical("pack-index/root.json") {
+        Some(remote.get_physical("pack-index/root.json")?)
+    } else {
+        None
+    };
     Ok(GcFenceState {
         refs,
         active_intent_paths,
         active_lease_paths,
         layout_root_generation,
+        pack_index_root_bytes,
     })
 }
 
