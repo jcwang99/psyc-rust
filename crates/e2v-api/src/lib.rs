@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+pub mod c_abi;
+
 use e2v_core::{
     BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
     InitOptions, ReadService, RepositoryFacade, RepositoryState,
@@ -1080,7 +1082,7 @@ fn gc_execute_response_from_result(result: e2v_sync::GcExecuteResult) -> GcExecu
     }
 }
 
-fn map_error(error: anyhow::Error) -> SdkError {
+pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
 
