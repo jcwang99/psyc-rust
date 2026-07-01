@@ -122,7 +122,8 @@ fn s3_remote_spec_exposes_safe_single_writer_push_capability() {
 }
 
 #[test]
-fn s3_remote_spec_constructs_backend_with_transaction_safety_capabilities() {
+fn s3_remote_spec_constructs_backend_with_safe_single_writer_capabilities_without_layout_root_cas()
+{
     let spec = e2v_sync::RemoteSpec::parse(
         "s3+https://alice:secret@s3.example.com/example-bucket/sync-root?region=us-east-1",
     )
@@ -139,5 +140,5 @@ fn s3_remote_spec_constructs_backend_with_transaction_safety_capabilities() {
     assert!(capability.supports_transaction_markers);
     assert!(capability.supports_reliable_remote_time);
     assert!(capability.supports_object_generation_or_etag);
-    assert!(capability.supports_layout_root_cas);
+    assert!(!capability.supports_layout_root_cas);
 }
