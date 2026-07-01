@@ -339,6 +339,27 @@ fn oversized_full_file_reads_are_not_retained_in_plaintext_memory_cache() {
 }
 
 #[test]
+fn cached_full_file_reads_still_reject_out_of_bounds_offsets() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root, snapshot_id)).unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let warm = vfs.read(&handle, 0, 32).unwrap();
+    assert_eq!(String::from_utf8(warm).unwrap(), "alpha");
+
+    let error = vfs.read(&handle, 6, 1).unwrap_err();
+    assert!(
+        error.to_string().contains("range offset out of bounds"),
+        "expected cached read to preserve out-of-bounds error semantics, got: {error:#}"
+    );
+}
+
+#[test]
 fn plaintext_memory_cache_evicts_older_entries_when_budget_is_exceeded() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

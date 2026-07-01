@@ -390,6 +390,8 @@ impl ReadOnlyVfs {
             opened_file.file_object_id().to_string(),
             opened_file.layout_generation(),
         );
+        let file_size = opened_file.file.file_size() as usize;
+        anyhow::ensure!(offset <= file_size, "range offset out of bounds");
 
         if let Some(cached) = opened_file.cached_range_bytes(offset, length) {
             return Ok(cached);
@@ -401,7 +403,7 @@ impl ReadOnlyVfs {
             .unwrap()
             .get(&cache_key)
         {
-            let start = offset.min(cached.len());
+            let start = offset;
             let end = offset.saturating_add(length).min(cached.len());
             let requested = cached[start..end].to_vec();
             self.replace_open_file_cache(
@@ -442,7 +444,6 @@ impl ReadOnlyVfs {
                 &bytes,
             )?;
         }
-        let file_size = opened_file.file.file_size() as usize;
         if offset == 0 && offset.saturating_add(bytes.len()) >= file_size {
             let cacheable = self.cacheable_plaintext_range(0, bytes.clone());
             self.replace_open_file_cache(opened_file, cacheable.clone());
