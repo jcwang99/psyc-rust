@@ -144,8 +144,36 @@ struct RemoteReachabilityContext<'a, R: RemoteBackend> {
     validation_root: &'a RemoteValidationRoot,
     object_store: &'a DirectLayoutObjectStore,
     pack_cache: &'a mut BTreeMap<String, Vec<u8>>,
+    recorder: &'a mut dyn RemoteReachabilityRecorder,
+}
+
+pub(crate) trait RemoteReachabilityRecorder {
+    fn record(&mut self, object_id: &str) -> Result<bool>;
+}
+
+struct VecReachabilityRecorder<'a> {
     reachable_object_ids: &'a mut Vec<String>,
-    seen: &'a mut HashSet<String>,
+    seen: HashSet<String>,
+}
+
+impl RemoteReachabilityRecorder for VecReachabilityRecorder<'_> {
+    fn record(&mut self, object_id: &str) -> Result<bool> {
+        if self.seen.insert(object_id.to_string()) {
+            self.reachable_object_ids.push(object_id.to_string());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+pub(crate) struct RemoteReachabilityTraversal<'a, R: RemoteBackend> {
+    pub(crate) remote: &'a R,
+    pub(crate) remote_loose_object_ids: &'a BTreeSet<String>,
+    pub(crate) pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
+    pub(crate) validation_root: &'a RemoteValidationRoot,
+    pub(crate) validation_secrets: &'a RepoSecrets,
+    pub(crate) pack_cache: &'a mut BTreeMap<String, Vec<u8>>,
 }
 
 struct RemoteFetchValidationInputs<'a> {
@@ -1308,20 +1336,52 @@ pub(crate) fn collect_remote_reachable_object_ids<R: RemoteBackend>(
     pack_cache: &mut BTreeMap<String, Vec<u8>>,
     head_snapshot_id: &str,
 ) -> Result<Vec<String>> {
-    let object_store =
-        DirectLayoutObjectStore::new(validation_root.control_dir(), validation_secrets.clone());
-    let mut reachable_object_ids = Vec::new();
-    let mut seen = HashSet::new();
-    let mut context = RemoteReachabilityContext {
+    let mut traversal = RemoteReachabilityTraversal {
         remote,
         remote_loose_object_ids,
         pack_locations,
         validation_root,
-        object_store: &object_store,
+        validation_secrets,
         pack_cache,
-        reachable_object_ids: &mut reachable_object_ids,
-        seen: &mut seen,
     };
+    let mut reachable_object_ids = Vec::new();
+    let mut recorder = VecReachabilityRecorder {
+        reachable_object_ids: &mut reachable_object_ids,
+        seen: HashSet::new(),
+    };
+    collect_remote_reachable_object_ids_with_recorder(
+        &mut traversal,
+        head_snapshot_id,
+        &mut recorder,
+    )?;
+    Ok(reachable_object_ids)
+}
+
+pub(crate) fn collect_remote_reachable_object_ids_with_recorder<R: RemoteBackend>(
+    traversal: &mut RemoteReachabilityTraversal<'_, R>,
+    head_snapshot_id: &str,
+    recorder: &mut dyn RemoteReachabilityRecorder,
+) -> Result<()> {
+    let object_store = DirectLayoutObjectStore::new(
+        traversal.validation_root.control_dir(),
+        traversal.validation_secrets.clone(),
+    );
+    let mut context = RemoteReachabilityContext {
+        remote: traversal.remote,
+        remote_loose_object_ids: traversal.remote_loose_object_ids,
+        pack_locations: traversal.pack_locations,
+        validation_root: traversal.validation_root,
+        object_store: &object_store,
+        pack_cache: traversal.pack_cache,
+        recorder,
+    };
+    collect_remote_reachable_object_ids_with_context(&mut context, head_snapshot_id)
+}
+
+fn collect_remote_reachable_object_ids_with_context<R: RemoteBackend>(
+    context: &mut RemoteReachabilityContext<'_, R>,
+    head_snapshot_id: &str,
+) -> Result<()> {
     let mut pending_snapshots = vec![head_snapshot_id.to_string()];
 
     while let Some(snapshot_id) = pending_snapshots.pop() {
@@ -1333,11 +1393,7 @@ pub(crate) fn collect_remote_reachable_object_ids<R: RemoteBackend>(
             context.pack_cache,
             &snapshot_id,
         )?;
-        if !push_reachable_id(
-            context.reachable_object_ids,
-            context.seen,
-            snapshot_id.clone(),
-        ) {
+        if !record_reachable_id(context.recorder, &snapshot_id)? {
             continue;
         }
         let snapshot: RemoteSnapshotObject = read_remote_validation_object(
@@ -1346,7 +1402,7 @@ pub(crate) fn collect_remote_reachable_object_ids<R: RemoteBackend>(
             "snapshot",
         )?;
         validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
-        collect_remote_tree_object_ids(&mut context, &snapshot.root_tree_id)?;
+        collect_remote_tree_object_ids(context, &snapshot.root_tree_id)?;
         if let Some(parent_snapshot_id) = snapshot.parent_snapshot_id {
             validate_object_id_value(&parent_snapshot_id)
                 .with_context(|| format!("invalid parent snapshot id in snapshot {snapshot_id}"))?;
@@ -1354,7 +1410,7 @@ pub(crate) fn collect_remote_reachable_object_ids<R: RemoteBackend>(
         }
     }
 
-    Ok(reachable_object_ids)
+    Ok(())
 }
 
 fn collect_remote_tree_object_ids<R: RemoteBackend>(
@@ -1369,7 +1425,7 @@ fn collect_remote_tree_object_ids<R: RemoteBackend>(
         context.pack_cache,
         tree_id,
     )?;
-    if !push_reachable_id(context.reachable_object_ids, context.seen, tree_id.to_string()) {
+    if !record_reachable_id(context.recorder, tree_id)? {
         return Ok(());
     }
 
@@ -1396,11 +1452,7 @@ fn collect_remote_tree_object_ids<R: RemoteBackend>(
                     context.pack_cache,
                     &shard_id,
                 )?;
-                if !push_reachable_id(
-                    context.reachable_object_ids,
-                    context.seen,
-                    shard_id.clone(),
-                ) {
+                if !record_reachable_id(context.recorder, &shard_id)? {
                     continue;
                 }
                 let shard: RemoteTreeShardObject =
@@ -1445,7 +1497,7 @@ fn collect_remote_file_object_ids<R: RemoteBackend>(
         context.pack_cache,
         file_id,
     )?;
-    if !push_reachable_id(context.reachable_object_ids, context.seen, file_id.to_string()) {
+    if !record_reachable_id(context.recorder, file_id)? {
         return Ok(());
     }
 
@@ -1455,7 +1507,7 @@ fn collect_remote_file_object_ids<R: RemoteBackend>(
     for chunk_id in file.chunks {
         validate_object_id_value(&chunk_id)
             .with_context(|| format!("invalid chunk id in file {file_id}"))?;
-        push_reachable_id(context.reachable_object_ids, context.seen, chunk_id);
+        let _ = record_reachable_id(context.recorder, &chunk_id)?;
     }
     for shard_id in file.shard_ids {
         validate_object_id_value(&shard_id)
@@ -1468,11 +1520,7 @@ fn collect_remote_file_object_ids<R: RemoteBackend>(
             context.pack_cache,
             &shard_id,
         )?;
-        if !push_reachable_id(
-            context.reachable_object_ids,
-            context.seen,
-            shard_id.clone(),
-        ) {
+        if !record_reachable_id(context.recorder, &shard_id)? {
             continue;
         }
         let shard: RemoteFileShardObject =
@@ -1481,7 +1529,7 @@ fn collect_remote_file_object_ids<R: RemoteBackend>(
         for chunk_id in shard.chunks {
             validate_object_id_value(&chunk_id)
                 .with_context(|| format!("invalid chunk id in file shard for {file_id}"))?;
-            push_reachable_id(context.reachable_object_ids, context.seen, chunk_id);
+            let _ = record_reachable_id(context.recorder, &chunk_id)?;
         }
     }
     Ok(())
@@ -1543,17 +1591,11 @@ pub(crate) fn read_remote_validation_object<T: for<'de> Deserialize<'de>>(
     postcard_from_bytes(&plaintext).context("failed to decode remote object plaintext")
 }
 
-fn push_reachable_id(
-    reachable_object_ids: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    object_id: String,
-) -> bool {
-    if seen.insert(object_id.clone()) {
-        reachable_object_ids.push(object_id);
-        true
-    } else {
-        false
-    }
+fn record_reachable_id(
+    recorder: &mut dyn RemoteReachabilityRecorder,
+    object_id: &str,
+) -> Result<bool> {
+    recorder.record(object_id)
 }
 
 fn validate_manifest_schema_version(object_type: &str, schema_version: u32) -> Result<()> {
@@ -1562,4 +1604,120 @@ fn validate_manifest_schema_version(object_type: &str, schema_version: u32) -> R
         "unsupported {object_type} schema version {schema_version}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+
+    use e2v_core::{CommitOptions, InitOptions, ManifestStore, ManifestStoreApi, RepositoryFacade};
+    use e2v_store::{BlobStore, MemoryBackend, RefStore};
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::pack_index::load_remote_pack_locations_with_local_cache;
+    use crate::push::{PushOptions, push_head};
+
+    #[derive(Default)]
+    struct SetRecorder {
+        seen: BTreeSet<String>,
+    }
+
+    impl RemoteReachabilityRecorder for SetRecorder {
+        fn record(&mut self, object_id: &str) -> Result<bool> {
+            Ok(self.seen.insert(object_id.to_string()))
+        }
+    }
+
+    fn remote_loose_object_ids(remote: &MemoryBackend) -> BTreeSet<String> {
+        remote
+            .list_physical("objects/")
+            .unwrap()
+            .into_iter()
+            .filter_map(|relative_path| {
+                relative_path
+                    .strip_prefix("objects/")
+                    .and_then(|value| value.strip_suffix(".json"))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collect_remote_reachable_object_ids_can_stream_into_custom_recorder() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        let snapshot = facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-recorder".to_string(),
+            },
+        )
+        .unwrap();
+
+        let default_ref = remote
+            .read_ref(&e2v_store::RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .unwrap();
+        let control_dir = repo_root.join(".e2v");
+        let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+        let pack_locations =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        let control_plane =
+            read_remote_control_plane(&remote, default_ref.value.bytes.clone()).unwrap();
+        let validation_root = RemoteValidationRoot {
+            path: next_validation_root(&repo_root).unwrap(),
+        };
+        write_remote_control_plane_to_validation_root(&validation_root, &control_plane).unwrap();
+        let remote_loose_object_ids = remote_loose_object_ids(&remote);
+        let mut pack_cache = BTreeMap::new();
+        let mut traversal = RemoteReachabilityTraversal {
+            remote: &remote,
+            remote_loose_object_ids: &remote_loose_object_ids,
+            pack_locations: &pack_locations,
+            validation_root: &validation_root,
+            validation_secrets: &secrets,
+            pack_cache: &mut pack_cache,
+        };
+        let mut recorder = SetRecorder::default();
+
+        collect_remote_reachable_object_ids_with_recorder(
+            &mut traversal,
+            &snapshot.snapshot_id,
+            &mut recorder,
+        )
+        .unwrap();
+
+        let expected = ManifestStore::new(&repo_root)
+            .collect_reachable_object_ids(&snapshot.snapshot_id)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(recorder.seen, expected);
+    }
 }

@@ -4,11 +4,14 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use e2v_core::{RepositoryFacade, sync_support};
 use e2v_store::{BackendCapability, RefToken, RemoteBackend, validate_object_id_value};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::fetch::{
     RemoteValidationRoot, assert_remote_generations_meet_local_floor,
-    collect_remote_reachable_object_ids, next_validation_root, read_remote_control_plane,
+    RemoteReachabilityRecorder, RemoteReachabilityTraversal, collect_remote_reachable_object_ids,
+    collect_remote_reachable_object_ids_with_recorder, next_validation_root,
+    read_remote_control_plane,
     update_trusted_remote_state_from_control_plane, write_remote_control_plane_to_validation_root,
 };
 use crate::object_type::candidate_object_types;
@@ -18,6 +21,7 @@ use crate::remote_markers::{
     INTENT_EXPIRY_HOURS, marker_is_fresh_at, observe_remote_now_with_probe,
 };
 use e2v_store::DirectLayoutObjectStore;
+use tempfile::TempDir;
 
 const UNPUBLISHED_SNAPSHOT_GRACE_PERIOD_DAYS: u64 = 30;
 
@@ -87,6 +91,95 @@ struct GcDeleteJournal {
     grace_period_days: u64,
     fence_state: GcFenceState,
     pending_paths: Vec<String>,
+}
+
+struct GcReachabilityStore {
+    sqlite: rusqlite::Connection,
+    _temp_dir: TempDir,
+}
+
+impl GcReachabilityStore {
+    fn new(repo_root: &Path) -> Result<Self> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("e2v-gc-reachable-")
+            .tempdir_in(repo_root)
+            .or_else(|_| tempfile::Builder::new().prefix("e2v-gc-reachable-").tempdir())?;
+        let sqlite_path = temp_dir.path().join("reachable.sqlite3");
+        let sqlite = rusqlite::Connection::open(&sqlite_path).with_context(|| {
+            format!(
+                "failed to open gc reachability sqlite {}",
+                sqlite_path.display()
+            )
+        })?;
+        sqlite.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS reachable_objects (
+                object_id TEXT PRIMARY KEY NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reachable_physical_refs (
+                path TEXT PRIMARY KEY NOT NULL
+            );
+            ",
+        )?;
+        Ok(Self {
+            sqlite,
+            _temp_dir: temp_dir,
+        })
+    }
+
+    fn insert_object_id(&self, object_id: &str) -> Result<bool> {
+        let changed = self.sqlite.execute(
+            "INSERT OR IGNORE INTO reachable_objects(object_id) VALUES (?1)",
+            rusqlite::params![object_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn contains_object_id(&self, object_id: &str) -> Result<bool> {
+        let exists = self
+            .sqlite
+            .query_row(
+                "SELECT 1 FROM reachable_objects WHERE object_id = ?1 LIMIT 1",
+                rusqlite::params![object_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
+    fn insert_physical_ref(&self, path: &str) -> Result<bool> {
+        let changed = self.sqlite.execute(
+            "INSERT OR IGNORE INTO reachable_physical_refs(path) VALUES (?1)",
+            rusqlite::params![path],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn contains_physical_ref(&self, path: &str) -> Result<bool> {
+        let exists = self
+            .sqlite
+            .query_row(
+                "SELECT 1 FROM reachable_physical_refs WHERE path = ?1 LIMIT 1",
+                rusqlite::params![path],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
+    fn clear_physical_refs(&self) -> Result<()> {
+        self.sqlite
+            .execute("DELETE FROM reachable_physical_refs", [])?;
+        Ok(())
+    }
+}
+
+impl RemoteReachabilityRecorder for GcReachabilityStore {
+    fn record(&mut self, object_id: &str) -> Result<bool> {
+        self.insert_object_id(object_id)
+    }
 }
 
 pub fn force_accept_remote_rollback<R: RemoteBackend>(
@@ -354,16 +447,20 @@ pub fn gc_dry_run<R: RemoteBackend>(
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
-    let mut reachable_object_ids = collect_all_remote_reachable_object_ids(
+    let mut traversal = RemoteReachabilityTraversal {
         remote,
+        remote_loose_object_ids: &remote_loose_object_ids,
+        pack_locations: &pack_locations,
+        validation_root: &validation_root,
+        validation_secrets: &secrets,
+        pack_cache: &mut pack_cache,
+    };
+    let mut reachable_object_ids = GcReachabilityStore::new(&options.repo_root)?;
+    collect_all_remote_reachable_object_ids(
         &options.repo_root,
-        &remote_loose_object_ids,
-        &pack_locations,
-        &validation_root,
-        &secrets,
-        &mut pack_cache,
+        &mut traversal,
+        &mut reachable_object_ids,
     )?;
-    persist_cached_pack_data(&control_dir, &pack_cache)?;
     let mut maintenance_context = MaintenanceReachabilityContext {
         remote,
         repo_root: &options.repo_root,
@@ -373,12 +470,13 @@ pub fn gc_dry_run<R: RemoteBackend>(
         validation_secrets: &secrets,
         pack_cache: &mut pack_cache,
     };
-    reachable_object_ids.extend(collect_recent_unpublished_local_reachable_object_ids(
+    collect_recent_unpublished_local_reachable_object_ids(
         &mut maintenance_context,
-        &reachable_object_ids,
-    )?);
+        &mut reachable_object_ids,
+    )?;
+    persist_cached_pack_data(&control_dir, &pack_cache)?;
     let active_intent_paths = list_active_intent_paths(remote)?;
-    let mut unreachable_physical_refs = collect_unreachable_physical_refs(
+    let mut unreachable_physical_refs = collect_unreachable_physical_refs_with_spill(
         remote,
         &remote_loose_object_ids,
         &pack_locations,
@@ -808,19 +906,15 @@ fn remove_gc_delete_journal(path: &std::path::Path) -> Result<()> {
 }
 
 fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
-    remote: &R,
     repo_root: &std::path::Path,
-    remote_loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    validation_root: &RemoteValidationRoot,
-    validation_secrets: &e2v_store::RepoSecrets,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<BTreeSet<String>> {
+    traversal: &mut RemoteReachabilityTraversal<'_, R>,
+    reachable: &mut dyn RemoteReachabilityRecorder,
+) -> Result<()> {
     let local_default_ref_bytes = sync_support::read_default_ref_bytes(repo_root)?;
     let (default_branch_token, _) =
         sync_support::decode_default_ref_record(repo_root, &local_default_ref_bytes)?;
-    let mut reachable = BTreeSet::new();
-    for listed_ref in list_remote_branch_refs(remote, repo_root)? {
+    let mut saw_head_snapshot = false;
+    for listed_ref in list_remote_branch_refs(traversal.remote, repo_root)? {
         let (decoded_branch_token, head_snapshot_id) =
             sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)
                 .with_context(|| {
@@ -838,20 +932,17 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
         let Some(head_snapshot_id) = head_snapshot_id else {
             continue;
         };
-        let per_ref_reachable = collect_remote_reachable_object_ids(
-            remote,
-            remote_loose_object_ids,
-            pack_locations,
-            validation_root,
-            validation_secrets,
-            pack_cache,
+        saw_head_snapshot = true;
+        collect_remote_reachable_object_ids_with_recorder(
+            traversal,
             &head_snapshot_id,
+            reachable,
         )?;
-        reachable.extend(per_ref_reachable);
     }
 
-    if reachable.is_empty() {
-        let default_ref = remote
+    if !saw_head_snapshot {
+        let default_ref = traversal
+            .remote
             .read_ref(&RefToken::new(default_branch_token.clone()))?
             .ok_or_else(|| {
                 anyhow::anyhow!("remote branch ref not found for {default_branch_token}")
@@ -859,34 +950,29 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
         let (_, head_snapshot_id) =
             sync_support::decode_default_ref_record(repo_root, &default_ref.value.bytes)?;
         if let Some(head_snapshot_id) = head_snapshot_id {
-            reachable.extend(collect_remote_reachable_object_ids(
-                remote,
-                remote_loose_object_ids,
-                pack_locations,
-                validation_root,
-                validation_secrets,
-                pack_cache,
-                &head_snapshot_id,
-            )?);
+            collect_remote_reachable_object_ids_with_recorder(traversal, &head_snapshot_id, reachable)?;
         }
     }
 
-    Ok(reachable)
+    Ok(())
 }
 
 fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
     context: &mut MaintenanceReachabilityContext<'_, R>,
-    remote_reachable_object_ids: &BTreeSet<String>,
-) -> Result<BTreeSet<String>> {
+    reachable_object_ids: &mut GcReachabilityStore,
+) -> Result<()> {
     let facade = RepositoryFacade::new();
-    let mut candidate_head_snapshot_ids = facade
-        .list_branches(context.repo_root)?
-        .into_iter()
-        .filter_map(|branch| branch.head_snapshot_id)
-        .filter(|snapshot_id| !remote_reachable_object_ids.contains(snapshot_id))
-        .collect::<BTreeSet<_>>();
+    let mut candidate_head_snapshot_ids = BTreeSet::new();
+    for branch in facade.list_branches(context.repo_root)? {
+        let Some(snapshot_id) = branch.head_snapshot_id else {
+            continue;
+        };
+        if !reachable_object_ids.contains_object_id(&snapshot_id)? {
+            candidate_head_snapshot_ids.insert(snapshot_id);
+        }
+    }
     if candidate_head_snapshot_ids.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(());
     }
 
     let candidate_paths = candidate_head_snapshot_ids
@@ -902,7 +988,7 @@ fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
         .into_iter()
         .collect::<Vec<_>>();
     if candidate_paths.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(());
     }
 
     let unpublished_safe_horizon = observed_remote_safe_horizon(
@@ -924,44 +1010,47 @@ fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
             .unwrap_or(false)
     });
     if candidate_head_snapshot_ids.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(());
     }
 
-    let mut protected_object_ids = BTreeSet::new();
     for snapshot_id in candidate_head_snapshot_ids {
-        let reachable = collect_remote_reachable_object_ids(
-            context.remote,
-            context.remote_loose_object_ids,
-            context.pack_locations,
-            context.validation_root,
-            context.validation_secrets,
-            context.pack_cache,
+        let mut traversal = RemoteReachabilityTraversal {
+            remote: context.remote,
+            remote_loose_object_ids: context.remote_loose_object_ids,
+            pack_locations: context.pack_locations,
+            validation_root: context.validation_root,
+            validation_secrets: context.validation_secrets,
+            pack_cache: context.pack_cache,
+        };
+        collect_remote_reachable_object_ids_with_recorder(
+            &mut traversal,
             &snapshot_id,
+            reachable_object_ids,
         )
         .with_context(|| {
             format!(
                 "failed to collect remote graph for recent unpublished local snapshot {snapshot_id}"
             )
         })?;
-        protected_object_ids.extend(reachable);
     }
-    Ok(protected_object_ids)
+    Ok(())
 }
 
-fn collect_unreachable_physical_refs<R: RemoteBackend>(
+fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
     remote: &R,
     remote_loose_object_ids: &BTreeSet<String>,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    reachable_object_ids: &BTreeSet<String>,
+    reachable: &GcReachabilityStore,
 ) -> Result<Vec<String>> {
-    let mut reachable_physical_refs = BTreeSet::new();
-    for object_id in reachable_object_ids {
-        if remote_loose_object_ids.contains(object_id) {
-            reachable_physical_refs.insert(format!("objects/{object_id}.json"));
-            continue;
+    reachable.clear_physical_refs()?;
+    for object_id in remote_loose_object_ids {
+        if reachable.contains_object_id(object_id)? {
+            reachable.insert_physical_ref(&format!("objects/{object_id}.json"))?;
         }
-        if let Some(location) = pack_locations.get(object_id) {
-            reachable_physical_refs.insert(location.physical_ref().container_id);
+    }
+    for (object_id, location) in pack_locations {
+        if reachable.contains_object_id(object_id)? {
+            reachable.insert_physical_ref(&location.physical_ref().container_id)?;
         }
     }
 
@@ -977,10 +1066,13 @@ fn collect_unreachable_physical_refs<R: RemoteBackend>(
         .collect::<Vec<_>>();
     candidates.extend(remote.list_physical("packs/data/")?);
 
-    Ok(candidates
-        .into_iter()
-        .filter(|path| !reachable_physical_refs.contains(path))
-        .collect())
+    let mut unreachable = Vec::new();
+    for path in candidates {
+        if !reachable.contains_physical_ref(&path)? {
+            unreachable.push(path);
+        }
+    }
+    Ok(unreachable)
 }
 
 fn remote_physical_path_for_object(
@@ -1119,4 +1211,87 @@ fn physical_ref_is_older_than_horizon<R: RemoteBackend>(
         )
     })?;
     Ok(modified_at <= safe_horizon)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use e2v_store::{BlobStore, MemoryBackend};
+
+    fn object_id(fill: char) -> String {
+        std::iter::repeat_n(fill, 64).collect()
+    }
+
+    #[test]
+    fn gc_reachability_store_deduplicates_object_and_physical_ids() {
+        let temp = tempdir().unwrap();
+        let store = GcReachabilityStore::new(temp.path()).unwrap();
+
+        assert!(store.insert_object_id(&object_id('a')).unwrap());
+        assert!(!store.insert_object_id(&object_id('a')).unwrap());
+        assert!(store.contains_object_id(&object_id('a')).unwrap());
+        assert!(!store.contains_object_id(&object_id('b')).unwrap());
+
+        assert!(store.insert_physical_ref("objects/test.json").unwrap());
+        assert!(!store.insert_physical_ref("objects/test.json").unwrap());
+        assert!(store.contains_physical_ref("objects/test.json").unwrap());
+
+        store.clear_physical_refs().unwrap();
+        assert!(!store.contains_physical_ref("objects/test.json").unwrap());
+    }
+
+    #[test]
+    fn spilled_reachable_ids_can_drive_unreachable_physical_ref_collection() {
+        let temp = tempdir().unwrap();
+        let store = GcReachabilityStore::new(temp.path()).unwrap();
+        let remote = MemoryBackend::new();
+        let reachable_loose = object_id('a');
+        let unreachable_loose = object_id('b');
+        let packed_object = object_id('c');
+        let pack_data_path = "packs/data/pack-00000001.bin".to_string();
+
+        remote
+            .put_physical(&format!("objects/{reachable_loose}.json"), br#"{"reachable":true}"#)
+            .unwrap();
+        remote
+            .put_physical(
+                &format!("objects/{unreachable_loose}.json"),
+                br#"{"reachable":false}"#,
+            )
+            .unwrap();
+        remote.put_physical(&pack_data_path, b"packed-object").unwrap();
+
+        let remote_loose_object_ids = BTreeSet::from([
+            reachable_loose.clone(),
+            unreachable_loose.clone(),
+        ]);
+        let pack_locations = BTreeMap::from([(
+            packed_object.clone(),
+            PackedObjectLocation {
+                data_path: pack_data_path.clone(),
+                offset: 0,
+                length: 13,
+            },
+        )]);
+
+        store.insert_object_id(&reachable_loose).unwrap();
+        store.insert_object_id(&packed_object).unwrap();
+
+        let unreachable = collect_unreachable_physical_refs_with_spill(
+            &remote,
+            &remote_loose_object_ids,
+            &pack_locations,
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unreachable,
+            vec![format!("objects/{unreachable_loose}.json")]
+        );
+    }
 }
