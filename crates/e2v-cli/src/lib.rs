@@ -2,15 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use e2v_api::Sdk;
+use e2v_api::{GcExecuteRequest, Sdk, VerifyRemoteRequest};
 use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
 use e2v_store::{BackendCapability, RemoteBackend};
 use e2v_sync::{
-    GcDryRunOptions, GcExecuteOptions, RepairRemoteOptions, VerifyRemoteOptions,
-    force_accept_remote_rollback as force_accept_remote_rollback_sync, gc_dry_run, gc_execute,
-    gc_execute_capability_status, load_trusted_remote_state_for_repo,
-    remote_spec::RemoteBackendRef, repair_remote, verify_remote,
+    gc_execute_capability_status, load_trusted_remote_state_for_repo, remote_spec::RemoteBackendRef,
 };
 use e2v_vfs::{MountLaunchSummary, mount_live_branch, mount_snapshot};
 use serde::Serialize;
@@ -368,22 +365,9 @@ fn execute(cli: Cli) -> Result<String> {
         Command::Verify { command, repo } => match command {
             VerifyCommand::Remote { sample_percent } => {
                 let sample_percent = parse_percent_arg(&sample_percent)?;
-                let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
-                let result = remote_spec.with_backend(|remote| match remote {
-                    RemoteBackendRef::LocalFolder(remote) => verify_remote(
-                        remote,
-                        VerifyRemoteOptions {
-                            repo_root: repo.clone(),
-                            sample_percent,
-                        },
-                    ),
-                    RemoteBackendRef::Webdav(remote) => verify_remote(
-                        remote,
-                        VerifyRemoteOptions {
-                            repo_root: repo.clone(),
-                            sample_percent,
-                        },
-                    ),
+                let result = sdk.verify_default_remote(VerifyRemoteRequest {
+                    repo_root: repo.clone(),
+                    sample_percent,
                 })?;
                 let head_snapshot_id = facade
                     .snapshots(&repo)?
@@ -404,7 +388,6 @@ fn execute(cli: Cli) -> Result<String> {
             confirm_remote_rollback,
             password,
         } => {
-            let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
             if force_accept_remote_rollback {
                 anyhow::ensure!(
                     confirm_remote_rollback,
@@ -413,41 +396,13 @@ fn execute(cli: Cli) -> Result<String> {
                 let password = password.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--password is required with --force-accept-remote-rollback")
                 })?;
-                let result = remote_spec.with_backend(|remote| match remote {
-                    RemoteBackendRef::LocalFolder(remote) => force_accept_remote_rollback_sync(
-                        remote,
-                        RepairRemoteOptions {
-                            repo_root: repo.clone(),
-                        },
-                        password,
-                    ),
-                    RemoteBackendRef::Webdav(remote) => force_accept_remote_rollback_sync(
-                        remote,
-                        RepairRemoteOptions {
-                            repo_root: repo.clone(),
-                        },
-                        password,
-                    ),
-                })?;
+                let result = sdk.force_accept_default_remote_rollback(&repo, password)?;
                 Ok(format!(
                     "accepted remote rollback and rebuilt local fact view from remote; repaired {} local objects\n",
                     result.repaired_objects
                 ))
             } else {
-                let result = remote_spec.with_backend(|remote| match remote {
-                    RemoteBackendRef::LocalFolder(remote) => repair_remote(
-                        remote,
-                        RepairRemoteOptions {
-                            repo_root: repo.clone(),
-                        },
-                    ),
-                    RemoteBackendRef::Webdav(remote) => repair_remote(
-                        remote,
-                        RepairRemoteOptions {
-                            repo_root: repo.clone(),
-                        },
-                    ),
-                })?;
+                let result = sdk.repair_default_remote(&repo)?;
                 Ok(format!(
                     "repaired {} local objects\n",
                     result.repaired_objects
@@ -455,23 +410,9 @@ fn execute(cli: Cli) -> Result<String> {
             }
         }
         Command::Gc { command, repo } => {
-            let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
             match command {
                 GcCommand::DryRun => {
-                    let report = remote_spec.with_backend(|remote| match remote {
-                        RemoteBackendRef::LocalFolder(remote) => gc_dry_run(
-                            remote,
-                            GcDryRunOptions {
-                                repo_root: repo.clone(),
-                            },
-                        ),
-                        RemoteBackendRef::Webdav(remote) => gc_dry_run(
-                            remote,
-                            GcDryRunOptions {
-                                repo_root: repo.clone(),
-                            },
-                        ),
-                    })?;
+                    let report = sdk.gc_default_remote_dry_run(&repo)?;
                     Ok(format!(
                         "gc dry-run: {} unreachable physical refs, {} active intents\n",
                         report.unreachable_physical_refs.len(),
@@ -483,25 +424,11 @@ fn execute(cli: Cli) -> Result<String> {
                     confirm_single_writer_maintenance_window,
                 } => {
                     let grace_period_days = parse_grace_period_days(&grace_period_days)?;
-                    let result = remote_spec.with_backend(|remote| match remote {
-                        RemoteBackendRef::LocalFolder(remote) => gc_execute(
-                            remote,
-                            GcExecuteOptions {
-                                repo_root: repo.clone(),
-                                grace_period_days,
-                                allow_single_writer_maintenance_window:
-                                    confirm_single_writer_maintenance_window,
-                            },
-                        ),
-                        RemoteBackendRef::Webdav(remote) => gc_execute(
-                            remote,
-                            GcExecuteOptions {
-                                repo_root: repo.clone(),
-                                grace_period_days,
-                                allow_single_writer_maintenance_window:
-                                    confirm_single_writer_maintenance_window,
-                            },
-                        ),
+                    let result = sdk.gc_default_remote_execute(GcExecuteRequest {
+                        repo_root: repo.clone(),
+                        grace_period_days,
+                        allow_single_writer_maintenance_window:
+                            confirm_single_writer_maintenance_window,
                     })?;
                     Ok(format!(
                         "gc execute: deleted {} physical refs\n",

@@ -601,6 +601,121 @@ fn verify_remote_command_uses_default_file_remote() {
 }
 
 #[test]
+fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let facade = RepositoryFacade::new();
+    let branch_state = facade.open(&repo_root).unwrap().branch;
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let remote = LocalFolderBackend::new(&remote_root);
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: branch_state.token_hex.clone(),
+            operation_id: "cli-maintenance-contract".to_string(),
+        },
+    )
+    .unwrap();
+
+    let stray = "objects/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json";
+    remote.put_physical(stray, br#"{"garbage":true}"#).unwrap();
+    remote
+        .override_physical_modified_time_for_test(
+            stray,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+        )
+        .unwrap();
+
+    e2v_cli::run_cli_for_test([
+        "e2v",
+        "remote",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "add",
+        "origin",
+        &file_remote_spec(&remote_root),
+    ])
+    .unwrap();
+
+    let verify_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "verify",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "remote",
+        "--sample",
+        "100%",
+    ])
+    .unwrap();
+    assert!(verify_output.contains("sampled"));
+
+    let repair_output =
+        e2v_cli::run_cli_for_test(["e2v", "repair", "--repo", repo_root.to_str().unwrap()])
+            .unwrap();
+    assert!(repair_output.contains("repaired 0"));
+
+    let gc_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "gc",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "--execute",
+        "--grace-period",
+        "30",
+    ])
+    .unwrap();
+    assert!(gc_output.contains("deleted 1 physical refs"));
+}
+
+#[test]
+fn maintenance_commands_delegate_through_the_sdk_boundary() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for legacy_call in [
+        "verify_remote(",
+        "repair_remote(",
+        "gc_dry_run(",
+        "gc_execute(",
+        "force_accept_remote_rollback_sync(",
+    ] {
+        assert!(
+            !source.contains(legacy_call),
+            "expected CLI maintenance commands to delegate through e2v_api::Sdk instead of {legacy_call}"
+        );
+    }
+
+    for sdk_call in [
+        "sdk.verify_default_remote(",
+        "sdk.repair_default_remote(",
+        "sdk.force_accept_default_remote_rollback(",
+        "sdk.gc_default_remote_dry_run(",
+        "sdk.gc_default_remote_execute(",
+    ] {
+        assert!(
+            source.contains(sdk_call),
+            "expected CLI maintenance commands to use SDK call {sdk_call}"
+        );
+    }
+}
+
+#[test]
 fn repair_command_uses_default_file_remote() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
