@@ -599,6 +599,48 @@ fn encrypted_disk_cache_ignores_unrelated_subdirectories_when_cold() {
 }
 
 #[test]
+fn encrypted_disk_cache_path_conflicts_do_not_break_repository_reads() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    {
+        let vfs = ReadOnlyVfs::mount_snapshot(
+            VfsMountConfig::snapshot(repo_root.clone(), snapshot_id.clone())
+                .with_encrypted_disk_cache_dir(cache_dir.clone())
+                .with_plaintext_memory_cache_budget_bytes(0),
+        )
+        .unwrap();
+        let handle = vfs.open_file("tracked.txt").unwrap();
+        let first = vfs.read(&handle, 1, 3).unwrap();
+        assert_eq!(String::from_utf8(first).unwrap(), "lph");
+    }
+
+    let cache_entry = fs::read_dir(&cache_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(&cache_entry).unwrap();
+    fs::create_dir(&cache_entry).unwrap();
+
+    let reopened_vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root, snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir)
+            .with_plaintext_memory_cache_budget_bytes(0),
+    )
+    .unwrap();
+    let reopened = reopened_vfs.open_file("tracked.txt").unwrap();
+    let reread = reopened_vfs.read(&reopened, 1, 3).unwrap();
+
+    assert_eq!(String::from_utf8(reread).unwrap(), "lph");
+}
+
+#[test]
 fn prefix_reads_do_not_require_unrelated_later_chunks_to_authenticate() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

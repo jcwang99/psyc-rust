@@ -436,13 +436,13 @@ impl ReadOnlyVfs {
             .read_service
             .read_range(&opened_file.file, offset, length)?;
         if let Some(cache) = &self.encrypted_range_cache {
-            cache.write_range(
+            let _ = cache.write_range(
                 opened_file.snapshot_id(),
                 opened_file.file_object_id(),
                 opened_file.layout_generation(),
                 offset,
                 &bytes,
-            )?;
+            );
         }
         if offset == 0 && offset.saturating_add(bytes.len()) >= file_size {
             let cacheable = self.cacheable_plaintext_range(0, bytes.clone());
@@ -555,7 +555,7 @@ impl EncryptedRangeCache {
         );
         let bytes = match fs::read(&cache_path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+            Err(error) if Self::should_treat_as_cache_miss(&error) => {
                 return self.read_covering_range(
                     snapshot_id,
                     file_object_id,
@@ -577,6 +577,16 @@ impl EncryptedRangeCache {
             );
         }
         Ok(Some(plaintext))
+    }
+
+    fn should_treat_as_cache_miss(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            ErrorKind::NotFound
+                | ErrorKind::PermissionDenied
+                | ErrorKind::InvalidData
+                | ErrorKind::IsADirectory
+        )
     }
 
     fn write_range(
