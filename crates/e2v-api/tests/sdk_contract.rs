@@ -1,9 +1,14 @@
 use std::fs;
+use std::path::Path;
 
 use e2v_api::{
     CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest,
     InitRepositoryOptions, PushRequest, Sdk, SdkErrorCode, parse_remote_spec,
 };
+
+fn file_remote_spec(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy().replace('\\', "/"))
+}
 
 #[test]
 fn sdk_can_init_commit_and_read_repository_without_internal_crates() {
@@ -347,6 +352,92 @@ fn sdk_can_fetch_updates_from_registered_default_remote() {
 }
 
 #[test]
+fn sdk_can_push_and_fetch_with_explicit_remote_spec_without_default_remote_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = Sdk::new();
+    let source_state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "first".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_repo);
+    sdk.push_remote(
+        &remote_spec,
+        PushRequest {
+            repo_root: source_repo.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "push-explicit-1".to_string(),
+        },
+    )
+    .unwrap();
+
+    let cloned = sdk
+        .clone_remote(CloneRequest {
+            remote_spec: remote_spec.clone(),
+            target_repo_root: clone_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: source_state.branch.token_hex.clone(),
+        })
+        .unwrap();
+
+    assert!(
+        !source_repo.join(".e2v").join("remotes").join("default.json").exists(),
+        "explicit remote push should not require default remote registration"
+    );
+    assert!(
+        !clone_repo.join(".e2v").join("remotes").join("default.json").exists(),
+        "explicit remote clone/fetch flow should not require default remote registration"
+    );
+
+    fs::write(source_repo.join("tracked.txt"), "beta").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "second".to_string(),
+    })
+    .unwrap();
+    sdk.push_remote(
+        &remote_spec,
+        PushRequest {
+            repo_root: source_repo.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            operation_id: "push-explicit-2".to_string(),
+        },
+    )
+    .unwrap();
+
+    sdk.fetch_remote(
+        &remote_spec,
+        FetchRequest {
+            repo_root: clone_repo.clone(),
+            branch_token: cloned.branch_token.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        },
+    )
+    .unwrap();
+
+    let read = sdk.open_read_handle(&clone_repo).unwrap();
+    let snapshot = read.resolve_branch(&cloned.branch_token).unwrap();
+    let file = read.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read.read_range(&file, 0, 32).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "beta");
+}
+
+#[test]
 fn sdk_public_workflows_can_be_typed_without_internal_crates() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -660,6 +751,98 @@ fn sdk_can_verify_repair_accept_rollback_and_gc_default_remote() {
         })
         .unwrap();
     assert!(gc_execute.deleted_physical_refs.is_empty());
+}
+
+#[test]
+fn sdk_can_run_maintenance_with_explicit_remote_spec_without_default_remote_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.push_remote(
+        &remote_spec,
+        PushRequest {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-explicit-maintenance-1".to_string(),
+        },
+    )
+    .unwrap();
+
+    let verified = sdk
+        .verify_remote(
+            &remote_spec,
+            e2v_api::VerifyRemoteRequest {
+                repo_root: repo_root.clone(),
+                sample_percent: 100,
+            },
+        )
+        .unwrap();
+    assert!(verified.sampled_objects > 0);
+
+    let object_path = fs::read_dir(repo_root.join(".e2v").join("objects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(&object_path).unwrap();
+    let repaired = sdk.repair_remote(&remote_spec, &repo_root).unwrap();
+    assert!(repaired.repaired_objects > 0);
+    assert!(object_path.exists());
+
+    fs::write(repo_root.join("tracked.txt"), "beta").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "local-ahead".to_string(),
+    })
+    .unwrap();
+    let accepted = sdk
+        .force_accept_remote_rollback(
+            &remote_spec,
+            &repo_root,
+            "correct horse battery staple",
+        )
+        .unwrap();
+    assert!(accepted.repaired_objects <= repaired.repaired_objects);
+
+    let gc_report = sdk.gc_remote_dry_run(&remote_spec, &repo_root).unwrap();
+    assert!(gc_report.unreachable_physical_refs.is_empty());
+
+    let gc_execute = sdk
+        .gc_remote_execute(
+            &remote_spec,
+            e2v_api::GcExecuteRequest {
+                repo_root: repo_root.clone(),
+                grace_period_days: 30,
+                allow_single_writer_maintenance_window: false,
+            },
+        )
+        .unwrap();
+    assert!(gc_execute.deleted_physical_refs.is_empty());
+
+    assert!(
+        !repo_root.join(".e2v").join("remotes").join("default.json").exists(),
+        "explicit remote maintenance should not require default remote registration"
+    );
 }
 
 #[test]

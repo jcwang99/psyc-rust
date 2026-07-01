@@ -596,8 +596,8 @@ impl Sdk {
         load_default_remote_registration(repo_root.as_ref())
     }
 
-    pub fn push_default_remote(&self, request: PushRequest) -> SdkResult<PushResponse> {
-        let remote_spec = load_default_remote_spec(&request.repo_root)?;
+    pub fn push_remote(&self, remote_spec: &str, request: PushRequest) -> SdkResult<PushResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
         with_remote_backend!(&remote_spec, |backend| {
             e2v_sync::push_head(
                 &self.facade,
@@ -609,12 +609,21 @@ impl Sdk {
                 },
             )
         })
-            .map(push_response_from_result)
-            .map_err(map_error)
+        .map(push_response_from_result)
+        .map_err(map_error)
     }
 
-    pub fn fetch_default_remote(&self, request: FetchRequest) -> SdkResult<FetchResponse> {
-        let remote_spec = load_default_remote_spec(&request.repo_root)?;
+    pub fn push_default_remote(&self, request: PushRequest) -> SdkResult<PushResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.push_remote(&stored.spec, request)
+    }
+
+    pub fn fetch_remote(
+        &self,
+        remote_spec: &str,
+        request: FetchRequest,
+    ) -> SdkResult<FetchResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
         with_remote_backend!(&remote_spec, |backend| {
             e2v_sync::fetch_remote(
                 backend,
@@ -625,8 +634,13 @@ impl Sdk {
                 },
             )
         })
-            .map(fetch_response_from_result)
-            .map_err(map_error)
+        .map(fetch_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn fetch_default_remote(&self, request: FetchRequest) -> SdkResult<FetchResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.fetch_remote(&stored.spec, request)
     }
 
     pub fn clone_remote(&self, request: CloneRequest) -> SdkResult<CloneResponse> {
@@ -645,11 +659,12 @@ impl Sdk {
             .map_err(map_error)
     }
 
-    pub fn verify_default_remote(
+    pub fn verify_remote(
         &self,
+        remote_spec: &str,
         request: VerifyRemoteRequest,
     ) -> SdkResult<VerifyRemoteResponse> {
-        let remote_spec = load_default_remote_spec(&request.repo_root)?;
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
         with_remote_backend!(&remote_spec, |backend| {
             e2v_sync::verify_remote(
                 backend,
@@ -659,16 +674,25 @@ impl Sdk {
                 },
             )
         })
-            .map(verify_remote_response_from_result)
-            .map_err(map_error)
+        .map(verify_remote_response_from_result)
+        .map_err(map_error)
     }
 
-    pub fn repair_default_remote(
+    pub fn verify_default_remote(
         &self,
+        request: VerifyRemoteRequest,
+    ) -> SdkResult<VerifyRemoteResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.verify_remote(&stored.spec, request)
+    }
+
+    pub fn repair_remote(
+        &self,
+        remote_spec: &str,
         repo_root: impl AsRef<Path>,
     ) -> SdkResult<RepairRemoteResponse> {
         let repo_root = repo_root.as_ref().to_path_buf();
-        let remote_spec = load_default_remote_spec(&repo_root)?;
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
         with_remote_backend!(&remote_spec, |backend| {
             e2v_sync::repair_remote(
                 backend,
@@ -677,17 +701,26 @@ impl Sdk {
                 },
             )
         })
-            .map(repair_remote_response_from_result)
-            .map_err(map_error)
+        .map(repair_remote_response_from_result)
+        .map_err(map_error)
     }
 
-    pub fn force_accept_default_remote_rollback(
+    pub fn repair_default_remote(
         &self,
+        repo_root: impl AsRef<Path>,
+    ) -> SdkResult<RepairRemoteResponse> {
+        let stored = self.load_default_remote(&repo_root)?;
+        self.repair_remote(&stored.spec, repo_root)
+    }
+
+    pub fn force_accept_remote_rollback(
+        &self,
+        remote_spec: &str,
         repo_root: impl AsRef<Path>,
         password: &str,
     ) -> SdkResult<RepairRemoteResponse> {
         let repo_root = repo_root.as_ref().to_path_buf();
-        let remote_spec = load_default_remote_spec(&repo_root)?;
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
         with_remote_backend!(&remote_spec, |backend| {
             e2v_sync::force_accept_remote_rollback(
                 backend,
@@ -697,16 +730,26 @@ impl Sdk {
                 password,
             )
         })
-            .map(repair_remote_response_from_result)
-            .map_err(map_error)
+        .map(repair_remote_response_from_result)
+        .map_err(map_error)
     }
 
-    pub fn gc_default_remote_dry_run(
+    pub fn force_accept_default_remote_rollback(
         &self,
+        repo_root: impl AsRef<Path>,
+        password: &str,
+    ) -> SdkResult<RepairRemoteResponse> {
+        let stored = self.load_default_remote(&repo_root)?;
+        self.force_accept_remote_rollback(&stored.spec, repo_root, password)
+    }
+
+    pub fn gc_remote_dry_run(
+        &self,
+        remote_spec: &str,
         repo_root: impl AsRef<Path>,
     ) -> SdkResult<GcDryRunResponse> {
         let repo_root = repo_root.as_ref().to_path_buf();
-        let remote_spec = load_default_remote_spec(&repo_root)?;
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
         with_remote_backend!(&remote_spec, |backend| {
             e2v_sync::gc_dry_run(
                 backend,
@@ -715,15 +758,24 @@ impl Sdk {
                 },
             )
         })
-            .map(gc_dry_run_response_from_result)
-            .map_err(map_error)
+        .map(gc_dry_run_response_from_result)
+        .map_err(map_error)
     }
 
-    pub fn gc_default_remote_execute(
+    pub fn gc_default_remote_dry_run(
         &self,
+        repo_root: impl AsRef<Path>,
+    ) -> SdkResult<GcDryRunResponse> {
+        let stored = self.load_default_remote(&repo_root)?;
+        self.gc_remote_dry_run(&stored.spec, repo_root)
+    }
+
+    pub fn gc_remote_execute(
+        &self,
+        remote_spec: &str,
         request: GcExecuteRequest,
     ) -> SdkResult<GcExecuteResponse> {
-        let remote_spec = load_default_remote_spec(&request.repo_root)?;
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
         with_remote_backend!(&remote_spec, |backend| {
             e2v_sync::gc_execute(
                 backend,
@@ -735,8 +787,16 @@ impl Sdk {
                 },
             )
         })
-            .map(gc_execute_response_from_result)
-            .map_err(map_error)
+        .map(gc_execute_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn gc_default_remote_execute(
+        &self,
+        request: GcExecuteRequest,
+    ) -> SdkResult<GcExecuteResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.gc_remote_execute(&stored.spec, request)
     }
 }
 
@@ -836,11 +896,6 @@ fn load_default_remote_registration(repo_root: &Path) -> SdkResult<RemoteRegistr
     serde_json::from_slice(&bytes)
         .map_err(anyhow::Error::from)
         .map_err(map_error)
-}
-
-fn load_default_remote_spec(repo_root: &Path) -> SdkResult<RemoteSpec> {
-    let stored = load_default_remote_registration(repo_root)?;
-    RemoteSpec::parse(&stored.spec).map_err(map_error)
 }
 
 fn remote_path(repo_root: &Path, name: &str) -> PathBuf {
