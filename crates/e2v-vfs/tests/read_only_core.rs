@@ -18,14 +18,14 @@ use e2v_vfs::{
         WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
         WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
         WinfspRuntimeLibrary, WinfspVolumeParams, opened_file_cached_plaintext,
-        winfsp_host_session_new, winfsp_runtime_get_symbol_address,
-        winfsp_runtime_paths_from_candidate_roots, winfsp_runtime_paths_from_install_root,
-        winfsp_runtime_resolve_mount_exports, winfsp_session_build_native_create_request,
-        winfsp_session_create_filesystem_handle, winfsp_session_destroy_filesystem_handle,
-        winfsp_session_has_native_filesystem_handle, winfsp_session_is_mounted,
-        winfsp_session_run_mount_lifecycle,
+        try_mount_live_branch_on_current_platform_for_test,
+        try_mount_snapshot_on_current_platform_for_test, winfsp_host_session_new,
+        winfsp_runtime_get_symbol_address, winfsp_runtime_paths_from_candidate_roots,
+        winfsp_runtime_paths_from_install_root, winfsp_runtime_resolve_mount_exports,
+        winfsp_session_build_native_create_request, winfsp_session_create_filesystem_handle,
+        winfsp_session_destroy_filesystem_handle, winfsp_session_has_native_filesystem_handle,
+        winfsp_session_is_mounted, winfsp_session_run_mount_lifecycle,
     },
-    try_mount_snapshot_on_current_platform,
 };
 
 enum UnreadableCacheEntryGuard {
@@ -1314,6 +1314,28 @@ fn vfs_root_keeps_mounted_filesystem_opaque() {
 }
 
 #[test]
+fn vfs_root_does_not_expose_platform_try_mount_helpers() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+    let public_surface = source.split("#[doc(hidden)]").next().unwrap_or(&source);
+
+    for helper in [
+        "pub use platform::{\n    try_mount_live_branch_on_current_platform, try_mount_snapshot_on_current_platform,\n};",
+        "pub fn try_mount_snapshot_on_current_platform(",
+        "pub fn try_mount_live_branch_on_current_platform(",
+    ] {
+        assert!(
+            !public_surface.contains(helper),
+            "crate root should keep platform try-mount helpers behind the doc-hidden testing surface: {helper}"
+        );
+    }
+}
+
+#[test]
 fn snapshot_vfs_accepts_rooted_and_trailing_slash_paths() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1720,7 +1742,7 @@ fn mount_requests_stop_at_the_platform_boundary_with_explicit_status() {
     init_repo(&repo_root);
 
     let first_snapshot_id = commit_message(&repo_root, "first", "alpha");
-    let summary = try_mount_snapshot_on_current_platform(
+    let summary = try_mount_snapshot_on_current_platform_for_test(
         VfsMountConfig::snapshot(repo_root, first_snapshot_id),
         PathBuf::from("X:"),
     )
@@ -1745,7 +1767,7 @@ fn current_platform_mount_uses_the_windows_adapter_boundary() {
     init_repo(&repo_root);
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
-    let summary = try_mount_snapshot_on_current_platform(
+    let summary = try_mount_snapshot_on_current_platform_for_test(
         VfsMountConfig::snapshot(repo_root, snapshot_id),
         PathBuf::from("X:"),
     )
@@ -3083,7 +3105,7 @@ fn mount_snapshot_returns_a_launcher_summary_that_matches_the_request() {
     init_repo(&repo_root);
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
-    let summary = try_mount_snapshot_on_current_platform(
+    let summary = try_mount_snapshot_on_current_platform_for_test(
         VfsMountConfig::snapshot(repo_root, snapshot_id),
         PathBuf::from("Q:"),
     )
@@ -3117,7 +3139,7 @@ fn mount_live_branch_summary_reports_direct_io_when_invalidation_is_unreliable()
         .branch
         .token_hex;
 
-    let summary = e2v_vfs::try_mount_live_branch_on_current_platform(
+    let summary = try_mount_live_branch_on_current_platform_for_test(
         VfsMountConfig::live_branch(repo_root, branch_token)
             .with_platform_capabilities(PlatformCapabilities::no_reliable_invalidation()),
         PathBuf::from("R:"),

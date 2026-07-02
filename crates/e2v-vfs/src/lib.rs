@@ -15,7 +15,7 @@ use unicode_normalization::UnicodeNormalization;
 mod platform;
 mod windows;
 
-pub use platform::{
+use crate::platform::{
     try_mount_live_branch_on_current_platform, try_mount_snapshot_on_current_platform,
 };
 
@@ -1274,6 +1274,20 @@ pub mod testing {
         pub fn launch_test_request(self, request: MountRequest) -> Result<MountLaunchSummary> {
             crate::platform::PlatformMountAdapter::launch(&self, request.into_inner())
         }
+    }
+
+    pub fn try_mount_snapshot_on_current_platform_for_test(
+        config: VfsMountConfig,
+        mount_point: PathBuf,
+    ) -> Result<MountLaunchSummary> {
+        crate::platform::try_mount_snapshot_on_current_platform(config, mount_point)
+    }
+
+    pub fn try_mount_live_branch_on_current_platform_for_test(
+        config: VfsMountConfig,
+        mount_point: PathBuf,
+    ) -> Result<MountLaunchSummary> {
+        crate::platform::try_mount_live_branch_on_current_platform(config, mount_point)
     }
 
     pub fn opened_file_cached_plaintext(opened_file: &OpenedFile) -> Option<Vec<u8>> {
