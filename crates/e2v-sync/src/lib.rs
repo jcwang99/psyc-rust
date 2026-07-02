@@ -19,7 +19,6 @@ pub use journal::{
     ObjectUploadRecord, ObjectUploadState, OperationId, OperationJournal, OperationMetadata,
     OperationType,
 };
-pub use publisher::{RecoveryAction, SimpleTransactionPublisher, TransactionPublisher};
 pub use push::{PushOptions, PushResult, ResumeOptions, ResumeResult, push_head, resume_push};
 pub use remote_maintenance::{
     GcDryRunOptions, GcDryRunReport, GcExecuteCapabilityStatus, GcExecuteOptions, GcExecuteResult,
@@ -28,7 +27,6 @@ pub use remote_maintenance::{
     repair_remote, verify_remote,
 };
 pub use remote_spec::{RemoteBackendRef, RemoteSpec};
-pub use transaction::{PublishPlan, PublishSession, PublishedObject};
 pub use trusted_state::TrustedRemoteState;
 pub use web::{ServeHandle, ServeOptions, build_local_web_router, serve_local_web};
 

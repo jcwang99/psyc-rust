@@ -81,6 +81,47 @@ fn sync_exposes_a_single_doc_hidden_probe_surface() {
     );
 }
 
+#[test]
+fn sync_root_does_not_reexport_internal_transaction_publisher_types() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for legacy_reexport in [
+        "pub use publisher::{RecoveryAction, SimpleTransactionPublisher, TransactionPublisher};",
+        "pub use transaction::{PublishPlan, PublishSession, PublishedObject};",
+    ] {
+        assert!(
+            !source.contains(legacy_reexport),
+            "e2v-sync should keep internal transaction publisher types behind crate-private boundaries: {legacy_reexport}"
+        );
+    }
+}
+
+#[test]
+fn publisher_does_not_keep_unused_internal_recovery_or_backend_accessors() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("publisher.rs"),
+    )
+    .unwrap();
+
+    for dead_interface in [
+        "pub enum RecoveryAction",
+        "fn recover(&self, operation_id: &OperationId) -> Result<RecoveryAction>;",
+        "pub fn remote_backend(&self) -> &R",
+    ] {
+        assert!(
+            !source.contains(dead_interface),
+            "publisher should not keep dead internal interface surface: {dead_interface}"
+        );
+    }
+}
+
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     RefToken::new(format!(
         "keyring/{}",

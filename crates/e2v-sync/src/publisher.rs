@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use e2v_store::{BackendCapability, CasResult, EncryptedRef, LayoutRootVersion, RemoteBackend};
 
-use crate::journal::{ObjectUploadState, OperationId, OperationJournal, validate_sync_identifier};
+use crate::journal::{OperationJournal, validate_sync_identifier};
 use crate::remote_markers::{
     INTENT_EXPIRY_HOURS, RemoteWriteIntentMarker, RemoteWriterLeaseMarker,
     build_write_intent_marker, build_writer_lease_marker, marker_is_fresh_at,
@@ -10,12 +10,6 @@ use crate::remote_markers::{
     renew_writer_lease_marker, system_time_to_unix_ms,
 };
 use crate::transaction::{PublishPlan, PublishSession, PublishedObject};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecoveryAction {
-    ResumePendingObjects(Vec<String>),
-    NothingToDo,
-}
 
 pub trait TransactionPublisher {
     fn begin(&self, plan: PublishPlan) -> Result<PublishSession>;
@@ -25,7 +19,6 @@ pub trait TransactionPublisher {
     fn pre_commit_verify(&self, session: &PublishSession) -> Result<()>;
     fn publish_ref(&self, session: &PublishSession, next: EncryptedRef) -> Result<CasResult>;
     fn complete(&self, session: PublishSession) -> Result<()>;
-    fn recover(&self, operation_id: &OperationId) -> Result<RecoveryAction>;
 }
 
 #[derive(Clone)]
@@ -47,11 +40,6 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             remote_backend,
         }
     }
-
-    pub fn remote_backend(&self) -> &R {
-        &self.remote_backend
-    }
-
     fn renew_intent_if_needed(
         &self,
         path: &str,
@@ -322,27 +310,6 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
         }
         Ok(())
     }
-
-    fn recover(&self, operation_id: &OperationId) -> Result<RecoveryAction> {
-        let mut pending = Vec::new();
-        let mut cursor = Some(0usize);
-        while let Some(start) = cursor {
-            let batch = self
-                .journal
-                .pending_object_batch(operation_id, start, 128)?;
-            for record in batch.records {
-                if record.state == ObjectUploadState::Uploaded {
-                    pending.push(record.object_id);
-                }
-            }
-            cursor = batch.next_cursor;
-        }
-        if pending.is_empty() {
-            Ok(RecoveryAction::NothingToDo)
-        } else {
-            Ok(RecoveryAction::ResumePendingObjects(pending))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -351,6 +318,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use tempfile::tempdir;
+
+    use crate::journal::OperationId;
 
     use e2v_store::{
         BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot, LayoutRootStore,
@@ -645,6 +614,7 @@ mod tests {
     fn begin_writes_structured_active_intent_marker() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = e2v_store::MemoryBackend::new();
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: true,
@@ -661,7 +631,7 @@ mod tests {
                 supports_oblivious_access_schedule: false,
             },
             journal,
-            e2v_store::MemoryBackend::new(),
+            remote.clone(),
         );
 
         let session = publisher
@@ -674,8 +644,7 @@ mod tests {
             })
             .unwrap();
 
-        let active_intent = publisher
-            .remote_backend()
+        let active_intent = remote
             .get_physical("transactions/active/op-intent.intent")
             .unwrap();
         let intent: serde_json::Value = serde_json::from_slice(&active_intent).unwrap();
@@ -702,6 +671,7 @@ mod tests {
     fn pre_commit_verify_rejects_missing_active_intent() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = e2v_store::MemoryBackend::new();
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: true,
@@ -718,7 +688,7 @@ mod tests {
                 supports_oblivious_access_schedule: false,
             },
             journal,
-            e2v_store::MemoryBackend::new(),
+            remote.clone(),
         );
 
         let session = publisher
@@ -730,8 +700,7 @@ mod tests {
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
-        publisher
-            .remote_backend()
+        remote
             .put_physical("transactions/active/op-precommit.intent", b"")
             .unwrap();
 
@@ -744,6 +713,7 @@ mod tests {
     fn pre_commit_verify_rejects_foreign_active_intent_marker() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = e2v_store::MemoryBackend::new();
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: true,
@@ -760,7 +730,7 @@ mod tests {
                 supports_oblivious_access_schedule: false,
             },
             journal,
-            e2v_store::MemoryBackend::new(),
+            remote.clone(),
         );
 
         let session = publisher
@@ -772,8 +742,7 @@ mod tests {
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
-        publisher
-            .remote_backend()
+        remote
             .put_physical(
                 "transactions/active/op-intent-owner.intent",
                 serde_json::to_vec(&serde_json::json!({
@@ -794,6 +763,7 @@ mod tests {
     fn begin_uses_single_writer_mode_when_cas_is_unavailable_but_lease_exists() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = e2v_store::MemoryBackend::new();
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,
@@ -810,7 +780,7 @@ mod tests {
                 supports_oblivious_access_schedule: false,
             },
             journal,
-            e2v_store::MemoryBackend::new(),
+            remote.clone(),
         );
 
         let session = publisher
@@ -822,10 +792,7 @@ mod tests {
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
-        let lease = publisher
-            .remote_backend()
-            .get_physical("leases/branch-token.lock")
-            .unwrap();
+        let lease = remote.get_physical("leases/branch-token.lock").unwrap();
         let lease_marker: serde_json::Value = serde_json::from_slice(&lease).unwrap();
 
         assert_eq!(session.writer_mode, WriterMode::SingleWriter);
@@ -1242,6 +1209,7 @@ mod tests {
     fn pre_commit_verify_rejects_foreign_writer_lease_holder() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = e2v_store::MemoryBackend::new();
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,
@@ -1258,7 +1226,7 @@ mod tests {
                 supports_oblivious_access_schedule: false,
             },
             journal,
-            e2v_store::MemoryBackend::new(),
+            remote.clone(),
         );
 
         let session = publisher
@@ -1270,8 +1238,7 @@ mod tests {
                 writer_mode: WriterMode::ReadOnly,
             })
             .unwrap();
-        publisher
-            .remote_backend()
+        remote
             .put_physical(
                 "leases/branch-token.lock",
                 serde_json::to_vec(&serde_json::json!({
