@@ -1,17 +1,17 @@
-pub mod clone;
-pub mod fetch;
-pub mod journal;
+mod clone;
+mod fetch;
+mod journal;
 mod object_type;
 mod pack;
 mod pack_index;
-pub mod publisher;
-pub mod push;
-pub mod remote_maintenance;
+mod publisher;
+mod push;
+mod remote_maintenance;
 mod remote_markers;
-pub mod remote_spec;
-pub mod transaction;
+mod remote_spec;
+mod transaction;
 mod trusted_state;
-pub mod web;
+mod web;
 
 pub use clone::{CloneOptions, CloneResult, clone_remote};
 pub use fetch::{FetchOptions, FetchResult, fetch_remote};

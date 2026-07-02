@@ -7,8 +7,8 @@ use e2v_core::{
     BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
     InitOptions, ReadService, RepositoryFacade, RepositoryState, ShareAcceptDeviceOptions,
     ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle, ShareInviteDeviceOptions,
-    ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions, ShareRevokeMemberOptions,
-    SnapshotSummary,
+    ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions,
+    ShareRevokeMemberOptions, SnapshotHandle, SnapshotSummary,
 };
 use e2v_sync::{
     CloneOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions, PushOptions, RemoteSpec,
@@ -259,7 +259,7 @@ pub struct SnapshotView {
     pub layout_generation: u64,
     pub branch_token: Option<String>,
     #[serde(skip)]
-    inner: e2v_core::facade::SnapshotHandle,
+    inner: SnapshotHandle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1040,10 +1040,7 @@ fn directory_entry_info_from_entry(entry: DirectoryEntry) -> DirectoryEntryInfo 
     }
 }
 
-fn snapshot_view_from_handle(
-    handle: e2v_core::facade::SnapshotHandle,
-    branch_token: Option<String>,
-) -> SnapshotView {
+fn snapshot_view_from_handle(handle: SnapshotHandle, branch_token: Option<String>) -> SnapshotView {
     SnapshotView {
         snapshot_id: handle.snapshot_id.clone(),
         layout_generation: handle.layout_generation,

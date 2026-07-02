@@ -8,8 +8,7 @@ use anyhow::Result;
 use blake3::Hasher;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use e2v_core::facade::SnapshotHandle;
-use e2v_core::{DirectoryEntry, FileHandle, ReadService};
+use e2v_core::{DirectoryEntry, FileHandle, ReadService, SnapshotHandle};
 use getrandom::fill as getrandom_fill;
 use unicode_normalization::UnicodeNormalization;
 

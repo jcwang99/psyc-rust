@@ -1,5 +1,5 @@
 mod chunker;
-pub mod facade;
+mod facade;
 mod keyring;
 mod local_index;
 mod manifest_store;
@@ -87,7 +87,7 @@ pub mod testing {
 
 pub use facade::{
     BranchState, BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry,
-    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState,
+    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState, SnapshotHandle,
     ShareAcceptDeviceOptions, ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle,
     ShareInviteDeviceOptions, ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions,
     ShareRevokeMemberOptions, SnapshotSummary, validate_layout_root_value,

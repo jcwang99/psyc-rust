@@ -29,6 +29,23 @@ fn push_test_threshold_override_is_not_exposed_as_a_public_api_function() {
     );
 }
 
+#[test]
+fn push_and_publisher_modules_are_not_exposed_as_public_crate_modules() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for legacy_module in ["pub mod push;", "pub mod publisher;"] {
+        assert!(
+            !source.contains(legacy_module),
+            "e2v-sync should expose stable root re-exports instead of public module {legacy_module}"
+        );
+    }
+}
+
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     RefToken::new(format!(
         "keyring/{}",

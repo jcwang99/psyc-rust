@@ -70,6 +70,21 @@ fn facade_test_helpers_are_not_exposed_as_public_api_functions() {
 }
 
 #[test]
+fn facade_module_is_not_exposed_as_a_public_crate_module() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub mod facade;"),
+        "e2v-core should expose stable root re-exports instead of a public facade module"
+    );
+}
+
+#[test]
 fn init_creates_control_plane_files_for_local_direct_layout() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
