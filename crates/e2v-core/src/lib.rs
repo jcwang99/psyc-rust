@@ -101,7 +101,6 @@ pub use manifest_store::{
 pub use working_tree::{SnapshotReader, StableReadPolicy};
 
 pub mod sync_support {
-    use std::collections::BTreeMap;
     use std::path::Component;
     use std::path::{Path, PathBuf};
 
@@ -515,7 +514,6 @@ pub mod sync_support {
             "pack index root layout id must not be empty"
         );
 
-        let mut locations = BTreeMap::new();
         for segment_path in &root.segments {
             ensure!(
                 segment_path.starts_with(REMOTE_PACK_INDEX_PREFIX)
@@ -533,21 +531,20 @@ pub mod sync_support {
                     "invalid aggregate pack data path {}",
                     entry.data_path
                 );
-                locations.insert(
-                    entry.object_id,
-                    CachedPackedObjectLocation {
+                if entry.object_id == object_id {
+                    return CachedPackedObjectLocation {
                         data_path: entry.data_path,
                         offset: entry.offset as usize,
                         length: entry.length as usize,
-                    },
-                );
+                    }
+                    .physical_ref();
+                }
             }
         }
 
-        let location = locations.remove(object_id).ok_or_else(|| {
-            anyhow::anyhow!("cached pack index has no entry for object {object_id}")
-        })?;
-        location.physical_ref()
+        Err(anyhow::anyhow!(
+            "cached pack index has no entry for object {object_id}"
+        ))
     }
 
     struct LocalObjectEnvelopeHeader {

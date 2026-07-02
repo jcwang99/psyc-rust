@@ -2919,6 +2919,84 @@ fn sync_support_reports_missing_cached_pack_entry_for_object_id() {
 }
 
 #[test]
+fn sync_support_stops_scanning_cached_segments_after_resolving_target_object() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": [
+            "packs/index/op-00000000.json",
+            "packs/index/op-00000001.json",
+        ],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let first_segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "pack_id": "op-00000000",
+        "data_path": "packs/data/op-00000000.bin",
+        "entries": [
+            {
+                "object_id": "abc",
+                "offset": 3u64,
+                "length": 5u64,
+            }
+        ],
+    });
+    let first_segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:packs/index/op-00000000.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&first_segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000000.json"),
+        first_segment_bytes,
+    )
+    .unwrap();
+
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000001.json"),
+        br#"{"tampered":true}"#,
+    )
+    .unwrap();
+
+    let physical_ref =
+        e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(&repo_root, "abc")
+            .unwrap();
+
+    assert_eq!(physical_ref.layout_id, "pack");
+    assert_eq!(physical_ref.container_id, "packs/data/op-00000000.bin");
+    assert_eq!(physical_ref.offset, Some(3));
+    assert_eq!(physical_ref.length, 5);
+}
+
+#[test]
 fn read_range_falls_back_to_cached_pack_data_when_loose_chunk_is_missing() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
