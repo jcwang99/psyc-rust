@@ -885,26 +885,35 @@ fn commit_honors_custom_volatile_retry_budget_on_real_unstable_file() {
     let started_flag = Arc::clone(&writer_started);
     let writer_path = file_path.clone();
     let writer = std::thread::spawn(move || {
-        let mut toggle = false;
+        use std::io::{Seek, SeekFrom};
+
+        let mut block_index = 0usize;
+        let block_size = 64 * 1024usize;
+        let block_count = (9 * 1024 * 1024) / block_size;
         while writer_flag.load(Ordering::SeqCst) {
-            let fill = if toggle { b'B' } else { b'C' };
-            if let Ok(mut file) = fs::File::create(&writer_path) {
-                let chunk = vec![fill; 256 * 1024];
-                for _ in 0..36 {
-                    if file.write_all(&chunk).is_err() {
-                        break;
-                    }
-                    if file.flush().is_err() {
-                        break;
-                    }
-                    started_flag.store(true, Ordering::SeqCst);
-                    std::thread::yield_now();
-                    if !writer_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
+            let fill = if block_index.is_multiple_of(2) {
+                b'B'
+            } else {
+                b'C'
+            };
+            if let Ok(mut file) = fs::OpenOptions::new().write(true).open(&writer_path) {
+                let offset = ((block_index % block_count) * block_size) as u64;
+                if file.seek(SeekFrom::Start(offset)).is_err() {
+                    break;
                 }
+                let chunk = vec![fill; block_size];
+                if file.write_all(&chunk).is_err() {
+                    break;
+                }
+                if file.flush().is_err() {
+                    break;
+                }
+                started_flag.store(true, Ordering::SeqCst);
+                block_index += 1;
+                std::thread::sleep(Duration::from_millis(1));
+            } else {
+                break;
             }
-            toggle = !toggle;
         }
     });
     let deadline = Instant::now() + Duration::from_secs(2);
