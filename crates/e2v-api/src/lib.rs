@@ -682,13 +682,16 @@ impl Sdk {
             .ok_or_else(|| anyhow::anyhow!("remote branch ref does not point to a snapshot"))
             .map_err(map_error)?;
 
-        self.facade
-            .update_branch_head_if_fast_forward(
-                &request.repo_root,
-                &request.branch_token,
-                Some(&fetched_snapshot_id),
-            )
-            .map_err(map_error)?;
+        if let Err(error) = self.facade.update_branch_head_if_fast_forward(
+            &request.repo_root,
+            &request.branch_token,
+            Some(&fetched_snapshot_id),
+        ) {
+            let _ = self
+                .facade
+                .restore_default_ref_from_branch(&request.repo_root, &request.branch_token);
+            return Err(map_error(error));
+        }
 
         Ok(pull_response_from_snapshot(
             fetched_snapshot_id.clone(),

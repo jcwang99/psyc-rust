@@ -1554,6 +1554,32 @@ impl RepositoryFacade {
         }
         Ok(previous_head_snapshot_id)
     }
+
+    pub fn restore_default_ref_from_branch(
+        &self,
+        repo_root: impl AsRef<Path>,
+        ref_token_hex: &str,
+    ) -> Result<Option<String>> {
+        validate_ref_token_value(ref_token_hex)?;
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let branch_ref = if let Some(branch_ref) =
+            read_branch_ref_if_exists(&control_dir, &repo_secrets, ref_token_hex)?
+        {
+            branch_ref
+        } else {
+            let current_default_ref = read_default_ref(&control_dir, &repo_secrets)?;
+            ensure!(
+                current_default_ref.ref_token_hex == ref_token_hex,
+                "branch ref not found for token"
+            );
+            current_default_ref
+        };
+        let head_snapshot_id = branch_ref.head_snapshot_id.clone();
+        write_default_ref(&control_dir, &repo_secrets, &branch_ref)?;
+        Ok(head_snapshot_id)
+    }
 }
 
 impl ReadService {

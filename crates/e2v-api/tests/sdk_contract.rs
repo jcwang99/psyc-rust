@@ -520,6 +520,8 @@ fn sdk_pull_rejects_diverged_local_history_without_moving_the_current_branch() {
         operation_id: "push-remote-only".to_string(),
     })
     .unwrap();
+    let default_ref_before =
+        fs::read(clone_repo.join(".e2v").join("refs").join("default.json")).unwrap();
 
     let error = sdk
         .pull_default_remote(PullRequest {
@@ -534,6 +536,10 @@ fn sdk_pull_rejects_diverged_local_history_without_moving_the_current_branch() {
     let read = sdk.open_read_handle(&clone_repo).unwrap();
     let snapshot = read.resolve_branch(&source_state.branch.token_hex).unwrap();
     assert_eq!(snapshot.snapshot_id, local_only.snapshot_id);
+    assert_eq!(
+        fs::read(clone_repo.join(".e2v").join("refs").join("default.json"),).unwrap(),
+        default_ref_before
+    );
 }
 
 #[test]
