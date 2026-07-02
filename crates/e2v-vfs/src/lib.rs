@@ -16,9 +16,7 @@ mod platform;
 mod windows;
 
 pub use platform::{
-    LinuxMountAdapter, MacosMountAdapter, PlatformFamily, PlatformMountAdapter,
-    WindowsMountAdapter, try_mount_live_branch_on_current_platform,
-    try_mount_snapshot_on_current_platform,
+    try_mount_live_branch_on_current_platform, try_mount_snapshot_on_current_platform,
 };
 
 const DEFAULT_PLAINTEXT_MEMORY_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -1207,6 +1205,10 @@ pub mod testing {
     use super::OpenedFile;
     use crate::windows::{WinfspMountExports, WinfspNativeCreateRequest, WinfspRuntimePaths};
 
+    pub use crate::platform::{
+        LinuxMountAdapter, MacosMountAdapter, PlatformFamily, PlatformMountAdapter,
+        WindowsMountAdapter,
+    };
     pub use crate::windows::{
         WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
         WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,

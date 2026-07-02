@@ -12,10 +12,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 use e2v_vfs::{
-    CachePolicy, LinuxMountAdapter, MacosMountAdapter, MountRequest, PlatformCapabilities,
-    PlatformFamily, PlatformMountAdapter, ReadOnlyVfs, VfsHostLauncher, VfsMountConfig,
+    CachePolicy, MountRequest, PlatformCapabilities, ReadOnlyVfs, VfsHostLauncher, VfsMountConfig,
     VfsNodeKind, VfsSemantic,
     testing::{
+        LinuxMountAdapter, MacosMountAdapter, PlatformFamily, PlatformMountAdapter,
         WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
         WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
         WinfspRuntimeLibrary, WinfspVolumeParams, opened_file_cached_plaintext,
@@ -1174,6 +1174,35 @@ fn vfs_root_does_not_reexport_winfsp_host_internals() {
             assert!(
                 !export_block.contains(symbol),
                 "crate root should not publicly re-export WinFSP host internals: {symbol}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vfs_root_does_not_reexport_platform_adapter_test_seams() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    if let Some(start) = source.find("pub use platform::{") {
+        let export_block = &source[start..]
+            .split_once("};")
+            .map(|(block, _)| block)
+            .unwrap_or(&source[start..]);
+        for symbol in [
+            "PlatformFamily",
+            "PlatformMountAdapter",
+            "LinuxMountAdapter",
+            "MacosMountAdapter",
+            "WindowsMountAdapter",
+        ] {
+            assert!(
+                !export_block.contains(symbol),
+                "crate root should not publicly re-export platform adapter test seams: {symbol}"
             );
         }
     }
