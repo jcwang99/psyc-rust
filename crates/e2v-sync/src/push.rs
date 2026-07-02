@@ -568,6 +568,13 @@ fn publish_remote_keyring_pointer<R: RemoteBackend>(
 }
 
 fn mirror_remote_keyring_pointer<R: RemoteBackend>(remote: &R, pointer_bytes: &[u8]) -> Result<()> {
+    if remote
+        .get_physical("control/keyring/keyring.current")
+        .map(|bytes| bytes == pointer_bytes)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     remote.put_physical("control/keyring/keyring.current", pointer_bytes)?;
     Ok(())
 }
