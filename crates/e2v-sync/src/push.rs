@@ -483,6 +483,53 @@ fn remote_control_plane_matches<R: RemoteBackend>(remote: &R, layout_root_bytes:
 }
 
 fn remote_keyring_matches<R: RemoteBackend>(remote: &R, keyring_files: &[PathBuf]) -> bool {
+    let pointer_file = match keyring_files
+        .iter()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("keyring.current"))
+    {
+        Some(path) => path,
+        None => return false,
+    };
+    let pointer_bytes = match std::fs::read(pointer_file) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let pointer: serde_json::Value = match serde_json::from_slice(&pointer_bytes) {
+        Ok(pointer) => pointer,
+        Err(_) => return false,
+    };
+    let current = match pointer["current"].as_str() {
+        Some(current) => current,
+        None => return false,
+    };
+    let current_keyring = match keyring_files
+        .iter()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(current))
+    {
+        Some(path) => path,
+        None => return false,
+    };
+    let repo_id = match serde_json::from_slice::<serde_json::Value>(
+        &match std::fs::read(current_keyring) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        },
+    ) {
+        Ok(keyring) => match keyring["repo_id"].as_str() {
+            Some(repo_id) => repo_id.to_string(),
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
+    let remote_pointer = match remote.read_ref(&pointer_token) {
+        Ok(Some(stored)) => stored.value.bytes,
+        _ => return false,
+    };
+    if remote_pointer != pointer_bytes {
+        return false;
+    }
+
     keyring_files.iter().all(|keyring_file| {
         let file_name = match keyring_file.file_name().and_then(|name| name.to_str()) {
             Some(name) => name,

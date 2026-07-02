@@ -413,6 +413,107 @@ impl RemoteBackend for KeyringPointerRetryOnceBackend {
 }
 
 #[derive(Debug, Clone)]
+struct KeyringPointerRefHiddenRemote {
+    inner: MemoryBackend,
+}
+
+impl KeyringPointerRefHiddenRemote {
+    fn new(inner: MemoryBackend) -> Self {
+        Self { inner }
+    }
+}
+
+impl BlobStore for KeyringPointerRefHiddenRemote {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for KeyringPointerRefHiddenRemote {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        if token.value.starts_with("keyring/") {
+            return Ok(None);
+        }
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        Ok(self
+            .inner
+            .list_refs()?
+            .into_iter()
+            .filter(|listed| !listed.token.value.starts_with("keyring/"))
+            .collect())
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for KeyringPointerRefHiddenRemote {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for KeyringPointerRefHiddenRemote {
+    fn capability(&self) -> &BackendCapability {
+        self.inner.capability()
+    }
+}
+
+#[derive(Debug, Clone)]
 struct FixedRemoteTimeSingleWriterBackend {
     inner: MemoryBackend,
     capability: BackendCapability,
@@ -6141,6 +6242,178 @@ fn push_publishes_keyring_pointer_ref_alongside_physical_pointer() {
         .expect("keyring pointer ref should exist");
 
     assert_eq!(pointer_ref.value.bytes, pointer_bytes);
+}
+
+#[test]
+fn push_rejects_remote_without_keyring_pointer_ref_even_if_physical_pointer_file_exists() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "keyring-pointer-ref-required".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "seed-keyring-pointer-ref-required".to_string(),
+        },
+    )
+    .unwrap();
+
+    let hidden_ref_remote = KeyringPointerRefHiddenRemote::new(remote.clone());
+    fs::write(repo_root.join("hello.txt"), b"hello again").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "push-after-hidden-keyring-ref".to_string(),
+        })
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &hidden_ref_remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-after-hidden-keyring-ref".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("keyring pointer ref")
+            || error.to_string().contains("missing")
+            || error.to_string().contains("keyring"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn push_noop_rejects_remote_without_keyring_pointer_ref_even_if_physical_pointer_file_exists() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "keyring-pointer-ref-required-noop".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let seeded = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "seed-keyring-pointer-ref-required-noop".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(seeded.published_snapshot_id, commit.snapshot_id);
+
+    let hidden_ref_remote = KeyringPointerRefHiddenRemote::new(remote.clone());
+    let error = push_head(
+        &facade,
+        &hidden_ref_remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "noop-after-hidden-keyring-ref".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("keyring pointer ref")
+            || error.to_string().contains("missing")
+            || error.to_string().contains("keyring"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn resume_noop_rejects_remote_without_keyring_pointer_ref_even_if_physical_pointer_file_exists() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "keyring-pointer-ref-required-resume-noop".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let seeded = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "seed-keyring-pointer-ref-required-resume-noop".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(seeded.published_snapshot_id, commit.snapshot_id);
+
+    let hidden_ref_remote = KeyringPointerRefHiddenRemote::new(remote.clone());
+    let error = resume_push(
+        &facade,
+        &hidden_ref_remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-noop-after-hidden-keyring-ref".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("keyring pointer ref")
+            || error.to_string().contains("missing")
+            || error.to_string().contains("keyring"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]
