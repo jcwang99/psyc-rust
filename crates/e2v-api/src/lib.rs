@@ -5,10 +5,10 @@ pub mod c_abi;
 
 use e2v_core::{
     BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
-    InitOptions, ReadService, RepositoryFacade, RepositoryState,
-    ShareAcceptDeviceOptions, ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle,
-    ShareInviteDeviceOptions, ShareInviteMemberOptions, ShareListResult,
-    ShareRevokeDeviceOptions, ShareRevokeMemberOptions, SnapshotSummary,
+    InitOptions, ReadService, RepositoryFacade, RepositoryState, ShareAcceptDeviceOptions,
+    ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle, ShareInviteDeviceOptions,
+    ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions, ShareRevokeMemberOptions,
+    SnapshotSummary,
 };
 use e2v_sync::{
     CloneOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions, PushOptions, RemoteSpec,
@@ -373,10 +373,7 @@ impl Sdk {
             .map_err(map_error)
     }
 
-    pub fn commit_repository(
-        &self,
-        options: CommitRepositoryOptions,
-    ) -> SdkResult<CommitInfo> {
+    pub fn commit_repository(&self, options: CommitRepositoryOptions) -> SdkResult<CommitInfo> {
         self.facade
             .commit(CommitOptions {
                 repo_root: options.repo_root,
@@ -396,21 +393,14 @@ impl Sdk {
             .map_err(map_error)
     }
 
-    pub fn list_snapshots(
-        &self,
-        repo_root: impl AsRef<Path>,
-    ) -> SdkResult<Vec<SnapshotInfo>> {
+    pub fn list_snapshots(&self, repo_root: impl AsRef<Path>) -> SdkResult<Vec<SnapshotInfo>> {
         self.facade
             .snapshots(repo_root)
             .map(|items| items.into_iter().map(snapshot_info_from_summary).collect())
             .map_err(map_error)
     }
 
-    pub fn verify_snapshot(
-        &self,
-        repo_root: impl AsRef<Path>,
-        snapshot_id: &str,
-    ) -> SdkResult<()> {
+    pub fn verify_snapshot(&self, repo_root: impl AsRef<Path>, snapshot_id: &str) -> SdkResult<()> {
         self.facade
             .verify_snapshot(repo_root, snapshot_id)
             .map_err(map_error)
@@ -442,7 +432,8 @@ impl Sdk {
         self.facade
             .list_branches(repo_root)
             .map(|items| {
-                items.into_iter()
+                items
+                    .into_iter()
                     .map(branch_summary_info_from_summary)
                     .collect()
             })
@@ -460,11 +451,7 @@ impl Sdk {
             .map_err(map_error)
     }
 
-    pub fn delete_branch(
-        &self,
-        repo_root: impl AsRef<Path>,
-        branch_name: &str,
-    ) -> SdkResult<()> {
+    pub fn delete_branch(&self, repo_root: impl AsRef<Path>, branch_name: &str) -> SdkResult<()> {
         self.facade
             .delete_branch(repo_root, branch_name)
             .map_err(map_error)
@@ -656,8 +643,8 @@ impl Sdk {
                 },
             )
         })
-            .map(clone_response_from_result)
-            .map_err(map_error)
+        .map(clone_response_from_result)
+        .map_err(map_error)
     }
 
     pub fn verify_remote(
@@ -828,7 +815,12 @@ impl ReadHandle {
     ) -> SdkResult<Vec<DirectoryEntryInfo>> {
         self.read_service
             .read_dir(&snapshot.inner, path)
-            .map(|entries| entries.into_iter().map(directory_entry_info_from_entry).collect())
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(directory_entry_info_from_entry)
+                    .collect()
+            })
             .map_err(map_error)
     }
 
@@ -839,12 +831,7 @@ impl ReadHandle {
             .map_err(map_error)
     }
 
-    pub fn read_range(
-        &self,
-        file: &FileView,
-        offset: usize,
-        length: usize,
-    ) -> SdkResult<Vec<u8>> {
+    pub fn read_range(&self, file: &FileView, offset: usize, length: usize) -> SdkResult<Vec<u8>> {
         self.read_service
             .read_range(&file.inner, offset, length)
             .map_err(map_error)
@@ -876,7 +863,9 @@ fn add_remote_registration(
     };
     let path = remote_path(repo_root, name);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(anyhow::Error::from).map_err(map_error)?;
+        std::fs::create_dir_all(parent)
+            .map_err(anyhow::Error::from)
+            .map_err(map_error)?;
     }
     let bytes = serde_json::to_vec(&stored)
         .map_err(anyhow::Error::from)
@@ -1095,9 +1084,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         SdkErrorCode::NotFound
     } else if lower.contains("already exists") || lower.contains("must be empty before init") {
         SdkErrorCode::AlreadyExists
-    } else if lower.contains("permission denied")
-        || lower.contains("owner-admin local device")
-    {
+    } else if lower.contains("permission denied") || lower.contains("owner-admin local device") {
         SdkErrorCode::PermissionDenied
     } else if lower.contains("wrong password")
         || lower.contains("unlock")

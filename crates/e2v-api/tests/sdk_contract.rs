@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use e2v_api::{
-    CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest,
-    InitRepositoryOptions, PushRequest, Sdk, SdkErrorCode, parse_remote_spec,
+    parse_remote_spec, CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions,
+    FetchRequest, InitRepositoryOptions, PushRequest, Sdk, SdkErrorCode,
 };
 
 fn file_remote_spec(path: &Path) -> String {
@@ -101,11 +101,11 @@ fn sdk_can_register_default_remote_and_push_fetch_through_it() {
     let sdk = Sdk::new();
     let state = sdk
         .init_repository(InitRepositoryOptions {
-        repo_root: source_repo.clone(),
-        password: "correct horse battery staple".to_string(),
-        branch_name: "main".to_string(),
-    })
-    .unwrap();
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
     fs::write(source_repo.join("notes.txt"), "hello sync").unwrap();
     sdk.commit_repository(CommitRepositoryOptions {
         repo_root: source_repo.clone(),
@@ -113,8 +113,12 @@ fn sdk_can_register_default_remote_and_push_fetch_through_it() {
     })
     .unwrap();
 
-    let remote_spec = format!("file://{}", remote_repo.to_string_lossy().replace('\\', "/"));
-    sdk.add_remote(&source_repo, "origin", &remote_spec).unwrap();
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
     sdk.push_default_remote(PushRequest {
         repo_root: source_repo.clone(),
         branch_token: state.branch.token_hex.clone(),
@@ -124,11 +128,11 @@ fn sdk_can_register_default_remote_and_push_fetch_through_it() {
 
     let cloned = sdk
         .clone_remote(CloneRequest {
-        remote_spec,
-        target_repo_root: clone_repo.clone(),
-        password: "correct horse battery staple".to_string(),
-        branch_token: state.branch.token_hex.clone(),
-    })
+            remote_spec,
+            target_repo_root: clone_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        })
         .unwrap();
 
     let read = sdk.open_read_handle(&clone_repo).unwrap();
@@ -259,7 +263,10 @@ fn sdk_can_read_directory_entries_through_public_read_api() {
         .into_iter()
         .map(|entry| entry.name)
         .collect::<Vec<_>>();
-    assert_eq!(root_names, vec!["nested".to_string(), "root.txt".to_string()]);
+    assert_eq!(
+        root_names,
+        vec!["nested".to_string(), "root.txt".to_string()]
+    );
 
     let nested_entries = read.read_dir(&snapshot, "nested").unwrap();
     let nested_names = nested_entries
@@ -291,7 +298,8 @@ fn sdk_can_verify_snapshot_through_public_api() {
         })
         .unwrap();
 
-    sdk.verify_snapshot(&repo_root, &commit.snapshot_id).unwrap();
+    sdk.verify_snapshot(&repo_root, &commit.snapshot_id)
+        .unwrap();
 }
 
 #[test]
@@ -318,8 +326,12 @@ fn sdk_can_fetch_updates_from_registered_default_remote() {
     })
     .unwrap();
 
-    let remote_spec = format!("file://{}", remote_repo.to_string_lossy().replace('\\', "/"));
-    sdk.add_remote(&source_repo, "origin", &remote_spec).unwrap();
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
     sdk.push_default_remote(PushRequest {
         repo_root: source_repo.clone(),
         branch_token: source_state.branch.token_hex.clone(),
@@ -409,11 +421,19 @@ fn sdk_can_push_and_fetch_with_explicit_remote_spec_without_default_remote_regis
         .unwrap();
 
     assert!(
-        !source_repo.join(".e2v").join("remotes").join("default.json").exists(),
+        !source_repo
+            .join(".e2v")
+            .join("remotes")
+            .join("default.json")
+            .exists(),
         "explicit remote push should not require default remote registration"
     );
     assert!(
-        !clone_repo.join(".e2v").join("remotes").join("default.json").exists(),
+        !clone_repo
+            .join(".e2v")
+            .join("remotes")
+            .join("default.json")
+            .exists(),
         "explicit remote clone/fetch flow should not require default remote registration"
     );
 
@@ -484,13 +504,17 @@ fn sdk_public_workflows_can_be_typed_without_internal_crates() {
         remote_root.to_string_lossy().replace('\\', "/")
     ))
     .unwrap();
-    let remote: e2v_api::RemoteRegistration =
-        sdk.add_remote(&repo_root, "origin", remote_spec.as_str()).unwrap();
+    let remote: e2v_api::RemoteRegistration = sdk
+        .add_remote(&repo_root, "origin", remote_spec.as_str())
+        .unwrap();
 
     assert_eq!(repo.branch.token_hex, repo.branch.token_hex.clone());
     assert_eq!(snapshot.snapshot_id, commit.snapshot_id);
     assert!(snapshot.branch_token.is_none());
-    assert_eq!(String::from_utf8(read.read_range(&file, 0, 16).unwrap()).unwrap(), "typed");
+    assert_eq!(
+        String::from_utf8(read.read_range(&file, 0, 16).unwrap()).unwrap(),
+        "typed"
+    );
     assert_eq!(entries.len(), 1);
     assert_eq!(remote.name, "origin");
 }
@@ -711,7 +735,10 @@ fn sdk_can_verify_repair_accept_rollback_and_gc_default_remote() {
     })
     .unwrap();
 
-    let remote_spec = format!("file://{}", remote_root.to_string_lossy().replace('\\', "/"));
+    let remote_spec = format!(
+        "file://{}",
+        remote_root.to_string_lossy().replace('\\', "/")
+    );
     sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
     sdk.push_default_remote(PushRequest {
         repo_root: repo_root.clone(),
@@ -746,10 +773,7 @@ fn sdk_can_verify_repair_accept_rollback_and_gc_default_remote() {
     })
     .unwrap();
     let accepted = sdk
-        .force_accept_default_remote_rollback(
-            &repo_root,
-            "correct horse battery staple",
-        )
+        .force_accept_default_remote_rollback(&repo_root, "correct horse battery staple")
         .unwrap();
     assert!(accepted.repaired_objects <= repaired.repaired_objects);
 
@@ -842,11 +866,7 @@ fn sdk_can_run_maintenance_with_explicit_remote_spec_without_default_remote_regi
     })
     .unwrap();
     let accepted = sdk
-        .force_accept_remote_rollback(
-            &remote_spec,
-            &repo_root,
-            "correct horse battery staple",
-        )
+        .force_accept_remote_rollback(&remote_spec, &repo_root, "correct horse battery staple")
         .unwrap();
     assert!(accepted.repaired_objects <= repaired.repaired_objects);
 
@@ -882,7 +902,11 @@ fn sdk_can_run_maintenance_with_explicit_remote_spec_without_default_remote_regi
     assert!(gc_execute.deleted_physical_refs.is_empty());
 
     assert!(
-        !repo_root.join(".e2v").join("remotes").join("default.json").exists(),
+        !repo_root
+            .join(".e2v")
+            .join("remotes")
+            .join("default.json")
+            .exists(),
         "explicit remote maintenance should not require default remote registration"
     );
 }

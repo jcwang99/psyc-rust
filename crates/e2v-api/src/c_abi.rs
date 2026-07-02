@@ -2,8 +2,8 @@
 #![allow(non_upper_case_globals)]
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{CStr, CString, c_char};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ffi::{c_char, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use serde::Serialize;
@@ -11,9 +11,8 @@ use serde::Serialize;
 use crate::{
     CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest, InitRepositoryOptions,
     PushRequest, ReadHandle, Sdk, SdkError, SdkErrorCode, ShareAcceptDeviceRequest,
-    ShareAcceptMemberRequest, ShareInviteDeviceRequest,
-    ShareInviteMemberRequest, ShareRevokeDeviceRequest, ShareRevokeMemberRequest, SnapshotView,
-    VerifyRemoteRequest,
+    ShareAcceptMemberRequest, ShareInviteDeviceRequest, ShareInviteMemberRequest,
+    ShareRevokeDeviceRequest, ShareRevokeMemberRequest, SnapshotView, VerifyRemoteRequest,
 };
 
 #[repr(C)]
@@ -44,8 +43,7 @@ pub const E2V_AUTHENTICATION_REQUIRED: e2v_error_code_t =
     e2v_error_code_t::E2V_AUTHENTICATION_REQUIRED;
 pub const E2V_CONFLICT: e2v_error_code_t = e2v_error_code_t::E2V_CONFLICT;
 pub const E2V_NEEDS_REBASE: e2v_error_code_t = e2v_error_code_t::E2V_NEEDS_REBASE;
-pub const E2V_ROLLBACK_DETECTED: e2v_error_code_t =
-    e2v_error_code_t::E2V_ROLLBACK_DETECTED;
+pub const E2V_ROLLBACK_DETECTED: e2v_error_code_t = e2v_error_code_t::E2V_ROLLBACK_DETECTED;
 pub const E2V_UNSUPPORTED: e2v_error_code_t = e2v_error_code_t::E2V_UNSUPPORTED;
 pub const E2V_CORRUPT_STATE: e2v_error_code_t = e2v_error_code_t::E2V_CORRUPT_STATE;
 pub const E2V_IO: e2v_error_code_t = e2v_error_code_t::E2V_IO;
@@ -215,7 +213,9 @@ where
 
 fn ffi_read_c_string(value: *const c_char, argument_name: &str) -> crate::SdkResult<String> {
     if value.is_null() {
-        return Err(invalid_argument(format!("{argument_name} must not be null")));
+        return Err(invalid_argument(format!(
+            "{argument_name} must not be null"
+        )));
     }
     let text = unsafe { CStr::from_ptr(value) }
         .to_str()
@@ -250,13 +250,11 @@ fn write_owned_bytes(target: *mut e2v_bytes_t, value: Vec<u8>) -> crate::SdkResu
     Ok(())
 }
 
-fn ffi_read_bytes(
-    ptr: *const u8,
-    len: usize,
-    argument_name: &str,
-) -> crate::SdkResult<Vec<u8>> {
+fn ffi_read_bytes(ptr: *const u8, len: usize, argument_name: &str) -> crate::SdkResult<Vec<u8>> {
     if ptr.is_null() {
-        return Err(invalid_argument(format!("{argument_name} must not be null")));
+        return Err(invalid_argument(format!(
+            "{argument_name} must not be null"
+        )));
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     Ok(bytes.to_vec())
@@ -789,10 +787,7 @@ pub unsafe extern "C" fn e2v_share_accept_member_json(
             ffi_read_c_string(repo_root, "repo_root")?,
             ShareAcceptMemberRequest {
                 invite_bytes: ffi_read_bytes(invite_bytes, invite_len, "invite_bytes")?,
-                local_device_label: ffi_read_c_string(
-                    local_device_label,
-                    "local_device_label",
-                )?,
+                local_device_label: ffi_read_c_string(local_device_label, "local_device_label")?,
             },
         )
     })
@@ -835,10 +830,7 @@ pub unsafe extern "C" fn e2v_share_accept_device_json(
             ffi_read_c_string(repo_root, "repo_root")?,
             ShareAcceptDeviceRequest {
                 invite_bytes: ffi_read_bytes(invite_bytes, invite_len, "invite_bytes")?,
-                local_device_label: ffi_read_c_string(
-                    local_device_label,
-                    "local_device_label",
-                )?,
+                local_device_label: ffi_read_c_string(local_device_label, "local_device_label")?,
             },
         )
     })
