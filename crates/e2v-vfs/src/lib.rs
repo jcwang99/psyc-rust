@@ -450,18 +450,6 @@ impl ReadOnlyVfs {
                     .unwrap()
                     .insert(cache_key, cacheable.bytes);
             }
-        } else if offset == 0 && offset.saturating_add(length) >= file_size {
-            let full = self
-                .read_service
-                .read_range(&opened_file.file, 0, file_size)?;
-            let cacheable = self.cacheable_plaintext_range(0, full);
-            if let Some(cacheable) = cacheable.clone() {
-                self.plaintext_cache
-                    .lock()
-                    .unwrap()
-                    .insert(cache_key, cacheable.bytes.clone());
-            }
-            self.replace_open_file_cache(opened_file, cacheable);
         } else {
             self.replace_open_file_cache(
                 opened_file,
