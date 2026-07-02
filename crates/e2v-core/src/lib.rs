@@ -87,10 +87,10 @@ pub mod testing {
 
 pub use facade::{
     BranchState, BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry,
-    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState, SnapshotHandle,
+    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState,
     ShareAcceptDeviceOptions, ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle,
     ShareInviteDeviceOptions, ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions,
-    ShareRevokeMemberOptions, SnapshotSummary, validate_layout_root_value,
+    ShareRevokeMemberOptions, SnapshotHandle, SnapshotSummary, validate_layout_root_value,
 };
 pub use keyring::clear_unlocked_keyring_cache;
 pub use local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
@@ -237,18 +237,33 @@ pub mod sync_support {
         let length = usize::try_from(physical_ref.length)
             .map_err(|_| anyhow::anyhow!("cached pack length is too large to read"))?;
         let pack_path = cached_pack_data_path(repo_root.as_ref(), &physical_ref.container_id)?;
-        let bytes = std::fs::read(&pack_path).with_context(|| {
+        let mut pack_file = std::fs::File::open(&pack_path).with_context(|| {
             format!(
                 "cached pack data is missing for {}",
                 physical_ref.container_id
             )
         })?;
-        let end = offset.saturating_add(length);
-        ensure!(
-            end <= bytes.len(),
-            "cached pack object range out of bounds for {object_id}"
-        );
-        Ok(bytes[offset..end].to_vec())
+        read_cached_pack_object_range(&mut pack_file, offset, length, object_id)
+    }
+
+    fn read_cached_pack_object_range<R: std::io::Read + std::io::Seek>(
+        reader: &mut R,
+        offset: usize,
+        length: usize,
+        object_id: &str,
+    ) -> Result<Vec<u8>> {
+        use std::io::SeekFrom;
+
+        let offset_u64 = u64::try_from(offset)
+            .map_err(|_| anyhow::anyhow!("cached pack offset is too large to seek"))?;
+        reader
+            .seek(SeekFrom::Start(offset_u64))
+            .with_context(|| format!("cached pack object range out of bounds for {object_id}"))?;
+        let mut bytes = vec![0u8; length];
+        reader
+            .read_exact(&mut bytes)
+            .with_context(|| format!("cached pack object range out of bounds for {object_id}"))?;
+        Ok(bytes)
     }
 
     pub fn decode_object_bytes_for_sync(
@@ -752,5 +767,30 @@ pub mod sync_support {
         repo_root: impl AsRef<Path>,
     ) -> Result<Vec<SnapshotSummary>> {
         facade.snapshots(repo_root)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::Cursor;
+
+        use super::*;
+
+        #[test]
+        fn cached_pack_object_reads_only_the_requested_range() {
+            let object_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let mut short_reader = Cursor::new(b"34".to_vec());
+            let error = read_cached_pack_object_range(&mut short_reader, 3, 5, object_id)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cached pack object range out of bounds"),
+                "unexpected error: {error:#}"
+            );
+
+            let mut reader = Cursor::new(b"01234567".to_vec());
+            let bytes = read_cached_pack_object_range(&mut reader, 3, 5, object_id).unwrap();
+            assert_eq!(bytes, b"34567");
+        }
     }
 }
