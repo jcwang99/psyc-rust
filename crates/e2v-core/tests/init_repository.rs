@@ -32,6 +32,12 @@ struct RefRecordMirror {
     head_snapshot_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckoutPathMappingMirror {
+    snapshot_path: String,
+    local_path: String,
+}
+
 trait StreamingTreeWalkTestExt {
     fn walk_tree_streaming_for_test(
         &self,
@@ -1602,6 +1608,55 @@ fn checkout_restores_snapshot_into_target_directory() {
     let mapping = fs::read_to_string(mapping_path).unwrap();
     assert!(mapping.contains("root.txt"));
     assert!(mapping.contains("nested/hello.txt"));
+}
+
+#[test]
+fn repeated_checkout_does_not_duplicate_local_checkout_mapping_entries() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "snapshot".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: commit.snapshot_id.clone(),
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+
+    let mapping_path = checkout_target.join(".e2v-checkout-mapping.json");
+    let mappings: Vec<CheckoutPathMappingMirror> =
+        serde_json::from_slice(&fs::read(mapping_path).unwrap()).unwrap();
+    let snapshot_paths = mappings
+        .iter()
+        .map(|entry| entry.snapshot_path.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(mappings.len(), 2);
+    assert_eq!(snapshot_paths, vec!["nested/hello.txt", "root.txt"]);
 }
 
 #[test]

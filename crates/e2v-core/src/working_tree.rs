@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -368,6 +368,13 @@ impl WorkingTree {
         snapshot_path: &str,
         final_path: &Path,
     ) -> Result<()> {
+        self.record_platform_name_mappings(std::iter::once((snapshot_path, final_path)))
+    }
+
+    pub fn record_platform_name_mappings<'a, I>(&self, mappings_to_record: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (&'a str, &'a Path)>,
+    {
         let mapping_path = self.repo_root.join(".e2v-checkout-mapping.json");
         let mut mappings: Vec<CheckoutPathMapping> = if mapping_path.is_file() {
             let bytes = fs::read(&mapping_path).with_context(|| {
@@ -377,11 +384,33 @@ impl WorkingTree {
         } else {
             Vec::new()
         };
+        let mut indices_by_snapshot_path = mappings
+            .iter()
+            .enumerate()
+            .map(|(index, mapping)| (mapping.snapshot_path.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut changed = false;
 
-        mappings.push(CheckoutPathMapping {
-            snapshot_path: snapshot_path.to_string(),
-            local_path: final_path.to_string_lossy().to_string(),
-        });
+        for (snapshot_path, final_path) in mappings_to_record {
+            let local_path = final_path.to_string_lossy().to_string();
+            if let Some(index) = indices_by_snapshot_path.get(snapshot_path).copied() {
+                if mappings[index].local_path != local_path {
+                    mappings[index].local_path = local_path;
+                    changed = true;
+                }
+                continue;
+            }
+            indices_by_snapshot_path.insert(snapshot_path.to_string(), mappings.len());
+            mappings.push(CheckoutPathMapping {
+                snapshot_path: snapshot_path.to_string(),
+                local_path,
+            });
+            changed = true;
+        }
+
+        if !changed {
+            return Ok(());
+        }
 
         let bytes =
             serde_json::to_vec_pretty(&mappings).context("failed to encode checkout mapping")?;

@@ -1453,13 +1453,19 @@ impl RepositoryFacade {
             }
         }
 
+        let mut platform_name_mappings = Vec::with_capacity(staged.len());
         for (snapshot_path, temp_path, final_path) in staged {
             working_tree.publish_checkout_temp(&temp_path, &final_path)?;
             let observed_name = working_tree.observed_checkout_name(&final_path)?;
             let expected_name = snapshot_path.split('/').next_back().unwrap_or_default();
             working_tree.validate_checkout_read_back(expected_name, &observed_name)?;
-            working_tree.record_platform_name_mapping(&snapshot_path, &final_path)?;
+            platform_name_mappings.push((snapshot_path, final_path));
         }
+        working_tree.record_platform_name_mappings(
+            platform_name_mappings
+                .iter()
+                .map(|(snapshot_path, final_path)| (snapshot_path.as_str(), final_path.as_path())),
+        )?;
 
         Ok(())
     }
