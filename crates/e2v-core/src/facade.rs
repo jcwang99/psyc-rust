@@ -1523,13 +1523,15 @@ impl ReadService {
 
     pub fn open_snapshot(&self, snapshot_id: &str) -> Result<SnapshotHandle> {
         validate_object_id_value(snapshot_id).context("invalid snapshot id")?;
-        let repo_state = RepositoryFacade::new().open(&self.repo_root)?;
-        let manifest_store = LocalManifestStore::new(&self.repo_root);
-        let snapshot = manifest_store.get_snapshot(snapshot_id)?;
+        let control_dir = self.repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let object_store = open_object_store_with_secrets(&control_dir, repo_secrets);
+        let layout_root = validate_layout_root(&control_dir)?;
+        let snapshot = read_snapshot_object(&object_store, snapshot_id)?;
 
         Ok(SnapshotHandle {
             snapshot_id: snapshot_id.to_string(),
-            layout_generation: repo_state.layout_generation,
+            layout_generation: layout_root.generation,
             root_tree_id: snapshot.root_tree_id,
         })
     }
@@ -1560,7 +1562,8 @@ impl ReadService {
     }
 
     pub fn read_dir(&self, snapshot: &SnapshotHandle, path: &str) -> Result<Vec<DirectoryEntry>> {
-        RepositoryFacade::new().open(&self.repo_root)?;
+        let control_dir = self.repo_root.join(CONTROL_DIR);
+        let _repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let manifest_store = LocalManifestStore::new(&self.repo_root);
         let tree_id = resolve_tree_for_path(&manifest_store, &snapshot.root_tree_id, path)?;
         let tree = manifest_store.get_tree_node(&tree_id)?;
@@ -1576,7 +1579,8 @@ impl ReadService {
     }
 
     pub fn open_file(&self, snapshot: &SnapshotHandle, path: &str) -> Result<FileHandle> {
-        RepositoryFacade::new().open(&self.repo_root)?;
+        let control_dir = self.repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let manifest_store = LocalManifestStore::new(&self.repo_root);
         let (parent_path, file_name) = split_parent_and_name(path)?;
         let tree_id = resolve_tree_for_path(&manifest_store, &snapshot.root_tree_id, &parent_path)?;
@@ -1586,8 +1590,7 @@ impl ReadService {
             .into_iter()
             .find(|entry| entry.name == file_name && entry.kind == "file");
         let entry = entry.with_context(|| format!("file not found in snapshot: {path}"))?;
-        let control_dir = self.repo_root.join(CONTROL_DIR);
-        let object_store = open_object_store(&control_dir)?;
+        let object_store = open_object_store_with_secrets(&control_dir, repo_secrets);
         let file = read_file_object(&object_store, &entry.object_id)?;
 
         Ok(FileHandle {
@@ -1607,9 +1610,9 @@ impl ReadService {
     }
 
     pub fn read_range(&self, file: &FileHandle, offset: usize, length: usize) -> Result<Vec<u8>> {
-        RepositoryFacade::new().open(&self.repo_root)?;
         let control_dir = self.repo_root.join(CONTROL_DIR);
-        let object_store = open_object_store(&control_dir)?;
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let object_store = open_object_store_with_secrets(&control_dir, repo_secrets);
         let file_size: usize = file
             .file_size
             .try_into()
