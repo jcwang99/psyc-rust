@@ -3795,6 +3795,21 @@ fn clone_cleans_up_control_dir_when_password_is_wrong() {
 }
 
 #[test]
+fn fetch_does_not_expand_layout_root_bytes_with_pretty_json_whitespace() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("fetch.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("serde_json::to_vec_pretty(&layout_root)?"),
+        "fetch should preserve compact layout-root bytes instead of re-encoding them with pretty JSON whitespace"
+    );
+}
+
+#[test]
 fn fetch_preserves_local_device_credential_file() {
     let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
     let target_repo_root = temp.path().join("fetch-target");

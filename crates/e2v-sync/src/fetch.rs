@@ -1003,7 +1003,7 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
     );
     let layout_root = remote.read_layout_root()?;
     validate_layout_root_value(&layout_root)?;
-    let layout_root_bytes = serde_json::to_vec_pretty(&layout_root)?;
+    let layout_root_bytes = serde_json::to_vec(&layout_root)?;
 
     Ok(RemoteControlPlane {
         repo_id,

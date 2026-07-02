@@ -3270,7 +3270,7 @@ fn sync_path(path: &Path) -> Result<()> {
 }
 
 fn atomic_write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value).context("failed to encode json")?;
+    let bytes = serde_json::to_vec(value).context("failed to encode json")?;
     atomic_write_bytes(path, &bytes)
 }
 
