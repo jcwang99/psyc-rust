@@ -451,7 +451,11 @@ async fn tampered_branch_page_renders_internal_server_error_html() {
         })
         .unwrap();
 
-    let ref_path = repo_root.join(".e2v").join("refs").join("default.json");
+    let ref_path = repo_root
+        .join(".e2v")
+        .join("refs")
+        .join("branches")
+        .join(format!("{}.json", state.branch.token_hex));
     let mut bytes = std::fs::read(&ref_path).unwrap();
     let last_index = bytes.len() - 1;
     bytes[last_index] ^= 0x01;
