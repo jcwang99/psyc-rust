@@ -664,7 +664,7 @@ impl RefStore for OpendalMemoryBackend {
             },
             value: next,
         };
-        self.put_physical(&Self::ref_path(token), &serde_json::to_vec_pretty(&stored)?)?;
+        self.put_physical(&Self::ref_path(token), &serde_json::to_vec(&stored)?)?;
         Ok(CasResult {
             applied: true,
             current: Some(stored),
@@ -744,7 +744,7 @@ impl RefStore for OpendalWebdavBackend {
         };
         self.put_physical(
             &OpendalMemoryBackend::ref_path(token),
-            &serde_json::to_vec_pretty(&stored)?,
+            &serde_json::to_vec(&stored)?,
         )?;
         Ok(CasResult {
             applied: true,
@@ -813,7 +813,7 @@ impl LayoutRootStore for OpendalMemoryBackend {
             });
         }
 
-        let bytes = serde_json::to_vec_pretty(&next)?;
+        let bytes = serde_json::to_vec(&next)?;
         self.put_physical("layout_root.json", &bytes)?;
         self.put_physical(&Self::layout_history_path(next.generation), &bytes)?;
         Ok(CasResult {
@@ -859,7 +859,7 @@ impl LayoutRootStore for OpendalWebdavBackend {
             });
         }
 
-        let bytes = serde_json::to_vec_pretty(&next)?;
+        let bytes = serde_json::to_vec(&next)?;
         self.put_physical("layout_root.json", &bytes)?;
         self.put_physical(
             &OpendalMemoryBackend::layout_history_path(next.generation),
@@ -1059,7 +1059,7 @@ impl RefStore for OpendalS3Backend {
         };
         self.put_physical(
             &OpendalMemoryBackend::ref_path(token),
-            &serde_json::to_vec_pretty(&stored)?,
+            &serde_json::to_vec(&stored)?,
         )?;
         Ok(CasResult {
             applied: true,
@@ -1092,7 +1092,7 @@ impl LayoutRootStore for OpendalS3Backend {
             });
         }
 
-        let bytes = serde_json::to_vec_pretty(&next)?;
+        let bytes = serde_json::to_vec(&next)?;
         self.put_physical("layout_root.json", &bytes)?;
         self.put_physical(
             &OpendalMemoryBackend::layout_history_path(next.generation),

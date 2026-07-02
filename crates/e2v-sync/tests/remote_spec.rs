@@ -134,6 +134,31 @@ fn local_store_range_reads_do_not_materialize_the_full_file_first() {
 }
 
 #[test]
+fn store_ref_and_layout_root_records_do_not_spend_bytes_on_pretty_json_whitespace() {
+    let store_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("e2v-store")
+        .join("src");
+
+    for file_name in [
+        "local_backend.rs",
+        "memory_backend.rs",
+        "opendal_backend.rs",
+    ] {
+        let source = std::fs::read_to_string(store_src.join(file_name)).unwrap();
+        for pretty_write in [
+            "serde_json::to_vec_pretty(&stored)",
+            "serde_json::to_vec_pretty(&next)",
+        ] {
+            assert!(
+                !source.contains(pretty_write),
+                "store control-plane ref/layout writes should use compact JSON instead of pretty JSON in {file_name}: {pretty_write}"
+            );
+        }
+    }
+}
+
+#[test]
 fn parse_remote_spec_decodes_webdav_url_into_remote_config() {
     let spec = e2v_sync::RemoteSpec::parse("webdav+https://alice:secret@example.com/repo").unwrap();
 

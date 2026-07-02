@@ -344,7 +344,7 @@ impl RefStore for LocalFolderBackend {
             },
             value: next,
         };
-        self.put_physical(&Self::ref_path(token), &serde_json::to_vec_pretty(&stored)?)?;
+        self.put_physical(&Self::ref_path(token), &serde_json::to_vec(&stored)?)?;
         Ok(CasResult {
             applied: true,
             current: Some(stored),
@@ -376,7 +376,7 @@ impl LayoutRootStore for LocalFolderBackend {
             });
         }
 
-        let bytes = serde_json::to_vec_pretty(&next)?;
+        let bytes = serde_json::to_vec(&next)?;
         self.put_physical("layout_root.json", &bytes)?;
         self.put_physical(&Self::layout_history_path(next.generation), &bytes)?;
         Ok(CasResult {

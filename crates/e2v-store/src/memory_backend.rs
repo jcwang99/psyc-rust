@@ -153,7 +153,7 @@ impl RefStore for MemoryBackend {
             version: next_version,
             value: next,
         };
-        self.put_physical(&Self::ref_path(token), &serde_json::to_vec_pretty(&stored)?)?;
+        self.put_physical(&Self::ref_path(token), &serde_json::to_vec(&stored)?)?;
         Ok(CasResult {
             applied: true,
             current: Some(stored),
@@ -272,7 +272,7 @@ impl LayoutRootStore for MemoryBackend {
                 current: None,
             });
         }
-        let bytes = serde_json::to_vec_pretty(&next)?;
+        let bytes = serde_json::to_vec(&next)?;
         *self.layout_root.lock().unwrap() = next.clone();
         self.put_physical("layout_root.json", &bytes)?;
         self.put_physical(&Self::layout_history_path(next.generation), &bytes)?;
@@ -352,7 +352,7 @@ mod tests {
             backend
                 .get_physical("control/refs/by-token/branches/main.json")
                 .unwrap(),
-            serde_json::to_vec_pretty(&StoredRef {
+            serde_json::to_vec(&StoredRef {
                 version: RefVersion { value: 1 },
                 value: next,
             })
@@ -371,7 +371,7 @@ mod tests {
         backend
             .put_physical(
                 "control/refs/by-token/branches/main.json",
-                &serde_json::to_vec_pretty(&stored).unwrap(),
+                &serde_json::to_vec(&stored).unwrap(),
             )
             .unwrap();
 
@@ -392,13 +392,13 @@ mod tests {
         backend
             .put_physical(
                 "control/refs/by-token/branches/zeta.json",
-                &serde_json::to_vec_pretty(&zeta).unwrap(),
+                &serde_json::to_vec(&zeta).unwrap(),
             )
             .unwrap();
         backend
             .put_physical(
                 "control/refs/by-token/branches/alpha.json",
-                &serde_json::to_vec_pretty(&alpha).unwrap(),
+                &serde_json::to_vec(&alpha).unwrap(),
             )
             .unwrap();
 
@@ -433,7 +433,7 @@ mod tests {
         assert!(result.applied);
         assert_eq!(
             backend.get_physical("layout_root.json").unwrap(),
-            serde_json::to_vec_pretty(&next).unwrap()
+            serde_json::to_vec(&next).unwrap()
         );
     }
 
@@ -456,7 +456,7 @@ mod tests {
             backend
                 .get_physical("control/layout-roots/00000000000000000002.json")
                 .unwrap(),
-            serde_json::to_vec_pretty(&next).unwrap()
+            serde_json::to_vec(&next).unwrap()
         );
     }
 
@@ -470,10 +470,7 @@ mod tests {
             mapping_policy: "loose".to_string(),
         };
         backend
-            .put_physical(
-                "layout_root.json",
-                &serde_json::to_vec_pretty(&physical).unwrap(),
-            )
+            .put_physical("layout_root.json", &serde_json::to_vec(&physical).unwrap())
             .unwrap();
 
         assert_eq!(backend.read_layout_root().unwrap(), physical);
@@ -497,13 +494,13 @@ mod tests {
         backend
             .put_physical(
                 "control/layout-roots/00000000000000000002.json",
-                &serde_json::to_vec_pretty(&generation_two).unwrap(),
+                &serde_json::to_vec(&generation_two).unwrap(),
             )
             .unwrap();
         backend
             .put_physical(
                 "control/layout-roots/00000000000000000003.json",
-                &serde_json::to_vec_pretty(&generation_three).unwrap(),
+                &serde_json::to_vec(&generation_three).unwrap(),
             )
             .unwrap();
 
@@ -524,10 +521,7 @@ mod tests {
             mapping_policy: "loose".to_string(),
         };
         backend
-            .put_physical(
-                "layout_root.json",
-                &serde_json::to_vec_pretty(&physical).unwrap(),
-            )
+            .put_physical("layout_root.json", &serde_json::to_vec(&physical).unwrap())
             .unwrap();
 
         assert_eq!(
