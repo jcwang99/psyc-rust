@@ -404,6 +404,104 @@ impl WorkingTree {
         Ok(())
     }
 
+    pub(crate) fn read_platform_name_mappings(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mapping_path = self.repo_root.join(LOCAL_CHECKOUT_MAPPING_FILE);
+        if !mapping_path.is_file() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&mapping_path).with_context(|| {
+            format!("failed to read checkout mapping {}", mapping_path.display())
+        })?;
+        let mappings: Vec<CheckoutPathMapping> =
+            serde_json::from_slice(&bytes).context("failed to decode checkout mapping")?;
+        Ok(mappings
+            .into_iter()
+            .map(|mapping| (mapping.snapshot_path, PathBuf::from(mapping.local_path)))
+            .collect())
+    }
+
+    pub(crate) fn remove_stale_platform_name_mappings<'a, I>(
+        &self,
+        previous_mappings: &[(String, PathBuf)],
+        current_mappings: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (&'a str, &'a Path)>,
+    {
+        let mut current_snapshot_paths = HashSet::new();
+        let mut current_local_paths = HashSet::new();
+        for (snapshot_path, local_path) in current_mappings {
+            current_snapshot_paths.insert(snapshot_path.to_string());
+            current_local_paths.insert(local_path.to_path_buf());
+        }
+
+        for (snapshot_path, local_path) in previous_mappings {
+            if current_snapshot_paths.contains(snapshot_path)
+                || current_local_paths.contains(local_path)
+                || !local_path.starts_with(&self.repo_root)
+            {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(local_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect stale checkout path {}",
+                            local_path.display()
+                        )
+                    });
+                }
+            };
+            let file_type = metadata.file_type();
+            if metadata.is_file() || file_type.is_symlink() {
+                fs::remove_file(local_path).with_context(|| {
+                    format!(
+                        "failed to remove stale checkout path {}",
+                        local_path.display()
+                    )
+                })?;
+                self.remove_empty_checkout_ancestors(local_path.parent())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_empty_checkout_ancestors(&self, start: Option<&Path>) -> Result<()> {
+        let mut current = match start {
+            Some(path) => path.to_path_buf(),
+            None => return Ok(()),
+        };
+
+        while current.starts_with(&self.repo_root) && current != self.repo_root {
+            match fs::remove_dir(&current) {
+                Ok(()) => {
+                    if !current.pop() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if !current.pop() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to remove empty checkout directory {}",
+                            current.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn nearest_existing_checkout_directory(
         &self,
         target_dir: &Path,

@@ -1418,6 +1418,7 @@ impl RepositoryFacade {
             _options.target_dir.display()
         );
 
+        let previous_platform_name_mappings = working_tree.read_platform_name_mappings()?;
         let planned_files = collect_checkout_file_paths(&read_service, &snapshot, "")?;
         let relative_paths = planned_files
             .iter()
@@ -1461,6 +1462,12 @@ impl RepositoryFacade {
             working_tree.validate_checkout_read_back(expected_name, &observed_name)?;
             platform_name_mappings.push((snapshot_path, final_path));
         }
+        working_tree.remove_stale_platform_name_mappings(
+            &previous_platform_name_mappings,
+            platform_name_mappings
+                .iter()
+                .map(|(snapshot_path, final_path)| (snapshot_path.as_str(), final_path.as_path())),
+        )?;
         working_tree.write_platform_name_mappings(
             platform_name_mappings
                 .iter()

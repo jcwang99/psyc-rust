@@ -1715,6 +1715,64 @@ fn checkout_rewrites_local_checkout_mapping_to_current_snapshot_entries() {
 }
 
 #[test]
+fn checkout_removes_previously_materialized_files_missing_from_new_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: second.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(checkout_target.join("nested").join("hello.txt")).unwrap(),
+        "hello nested"
+    );
+
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: first.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(checkout_target.join("root.txt")).unwrap(),
+        "root"
+    );
+    assert!(
+        !checkout_target.join("nested").join("hello.txt").exists(),
+        "checkout should remove previously materialized files that are absent from the new snapshot"
+    );
+}
+
+#[test]
 fn commit_ignores_local_checkout_mapping_artifact() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
