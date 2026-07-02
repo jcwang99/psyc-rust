@@ -111,6 +111,32 @@ fn testing_module_does_not_reexport_core_facade_types_or_sync_reconcile_directly
 }
 
 #[test]
+fn sync_support_module_is_kept_doc_hidden_as_an_internal_sync_boundary() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+    let lines = source.lines().collect::<Vec<_>>();
+    let sync_support_line = lines
+        .iter()
+        .position(|line| line.trim() == "pub mod sync_support {")
+        .expect("expected sync_support module declaration");
+    let previous_non_empty = lines[..sync_support_line]
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .copied();
+
+    assert_eq!(
+        previous_non_empty,
+        Some("#[doc(hidden)]"),
+        "e2v-core::sync_support should stay doc-hidden because it is an internal sync boundary rather than the stable public read/write API"
+    );
+}
+
+#[test]
 fn init_creates_control_plane_files_for_local_direct_layout() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

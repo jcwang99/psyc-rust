@@ -108,6 +108,7 @@ pub use manifest_store::{
 };
 pub use working_tree::{SnapshotReader, StableReadPolicy};
 
+#[doc(hidden)]
 pub mod sync_support {
     use std::path::Component;
     use std::path::{Path, PathBuf};
