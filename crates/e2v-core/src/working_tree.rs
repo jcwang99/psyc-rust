@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -363,52 +363,33 @@ impl WorkingTree {
             .with_context(|| format!("file not found after publish: {expected_name}"))
     }
 
-    pub fn record_platform_name_mapping(
-        &self,
-        snapshot_path: &str,
-        final_path: &Path,
-    ) -> Result<()> {
-        self.record_platform_name_mappings(std::iter::once((snapshot_path, final_path)))
-    }
-
-    pub fn record_platform_name_mappings<'a, I>(&self, mappings_to_record: I) -> Result<()>
+    pub(crate) fn write_platform_name_mappings<'a, I>(&self, mappings_to_write: I) -> Result<()>
     where
         I: IntoIterator<Item = (&'a str, &'a Path)>,
     {
         let mapping_path = self.repo_root.join(".e2v-checkout-mapping.json");
-        let mut mappings: Vec<CheckoutPathMapping> = if mapping_path.is_file() {
-            let bytes = fs::read(&mapping_path).with_context(|| {
-                format!("failed to read checkout mapping {}", mapping_path.display())
-            })?;
-            serde_json::from_slice(&bytes).context("failed to decode checkout mapping")?
-        } else {
-            Vec::new()
-        };
-        let mut indices_by_snapshot_path = mappings
-            .iter()
-            .enumerate()
-            .map(|(index, mapping)| (mapping.snapshot_path.clone(), index))
-            .collect::<HashMap<_, _>>();
-        let mut changed = false;
+        let mut mappings = Vec::new();
+        let mut seen_snapshot_paths = HashSet::new();
 
-        for (snapshot_path, final_path) in mappings_to_record {
-            let local_path = final_path.to_string_lossy().to_string();
-            if let Some(index) = indices_by_snapshot_path.get(snapshot_path).copied() {
-                if mappings[index].local_path != local_path {
-                    mappings[index].local_path = local_path;
-                    changed = true;
-                }
+        for (snapshot_path, final_path) in mappings_to_write {
+            if !seen_snapshot_paths.insert(snapshot_path.to_string()) {
                 continue;
             }
-            indices_by_snapshot_path.insert(snapshot_path.to_string(), mappings.len());
             mappings.push(CheckoutPathMapping {
                 snapshot_path: snapshot_path.to_string(),
-                local_path,
+                local_path: final_path.to_string_lossy().to_string(),
             });
-            changed = true;
         }
 
-        if !changed {
+        if mappings.is_empty() {
+            if mapping_path.is_file() {
+                fs::remove_file(&mapping_path).with_context(|| {
+                    format!(
+                        "failed to remove checkout mapping {}",
+                        mapping_path.display()
+                    )
+                })?;
+            }
             return Ok(());
         }
 

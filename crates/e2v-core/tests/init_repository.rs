@@ -1660,6 +1660,61 @@ fn repeated_checkout_does_not_duplicate_local_checkout_mapping_entries() {
 }
 
 #[test]
+fn checkout_rewrites_local_checkout_mapping_to_current_snapshot_entries() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: second.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: first.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+
+    let mapping_path = checkout_target.join(".e2v-checkout-mapping.json");
+    let mappings: Vec<CheckoutPathMappingMirror> =
+        serde_json::from_slice(&fs::read(mapping_path).unwrap()).unwrap();
+    let snapshot_paths = mappings
+        .iter()
+        .map(|entry| entry.snapshot_path.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(snapshot_paths, vec!["root.txt"]);
+}
+
+#[test]
 fn commit_ignores_local_checkout_mapping_artifact() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

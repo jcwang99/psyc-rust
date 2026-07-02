@@ -1461,7 +1461,7 @@ impl RepositoryFacade {
             working_tree.validate_checkout_read_back(expected_name, &observed_name)?;
             platform_name_mappings.push((snapshot_path, final_path));
         }
-        working_tree.record_platform_name_mappings(
+        working_tree.write_platform_name_mappings(
             platform_name_mappings
                 .iter()
                 .map(|(snapshot_path, final_path)| (snapshot_path.as_str(), final_path.as_path())),
