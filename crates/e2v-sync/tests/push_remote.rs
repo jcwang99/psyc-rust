@@ -3088,7 +3088,7 @@ fn push_encodes_pack_index_segments_without_pretty_printed_json_whitespace() {
         .unwrap();
     let index_bytes = remote.get_physical(&index_path).unwrap();
     let secrets =
-        e2v_core::sync_support::open_repo_secrets_for_sync(&repo_root.join(".e2v")).unwrap();
+        e2v_core::sync_support::open_repo_secrets_for_sync(repo_root.join(".e2v")).unwrap();
     let plaintext = e2v_core::sync_support::decrypt_control_record_for_sync(
         &secrets,
         &format!("pack-index-segment:{index_path}"),

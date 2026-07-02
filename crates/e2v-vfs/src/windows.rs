@@ -918,6 +918,21 @@ impl NativeWinfspVolumeParams {
     }
 }
 
+type WinfspCreateExFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut u16,
+    u32,
+    u32,
+    u32,
+    *mut c_void,
+    u64,
+    *mut c_void,
+    u32,
+    u8,
+    *mut *mut c_void,
+    *mut c_void,
+) -> i32;
+
 #[repr(C)]
 #[derive(Debug, Default)]
 struct NativeWinfspInterface {
@@ -1021,22 +1036,7 @@ struct NativeWinfspInterface {
         ) -> i32,
     >,
     set_delete: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u16, u8) -> i32>,
-    create_ex: Option<
-        unsafe extern "C" fn(
-            *mut c_void,
-            *mut u16,
-            u32,
-            u32,
-            u32,
-            *mut c_void,
-            u64,
-            *mut c_void,
-            u32,
-            u8,
-            *mut *mut c_void,
-            *mut c_void,
-        ) -> i32,
-    >,
+    create_ex: Option<WinfspCreateExFn>,
     overwrite_ex: Option<
         unsafe extern "C" fn(
             *mut c_void,
@@ -1386,8 +1386,8 @@ unsafe extern "C" fn host_create_ex(
     let wants_directory = (create_options & FILE_DIRECTORY_FILE) != 0;
     let wants_non_directory = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
     match metadata.kind {
-        crate::VfsNodeKind::Directory if wants_non_directory => return STATUS_NOT_A_DIRECTORY,
-        crate::VfsNodeKind::File if wants_directory => return STATUS_NOT_A_DIRECTORY,
+        crate::VfsNodeKind::Directory if wants_non_directory => STATUS_NOT_A_DIRECTORY,
+        crate::VfsNodeKind::File if wants_directory => STATUS_NOT_A_DIRECTORY,
         crate::VfsNodeKind::Directory => {
             let handle = Box::new(WinfspOpenHandle::from_opened_file_stub(
                 metadata.snapshot_id.clone(),

@@ -1104,6 +1104,45 @@ fn winfsp_test_probes_are_not_exposed_as_public_api_methods() {
     }
 }
 
+#[test]
+fn winfsp_runtime_callbacks_factor_create_ex_signature_behind_a_type_alias() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        source.contains("type WinfspCreateExFn = unsafe extern \"C\" fn("),
+        "WinFSP runtime bindings should name the create_ex callback signature once behind a local type alias"
+    );
+    assert!(
+        source.contains("create_ex: Option<WinfspCreateExFn>"),
+        "WinFSP runtime bindings should reuse the create_ex type alias instead of keeping the full callback signature inline"
+    );
+}
+
+#[test]
+fn winfsp_create_dispatch_does_not_keep_needless_return_arms() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    for needless_arm in [
+        "crate::VfsNodeKind::Directory if wants_non_directory => return STATUS_NOT_A_DIRECTORY,",
+        "crate::VfsNodeKind::File if wants_directory => return STATUS_NOT_A_DIRECTORY,",
+    ] {
+        assert!(
+            !source.contains(needless_arm),
+            "WinFSP create dispatch should keep status selection expression-oriented instead of using needless return arms: {needless_arm}"
+        );
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn winfsp_security_callbacks_reuse_a_single_cached_descriptor_parse() {
