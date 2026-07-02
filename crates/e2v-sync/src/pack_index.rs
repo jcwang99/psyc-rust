@@ -166,10 +166,11 @@ pub fn load_remote_operation_pack_locations_with_secrets<B: BlobStore>(
     let mut batch_index = 0usize;
     loop {
         let (_, _, index_path) = pack_paths(operation_id, batch_index)?;
-        if !remote.exists_physical(&index_path) {
-            break;
-        }
-        let bytes = remote.get_physical(&index_path)?;
+        let bytes = match remote.get_physical(&index_path) {
+            Ok(bytes) => bytes,
+            Err(error) if is_missing_physical_object_error(&error) => break,
+            Err(error) => return Err(error),
+        };
         append_segment_locations(remote, &index_path, &bytes, &mut locations, Some(secrets))?;
         batch_index += 1;
     }
@@ -505,6 +506,31 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct OperationSegmentProbeBackend {
+        inner: MemoryBackend,
+        segment_exists_calls: Arc<Mutex<usize>>,
+        segment_get_calls: Arc<Mutex<usize>>,
+    }
+
+    impl OperationSegmentProbeBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                segment_exists_calls: Arc::new(Mutex::new(0)),
+                segment_get_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn segment_exists_call_count(&self) -> usize {
+            *self.segment_exists_calls.lock().unwrap()
+        }
+
+        fn segment_get_call_count(&self) -> usize {
+            *self.segment_get_calls.lock().unwrap()
+        }
+    }
+
     impl BlobStore for RootProbeBackend {
         fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
             self.inner.put_physical(relative_path, bytes)
@@ -537,6 +563,51 @@ mod tests {
         fn exists_physical(&self, relative_path: &str) -> bool {
             if relative_path == PACK_INDEX_ROOT_PATH {
                 *self.root_exists_calls.lock().unwrap() += 1;
+            }
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl BlobStore for OperationSegmentProbeBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            if relative_path.starts_with(REMOTE_PACK_INDEX_PREFIX) {
+                *self.segment_get_calls.lock().unwrap() += 1;
+            }
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            if relative_path.starts_with(REMOTE_PACK_INDEX_PREFIX) {
+                *self.segment_exists_calls.lock().unwrap() += 1;
             }
             self.inner.exists_physical(relative_path)
         }
@@ -693,6 +764,45 @@ mod tests {
             1,
             "missing root should be determined from a single get attempt"
         );
+    }
+
+    #[test]
+    fn operation_pack_location_restore_uses_segment_gets_without_exists_probe_per_segment() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = OperationSegmentProbeBackend::new();
+        let operation_id = "resume-pack-locations";
+        let segment_path = "packs/index/resume-pack-locations-00000000.json";
+        let (index, payload) =
+            build_pack(operation_id, 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index.data_path, &payload).unwrap();
+        remote
+            .put_physical(
+                segment_path,
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    segment_path,
+                    &serde_json::to_vec(&index).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let locations =
+            load_remote_operation_pack_locations_with_secrets(&remote, operation_id, &secrets)
+                .unwrap();
+
+        assert!(locations.contains_key("abc"));
+        assert_eq!(
+            remote.segment_exists_call_count(),
+            0,
+            "operation pack location restore should not probe segment existence before reading"
+        );
+        assert_eq!(
+            remote.segment_get_call_count(),
+            2,
+            "operation pack location restore should read the present segment and then one missing sentinel path"
+        );
+        let _ = control_dir;
     }
 
     #[test]
