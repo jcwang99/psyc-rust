@@ -11,7 +11,7 @@ use e2v_store::{
     LayoutRootStore, ListedRef, MemoryBackend, RefStore, RefToken, RefVersion, RemoteBackend,
     StoredRef,
 };
-use e2v_sync::benchmarking::override_small_object_pack_threshold_for_test;
+use e2v_sync::testing::override_small_object_pack_threshold_for_test;
 use e2v_sync::{CloneOptions, FetchOptions, PushOptions, clone_remote, fetch_remote, push_head};
 use tempfile::tempdir;
 
@@ -190,7 +190,7 @@ fn first_local_object_path(objects_dir: &Path) -> Result<std::path::PathBuf> {
 }
 
 fn read_root_segment_count(control_dir: &Path, remote: &MemoryBackend) -> Result<usize> {
-    let root = e2v_sync::benchmarking::decode_pack_index_root_value_for_test(
+    let root = e2v_sync::testing::decode_pack_index_root_value_for_test(
         control_dir,
         &remote.get_physical("pack-index/root.json")?,
     )?;

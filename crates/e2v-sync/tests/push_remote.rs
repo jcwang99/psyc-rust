@@ -66,6 +66,21 @@ fn sync_testing_and_benchmarking_modules_do_not_reexport_internal_helpers_direct
     }
 }
 
+#[test]
+fn sync_exposes_a_single_doc_hidden_probe_surface() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub mod benchmarking"),
+        "benchmark harness should reuse the doc-hidden testing probe surface instead of introducing a second redundant probe module"
+    );
+}
+
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     RefToken::new(format!(
         "keyring/{}",

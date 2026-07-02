@@ -101,23 +101,3 @@ pub mod testing {
         crate::trusted_state::override_trusted_state_dir_for_test(path)
     }
 }
-
-#[doc(hidden)]
-pub mod benchmarking {
-    use anyhow::Result;
-    use serde_json::Value;
-    use std::path::Path;
-
-    pub fn override_small_object_pack_threshold_for_test(
-        threshold: usize,
-    ) -> crate::push::SmallObjectPackThresholdGuard {
-        crate::push::override_small_object_pack_threshold_for_test(threshold)
-    }
-
-    pub fn decode_pack_index_root_value_for_test(
-        control_dir: &Path,
-        bytes: &[u8],
-    ) -> Result<Value> {
-        crate::pack_index::decode_pack_index_root_value_for_test(control_dir, bytes)
-    }
-}
