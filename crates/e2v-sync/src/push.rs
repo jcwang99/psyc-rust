@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 
 use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
+use e2v_store::local_backend::is_missing_physical_object_error;
 use e2v_store::{EncryptedRef, LayoutRoot, RefToken, RemoteBackend, validate_object_id_value};
 
 use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_sync_identifier};
@@ -641,7 +642,7 @@ fn read_remote_current_keyring_bytes<R: RemoteBackend>(
         .context("invalid remote keyring pointer current file")?;
     match remote.get_physical(&format!("control/keyring/{current}")) {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.to_string().contains("missing physical object") => Ok(None),
+        Err(error) if is_missing_physical_object_error(&error) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -1148,11 +1149,12 @@ mod tests {
     use std::fs;
 
     use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
-    use e2v_store::{BlobStore, MemoryBackend};
+    use e2v_store::{BlobStore, LocalFolderBackend, MemoryBackend};
     use tempfile::tempdir;
 
     use super::{
-        PackedObjectLocation, remote_object_authenticates_for_repo,
+        PackedObjectLocation, PushOptions, push_head, read_remote_current_keyring_bytes,
+        remote_object_authenticates_for_repo,
         remote_snapshot_graph_authenticates_for_repo, should_pack_small_objects,
         upload_object_batch,
     };
@@ -1310,5 +1312,58 @@ mod tests {
         );
         assert_eq!(fs::read(&outside).unwrap(), b"leak");
         assert!(!remote.exists_physical("objects/..\\..\\..\\outside.json"));
+    }
+
+    #[test]
+    fn read_remote_current_keyring_bytes_treats_not_found_generation_as_missing() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        let remote_root = temp.path().join("remote");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::create_dir_all(&remote_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "unit-missing-remote-keyring-generation".to_string(),
+            })
+            .unwrap();
+
+        let remote = LocalFolderBackend::new(&remote_root);
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "unit-missing-remote-keyring-generation-op".to_string(),
+            },
+        )
+        .unwrap();
+
+        let pointer_bytes = remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap();
+        let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+        let current = pointer["current"].as_str().unwrap();
+        remote
+            .delete_physical(&format!("control/keyring/{current}"))
+            .unwrap();
+
+        let remote_keyring_bytes = read_remote_current_keyring_bytes(&remote, &repo_root).unwrap();
+
+        assert!(
+            remote_keyring_bytes.is_none(),
+            "missing remote keyring generation should be treated as absent state"
+        );
     }
 }
