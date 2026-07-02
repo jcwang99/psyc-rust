@@ -18,8 +18,16 @@ use e2v_vfs::{
     PlatformFamily, PlatformMountAdapter, ReadOnlyVfs, VfsHostLauncher, VfsMountConfig,
     VfsNodeKind, VfsSemantic, WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver,
     WinfspHostLauncher, WinfspHostSession, WinfspInvalidator, WinfspMountContext,
-    WinfspOpenRequest, WinfspRuntimeLibrary, WinfspRuntimePaths, WinfspVolumeParams,
-    testing::opened_file_cached_plaintext, try_mount_snapshot_on_current_platform,
+    WinfspOpenRequest, WinfspRuntimeLibrary, WinfspVolumeParams,
+    testing::{
+        opened_file_cached_plaintext, winfsp_host_session_new, winfsp_runtime_get_symbol_address,
+        winfsp_runtime_paths_from_candidate_roots, winfsp_runtime_paths_from_install_root,
+        winfsp_runtime_resolve_mount_exports, winfsp_session_build_native_create_request,
+        winfsp_session_create_filesystem_handle, winfsp_session_destroy_filesystem_handle,
+        winfsp_session_has_native_filesystem_handle, winfsp_session_is_mounted,
+        winfsp_session_run_mount_lifecycle,
+    },
+    try_mount_snapshot_on_current_platform,
 };
 
 enum UnreadableCacheEntryGuard {
@@ -1070,6 +1078,35 @@ fn opened_file_test_probe_is_not_exposed_as_a_public_api_method() {
 }
 
 #[test]
+fn winfsp_test_probes_are_not_exposed_as_public_api_methods() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    for signature in [
+        "pub fn from_install_root_for_test",
+        "pub fn from_candidate_roots_for_test",
+        "pub fn get_symbol_address_for_test",
+        "pub fn resolve_mount_exports_for_test",
+        "pub fn new_for_test",
+        "pub fn is_mounted_for_test",
+        "pub fn build_native_create_request_for_test",
+        "pub fn create_filesystem_handle_for_test",
+        "pub fn has_native_filesystem_handle_for_test",
+        "pub fn destroy_filesystem_handle_for_test",
+        "pub fn run_mount_lifecycle_for_test",
+    ] {
+        assert!(
+            !source.contains(signature),
+            "test-only WinFSP probe should not remain public: {signature}"
+        );
+    }
+}
+
+#[test]
 fn snapshot_vfs_accepts_rooted_and_trailing_slash_paths() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1841,8 +1878,7 @@ fn winfsp_runtime_paths_choose_arch_specific_dll_from_install_root() {
     fs::create_dir_all(&bin_dir).unwrap();
     fs::write(bin_dir.join("winfsp-x64.dll"), b"dll").unwrap();
 
-    let paths =
-        WinfspRuntimePaths::from_install_root_for_test(install_root.clone(), "x86_64").unwrap();
+    let paths = winfsp_runtime_paths_from_install_root(install_root.clone(), "x86_64").unwrap();
 
     assert_eq!(paths.install_root, install_root);
     assert_eq!(paths.bin_dir, bin_dir);
@@ -1855,8 +1891,7 @@ fn winfsp_runtime_paths_reject_missing_arch_specific_dll() {
     let install_root = temp.path().join("WinFsp");
     fs::create_dir_all(install_root.join("bin")).unwrap();
 
-    let error =
-        WinfspRuntimePaths::from_install_root_for_test(install_root.clone(), "x86_64").unwrap_err();
+    let error = winfsp_runtime_paths_from_install_root(install_root.clone(), "x86_64").unwrap_err();
 
     assert!(
         error.to_string().contains("winfsp-x64.dll"),
@@ -1873,11 +1908,9 @@ fn winfsp_runtime_paths_choose_first_existing_default_install_root() {
     fs::create_dir_all(&bin_dir).unwrap();
     fs::write(bin_dir.join("winfsp-x64.dll"), b"dll").unwrap();
 
-    let paths = WinfspRuntimePaths::from_candidate_roots_for_test(
-        &[missing_root, install_root.clone()],
-        "x86_64",
-    )
-    .unwrap();
+    let paths =
+        winfsp_runtime_paths_from_candidate_roots(&[missing_root, install_root.clone()], "x86_64")
+            .unwrap();
 
     assert_eq!(paths.install_root, install_root);
     assert_eq!(paths.dll_path, bin_dir.join("winfsp-x64.dll"));
@@ -1885,7 +1918,7 @@ fn winfsp_runtime_paths_choose_first_existing_default_install_root() {
 
 #[test]
 fn winfsp_runtime_library_loads_the_resolved_runtime_dll() {
-    let paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -1901,7 +1934,7 @@ fn winfsp_runtime_library_loads_the_resolved_runtime_dll() {
 
 #[test]
 fn winfsp_runtime_library_resolves_the_create_export() {
-    let paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -1911,16 +1944,14 @@ fn winfsp_runtime_library_resolves_the_create_export() {
     .unwrap();
     let library = WinfspRuntimeLibrary::load(&paths).unwrap();
 
-    let symbol = library
-        .get_symbol_address_for_test("FspFileSystemCreate")
-        .unwrap();
+    let symbol = winfsp_runtime_get_symbol_address(&library, "FspFileSystemCreate").unwrap();
 
     assert_ne!(symbol, 0);
 }
 
 #[test]
 fn winfsp_runtime_library_rejects_missing_exports() {
-    let paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -1930,9 +1961,8 @@ fn winfsp_runtime_library_rejects_missing_exports() {
     .unwrap();
     let library = WinfspRuntimeLibrary::load(&paths).unwrap();
 
-    let error = library
-        .get_symbol_address_for_test("DefinitelyMissingWinfspSymbol")
-        .unwrap_err();
+    let error =
+        winfsp_runtime_get_symbol_address(&library, "DefinitelyMissingWinfspSymbol").unwrap_err();
 
     assert!(
         error
@@ -1944,7 +1974,7 @@ fn winfsp_runtime_library_rejects_missing_exports() {
 
 #[test]
 fn winfsp_runtime_library_resolves_required_mount_exports() {
-    let paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -1954,7 +1984,7 @@ fn winfsp_runtime_library_resolves_required_mount_exports() {
     .unwrap();
     let library = WinfspRuntimeLibrary::load(&paths).unwrap();
 
-    let exports = library.resolve_mount_exports_for_test().unwrap();
+    let exports = winfsp_runtime_resolve_mount_exports(&library).unwrap();
 
     assert_ne!(exports.create, 0);
     assert_ne!(exports.set_mount_point, 0);
@@ -1976,7 +2006,7 @@ fn winfsp_host_session_can_be_built_from_runtime_and_mount_context() {
     let context = WinfspMountContext::from_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
-    let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -1986,13 +2016,13 @@ fn winfsp_host_session_can_be_built_from_runtime_and_mount_context() {
     .unwrap();
     let runtime = WinfspRuntimeLibrary::load(&runtime_paths).unwrap();
 
-    let session = WinfspHostSession::new_for_test(runtime, host_config, volume_params).unwrap();
+    let session = winfsp_host_session_new(runtime, host_config, volume_params).unwrap();
 
     assert_eq!(session.mount_point(), &PathBuf::from("W:"));
     assert_eq!(session.filesystem_name(), "e2v-ro");
     assert_eq!(session.volume_label(), "e2v snapshot-pinned");
     assert!(session.has_required_mount_exports());
-    assert!(!session.is_mounted_for_test());
+    assert!(!winfsp_session_is_mounted(&session));
 }
 
 #[test]
@@ -2008,7 +2038,7 @@ fn winfsp_host_session_builds_a_native_create_request() {
     let context = WinfspMountContext::from_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
-    let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -2017,9 +2047,9 @@ fn winfsp_host_session_builds_a_native_create_request() {
     )
     .unwrap();
     let runtime = WinfspRuntimeLibrary::load(&runtime_paths).unwrap();
-    let session = WinfspHostSession::new_for_test(runtime, host_config, volume_params).unwrap();
+    let session = winfsp_host_session_new(runtime, host_config, volume_params).unwrap();
 
-    let request = session.build_native_create_request_for_test().unwrap();
+    let request = winfsp_session_build_native_create_request(&session).unwrap();
 
     assert_eq!(request.device_path, "WinFsp.Disk");
     assert_eq!(request.mount_point, PathBuf::from("W:"));
@@ -2041,7 +2071,7 @@ fn winfsp_host_session_can_create_and_destroy_a_native_filesystem_handle() {
     let context = WinfspMountContext::from_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
-    let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -2050,15 +2080,15 @@ fn winfsp_host_session_can_create_and_destroy_a_native_filesystem_handle() {
     )
     .unwrap();
     let runtime = WinfspRuntimeLibrary::load(&runtime_paths).unwrap();
-    let mut session = WinfspHostSession::new_for_test(runtime, host_config, volume_params).unwrap();
+    let mut session = winfsp_host_session_new(runtime, host_config, volume_params).unwrap();
 
-    session.create_filesystem_handle_for_test().unwrap();
+    winfsp_session_create_filesystem_handle(&mut session).unwrap();
 
-    assert!(session.has_native_filesystem_handle_for_test());
+    assert!(winfsp_session_has_native_filesystem_handle(&session));
 
-    session.destroy_filesystem_handle_for_test();
+    winfsp_session_destroy_filesystem_handle(&mut session);
 
-    assert!(!session.has_native_filesystem_handle_for_test());
+    assert!(!winfsp_session_has_native_filesystem_handle(&session));
 }
 
 #[test]
@@ -2135,7 +2165,7 @@ fn winfsp_host_session_can_run_mount_lifecycle_through_a_host_driver() {
     let context = WinfspMountContext::from_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
-    let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -2144,12 +2174,11 @@ fn winfsp_host_session_can_run_mount_lifecycle_through_a_host_driver() {
     )
     .unwrap();
     let runtime = WinfspRuntimeLibrary::load(&runtime_paths).unwrap();
-    let mut session = WinfspHostSession::new_for_test(runtime, host_config, volume_params).unwrap();
+    let mut session = winfsp_host_session_new(runtime, host_config, volume_params).unwrap();
     let driver = RecordingHostDriver::new();
 
-    session
-        .run_mount_lifecycle_for_test(&driver, session.mount_point().clone(), 0)
-        .unwrap();
+    let mount_point = session.mount_point().clone();
+    winfsp_session_run_mount_lifecycle(&mut session, &driver, mount_point, 0).unwrap();
 
     assert_eq!(
         *driver.calls.lock().unwrap(),
@@ -2161,8 +2190,8 @@ fn winfsp_host_session_can_run_mount_lifecycle_through_a_host_driver() {
             HostCall::DeleteFilesystemHandle,
         ]
     );
-    assert!(session.is_mounted_for_test());
-    assert!(!session.has_native_filesystem_handle_for_test());
+    assert!(winfsp_session_is_mounted(&session));
+    assert!(!winfsp_session_has_native_filesystem_handle(&session));
 }
 
 #[test]
@@ -2171,7 +2200,7 @@ fn winfsp_host_session_mount_lifecycle_cleans_up_a_real_native_handle() {
 
     impl WinfspHostDriver for NativeHandleLifecycleDriver {
         fn create_filesystem_handle(&self, session: &mut WinfspHostSession) -> anyhow::Result<()> {
-            session.create_filesystem_handle_for_test()
+            winfsp_session_create_filesystem_handle(session)
         }
 
         fn set_mount_point(&self, _mount_point: &std::path::Path) -> anyhow::Result<()> {
@@ -2187,7 +2216,7 @@ fn winfsp_host_session_mount_lifecycle_cleans_up_a_real_native_handle() {
         }
 
         fn delete_filesystem_handle(&self, session: &mut WinfspHostSession) -> anyhow::Result<()> {
-            session.destroy_filesystem_handle_for_test();
+            winfsp_session_destroy_filesystem_handle(session);
             Ok(())
         }
     }
@@ -2203,7 +2232,7 @@ fn winfsp_host_session_mount_lifecycle_cleans_up_a_real_native_handle() {
     let context = WinfspMountContext::from_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
-    let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -2212,14 +2241,18 @@ fn winfsp_host_session_mount_lifecycle_cleans_up_a_real_native_handle() {
     )
     .unwrap();
     let runtime = WinfspRuntimeLibrary::load(&runtime_paths).unwrap();
-    let mut session = WinfspHostSession::new_for_test(runtime, host_config, volume_params).unwrap();
+    let mut session = winfsp_host_session_new(runtime, host_config, volume_params).unwrap();
 
-    session
-        .run_mount_lifecycle_for_test(&NativeHandleLifecycleDriver, PathBuf::from("W:"), 0)
-        .unwrap();
+    winfsp_session_run_mount_lifecycle(
+        &mut session,
+        &NativeHandleLifecycleDriver,
+        PathBuf::from("W:"),
+        0,
+    )
+    .unwrap();
 
-    assert!(session.is_mounted_for_test());
-    assert!(!session.has_native_filesystem_handle_for_test());
+    assert!(winfsp_session_is_mounted(&session));
+    assert!(!winfsp_session_has_native_filesystem_handle(&session));
 }
 
 #[test]
