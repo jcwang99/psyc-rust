@@ -1123,6 +1123,23 @@ fn winfsp_security_callbacks_reuse_a_single_cached_descriptor_parse() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn winfsp_directory_callbacks_do_not_reload_the_runtime_library() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    let load_count = source.matches("WinfspRuntimeLibrary::load(").count();
+    assert_eq!(
+        load_count, 1,
+        "WinFSP host should load the runtime once during mount startup and reuse cached callback helpers, found {load_count} runtime loads"
+    );
+}
+
 #[test]
 fn snapshot_vfs_accepts_rooted_and_trailing_slash_paths() {
     let temp = tempdir().unwrap();

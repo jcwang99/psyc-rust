@@ -185,6 +185,7 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
     let runtime = WinfspRuntimeLibrary::load(&runtime_paths)?;
     let stop_state = Arc::new(HostStopState::default());
     let interface = Box::new(NativeWinfspInterface::read_only_host());
+    mount_context.set_add_dir_info_fn(runtime.add_dir_info_fn());
     let mut native_volume_params = NativeWinfspVolumeParams::from_volume_params(&volume_params);
     let device_path = widestr_from_str("WinFsp.Disk");
     let mut native_filesystem = std::ptr::null_mut::<c_void>();
@@ -1628,17 +1629,8 @@ unsafe extern "C" fn host_read_directory(
         }
     };
     let marker_name = normalized_logical_path_from_windows_path(marker);
-    let add_dir_info = match WinfspRuntimePaths::from_candidate_roots_for_test(
-        &[
-            PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
-            PathBuf::from(r"C:\Program Files\WinFsp"),
-        ],
-        "x86_64",
-    )
-    .and_then(|paths| WinfspRuntimeLibrary::load(&paths))
-    {
-        Ok(runtime) => runtime.add_dir_info_fn(),
-        Err(_) => return STATUS_ACCESS_DENIED,
+    let Some(add_dir_info) = context.add_dir_info_fn() else {
+        return STATUS_ACCESS_DENIED;
     };
     for entry in entries {
         if !marker_name.is_empty() && entry.name <= marker_name {
@@ -1820,6 +1812,7 @@ pub struct WinfspMountContext {
     cache_policy: CachePolicy,
     observed_inode_ids: Arc<Mutex<BTreeSet<u64>>>,
     observed_directory_paths: Arc<Mutex<BTreeSet<String>>>,
+    add_dir_info: Option<FspFileSystemAddDirInfoFn>,
     security_descriptor: Arc<SecurityDescriptorBytes>,
     vfs: ReadOnlyVfs,
 }
@@ -1837,6 +1830,7 @@ impl WinfspMountContext {
             cache_policy,
             observed_inode_ids: Arc::new(Mutex::new(BTreeSet::new())),
             observed_directory_paths: Arc::new(Mutex::new(BTreeSet::new())),
+            add_dir_info: None,
             security_descriptor: Arc::new(
                 SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
                     .expect("read-only security descriptor should be valid"),
@@ -1863,6 +1857,10 @@ impl WinfspMountContext {
 
     pub fn refresh_namespace(&mut self) -> Result<RefreshOutcome> {
         self.vfs.refresh_live_branch()
+    }
+
+    fn set_add_dir_info_fn(&mut self, add_dir_info: FspFileSystemAddDirInfoFn) {
+        self.add_dir_info = Some(add_dir_info);
     }
 
     pub fn build_invalidation_plan(
@@ -1983,6 +1981,10 @@ impl WinfspMountContext {
 
     fn security_descriptor_bytes(&self) -> &[u8] {
         &self.security_descriptor.bytes
+    }
+
+    fn add_dir_info_fn(&self) -> Option<FspFileSystemAddDirInfoFn> {
+        self.add_dir_info
     }
 
     fn remember_inode(&self, inode_id: u64) {
