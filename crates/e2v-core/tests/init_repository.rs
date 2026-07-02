@@ -680,6 +680,35 @@ fn explicit_snapshot_reads_do_not_require_the_default_ref_to_exist() {
 }
 
 #[test]
+fn explicit_branch_resolution_does_not_require_the_default_ref_to_exist() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let created = facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "explicit branch".to_string(),
+        })
+        .unwrap();
+
+    let default_ref_path = repo_root.join(".e2v").join("refs").join("default.json");
+    fs::remove_file(default_ref_path).unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service
+        .resolve_branch(&created.branch.token_hex)
+        .unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+}
+
+#[test]
 fn create_branch_restores_access_via_local_device_after_cache_clear() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

@@ -1539,14 +1539,19 @@ impl ReadService {
     pub fn resolve_branch(&self, ref_token_hex: &str) -> Result<SnapshotHandle> {
         validate_ref_token_value(ref_token_hex)?;
         let control_dir = self.repo_root.join(CONTROL_DIR);
-        let repo_state = RepositoryFacade::new().open(&self.repo_root)?;
-        let repo_secrets = open_repo_secrets(&control_dir)?;
-        let current_ref = read_current_ref(&control_dir)?;
-        let branch_ref = if current_ref.ref_token_hex == ref_token_hex {
-            current_ref
-        } else {
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let layout_root = validate_layout_root(&control_dir)?;
+        let branch_ref = if let Some(branch_ref) =
             read_branch_ref_if_exists(&control_dir, &repo_secrets, ref_token_hex)?
-                .context("branch ref not found for token")?
+        {
+            branch_ref
+        } else {
+            let current_ref = read_default_ref(&control_dir, &repo_secrets)?;
+            anyhow::ensure!(
+                current_ref.ref_token_hex == ref_token_hex,
+                "branch ref not found for token"
+            );
+            current_ref
         };
         let snapshot_id = branch_ref
             .head_snapshot_id
@@ -1556,7 +1561,7 @@ impl ReadService {
 
         Ok(SnapshotHandle {
             snapshot_id,
-            layout_generation: repo_state.layout_generation,
+            layout_generation: layout_root.generation,
             root_tree_id: snapshot.root_tree_id,
         })
     }
