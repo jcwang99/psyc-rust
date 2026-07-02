@@ -1104,6 +1104,25 @@ fn winfsp_test_probes_are_not_exposed_as_public_api_methods() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn winfsp_security_callbacks_reuse_a_single_cached_descriptor_parse() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    let parse_count = source
+        .matches("SecurityDescriptorBytes::from_sddl(")
+        .count();
+    assert_eq!(
+        parse_count, 1,
+        "WinFSP host should parse the read-only security descriptor once and reuse cached bytes, found {parse_count} parses"
+    );
+}
+
 #[test]
 fn snapshot_vfs_accepts_rooted_and_trailing_slash_paths() {
     let temp = tempdir().unwrap();

@@ -41,7 +41,6 @@ pub struct WindowsMountedFilesystemHost {
     runtime: WinfspRuntimeLibrary,
     _interface: Box<NativeWinfspInterface>,
     _mount_context: Box<WinfspMountContext>,
-    _security_descriptor: Arc<SecurityDescriptorBytes>,
     stop_state: Arc<HostStopState>,
 }
 
@@ -184,9 +183,6 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
         "x86_64",
     )?;
     let runtime = WinfspRuntimeLibrary::load(&runtime_paths)?;
-    let security_descriptor = Arc::new(SecurityDescriptorBytes::from_sddl(
-        READ_ONLY_SECURITY_DESCRIPTOR_SDDL,
-    )?);
     let stop_state = Arc::new(HostStopState::default());
     let interface = Box::new(NativeWinfspInterface::read_only_host());
     let mut native_volume_params = NativeWinfspVolumeParams::from_volume_params(&volume_params);
@@ -266,7 +262,6 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
                 runtime,
                 _interface: interface,
                 _mount_context: mount_context,
-                _security_descriptor: security_descriptor,
                 stop_state,
             },
         ),
@@ -1190,6 +1185,33 @@ fn unsupported_winfsp_status(event: &str, status: i32) -> i32 {
     status
 }
 
+fn copy_security_descriptor_bytes(
+    security_descriptor_bytes: &[u8],
+    security_descriptor: *mut c_void,
+    security_descriptor_size: *mut usize,
+) -> i32 {
+    if security_descriptor_size.is_null() {
+        return STATUS_ACCESS_DENIED;
+    }
+    let requested = unsafe { *security_descriptor_size };
+    unsafe {
+        *security_descriptor_size = security_descriptor_bytes.len();
+    }
+    if requested < security_descriptor_bytes.len() {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    if !security_descriptor.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                security_descriptor_bytes.as_ptr(),
+                security_descriptor.cast::<u8>(),
+                security_descriptor_bytes.len(),
+            );
+        }
+    }
+    STATUS_SUCCESS
+}
+
 fn fill_file_info_from_metadata(
     file_info: &mut NativeFspFsctlFileInfo,
     metadata: &VfsNodeMetadata,
@@ -1266,31 +1288,11 @@ unsafe extern "C" fn host_get_security_by_name(
             };
         }
     }
-    let descriptor = READ_ONLY_SECURITY_DESCRIPTOR_SDDL;
-    let security_descriptor_bytes =
-        match SecurityDescriptorBytes::from_sddl(descriptor).map(|value| value.bytes) {
-            Ok(bytes) => bytes,
-            Err(_) => return STATUS_ACCESS_DENIED,
-        };
-    if !security_descriptor_size.is_null() {
-        let requested = unsafe { *security_descriptor_size };
-        unsafe {
-            *security_descriptor_size = security_descriptor_bytes.len();
-        }
-        if requested < security_descriptor_bytes.len() {
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        if !security_descriptor.is_null() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    security_descriptor_bytes.as_ptr(),
-                    security_descriptor.cast::<u8>(),
-                    security_descriptor_bytes.len(),
-                );
-            }
-        }
-    }
-    STATUS_SUCCESS
+    copy_security_descriptor_bytes(
+        context.security_descriptor_bytes(),
+        security_descriptor,
+        security_descriptor_size,
+    )
 }
 
 unsafe extern "C" fn host_set_volume_label_w(
@@ -1547,42 +1549,18 @@ unsafe extern "C" fn host_get_file_info(
 }
 
 unsafe extern "C" fn host_get_security(
-    _filesystem: *mut c_void,
+    filesystem: *mut c_void,
     _file_context: *mut c_void,
     security_descriptor: *mut c_void,
     security_descriptor_size: *mut usize,
 ) -> i32 {
     debug_winfsp("get_security", "");
-    let security_descriptor_bytes =
-        match SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
-            .map(|value| value.bytes)
-        {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                debug_winfsp("get_security_err", &error.to_string());
-                return STATUS_ACCESS_DENIED;
-            }
-        };
-    if security_descriptor_size.is_null() {
-        return STATUS_ACCESS_DENIED;
-    }
-    let requested = unsafe { *security_descriptor_size };
-    unsafe {
-        *security_descriptor_size = security_descriptor_bytes.len();
-    }
-    if requested < security_descriptor_bytes.len() {
-        return STATUS_BUFFER_OVERFLOW;
-    }
-    if !security_descriptor.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                security_descriptor_bytes.as_ptr(),
-                security_descriptor.cast::<u8>(),
-                security_descriptor_bytes.len(),
-            );
-        }
-    }
-    STATUS_SUCCESS
+    let context = context_from_filesystem(filesystem);
+    copy_security_descriptor_bytes(
+        context.security_descriptor_bytes(),
+        security_descriptor,
+        security_descriptor_size,
+    )
 }
 
 unsafe extern "C" fn host_set_basic_info(
@@ -1842,6 +1820,7 @@ pub struct WinfspMountContext {
     cache_policy: CachePolicy,
     observed_inode_ids: Arc<Mutex<BTreeSet<u64>>>,
     observed_directory_paths: Arc<Mutex<BTreeSet<String>>>,
+    security_descriptor: Arc<SecurityDescriptorBytes>,
     vfs: ReadOnlyVfs,
 }
 
@@ -1858,6 +1837,10 @@ impl WinfspMountContext {
             cache_policy,
             observed_inode_ids: Arc::new(Mutex::new(BTreeSet::new())),
             observed_directory_paths: Arc::new(Mutex::new(BTreeSet::new())),
+            security_descriptor: Arc::new(
+                SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
+                    .expect("read-only security descriptor should be valid"),
+            ),
             vfs,
         }
     }
@@ -1996,6 +1979,10 @@ impl WinfspMountContext {
             sector_size: DEFAULT_SECTOR_SIZE,
             read_only: true,
         }
+    }
+
+    fn security_descriptor_bytes(&self) -> &[u8] {
+        &self.security_descriptor.bytes
     }
 
     fn remember_inode(&self, inode_id: u64) {
