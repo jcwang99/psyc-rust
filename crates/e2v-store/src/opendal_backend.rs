@@ -429,10 +429,11 @@ impl BlobStore for OpendalMemoryBackend {
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
-        if self.exists_physical(relative_path) {
-            self.operator.delete(relative_path)?;
+        match self.operator.delete(relative_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         }
-        Ok(())
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {
@@ -513,10 +514,11 @@ impl BlobStore for OpendalWebdavBackend {
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
-        if self.exists_physical(relative_path) {
-            self.operator.delete(relative_path)?;
+        match self.operator.delete(relative_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         }
-        Ok(())
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {
@@ -947,10 +949,11 @@ impl BlobStore for OpendalS3Backend {
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
-        if self.exists_physical(relative_path) {
-            self.operator.delete(relative_path)?;
+        match self.operator.delete(relative_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         }
-        Ok(())
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {

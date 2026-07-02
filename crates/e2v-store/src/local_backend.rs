@@ -187,19 +187,37 @@ impl BlobStore for LocalFolderBackend {
         offset: usize,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let bytes = self.get_object(relative_path)?;
-        anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
-        let end = offset.saturating_add(length).min(bytes.len());
-        Ok(bytes[offset..end].to_vec())
+        let full_path = self.resolve_relative_path(relative_path)?;
+        let mut file = fs::File::open(&full_path)
+            .with_context(|| format!("failed to read object {}", full_path.display()))?;
+        let total_length: usize = file
+            .metadata()
+            .with_context(|| format!("failed to stat object {}", full_path.display()))?
+            .len()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("object length does not fit in usize"))?;
+        anyhow::ensure!(offset <= total_length, "range offset out of bounds");
+        let end = offset.saturating_add(length).min(total_length);
+        if offset == end {
+            return Ok(Vec::new());
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset as u64))
+            .with_context(|| format!("failed to seek object {}", full_path.display()))?;
+        let mut bytes = vec![0u8; end - offset];
+        file.read_exact(&mut bytes)
+            .with_context(|| format!("failed to read object range {}", full_path.display()))?;
+        Ok(bytes)
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
         let full_path = self.resolve_relative_path(relative_path)?;
-        if !full_path.exists() {
-            return Ok(());
+        match fs::remove_file(&full_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to delete object {}", full_path.display())),
         }
-        fs::remove_file(&full_path)
-            .with_context(|| format!("failed to delete object {}", full_path.display()))
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {

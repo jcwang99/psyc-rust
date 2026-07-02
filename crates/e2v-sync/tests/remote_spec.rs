@@ -93,6 +93,47 @@ fn store_read_paths_do_not_probe_ref_or_layout_root_existence_before_loading() {
 }
 
 #[test]
+fn store_delete_paths_do_not_probe_existence_before_removal() {
+    let store_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("e2v-store")
+        .join("src");
+    let local_source = std::fs::read_to_string(store_src.join("local_backend.rs")).unwrap();
+    let opendal_source = std::fs::read_to_string(store_src.join("opendal_backend.rs")).unwrap();
+
+    for needless_probe in [
+        "if !full_path.exists() {",
+        "if self.exists_physical(relative_path) {",
+    ] {
+        assert!(
+            !local_source.contains(needless_probe),
+            "local backend delete path should not probe existence before removal: {needless_probe}"
+        );
+        assert!(
+            !opendal_source.contains(needless_probe),
+            "opendal backend delete path should not probe existence before removal: {needless_probe}"
+        );
+    }
+}
+
+#[test]
+fn local_store_range_reads_do_not_materialize_the_full_file_first() {
+    let local_source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("e2v-store")
+            .join("src")
+            .join("local_backend.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !local_source.contains("let bytes = self.get_object(relative_path)?;"),
+        "local backend range reads should stream from the file instead of materializing the full physical object first"
+    );
+}
+
+#[test]
 fn parse_remote_spec_decodes_webdav_url_into_remote_config() {
     let spec = e2v_sync::RemoteSpec::parse("webdav+https://alice:secret@example.com/repo").unwrap();
 
