@@ -4,7 +4,7 @@ use std::{
     net::TcpStream,
     process::{Child, Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
@@ -651,7 +651,7 @@ fn clone_command_clones_an_explicit_remote_spec_into_a_target_repo() {
 }
 
 #[test]
-fn mount_snapshot_command_delegates_to_e2v_vfs() {
+fn mount_snapshot_command_requires_cli_process_entrypoint() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -665,7 +665,7 @@ fn mount_snapshot_command_delegates_to_e2v_vfs() {
         .unwrap()
         .snapshot_id;
 
-    let output = e2v_cli::testing::run_cli([
+    let error = e2v_cli::testing::run_cli([
         "e2v",
         "mount",
         "--repo",
@@ -676,17 +676,17 @@ fn mount_snapshot_command_delegates_to_e2v_vfs() {
         "--mount-point",
         "X:",
     ])
-    .unwrap();
+    .unwrap_err();
 
-    assert!(output.contains("snapshot-pinned"));
-    assert!(output.contains("X:"));
-    assert!(output.contains("KernelCacheWithInvalidation"));
-    assert!(output.contains("read-only"));
-    assert!(output.contains("stream-only"));
+    assert!(
+        error
+            .to_string()
+            .contains("mount command requires the CLI process entrypoint")
+    );
 }
 
 #[test]
-fn mount_branch_command_delegates_to_e2v_vfs() {
+fn mount_branch_command_requires_cli_process_entrypoint() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -704,7 +704,7 @@ fn mount_branch_command_delegates_to_e2v_vfs() {
         .branch
         .token_hex;
 
-    let output = e2v_cli::testing::run_cli([
+    let error = e2v_cli::testing::run_cli([
         "e2v",
         "mount",
         "--repo",
@@ -715,13 +715,96 @@ fn mount_branch_command_delegates_to_e2v_vfs() {
         "--mount-point",
         "Y:",
     ])
-    .unwrap();
+    .unwrap_err();
 
-    assert!(output.contains("live-branch"));
-    assert!(output.contains("Y:"));
-    assert!(output.contains("KernelCacheWithInvalidation"));
-    assert!(output.contains("read-only"));
-    assert!(output.contains("stream-only"));
+    assert!(
+        error
+            .to_string()
+            .contains("mount command requires the CLI process entrypoint")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn mount_snapshot_command_keeps_process_alive_while_winfsp_mount_is_active() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let snapshot_id = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap()
+        .snapshot_id;
+
+    let bin = cli_binary_path();
+    let child = Command::new(bin)
+        .args([
+            "mount",
+            "--repo",
+            repo_root.to_str().unwrap(),
+            "snapshot",
+            "--snapshot",
+            &snapshot_id,
+            "--mount-point",
+            "R:",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard::new(child);
+
+    let mut stdout = child.child.stdout.take().unwrap();
+    let mut buffer = String::new();
+    for _ in 0..50 {
+        let mut chunk = [0u8; 256];
+        let read = stdout.read(&mut chunk).unwrap_or(0);
+        if read > 0 {
+            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+            if buffer.contains('\n') {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let first_line = buffer.lines().next().unwrap_or_default().trim().to_string();
+    assert!(
+        first_line.contains("mounted snapshot-pinned at R:\\"),
+        "mount command should print active mount summary, got stdout: {buffer:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::read_to_string(r"R:\tracked.txt") {
+            Ok(contents) => {
+                assert_eq!(contents, "alpha");
+                break;
+            }
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("retry read error={error:?}");
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("mounted file never became readable: {error:?}"),
+        }
+    }
+
+    drop(child);
+
+    let unmount_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::metadata(r"R:\") {
+            Err(_) => break,
+            Ok(_) if Instant::now() < unmount_deadline => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(metadata) => panic!("mount point should be released after CLI exit: {metadata:?}"),
+        }
+    }
 }
 
 #[test]

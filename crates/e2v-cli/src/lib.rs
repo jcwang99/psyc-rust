@@ -19,7 +19,9 @@ use e2v_sync::{
     RemoteBackendRef, ServeOptions, gc_execute_capability_status,
     load_trusted_remote_state_for_repo, serve_local_web,
 };
-use e2v_vfs::{MountLaunchSummary, mount_live_branch, mount_snapshot};
+use e2v_vfs::{MountLaunchSummary, start_live_branch_mount, start_snapshot_mount};
+#[cfg(not(windows))]
+use e2v_vfs::{mount_live_branch, mount_snapshot};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -268,13 +270,19 @@ struct DoctorBundleSummary {
 }
 
 pub fn run_from_env() -> Result<()> {
-    let cli = Cli::parse();
-    if let Command::Serve { repo } = &cli.command {
-        return run_serve_command(repo.clone());
+    match Cli::parse() {
+        Cli {
+            command: Command::Serve { repo },
+        } => run_serve_command(repo),
+        Cli {
+            command: Command::Mount { repo, command },
+        } => run_mount_command(repo, command),
+        cli => {
+            let output = execute(cli)?;
+            print!("{output}");
+            Ok(())
+        }
     }
-    let output = execute(cli)?;
-    print!("{output}");
-    Ok(())
 }
 
 fn execute(cli: Cli) -> Result<String> {
@@ -658,22 +666,7 @@ fn execute(cli: Cli) -> Result<String> {
             }
         }
         Command::Serve { .. } => anyhow::bail!("serve command requires the CLI process entrypoint"),
-        Command::Mount { command, repo } => match command {
-            MountCommand::Snapshot {
-                snapshot,
-                mount_point,
-            } => {
-                let summary = mount_snapshot(repo, snapshot, mount_point)?;
-                Ok(format_mount_summary(&summary))
-            }
-            MountCommand::Branch {
-                branch_token,
-                mount_point,
-            } => {
-                let summary = mount_live_branch(repo, branch_token, mount_point)?;
-                Ok(format_mount_summary(&summary))
-            }
-        },
+        Command::Mount { .. } => anyhow::bail!("mount command requires the CLI process entrypoint"),
     }
 }
 
@@ -701,6 +694,55 @@ fn run_serve_command(repo: PathBuf) -> Result<()> {
     std::io::stdout().flush()?;
     loop {
         std::thread::park();
+    }
+}
+
+fn run_mount_command(repo: PathBuf, command: MountCommand) -> Result<()> {
+    match command {
+        MountCommand::Snapshot {
+            snapshot,
+            mount_point,
+        } => {
+            #[cfg(windows)]
+            {
+                let mounted = start_snapshot_mount(repo, snapshot, mount_point)?;
+                print!("{}", format_mount_summary(mounted.summary()));
+                std::io::stdout().flush()?;
+                loop {
+                    let _keep_mount_alive = &mounted;
+                    std::thread::park();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let summary = mount_snapshot(repo, snapshot, mount_point)?;
+                print!("{}", format_mount_summary(&summary));
+                std::io::stdout().flush()?;
+                Ok(())
+            }
+        }
+        MountCommand::Branch {
+            branch_token,
+            mount_point,
+        } => {
+            #[cfg(windows)]
+            {
+                let mounted = start_live_branch_mount(repo, branch_token, mount_point)?;
+                print!("{}", format_mount_summary(mounted.summary()));
+                std::io::stdout().flush()?;
+                loop {
+                    let _keep_mount_alive = &mounted;
+                    std::thread::park();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let summary = mount_live_branch(repo, branch_token, mount_point)?;
+                print!("{}", format_mount_summary(&summary));
+                std::io::stdout().flush()?;
+                Ok(())
+            }
+        }
     }
 }
 
