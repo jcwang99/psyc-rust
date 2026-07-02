@@ -779,8 +779,8 @@ pub mod sync_support {
         fn cached_pack_object_reads_only_the_requested_range() {
             let object_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
             let mut short_reader = Cursor::new(b"34".to_vec());
-            let error = read_cached_pack_object_range(&mut short_reader, 3, 5, object_id)
-                .unwrap_err();
+            let error =
+                read_cached_pack_object_range(&mut short_reader, 3, 5, object_id).unwrap_err();
             assert!(
                 error
                     .to_string()
