@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use e2v_api::{
-    parse_remote_spec, CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions,
-    FetchRequest, InitRepositoryOptions, PullRequest, PushRequest, Sdk, SdkErrorCode,
+    CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest,
+    InitRepositoryOptions, PullRequest, PushRequest, Sdk, SdkErrorCode, parse_remote_spec,
 };
 
 fn file_remote_spec(path: &Path) -> String {

@@ -558,12 +558,11 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
         path: next_validation_root(inputs.repo_root)?,
     };
     write_remote_control_plane_to_validation_root(&validation_root, inputs.control_plane)?;
-    let validation_secrets =
-        load_remote_validation_secrets(
-            &validation_root,
-            inputs.password,
-            inputs.device_validation_secrets,
-        )?;
+    let validation_secrets = load_remote_validation_secrets(
+        &validation_root,
+        inputs.password,
+        inputs.device_validation_secrets,
+    )?;
     let mut pack_cache = BTreeMap::new();
     let (_, head_snapshot_id) = e2v_core::sync_support::decode_default_ref_record(
         &validation_root.path,
@@ -1383,11 +1382,8 @@ fn collect_remote_reachable_object_ids_with_context<R: RemoteBackend>(
         if !record_reachable_id(context.recorder, &snapshot_id)? {
             continue;
         }
-        let snapshot: RemoteSnapshotObject = read_remote_validation_object(
-            context.object_store,
-            &snapshot_id,
-            "snapshot",
-        )?;
+        let snapshot: RemoteSnapshotObject =
+            read_remote_validation_object(context.object_store, &snapshot_id, "snapshot")?;
         validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
         collect_remote_tree_object_ids(context, &snapshot.root_tree_id)?;
         if let Some(parent_snapshot_id) = snapshot.parent_snapshot_id {

@@ -116,8 +116,14 @@ pub struct OpendalS3Backend {
 
 impl OpendalS3Backend {
     pub fn new(config: S3RemoteConfig) -> Result<Self> {
-        anyhow::ensure!(!config.endpoint.trim().is_empty(), "s3 endpoint must not be empty");
-        anyhow::ensure!(!config.bucket.trim().is_empty(), "s3 bucket must not be empty");
+        anyhow::ensure!(
+            !config.endpoint.trim().is_empty(),
+            "s3 endpoint must not be empty"
+        );
+        anyhow::ensure!(
+            !config.bucket.trim().is_empty(),
+            "s3 bucket must not be empty"
+        );
         anyhow::ensure!(!config.root.trim().is_empty(), "s3 root must not be empty");
 
         let _guard = OPENDAL_RUNTIME.enter();
@@ -1079,7 +1085,10 @@ impl LayoutRootStore for OpendalS3Backend {
 
         let bytes = serde_json::to_vec_pretty(&next)?;
         self.put_physical("layout_root.json", &bytes)?;
-        self.put_physical(&OpendalMemoryBackend::layout_history_path(next.generation), &bytes)?;
+        self.put_physical(
+            &OpendalMemoryBackend::layout_history_path(next.generation),
+            &bytes,
+        )?;
         Ok(CasResult {
             applied: true,
             current: None,
@@ -1399,13 +1408,14 @@ mod tests {
     fn opendal_memory_backend_range_reads_use_backend_ranges_instead_of_full_object_reads() {
         let service = RangeRecordingService::new((0u8..=15).collect());
         let _guard = OPENDAL_RUNTIME.enter();
-        let operator = opendal::blocking::Operator::new(
-            Operator::from_inner(Arc::new(service.clone())),
-        )
-        .unwrap();
+        let operator =
+            opendal::blocking::Operator::new(Operator::from_inner(Arc::new(service.clone())))
+                .unwrap();
         let backend = OpendalMemoryBackend::from_operator(operator);
 
-        let bytes = backend.get_physical_range("objects/demo.bin", 4, 5).unwrap();
+        let bytes = backend
+            .get_physical_range("objects/demo.bin", 4, 5)
+            .unwrap();
 
         assert_eq!(bytes, vec![4, 5, 6, 7, 8]);
         assert_eq!(service.observed_ranges(), vec![4..9]);
@@ -1417,7 +1427,9 @@ mod tests {
         let token = RefToken::new("keyring/repo-123".to_string());
         let value = EncryptedRef::new(br#"{"generation":1,"current":"keyring.1"}"#.to_vec());
 
-        let cas = backend.compare_and_swap_ref(&token, None, value.clone()).unwrap();
+        let cas = backend
+            .compare_and_swap_ref(&token, None, value.clone())
+            .unwrap();
 
         assert!(cas.applied);
         assert_eq!(backend.read_ref(&token).unwrap().unwrap().value, value);

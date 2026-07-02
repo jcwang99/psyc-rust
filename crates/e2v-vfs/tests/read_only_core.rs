@@ -276,7 +276,9 @@ fn encrypted_disk_cache_hits_are_promoted_into_open_file_memory_cache() {
     assert_eq!(String::from_utf8(first).unwrap(), "lph");
 
     let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
-    let snapshot = read_service.open_snapshot(warm_handle.snapshot_id()).unwrap();
+    let snapshot = read_service
+        .open_snapshot(warm_handle.snapshot_id())
+        .unwrap();
     let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
     for chunk_id in file.debug_chunk_ids() {
         let chunk_path = repo_root
@@ -326,7 +328,9 @@ fn encrypted_disk_cache_remains_readable_after_repo_moves_to_a_new_path() {
 
     fs::rename(&original_repo_root, &moved_repo_root).unwrap();
 
-    let read_service = RepositoryFacade::new().read_service(&moved_repo_root).unwrap();
+    let read_service = RepositoryFacade::new()
+        .read_service(&moved_repo_root)
+        .unwrap();
     let snapshot = read_service.open_snapshot(&snapshot_id).unwrap();
     let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
     for chunk_id in file.debug_chunk_ids() {
@@ -398,9 +402,7 @@ fn oversized_full_file_reads_are_not_retained_in_plaintext_memory_cache() {
     let reopened = vfs.open_file("large.bin").unwrap();
     let error = vfs.read(&reopened, 0, 64 * 1024).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("authentication failed"),
+        error.to_string().contains("authentication failed"),
         "expected oversized read to miss plaintext cache and surface object corruption, got: {error:#}"
     );
 }
@@ -413,7 +415,8 @@ fn cached_full_file_reads_still_reject_out_of_bounds_offsets() {
     init_repo(&repo_root);
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
-    let vfs = ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root, snapshot_id)).unwrap();
+    let vfs =
+        ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root, snapshot_id)).unwrap();
 
     let handle = vfs.open_file("tracked.txt").unwrap();
     let warm = vfs.read(&handle, 0, 32).unwrap();
@@ -497,7 +500,9 @@ fn plaintext_memory_cache_evicts_older_entries_when_budget_is_exceeded() {
     assert_eq!(second, second_bytes);
 
     let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
-    let snapshot = read_service.open_snapshot(first_handle.snapshot_id()).unwrap();
+    let snapshot = read_service
+        .open_snapshot(first_handle.snapshot_id())
+        .unwrap();
     for (path, expected_name) in [("first.bin", b'a'), ("second.bin", b'b')] {
         let file = read_service.open_file(&snapshot, path).unwrap();
         for chunk_id in file.debug_chunk_ids() {
@@ -516,9 +521,7 @@ fn plaintext_memory_cache_evicts_older_entries_when_budget_is_exceeded() {
     let reopened_first = vfs.open_file("first.bin").unwrap();
     let first_error = vfs.read(&reopened_first, 0, 64 * 1024).unwrap_err();
     assert!(
-        first_error
-            .to_string()
-            .contains("authentication failed"),
+        first_error.to_string().contains("authentication failed"),
         "expected first cached file to be evicted once budget is exceeded, got: {first_error:#}"
     );
 
@@ -535,18 +538,17 @@ fn global_plaintext_cache_hits_only_promote_the_requested_slice_into_handle_cach
     init_repo(&repo_root);
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
-    let vfs = ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(
-        repo_root.clone(),
-        snapshot_id,
-    ))
-    .unwrap();
+    let vfs = ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root.clone(), snapshot_id))
+        .unwrap();
 
     let warm_handle = vfs.open_file("tracked.txt").unwrap();
     let first = vfs.read(&warm_handle, 0, 5).unwrap();
     assert_eq!(String::from_utf8(first).unwrap(), "alpha");
 
     let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
-    let snapshot = read_service.open_snapshot(warm_handle.snapshot_id()).unwrap();
+    let snapshot = read_service
+        .open_snapshot(warm_handle.snapshot_id())
+        .unwrap();
     let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
     for chunk_id in file.debug_chunk_ids() {
         let chunk_path = repo_root
@@ -590,7 +592,9 @@ fn encrypted_disk_cache_full_file_entry_can_serve_later_subrange_reads() {
     assert!(warm_handle.cached_plaintext_for_test().is_none());
 
     let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
-    let snapshot = read_service.open_snapshot(warm_handle.snapshot_id()).unwrap();
+    let snapshot = read_service
+        .open_snapshot(warm_handle.snapshot_id())
+        .unwrap();
     let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
     for chunk_id in file.debug_chunk_ids() {
         let chunk_path = repo_root

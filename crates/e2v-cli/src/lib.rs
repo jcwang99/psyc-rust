@@ -16,10 +16,10 @@ use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
 use e2v_store::{BackendCapability, RemoteBackend};
 use e2v_sync::{
-    gc_execute_capability_status, load_trusted_remote_state_for_repo,
-    remote_spec::RemoteBackendRef, serve_local_web, ServeOptions,
+    ServeOptions, gc_execute_capability_status, load_trusted_remote_state_for_repo,
+    remote_spec::RemoteBackendRef, serve_local_web,
 };
-use e2v_vfs::{mount_live_branch, mount_snapshot, MountLaunchSummary};
+use e2v_vfs::{MountLaunchSummary, mount_live_branch, mount_snapshot};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]

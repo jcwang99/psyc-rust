@@ -5,13 +5,13 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use e2v_store::{
-    validate_object_id_value, validate_ref_token_value, DirectLayoutObjectStore, EpochSecrets,
-    LayoutRoot, RepoSecrets,
+    DirectLayoutObjectStore, EpochSecrets, LayoutRoot, RepoSecrets, validate_object_id_value,
+    validate_ref_token_value,
 };
 use postcard::{from_bytes as postcard_from_bytes, to_stdvec as postcard_to_vec};
 use serde::{Deserialize, Serialize};
@@ -19,12 +19,12 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::chunker::FastCdcChunker;
 use crate::keyring::{
-    cache_unlocked_password, cache_unlocked_secrets, generate_local_device_credential,
-    open_repo_secrets, read_current_keyring_state, read_local_device_credential, seal_repo_secrets,
+    KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_password,
+    cache_unlocked_secrets, generate_local_device_credential, open_repo_secrets,
+    read_current_keyring_state, read_local_device_credential, seal_repo_secrets,
     seal_repo_secrets_for_device, unlock_repo_secrets, unlock_repo_secrets_from_generation_file,
     unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
-    unlock_repo_secrets_with_local_device, write_local_device_credential, KeyringPointer,
-    KeyringState, KEYRING_CURRENT_FILE, KEYRING_DIR,
+    unlock_repo_secrets_with_local_device, write_local_device_credential,
 };
 use crate::local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
 use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreApi};
@@ -3575,14 +3575,16 @@ mod facade_tests {
         };
         let mut keyring_one: KeyringState = read_json(generation_one_path.clone()).unwrap();
         keyring_one.generation = 2;
-        keyring_one.envelopes = vec![seal_repo_secrets(
-            &secrets_two.repo_id,
-            DEFAULT_ACTIVE_EPOCH,
-            "correct horse battery staple",
-            &secrets_two,
-            "len:28".to_string(),
-        )
-        .unwrap()];
+        keyring_one.envelopes = vec![
+            seal_repo_secrets(
+                &secrets_two.repo_id,
+                DEFAULT_ACTIVE_EPOCH,
+                "correct horse battery staple",
+                &secrets_two,
+                "len:28".to_string(),
+            )
+            .unwrap(),
+        ];
         atomic_write_json(generation_two_path, &keyring_one).unwrap();
         atomic_write_json(
             current_pointer_path,
@@ -3673,14 +3675,16 @@ mod facade_tests {
         };
         let keyring_two = KeyringState {
             generation: 2,
-            envelopes: vec![seal_repo_secrets(
-                &secrets_two.repo_id,
-                DEFAULT_ACTIVE_EPOCH,
-                "correct horse battery staple",
-                &secrets_two,
-                "len:28".to_string(),
-            )
-            .unwrap()],
+            envelopes: vec![
+                seal_repo_secrets(
+                    &secrets_two.repo_id,
+                    DEFAULT_ACTIVE_EPOCH,
+                    "correct horse battery staple",
+                    &secrets_two,
+                    "len:28".to_string(),
+                )
+                .unwrap(),
+            ],
             ..keyring_one.clone()
         };
 

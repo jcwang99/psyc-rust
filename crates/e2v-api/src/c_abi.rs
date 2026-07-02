@@ -2,16 +2,15 @@
 #![allow(non_upper_case_globals)]
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{c_char, CStr, CString};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, CString, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use serde::Serialize;
 
 use crate::{
     CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest, InitRepositoryOptions,
-    PullRequest, PushRequest, ReadHandle, Sdk, SdkError, SdkErrorCode,
-    ShareAcceptDeviceRequest,
+    PullRequest, PushRequest, ReadHandle, Sdk, SdkError, SdkErrorCode, ShareAcceptDeviceRequest,
     ShareAcceptMemberRequest, ShareInviteDeviceRequest, ShareInviteMemberRequest,
     ShareRevokeDeviceRequest, ShareRevokeMemberRequest, SnapshotView, VerifyRemoteRequest,
 };

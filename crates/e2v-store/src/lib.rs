@@ -13,8 +13,8 @@ pub use layout::LayoutRoot;
 pub use layout_root_store::{LayoutRootStore, LayoutRootVersion};
 pub use local_backend::{BlobStore, LocalFolderBackend, ObjectStat};
 pub use logical_object_store::{
-    DirectLayoutObjectStore, EpochSecrets, LoadedObject, LogicalObjectStore, PhysicalObjectRef, RepoSecrets,
-    validate_object_id_value,
+    DirectLayoutObjectStore, EpochSecrets, LoadedObject, LogicalObjectStore, PhysicalObjectRef,
+    RepoSecrets, validate_object_id_value,
 };
 pub use memory_backend::MemoryBackend;
 pub use opendal_backend::{

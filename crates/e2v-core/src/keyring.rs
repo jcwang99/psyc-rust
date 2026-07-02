@@ -701,14 +701,8 @@ mod tests {
             repo_manifest_enc_key_hex: hex_key(3),
             repo_nonce_key_hex: hex_key(4),
             repo_path_index_key_hex: hex_key(5),
-            epoch_manifest_enc_keys_hex: BTreeMap::from([
-                (1, hex_key(6)),
-                (2, hex_key(7)),
-            ]),
-            epoch_nonce_keys_hex: BTreeMap::from([
-                (1, hex_key(8)),
-                (2, hex_key(9)),
-            ]),
+            epoch_manifest_enc_keys_hex: BTreeMap::from([(1, hex_key(6)), (2, hex_key(7))]),
+            epoch_nonce_keys_hex: BTreeMap::from([(1, hex_key(8)), (2, hex_key(9))]),
         }
     }
 

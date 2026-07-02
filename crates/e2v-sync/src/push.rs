@@ -1170,9 +1170,8 @@ mod tests {
 
     use super::{
         PackedObjectLocation, PushOptions, push_head, read_remote_current_keyring_bytes,
-        remote_object_authenticates_for_repo,
-        remote_snapshot_graph_authenticates_for_repo, should_pack_small_objects,
-        upload_object_batch,
+        remote_object_authenticates_for_repo, remote_snapshot_graph_authenticates_for_repo,
+        should_pack_small_objects, upload_object_batch,
     };
     use crate::journal::OperationId;
 

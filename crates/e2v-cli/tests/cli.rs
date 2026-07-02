@@ -10,7 +10,7 @@ use std::{
 use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
 use e2v_store::BlobStore;
 use e2v_store::LocalFolderBackend;
-use e2v_sync::{push_head, PushOptions};
+use e2v_sync::{PushOptions, push_head};
 use tempfile::tempdir;
 
 fn cli_binary_path() -> std::path::PathBuf {

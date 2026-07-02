@@ -223,7 +223,12 @@ impl BlobStore for LocalFolderBackend {
             return Ok(listed);
         }
 
-        fn visit(base: &Path, current: &Path, prefix: &str, listed: &mut Vec<String>) -> Result<()> {
+        fn visit(
+            base: &Path,
+            current: &Path,
+            prefix: &str,
+            listed: &mut Vec<String>,
+        ) -> Result<()> {
             for entry in fs::read_dir(current)
                 .with_context(|| format!("failed to list objects under {}", current.display()))?
             {
@@ -386,8 +391,8 @@ mod tests {
     use std::fs;
 
     use crate::capability::WriterMode;
-    use crate::ref_store::{EncryptedRef, RefStore, RefToken};
     use crate::opendal_backend::RemoteBackend;
+    use crate::ref_store::{EncryptedRef, RefStore, RefToken};
 
     use tempfile::tempdir;
 
@@ -534,7 +539,10 @@ mod tests {
         let backend = LocalFolderBackend::new(temp.path());
 
         assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
-        assert_eq!(backend.capability().push_write_mode(), WriterMode::SingleWriter);
+        assert_eq!(
+            backend.capability().push_write_mode(),
+            WriterMode::SingleWriter
+        );
         assert!(backend.capability().supports_safe_single_writer_push());
     }
 

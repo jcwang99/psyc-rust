@@ -357,8 +357,8 @@ fn read_directory_entries(
         }
     }
 
-    let directory_root: DirectoryRootObject = postcard_from_bytes(&loaded.plaintext)
-        .context("failed to decode object plaintext")?;
+    let directory_root: DirectoryRootObject =
+        postcard_from_bytes(&loaded.plaintext).context("failed to decode object plaintext")?;
     validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
     let mut entries = Vec::new();
     for shard_id in directory_root.shards {

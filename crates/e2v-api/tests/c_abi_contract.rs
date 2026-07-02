@@ -38,8 +38,12 @@ fn path_c_string(path: &std::path::Path) -> CString {
 }
 
 fn read_header_file() -> String {
-    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("include").join("e2v_api.h"))
-        .unwrap()
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("include")
+            .join("e2v_api.h"),
+    )
+    .unwrap()
 }
 
 fn new_sdk_handle() -> *mut c_abi::e2v_sdk_t {
@@ -138,7 +142,10 @@ fn c_abi_rejects_null_out_parameter_with_invalid_argument() {
 
     assert_eq!(code, c_abi::E2V_INVALID_ARGUMENT);
     assert!(!error.is_null());
-    assert_eq!(unsafe { c_abi::e2v_error_code(error) }, c_abi::E2V_INVALID_ARGUMENT);
+    assert_eq!(
+        unsafe { c_abi::e2v_error_code(error) },
+        c_abi::E2V_INVALID_ARGUMENT
+    );
     unsafe {
         c_abi::e2v_error_free(error);
     }
@@ -151,14 +158,16 @@ fn c_abi_maps_missing_repo_to_not_found() {
     let mut json = c_abi::e2v_string_t::default();
     let mut error = std::ptr::null_mut();
 
-    let code = unsafe {
-        c_abi::e2v_open_repository_json(sdk, repo_root.as_ptr(), &mut json, &mut error)
-    };
+    let code =
+        unsafe { c_abi::e2v_open_repository_json(sdk, repo_root.as_ptr(), &mut json, &mut error) };
 
     assert_eq!(code, c_abi::E2V_NOT_FOUND);
     assert!(json.ptr.is_null());
     assert!(!error.is_null());
-    assert_eq!(unsafe { c_abi::e2v_error_code(error) }, c_abi::E2V_NOT_FOUND);
+    assert_eq!(
+        unsafe { c_abi::e2v_error_code(error) },
+        c_abi::E2V_NOT_FOUND
+    );
 
     let mut message = c_abi::e2v_string_t::default();
     let message_code = unsafe { c_abi::e2v_error_message(error, &mut message) };
@@ -180,7 +189,10 @@ fn c_abi_catches_panics_and_returns_internal_panic() {
 
     assert_eq!(code, c_abi::E2V_INTERNAL_PANIC);
     assert!(!error.is_null());
-    assert_eq!(unsafe { c_abi::e2v_error_code(error) }, c_abi::E2V_INTERNAL_PANIC);
+    assert_eq!(
+        unsafe { c_abi::e2v_error_code(error) },
+        c_abi::E2V_INTERNAL_PANIC
+    );
     unsafe {
         c_abi::e2v_error_free(error);
     }
@@ -242,7 +254,12 @@ fn c_abi_can_init_commit_and_read_file_bytes() {
     let branch_token = CString::new(repo.branch.token_hex).unwrap();
     let mut snapshot = std::ptr::null_mut();
     let resolve_code = unsafe {
-        c_abi::e2v_resolve_branch(read_handle, branch_token.as_ptr(), &mut snapshot, &mut error)
+        c_abi::e2v_resolve_branch(
+            read_handle,
+            branch_token.as_ptr(),
+            &mut snapshot,
+            &mut error,
+        )
     };
     assert_eq!(resolve_code, c_abi::E2V_OK);
     assert!(error.is_null());
@@ -275,12 +292,14 @@ fn c_abi_can_init_commit_and_read_file_bytes() {
     assert_eq!(entries[0].name, "hello.txt");
 
     let mut bytes = c_abi::e2v_bytes_t::default();
-    let read_bytes_code = unsafe {
-        c_abi::e2v_read_range(read_handle, file, 0, 32, &mut bytes, &mut error)
-    };
+    let read_bytes_code =
+        unsafe { c_abi::e2v_read_range(read_handle, file, 0, 32, &mut bytes, &mut error) };
     assert_eq!(read_bytes_code, c_abi::E2V_OK);
     assert!(error.is_null());
-    assert_eq!(String::from_utf8(read_owned_bytes(&mut bytes)).unwrap(), "hello ffi");
+    assert_eq!(
+        String::from_utf8(read_owned_bytes(&mut bytes)).unwrap(),
+        "hello ffi"
+    );
 
     let snapshot_id = c_string(&commit.snapshot_id);
     let mut opened_snapshot = std::ptr::null_mut();
@@ -351,7 +370,8 @@ fn c_abi_can_list_snapshots_checkout_and_change_password() {
         },
         c_abi::E2V_OK
     );
-    let first: CommitInfo = serde_json::from_str(&read_owned_string(&mut first_commit_json)).unwrap();
+    let first: CommitInfo =
+        serde_json::from_str(&read_owned_string(&mut first_commit_json)).unwrap();
 
     fs::write(repo_root.join("tracked.txt"), "beta").unwrap();
     let mut second_commit_json = c_abi::e2v_string_t::default();
@@ -492,12 +512,7 @@ fn c_abi_can_list_checkout_and_delete_branches() {
     let mut branches_json = c_abi::e2v_string_t::default();
     assert_eq!(
         unsafe {
-            c_abi::e2v_list_branches_json(
-                sdk,
-                repo_root_c.as_ptr(),
-                &mut branches_json,
-                &mut error,
-            )
+            c_abi::e2v_list_branches_json(sdk, repo_root_c.as_ptr(), &mut branches_json, &mut error)
         },
         c_abi::E2V_OK
     );
@@ -747,7 +762,10 @@ fn c_abi_can_register_remote_and_run_sync_maintenance_flows() {
     let sdk = new_sdk_handle();
     let source_repo_c = path_c_string(&source_repo);
     let clone_repo_c = path_c_string(&clone_repo);
-    let remote_spec = format!("file://{}", remote_repo.to_string_lossy().replace('\\', "/"));
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
     let remote_spec_c = c_string(&remote_spec);
     let mut error = std::ptr::null_mut();
     let mut init_json = c_abi::e2v_string_t::default();
@@ -1056,7 +1074,10 @@ fn c_abi_can_register_remote_and_run_sync_maintenance_flows() {
         },
         c_abi::E2V_INVALID_ARGUMENT
     );
-    assert_eq!(unsafe { c_abi::e2v_error_code(error) }, c_abi::E2V_INVALID_ARGUMENT);
+    assert_eq!(
+        unsafe { c_abi::e2v_error_code(error) },
+        c_abi::E2V_INVALID_ARGUMENT
+    );
     let maintenance_error = error_message_from_ptr(error);
     assert!(
         maintenance_error.contains("maintenance window"),
@@ -1101,7 +1122,10 @@ fn c_abi_pull_rejects_diverged_local_history_without_moving_the_current_branch()
     let sdk = new_sdk_handle();
     let source_repo_c = path_c_string(&source_repo);
     let clone_repo_c = path_c_string(&clone_repo);
-    let remote_spec = format!("file://{}", remote_repo.to_string_lossy().replace('\\', "/"));
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
     let remote_spec_c = c_string(&remote_spec);
     let mut error = std::ptr::null_mut();
     let mut init_json = c_abi::e2v_string_t::default();
@@ -1274,12 +1298,7 @@ fn c_abi_pull_rejects_diverged_local_history_without_moving_the_current_branch()
     let mut read_handle = std::ptr::null_mut();
     assert_eq!(
         unsafe {
-            c_abi::e2v_open_read_handle(
-                sdk,
-                clone_repo_c.as_ptr(),
-                &mut read_handle,
-                &mut error,
-            )
+            c_abi::e2v_open_read_handle(sdk, clone_repo_c.as_ptr(), &mut read_handle, &mut error)
         },
         c_abi::E2V_OK
     );
@@ -1313,7 +1332,10 @@ fn c_abi_pull_rejects_diverged_local_history_without_moving_the_current_branch()
         unsafe { c_abi::e2v_read_range(read_handle, file_handle, 0, 32, &mut bytes, &mut error) },
         c_abi::E2V_OK
     );
-    assert_eq!(String::from_utf8(read_owned_bytes(&mut bytes)).unwrap(), "local-only");
+    assert_eq!(
+        String::from_utf8(read_owned_bytes(&mut bytes)).unwrap(),
+        "local-only"
+    );
 
     unsafe {
         c_abi::e2v_file_view_free(file_handle);

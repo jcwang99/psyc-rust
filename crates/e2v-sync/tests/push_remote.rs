@@ -11,7 +11,7 @@ use serde_json::Value;
 use tempfile::tempdir;
 
 use e2v_sync::{
-    clone_remote, fetch_remote, push_head, resume_push, CloneOptions, PushOptions, ResumeOptions,
+    CloneOptions, PushOptions, ResumeOptions, clone_remote, fetch_remote, push_head, resume_push,
 };
 
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
@@ -1961,10 +1961,12 @@ fn push_uses_single_writer_lease_fallback_for_safe_single_writer_backend() {
     .unwrap();
 
     assert_eq!(pushed.published_snapshot_id, commit.snapshot_id);
-    assert!(remote
-        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-        .unwrap()
-        .is_some());
+    assert!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_some()
+    );
     assert!(!remote.exists_physical(&format!("leases/{}.lock", state.branch.token_hex)));
 }
 
@@ -2256,9 +2258,11 @@ fn push_refreshes_single_writer_heartbeat_during_long_running_upload_before_inte
         },
     )
     .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("simulated timed single-writer object upload interruption"));
+    assert!(
+        error
+            .to_string()
+            .contains("simulated timed single-writer object upload interruption")
+    );
 
     let intent: Value = serde_json::from_slice(
         &remote
@@ -3053,10 +3057,12 @@ fn resume_skips_uploaded_objects_and_republishes_missing_ref() {
 
     assert!(resumed.skipped_uploaded_objects > 0);
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
-    assert!(rebuilt
-        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-        .unwrap()
-        .is_some());
+    assert!(
+        rebuilt
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -3293,9 +3299,11 @@ fn resume_uploads_objects_missing_after_interrupted_push() {
         },
     )
     .unwrap_err();
-    assert!(push_error
-        .to_string()
-        .contains("simulated object upload interruption"));
+    assert!(
+        push_error
+            .to_string()
+            .contains("simulated object upload interruption")
+    );
 
     let resumed = resume_push(
         &facade,
@@ -3457,8 +3465,8 @@ fn resume_restores_missing_control_plane_files_before_republishing_ref() {
 }
 
 #[test]
-fn resume_succeeds_without_restoring_redundant_remote_ref_mirror_when_remote_ref_already_matches_local_head(
-) {
+fn resume_succeeds_without_restoring_redundant_remote_ref_mirror_when_remote_ref_already_matches_local_head()
+ {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -4129,9 +4137,11 @@ fn resume_reacquires_expired_single_writer_lease_before_republishing_missing_ref
         },
     )
     .unwrap_err();
-    assert!(push_error
-        .to_string()
-        .contains("simulated single-writer object upload interruption"));
+    assert!(
+        push_error
+            .to_string()
+            .contains("simulated single-writer object upload interruption")
+    );
 
     remote
         .inner
@@ -4466,10 +4476,12 @@ fn push_rejects_missing_remote_parent_chain() {
     .unwrap_err();
 
     assert!(error.to_string().contains("ancestor"));
-    assert!(remote
-        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-        .unwrap()
-        .is_none());
+    assert!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_none()
+    );
     assert!(second.snapshot_id.len() > 10);
 }
 
@@ -4517,10 +4529,12 @@ fn push_rejects_operation_id_with_path_traversal_before_mutating_remote_state() 
     assert!(remote.list_physical("objects/").unwrap().is_empty());
     assert!(remote.list_physical("packs/index/").unwrap().is_empty());
     assert!(remote.list_physical("packs/data/").unwrap().is_empty());
-    assert!(remote
-        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
-        .unwrap()
-        .is_none());
+    assert!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .is_none()
+    );
     assert!(!remote.exists_physical("transactions/active/../evil.intent"));
 }
 

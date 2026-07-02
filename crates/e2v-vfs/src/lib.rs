@@ -496,10 +496,8 @@ impl ReadOnlyVfs {
     }
 
     fn cacheable_plaintext_range(&self, offset: usize, bytes: Vec<u8>) -> Option<CachedRange> {
-        (bytes.len() <= self.plaintext_memory_cache_budget_bytes).then_some(CachedRange {
-            offset,
-            bytes,
-        })
+        (bytes.len() <= self.plaintext_memory_cache_budget_bytes)
+            .then_some(CachedRange { offset, bytes })
     }
 
     fn replace_open_file_cache(&self, opened_file: &OpenedFile, cached_range: Option<CachedRange>) {
@@ -650,8 +648,13 @@ impl EncryptedRangeCache {
         offset: usize,
         length: usize,
     ) -> PathBuf {
-        let prefix =
-            self.cache_entry_key(snapshot_id, file_object_id, layout_generation, offset, length);
+        let prefix = self.cache_entry_key(
+            snapshot_id,
+            file_object_id,
+            layout_generation,
+            offset,
+            length,
+        );
         self.cache_dir.join(format!("{prefix}.bin"))
     }
 
@@ -694,7 +697,8 @@ impl EncryptedRangeCache {
         offset: usize,
         length: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let mut candidates = self.range_index_entries(snapshot_id, file_object_id, layout_generation)?;
+        let mut candidates =
+            self.range_index_entries(snapshot_id, file_object_id, layout_generation)?;
         let mut stale_entries = Vec::new();
         for candidate in candidates.iter().cloned() {
             let path = self.cache_path(
@@ -720,8 +724,7 @@ impl EncryptedRangeCache {
                 }
             };
             let cached_length = plaintext.len();
-            if cached_offset != candidate.offset || cached_length != candidate.length
-            {
+            if cached_offset != candidate.offset || cached_length != candidate.length {
                 stale_entries.push(candidate);
                 continue;
             }
@@ -793,7 +796,8 @@ impl EncryptedRangeCache {
         layout_generation: u64,
         new_entry: RangeIndexEntry,
     ) -> Result<()> {
-        let mut entries = self.range_index_entries(snapshot_id, file_object_id, layout_generation)?;
+        let mut entries =
+            self.range_index_entries(snapshot_id, file_object_id, layout_generation)?;
         if !entries.contains(&new_entry) {
             entries.push(new_entry);
         }
@@ -836,7 +840,8 @@ impl EncryptedRangeCache {
         let remaining = if let Some(entries) = retained_entries {
             entries.to_vec()
         } else {
-            let Ok(mut entries) = self.range_index_entries(snapshot_id, file_object_id, layout_generation)
+            let Ok(mut entries) =
+                self.range_index_entries(snapshot_id, file_object_id, layout_generation)
             else {
                 return;
             };
@@ -880,14 +885,13 @@ impl EncryptedRangeCache {
         );
         let mut count_bytes = [0u8; 8];
         count_bytes.copy_from_slice(&bytes[..8]);
-        let count = usize::try_from(u64::from_le_bytes(count_bytes))
-            .map_err(|_| anyhow::anyhow!("encrypted VFS disk cache range index count is too large"))?;
+        let count = usize::try_from(u64::from_le_bytes(count_bytes)).map_err(|_| {
+            anyhow::anyhow!("encrypted VFS disk cache range index count is too large")
+        })?;
         let expected_len = 8usize
-            .checked_add(
-                count
-                    .checked_mul(16)
-                    .ok_or_else(|| anyhow::anyhow!("encrypted VFS disk cache range index is too large"))?,
-            )
+            .checked_add(count.checked_mul(16).ok_or_else(|| {
+                anyhow::anyhow!("encrypted VFS disk cache range index is too large")
+            })?)
             .ok_or_else(|| anyhow::anyhow!("encrypted VFS disk cache range index is too large"))?;
         anyhow::ensure!(
             bytes.len() == expected_len,
@@ -903,10 +907,12 @@ impl EncryptedRangeCache {
             length_bytes.copy_from_slice(&bytes[cursor..cursor + 8]);
             cursor += 8;
             entries.push(RangeIndexEntry {
-                offset: usize::try_from(u64::from_le_bytes(offset_bytes))
-                    .map_err(|_| anyhow::anyhow!("encrypted VFS disk cache range index offset is too large"))?,
-                length: usize::try_from(u64::from_le_bytes(length_bytes))
-                    .map_err(|_| anyhow::anyhow!("encrypted VFS disk cache range index length is too large"))?,
+                offset: usize::try_from(u64::from_le_bytes(offset_bytes)).map_err(|_| {
+                    anyhow::anyhow!("encrypted VFS disk cache range index offset is too large")
+                })?,
+                length: usize::try_from(u64::from_le_bytes(length_bytes)).map_err(|_| {
+                    anyhow::anyhow!("encrypted VFS disk cache range index length is too large")
+                })?,
             });
         }
         Ok(entries)

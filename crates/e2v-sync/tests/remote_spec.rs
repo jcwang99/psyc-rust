@@ -1,6 +1,6 @@
 use e2v_store::{
-    RemoteBackend, S3RemoteConfig, WebdavFlavor, WebdavRemoteConfig,
-    WebdavVerifiedCapabilities, WriterMode,
+    RemoteBackend, S3RemoteConfig, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
+    WriterMode,
 };
 use std::path::PathBuf;
 
