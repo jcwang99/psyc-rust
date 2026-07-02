@@ -3,16 +3,17 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use e2v_core::{RepositoryFacade, sync_support};
+use e2v_store::local_backend::is_missing_physical_object_error;
 use e2v_store::{BackendCapability, RefToken, RemoteBackend, validate_object_id_value};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::fetch::{
-    RemoteValidationRoot, assert_remote_generations_meet_local_floor,
-    RemoteReachabilityRecorder, RemoteReachabilityTraversal, collect_remote_reachable_object_ids,
+    RemoteReachabilityRecorder, RemoteReachabilityTraversal, RemoteValidationRoot,
+    assert_remote_generations_meet_local_floor, collect_remote_reachable_object_ids,
     collect_remote_reachable_object_ids_with_recorder, next_validation_root,
-    read_remote_control_plane,
-    update_trusted_remote_state_from_control_plane, write_remote_control_plane_to_validation_root,
+    read_remote_control_plane, update_trusted_remote_state_from_control_plane,
+    write_remote_control_plane_to_validation_root,
 };
 use crate::object_type::candidate_object_types;
 use crate::pack::PackedObjectLocation;
@@ -105,7 +106,11 @@ impl GcReachabilityStore {
         let temp_dir = tempfile::Builder::new()
             .prefix("e2v-gc-reachable-")
             .tempdir_in(repo_root)
-            .or_else(|_| tempfile::Builder::new().prefix("e2v-gc-reachable-").tempdir())?;
+            .or_else(|_| {
+                tempfile::Builder::new()
+                    .prefix("e2v-gc-reachable-")
+                    .tempdir()
+            })?;
         let sqlite_path = temp_dir.path().join("reachable.sqlite3");
         let sqlite = rusqlite::Connection::open(&sqlite_path).with_context(|| {
             format!(
@@ -565,6 +570,9 @@ pub fn gc_execute<R: RemoteBackend>(
             continue;
         }
         if let Err(error) = remote.delete_physical(path) {
+            if is_missing_physical_object_error(&error) {
+                continue;
+            }
             let pending_paths = candidate_paths[index..]
                 .iter()
                 .filter(|pending_path| remote.exists_physical(pending_path))
@@ -669,7 +677,8 @@ fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
     let physical_ref = location.physical_ref();
     if !pack_cache.contains_key(&physical_ref.container_id) {
         let pack_bytes = if let Some(control_dir) = control_dir {
-            if let Some(cached) = read_cached_pack_data_bytes(control_dir, &physical_ref.container_id)?
+            if let Some(cached) =
+                read_cached_pack_data_bytes(control_dir, &physical_ref.container_id)?
             {
                 cached
             } else {
@@ -678,7 +687,8 @@ fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
                     .length
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
-                let pack_bytes = remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
+                let pack_bytes =
+                    remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
                 cache_pack_data_bytes(control_dir, &physical_ref.container_id, &pack_bytes)?;
                 pack_bytes
             }
@@ -734,7 +744,10 @@ fn read_cached_pack_data_bytes(control_dir: &Path, container_id: &str) -> Result
     }
 }
 
-fn persist_cached_pack_data(control_dir: &Path, pack_cache: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+fn persist_cached_pack_data(
+    control_dir: &Path,
+    pack_cache: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
     for (container_id, pack_bytes) in pack_cache {
         cache_pack_data_bytes(control_dir, container_id, pack_bytes)?;
     }
@@ -939,11 +952,7 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
             continue;
         };
         saw_head_snapshot = true;
-        collect_remote_reachable_object_ids_with_recorder(
-            traversal,
-            &head_snapshot_id,
-            reachable,
-        )?;
+        collect_remote_reachable_object_ids_with_recorder(traversal, &head_snapshot_id, reachable)?;
     }
 
     if !saw_head_snapshot {
@@ -956,7 +965,11 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
         let (_, head_snapshot_id) =
             sync_support::decode_default_ref_record(repo_root, &default_ref.value.bytes)?;
         if let Some(head_snapshot_id) = head_snapshot_id {
-            collect_remote_reachable_object_ids_with_recorder(traversal, &head_snapshot_id, reachable)?;
+            collect_remote_reachable_object_ids_with_recorder(
+                traversal,
+                &head_snapshot_id,
+                reachable,
+            )?;
         }
     }
 
@@ -1003,13 +1016,11 @@ fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
         &candidate_paths,
     )?;
     candidate_head_snapshot_ids.retain(|snapshot_id| {
-        let Some(path) =
-            remote_physical_path_for_object(
-                context.remote_loose_object_ids,
-                context.pack_locations,
-                snapshot_id,
-            )
-        else {
+        let Some(path) = remote_physical_path_for_object(
+            context.remote_loose_object_ids,
+            context.pack_locations,
+            snapshot_id,
+        ) else {
             return false;
         };
         !physical_ref_is_older_than_horizon(context.remote, &path, unpublished_safe_horizon)
@@ -1117,10 +1128,10 @@ fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> 
     let active_lease_paths = list_active_lease_paths(remote)?;
     let layout_root_bytes = remote.get_physical("layout_root.json")?;
     let layout_root_generation = remote.read_layout_root()?.generation;
-    let pack_index_root_bytes = if remote.exists_physical("pack-index/root.json") {
-        Some(remote.get_physical("pack-index/root.json")?)
-    } else {
-        None
+    let pack_index_root_bytes = match remote.get_physical("pack-index/root.json") {
+        Ok(bytes) => Some(bytes),
+        Err(error) if is_missing_physical_object_error(&error) => None,
+        Err(error) => return Err(error),
     };
     Ok(GcFenceState {
         refs,
@@ -1207,11 +1218,16 @@ fn observed_remote_latest_time<R: RemoteBackend>(
         })?);
     }
     for path in candidate_paths {
-        observed_times.push(remote.stat_physical(path)?.modified_at.ok_or_else(|| {
-            anyhow::anyhow!(
-                "gc execute aborted: physical ref {path} has no reliable remote modification time"
-            )
-        })?);
+        let modified_at = match remote.stat_physical(path) {
+            Ok(stat) => stat.modified_at.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gc execute aborted: physical ref {path} has no reliable remote modification time"
+                )
+            })?,
+            Err(error) if is_missing_physical_object_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        observed_times.push(modified_at);
     }
     let observed_now = observed_times
         .into_iter()
@@ -1225,11 +1241,15 @@ fn physical_ref_is_older_than_horizon<R: RemoteBackend>(
     path: &str,
     safe_horizon: std::time::SystemTime,
 ) -> Result<bool> {
-    let modified_at = remote.stat_physical(path)?.modified_at.ok_or_else(|| {
-        anyhow::anyhow!(
-            "gc execute aborted: physical ref {path} has no reliable remote modification time"
-        )
-    })?;
+    let modified_at = match remote.stat_physical(path) {
+        Ok(stat) => stat.modified_at.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gc execute aborted: physical ref {path} has no reliable remote modification time"
+            )
+        })?,
+        Err(error) if is_missing_physical_object_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
     Ok(modified_at <= safe_horizon)
 }
 
@@ -1275,7 +1295,10 @@ mod tests {
         let pack_data_path = "packs/data/pack-00000001.bin".to_string();
 
         remote
-            .put_physical(&format!("objects/{reachable_loose}.json"), br#"{"reachable":true}"#)
+            .put_physical(
+                &format!("objects/{reachable_loose}.json"),
+                br#"{"reachable":true}"#,
+            )
             .unwrap();
         remote
             .put_physical(
@@ -1283,12 +1306,12 @@ mod tests {
                 br#"{"reachable":false}"#,
             )
             .unwrap();
-        remote.put_physical(&pack_data_path, b"packed-object").unwrap();
+        remote
+            .put_physical(&pack_data_path, b"packed-object")
+            .unwrap();
 
-        let remote_loose_object_ids = BTreeSet::from([
-            reachable_loose.clone(),
-            unreachable_loose.clone(),
-        ]);
+        let remote_loose_object_ids =
+            BTreeSet::from([reachable_loose.clone(), unreachable_loose.clone()]);
         let pack_locations = BTreeMap::from([(
             packed_object.clone(),
             PackedObjectLocation {

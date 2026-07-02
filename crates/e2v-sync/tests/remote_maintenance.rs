@@ -981,11 +981,7 @@ impl BlobStore for PackIndexRootChangesBeforeDeleteBackend {
             let saw_first = self
                 .listed_active_once
                 .swap(true, std::sync::atomic::Ordering::SeqCst);
-            if saw_first
-                && !self
-                    .mutated
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
+            if saw_first && !self.mutated.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 self.inner
                     .put_physical("pack-index/root.json", &self.replacement_root_bytes)?;
             }
@@ -1032,6 +1028,130 @@ impl LayoutRootStore for PackIndexRootChangesBeforeDeleteBackend {
 }
 
 impl e2v_store::RemoteBackend for PackIndexRootChangesBeforeDeleteBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackIndexRootDisappearsDuringFenceBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    listed_active_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    delete_on_next_pack_index_root_get: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    deleted_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PackIndexRootDisappearsDuringFenceBackend {
+    fn new(inner: MemoryBackend) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            listed_active_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            delete_on_next_pack_index_root_get: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            deleted_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl BlobStore for PackIndexRootDisappearsDuringFenceBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        if relative_path == "pack-index/root.json"
+            && self
+                .delete_on_next_pack_index_root_get
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            && !self
+                .deleted_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner.delete_physical(relative_path)?;
+        }
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        if prefix == "transactions/active/" {
+            let saw_first = self
+                .listed_active_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            if saw_first {
+                self.delete_on_next_pack_index_root_get
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for PackIndexRootDisappearsDuringFenceBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for PackIndexRootDisappearsDuringFenceBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for PackIndexRootDisappearsDuringFenceBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }
@@ -1097,11 +1217,7 @@ impl BlobStore for LayoutRootBytesChangeBeforeDeleteBackend {
             let saw_first = self
                 .listed_active_once
                 .swap(true, std::sync::atomic::Ordering::SeqCst);
-            if saw_first
-                && !self
-                    .mutated
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
+            if saw_first && !self.mutated.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 self.inner
                     .put_physical("layout_root.json", &self.replacement_layout_root_bytes)?;
             }
@@ -1256,6 +1372,226 @@ impl LayoutRootStore for FailOnceOnDeleteBackend {
 }
 
 impl e2v_store::RemoteBackend for FailOnceOnDeleteBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DisappearBeforeDeleteBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    target_path: String,
+    deleted_on_stat: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DisappearBeforeDeleteBackend {
+    fn new(inner: MemoryBackend, target_path: impl Into<String>) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            target_path: target_path.into(),
+            deleted_on_stat: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl BlobStore for DisappearBeforeDeleteBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        if relative_path == self.target_path
+            && !self
+                .deleted_on_stat
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner.delete_physical(relative_path)?;
+        }
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for DisappearBeforeDeleteBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for DisappearBeforeDeleteBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for DisappearBeforeDeleteBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DisappearDuringDeleteBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    target_path: String,
+    deleted_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DisappearDuringDeleteBackend {
+    fn new(inner: MemoryBackend, target_path: impl Into<String>) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            target_path: target_path.into(),
+            deleted_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl BlobStore for DisappearDuringDeleteBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        if relative_path == self.target_path
+            && !self
+                .deleted_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner.delete_physical(relative_path)?;
+            return Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("simulated delete race for {relative_path}"),
+            )));
+        }
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for DisappearDuringDeleteBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for DisappearDuringDeleteBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for DisappearDuringDeleteBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }
@@ -1886,6 +2222,140 @@ fn gc_execute_resumes_from_local_deletion_journal_after_partial_failure() {
 }
 
 #[test]
+fn gc_execute_ignores_candidate_that_disappears_before_delete() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-gc-disappearing-candidate".to_string(),
+        },
+    )
+    .unwrap();
+
+    let stray_object_path =
+        "objects/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json";
+    remote
+        .put_physical(stray_object_path, br#"{"garbage":true}"#)
+        .unwrap();
+    remote
+        .override_physical_modified_time_for_test(
+            stray_object_path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+        )
+        .unwrap();
+
+    let raced_remote = DisappearBeforeDeleteBackend::new(remote.clone(), stray_object_path);
+
+    let result = gc_execute(
+        &raced_remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "unexpected error when candidate disappeared before delete: {result:#?}"
+    );
+    assert!(
+        !remote.exists_physical(stray_object_path),
+        "disappearing candidate should remain absent after gc execute"
+    );
+}
+
+#[test]
+fn gc_execute_ignores_candidate_that_disappears_during_delete() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-gc-disappearing-during-delete".to_string(),
+        },
+    )
+    .unwrap();
+
+    let stray_object_path =
+        "objects/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.json";
+    remote
+        .put_physical(stray_object_path, br#"{"garbage":true}"#)
+        .unwrap();
+    remote
+        .override_physical_modified_time_for_test(
+            stray_object_path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+        )
+        .unwrap();
+
+    let raced_remote = DisappearDuringDeleteBackend::new(remote.clone(), stray_object_path);
+
+    let result = gc_execute(
+        &raced_remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "unexpected error when candidate disappeared during delete: {result:#?}"
+    );
+    assert!(
+        !remote.exists_physical(stray_object_path),
+        "candidate should remain absent after disappearing during delete"
+    );
+}
+
+#[test]
 fn gc_dry_run_keeps_objects_reachable_from_other_remote_branch_refs() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -2472,6 +2942,94 @@ fn gc_execute_aborts_when_pack_index_root_changes_after_dry_run() {
     assert!(
         remote.exists_physical(&resurrected_segment),
         "gc execute should not delete a pack index segment that became reachable again"
+    );
+}
+
+#[test]
+fn gc_execute_treats_disappearing_pack_index_root_as_fence_change() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let remote = MemoryBackend::new();
+
+    for version in 0..5usize {
+        fs::write(repo_root.join("rolling.txt"), format!("rolling-{version}")).unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: format!("gc-pack-index-disappear-{version}"),
+            })
+            .unwrap();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: format!("gc-pack-index-disappear-op-{version}"),
+            },
+        )
+        .unwrap();
+    }
+
+    let root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let referenced_segments = root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    let unreferenced_segments = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .chain(remote.list_physical("pack-index/segments/").unwrap())
+        .filter(|path| !referenced_segments.contains(path))
+        .collect::<Vec<_>>();
+    let resurrected_segment = unreferenced_segments
+        .first()
+        .cloned()
+        .expect("expected an obsolete pack index segment after compaction");
+
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+    remote
+        .override_physical_modified_time_for_test(&resurrected_segment, old_time)
+        .unwrap();
+
+    let raced_remote = PackIndexRootDisappearsDuringFenceBackend::new(remote.clone());
+
+    let error = gc_execute(
+        &raced_remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("changed during execution"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        remote.exists_physical(&resurrected_segment),
+        "gc execute should not delete candidates after pack index root disappeared"
     );
 }
 
