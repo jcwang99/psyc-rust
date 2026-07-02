@@ -688,21 +688,30 @@ fn cleanup_completed_operation_markers<R: RemoteBackend>(
     branch_token: &str,
 ) -> Result<()> {
     let intent_path = format!("transactions/active/{}.intent", operation_id.value);
-    if remote.exists_physical(&intent_path) {
-        remote.delete_physical(&intent_path)?;
+    match remote.delete_physical(&intent_path) {
+        Ok(()) => {}
+        Err(error) if is_missing_physical_object_error(&error) => {}
+        Err(error) => return Err(error),
     }
 
     let lease_path = format!("leases/{branch_token}.lock");
-    if remote.exists_physical(&lease_path) {
-        let lease_bytes = remote.get_physical(&lease_path)?;
-        let lease_marker: serde_json::Value = serde_json::from_slice(&lease_bytes)?;
-        if lease_marker
-            .get("operation_id")
-            .and_then(|value| value.as_str())
-            == Some(operation_id.value.as_str())
-        {
-            remote.delete_physical(&lease_path)?;
+    match remote.get_physical(&lease_path) {
+        Ok(lease_bytes) => {
+            let lease_marker: serde_json::Value = serde_json::from_slice(&lease_bytes)?;
+            if lease_marker
+                .get("operation_id")
+                .and_then(|value| value.as_str())
+                == Some(operation_id.value.as_str())
+            {
+                match remote.delete_physical(&lease_path) {
+                    Ok(()) => {}
+                    Err(error) if is_missing_physical_object_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
+        Err(error) if is_missing_physical_object_error(&error) => {}
+        Err(error) => return Err(error),
     }
 
     Ok(())

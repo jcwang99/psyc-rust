@@ -122,6 +122,26 @@ fn publisher_does_not_keep_unused_internal_recovery_or_backend_accessors() {
     }
 }
 
+#[test]
+fn push_cleanup_does_not_probe_marker_existence_before_removing_or_validating_it() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("push.rs"),
+    )
+    .unwrap();
+
+    for needless_probe in [
+        "if remote.exists_physical(&intent_path) {",
+        "if remote.exists_physical(&lease_path) {",
+    ] {
+        assert!(
+            !source.contains(needless_probe),
+            "push cleanup should not spend extra remote probes on marker existence checks: {needless_probe}"
+        );
+    }
+}
+
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     RefToken::new(format!(
         "keyring/{}",
