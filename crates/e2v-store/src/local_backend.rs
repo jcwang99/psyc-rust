@@ -268,10 +268,11 @@ impl RefStore for LocalFolderBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
         token.validate()?;
         let path = Self::ref_path(token);
-        if !self.exists_physical(&path) {
-            return Ok(None);
+        match self.get_physical(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if is_missing_physical_object_error(&error) => Ok(None),
+            Err(error) => Err(error),
         }
-        Ok(Some(serde_json::from_slice(&self.get_physical(&path)?)?))
     }
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
@@ -335,12 +336,13 @@ impl RefStore for LocalFolderBackend {
 
 impl LayoutRootStore for LocalFolderBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
-        if !self.exists_physical("layout_root.json") {
-            return Ok(Self::default_layout_root());
+        match self.get_physical("layout_root.json") {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if is_missing_physical_object_error(&error) => {
+                Ok(Self::default_layout_root())
+            }
+            Err(error) => Err(error),
         }
-        Ok(serde_json::from_slice(
-            &self.get_physical("layout_root.json")?,
-        )?)
     }
 
     fn compare_and_swap_layout_root(

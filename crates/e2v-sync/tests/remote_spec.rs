@@ -63,6 +63,36 @@ fn store_root_uses_single_reexport_surface_instead_of_public_module_duplicates()
 }
 
 #[test]
+fn store_read_paths_do_not_probe_ref_or_layout_root_existence_before_loading() {
+    let store_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("e2v-store")
+        .join("src");
+    let local_source = std::fs::read_to_string(store_src.join("local_backend.rs")).unwrap();
+    let memory_source = std::fs::read_to_string(store_src.join("memory_backend.rs")).unwrap();
+    let opendal_source = std::fs::read_to_string(store_src.join("opendal_backend.rs")).unwrap();
+
+    for needless_probe in [
+        "if !self.exists_physical(&path) {",
+        "if !self.exists_physical(\"layout_root.json\") {",
+        "if self.exists_physical(\"layout_root.json\") {",
+    ] {
+        assert!(
+            !local_source.contains(needless_probe),
+            "local backend should not probe ref/layout existence before loading it: {needless_probe}"
+        );
+        assert!(
+            !memory_source.contains(needless_probe),
+            "memory backend should not probe ref/layout existence before loading it: {needless_probe}"
+        );
+        assert!(
+            !opendal_source.contains(needless_probe),
+            "opendal backend should not probe ref/layout existence before loading it: {needless_probe}"
+        );
+    }
+}
+
+#[test]
 fn parse_remote_spec_decodes_webdav_url_into_remote_config() {
     let spec = e2v_sync::RemoteSpec::parse("webdav+https://alice:secret@example.com/repo").unwrap();
 

@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
     BackendCapability, BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot,
     LayoutRootStore, LayoutRootVersion, ListedRef, ObjectStat, RefStore, RefToken, RefVersion,
-    StoredRef,
+    StoredRef, is_missing_physical_object_error,
 };
 
 pub trait RemoteBackend: BlobStore + RefStore + LayoutRootStore + Send + Sync {
@@ -596,10 +596,11 @@ impl RefStore for OpendalMemoryBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
         token.validate()?;
         let path = Self::ref_path(token);
-        if !self.exists_physical(&path) {
-            return Ok(None);
+        match self.get_physical(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if is_missing_physical_object_error(&error) => Ok(None),
+            Err(error) => Err(error),
         }
-        Ok(Some(serde_json::from_slice(&self.get_physical(&path)?)?))
     }
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
@@ -673,10 +674,11 @@ impl RefStore for OpendalWebdavBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
         token.validate()?;
         let path = OpendalMemoryBackend::ref_path(token);
-        if !self.exists_physical(&path) {
-            return Ok(None);
+        match self.get_physical(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if is_missing_physical_object_error(&error) => Ok(None),
+            Err(error) => Err(error),
         }
-        Ok(Some(serde_json::from_slice(&self.get_physical(&path)?)?))
     }
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
@@ -787,12 +789,13 @@ impl LayoutRootStore for WebdavAlistMockBackend {
 
 impl LayoutRootStore for OpendalMemoryBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
-        if !self.exists_physical("layout_root.json") {
-            return Ok(Self::default_layout_root());
+        match self.get_physical("layout_root.json") {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if is_missing_physical_object_error(&error) => {
+                Ok(Self::default_layout_root())
+            }
+            Err(error) => Err(error),
         }
-        Ok(serde_json::from_slice(
-            &self.get_physical("layout_root.json")?,
-        )?)
     }
 
     fn compare_and_swap_layout_root(
@@ -832,12 +835,13 @@ impl LayoutRootStore for OpendalMemoryBackend {
 
 impl LayoutRootStore for OpendalWebdavBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
-        if !self.exists_physical("layout_root.json") {
-            return Ok(OpendalMemoryBackend::default_layout_root());
+        match self.get_physical("layout_root.json") {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if is_missing_physical_object_error(&error) => {
+                Ok(OpendalMemoryBackend::default_layout_root())
+            }
+            Err(error) => Err(error),
         }
-        Ok(serde_json::from_slice(
-            &self.get_physical("layout_root.json")?,
-        )?)
     }
 
     fn compare_and_swap_layout_root(
@@ -984,10 +988,11 @@ impl RefStore for OpendalS3Backend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
         token.validate()?;
         let path = OpendalMemoryBackend::ref_path(token);
-        if !self.exists_physical(&path) {
-            return Ok(None);
+        match self.get_physical(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if is_missing_physical_object_error(&error) => Ok(None),
+            Err(error) => Err(error),
         }
-        Ok(Some(serde_json::from_slice(&self.get_physical(&path)?)?))
     }
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
@@ -1062,12 +1067,13 @@ impl RefStore for OpendalS3Backend {
 
 impl LayoutRootStore for OpendalS3Backend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
-        if !self.exists_physical("layout_root.json") {
-            return Ok(OpendalMemoryBackend::default_layout_root());
+        match self.get_physical("layout_root.json") {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if is_missing_physical_object_error(&error) => {
+                Ok(OpendalMemoryBackend::default_layout_root())
+            }
+            Err(error) => Err(error),
         }
-        Ok(serde_json::from_slice(
-            &self.get_physical("layout_root.json")?,
-        )?)
     }
 
     fn compare_and_swap_layout_root(
