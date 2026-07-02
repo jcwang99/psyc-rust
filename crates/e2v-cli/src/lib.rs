@@ -1,12 +1,16 @@
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::Write,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use e2v_api::{
-    CheckoutSnapshotOptions, CommitRepositoryOptions, GcExecuteRequest, InitRepositoryOptions, Sdk,
-    ShareAcceptDeviceRequest, ShareAcceptMemberRequest, ShareInviteDeviceRequest,
-    ShareInviteMemberRequest, ShareRevokeDeviceRequest, ShareRevokeMemberRequest,
-    VerifyRemoteRequest,
+    CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest,
+    InitRepositoryOptions, PushRequest, Sdk, ShareAcceptDeviceRequest, ShareAcceptMemberRequest,
+    ShareInviteDeviceRequest, ShareInviteMemberRequest, ShareRevokeDeviceRequest,
+    ShareRevokeMemberRequest, VerifyRemoteRequest,
 };
 use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
@@ -51,6 +55,24 @@ enum Command {
         snapshot: String,
         #[arg(long = "target")]
         target_dir: PathBuf,
+    },
+    Push {
+        #[arg(long)]
+        repo: PathBuf,
+    },
+    Fetch {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    Clone {
+        remote_spec: String,
+        target_repo_root: PathBuf,
+        #[arg(long)]
+        password: String,
+        #[arg(long = "branch-token")]
+        branch_token: String,
     },
     Branch {
         #[command(subcommand)]
@@ -305,6 +327,49 @@ fn execute(cli: Cli) -> Result<String> {
                 "checked out {} to {}\n",
                 &snapshot[..snapshot.len().min(8)],
                 target_dir.display()
+            ))
+        }
+        Command::Push { repo } => {
+            let branch_token = sdk.open_repository(&repo)?.branch.token_hex;
+            let pushed = sdk.push_default_remote(PushRequest {
+                repo_root: repo,
+                branch_token,
+                operation_id: cli_operation_id("push")?,
+            })?;
+            Ok(format!(
+                "pushed {}\n",
+                &pushed.published_snapshot_id[..pushed.published_snapshot_id.len().min(8)]
+            ))
+        }
+        Command::Fetch { repo, password } => {
+            let branch_token = sdk.open_repository(&repo)?.branch.token_hex;
+            let fetched = sdk.fetch_default_remote(FetchRequest {
+                repo_root: repo,
+                branch_token,
+                password,
+            })?;
+            Ok(format!(
+                "downloaded {} objects\n",
+                fetched.downloaded_objects
+            ))
+        }
+        Command::Clone {
+            remote_spec,
+            target_repo_root,
+            password,
+            branch_token,
+        } => {
+            let cloned = sdk.clone_remote(CloneRequest {
+                remote_spec,
+                target_repo_root,
+                password,
+                branch_token,
+            })?;
+            Ok(format!(
+                "cloned {}\n",
+                cloned
+                    .head_snapshot_id
+                    .unwrap_or_else(|| "no-head".to_string())
             ))
         }
         Command::Branch { command, repo } => match command {
@@ -630,6 +695,14 @@ fn parse_grace_period_days(value: &str) -> Result<u64> {
     let parsed: u64 = number.parse()?;
     anyhow::ensure!(parsed > 0, "grace period must be greater than zero");
     Ok(parsed)
+}
+
+fn cli_operation_id(prefix: &str) -> Result<String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("system clock error: {error}"))?
+        .as_millis();
+    Ok(format!("cli-{prefix}-{millis}"))
 }
 
 fn remote_capability<'a>(remote: &'a RemoteBackendRef<'a>) -> &'a BackendCapability {

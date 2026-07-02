@@ -290,6 +290,188 @@ fn checkout_command_restores_an_explicit_snapshot_into_target_directory() {
 }
 
 #[test]
+fn push_command_uses_the_default_remote_for_the_current_branch() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let facade = RepositoryFacade::new();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = facade.open(&repo_root).unwrap().branch.token_hex;
+
+    e2v_cli::run_cli_for_test([
+        "e2v",
+        "remote",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "add",
+        "origin",
+        &file_remote_spec(&remote_root),
+    ])
+    .unwrap();
+
+    let output =
+        e2v_cli::run_cli_for_test(["e2v", "push", "--repo", repo_root.to_str().unwrap()]).unwrap();
+
+    assert!(output.contains("pushed"));
+    assert!(output.contains(&commit.snapshot_id[..8]));
+    let cloned = e2v_api::Sdk::new()
+        .clone_remote(e2v_api::CloneRequest {
+            remote_spec: file_remote_spec(&remote_root),
+            target_repo_root: temp.path().join("verify-clone"),
+            password: "correct horse battery staple".to_string(),
+            branch_token,
+        })
+        .unwrap();
+    assert_eq!(
+        cloned.head_snapshot_id.as_deref(),
+        Some(commit.snapshot_id.as_str())
+    );
+}
+
+#[test]
+fn fetch_command_uses_the_default_remote_for_the_current_branch() {
+    let temp = tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    init_repo(&source_repo);
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let facade = RepositoryFacade::new();
+    let first = facade
+        .commit(CommitOptions {
+            repo_root: source_repo.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+    let branch_token = facade.open(&source_repo).unwrap().branch.token_hex;
+    let remote = LocalFolderBackend::new(&remote_root);
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "cli-fetch-first".to_string(),
+        },
+    )
+    .unwrap();
+
+    let cloned = e2v_api::Sdk::new()
+        .clone_remote(e2v_api::CloneRequest {
+            remote_spec: file_remote_spec(&remote_root),
+            target_repo_root: clone_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: branch_token.clone(),
+        })
+        .unwrap();
+    e2v_api::Sdk::new()
+        .add_remote(&clone_repo, "origin", &file_remote_spec(&remote_root))
+        .unwrap();
+    assert_eq!(
+        cloned.head_snapshot_id.as_deref(),
+        Some(first.snapshot_id.as_str())
+    );
+
+    fs::write(source_repo.join("tracked.txt"), "beta").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: source_repo.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "cli-fetch-second".to_string(),
+        },
+    )
+    .unwrap();
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "fetch",
+        "--repo",
+        clone_repo.to_str().unwrap(),
+        "--password",
+        "correct horse battery staple",
+    ])
+    .unwrap();
+
+    assert!(output.contains("downloaded"));
+    let read = e2v_api::Sdk::new().open_read_handle(&clone_repo).unwrap();
+    let snapshot = read.resolve_branch(&branch_token).unwrap();
+    let file = read.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read.read_range(&file, 0, 64).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "beta");
+    assert_ne!(second.snapshot_id, first.snapshot_id);
+}
+
+#[test]
+fn clone_command_clones_an_explicit_remote_spec_into_a_target_repo() {
+    let temp = tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    init_repo(&source_repo);
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let facade = RepositoryFacade::new();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: source_repo.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = facade.open(&source_repo).unwrap().branch.token_hex;
+    let remote = LocalFolderBackend::new(&remote_root);
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "cli-clone".to_string(),
+        },
+    )
+    .unwrap();
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "clone",
+        &file_remote_spec(&remote_root),
+        clone_repo.to_str().unwrap(),
+        "--password",
+        "correct horse battery staple",
+        "--branch-token",
+        &branch_token,
+    ])
+    .unwrap();
+
+    assert!(output.contains("cloned"));
+    let read = e2v_api::Sdk::new().open_read_handle(&clone_repo).unwrap();
+    let snapshot = read.resolve_branch(&branch_token).unwrap();
+    let file = read.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read.read_range(&file, 0, 64).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+    assert_eq!(snapshot.snapshot_id, commit.snapshot_id);
+}
+
+#[test]
 fn mount_snapshot_command_delegates_to_e2v_vfs() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
