@@ -5,13 +5,13 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use e2v_store::{
-    DirectLayoutObjectStore, EpochSecrets, LayoutRoot, RepoSecrets, validate_object_id_value,
-    validate_ref_token_value,
+    validate_object_id_value, validate_ref_token_value, DirectLayoutObjectStore, EpochSecrets,
+    LayoutRoot, RepoSecrets,
 };
 use postcard::{from_bytes as postcard_from_bytes, to_stdvec as postcard_to_vec};
 use serde::{Deserialize, Serialize};
@@ -19,13 +19,12 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::chunker::FastCdcChunker;
 use crate::keyring::{
-    KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_password,
-    cache_unlocked_secrets, generate_local_device_credential, open_repo_secrets,
-    read_current_keyring_state, read_local_device_credential,
-    seal_repo_secrets, seal_repo_secrets_for_device, unlock_repo_secrets,
-    unlock_repo_secrets_from_generation_file,
+    cache_unlocked_password, cache_unlocked_secrets, generate_local_device_credential,
+    open_repo_secrets, read_current_keyring_state, read_local_device_credential, seal_repo_secrets,
+    seal_repo_secrets_for_device, unlock_repo_secrets, unlock_repo_secrets_from_generation_file,
     unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
-    unlock_repo_secrets_with_local_device, write_local_device_credential,
+    unlock_repo_secrets_with_local_device, write_local_device_credential, KeyringPointer,
+    KeyringState, KEYRING_CURRENT_FILE, KEYRING_DIR,
 };
 use crate::local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
 use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreApi};
@@ -178,7 +177,6 @@ impl FileHandle {
     pub fn debug_chunk_lengths(&self) -> &[u64] {
         &self.chunk_lengths
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -728,13 +726,14 @@ impl RepositoryFacade {
     pub fn snapshots(&self, repo_root: impl AsRef<Path>) -> Result<Vec<SnapshotSummary>> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let object_store = open_object_store_with_secrets(&control_dir, repo_secrets);
         let default_ref = read_current_ref(&control_dir)?;
-        let manifest_store = LocalManifestStore::new(&repo_root);
         let mut next_snapshot_id = default_ref.head_snapshot_id;
         let mut snapshots = Vec::new();
 
         while let Some(snapshot_id) = next_snapshot_id {
-            let snapshot = manifest_store.get_snapshot(&snapshot_id)?;
+            let snapshot = read_snapshot_object(&object_store, &snapshot_id)?;
             next_snapshot_id = snapshot.parent_snapshot_id.clone();
             snapshots.push(SnapshotSummary {
                 snapshot_id,
@@ -1561,6 +1560,7 @@ impl ReadService {
     }
 
     pub fn read_dir(&self, snapshot: &SnapshotHandle, path: &str) -> Result<Vec<DirectoryEntry>> {
+        RepositoryFacade::new().open(&self.repo_root)?;
         let manifest_store = LocalManifestStore::new(&self.repo_root);
         let tree_id = resolve_tree_for_path(&manifest_store, &snapshot.root_tree_id, path)?;
         let tree = manifest_store.get_tree_node(&tree_id)?;
@@ -1576,6 +1576,7 @@ impl ReadService {
     }
 
     pub fn open_file(&self, snapshot: &SnapshotHandle, path: &str) -> Result<FileHandle> {
+        RepositoryFacade::new().open(&self.repo_root)?;
         let manifest_store = LocalManifestStore::new(&self.repo_root);
         let (parent_path, file_name) = split_parent_and_name(path)?;
         let tree_id = resolve_tree_for_path(&manifest_store, &snapshot.root_tree_id, &parent_path)?;
@@ -1606,6 +1607,7 @@ impl ReadService {
     }
 
     pub fn read_range(&self, file: &FileHandle, offset: usize, length: usize) -> Result<Vec<u8>> {
+        RepositoryFacade::new().open(&self.repo_root)?;
         let control_dir = self.repo_root.join(CONTROL_DIR);
         let object_store = open_object_store(&control_dir)?;
         let file_size: usize = file
@@ -1663,7 +1665,8 @@ impl ReadService {
                 if shard_byte_start >= end {
                     break;
                 }
-                let shard: FileShardObject = read_stored_object(&object_store, shard_id, "file_shard")?;
+                let shard: FileShardObject =
+                    read_stored_object(&object_store, shard_id, "file_shard")?;
                 validate_manifest_schema_version_local("file_shard", shard.schema_version)?;
                 ensure!(
                     shard.chunks.len() == shard.chunk_lengths.len(),
@@ -2833,14 +2836,12 @@ fn read_stored_object<T: for<'de> Deserialize<'de>>(
     postcard_from_bytes(&plaintext).context("failed to decode object plaintext")
 }
 
-#[allow(dead_code)]
-#[cfg(test)]
 fn read_snapshot_object(
     object_store: &DirectLayoutObjectStore,
     object_id: &str,
 ) -> Result<SnapshotObject> {
     let snapshot: SnapshotObject = read_stored_object(object_store, object_id, "snapshot")?;
-    validate_manifest_schema_version("snapshot", snapshot.schema_version)?;
+    validate_manifest_schema_version_local("snapshot", snapshot.schema_version)?;
     Ok(snapshot)
 }
 
@@ -3484,16 +3485,14 @@ mod facade_tests {
         };
         let mut keyring_one: KeyringState = read_json(generation_one_path.clone()).unwrap();
         keyring_one.generation = 2;
-        keyring_one.envelopes = vec![
-            seal_repo_secrets(
-                &secrets_two.repo_id,
-                DEFAULT_ACTIVE_EPOCH,
-                "correct horse battery staple",
-                &secrets_two,
-                "len:28".to_string(),
-            )
-            .unwrap(),
-        ];
+        keyring_one.envelopes = vec![seal_repo_secrets(
+            &secrets_two.repo_id,
+            DEFAULT_ACTIVE_EPOCH,
+            "correct horse battery staple",
+            &secrets_two,
+            "len:28".to_string(),
+        )
+        .unwrap()];
         atomic_write_json(generation_two_path, &keyring_one).unwrap();
         atomic_write_json(
             current_pointer_path,
@@ -3584,16 +3583,14 @@ mod facade_tests {
         };
         let keyring_two = KeyringState {
             generation: 2,
-            envelopes: vec![
-                seal_repo_secrets(
-                    &secrets_two.repo_id,
-                    DEFAULT_ACTIVE_EPOCH,
-                    "correct horse battery staple",
-                    &secrets_two,
-                    "len:28".to_string(),
-                )
-                .unwrap(),
-            ],
+            envelopes: vec![seal_repo_secrets(
+                &secrets_two.repo_id,
+                DEFAULT_ACTIVE_EPOCH,
+                "correct horse battery staple",
+                &secrets_two,
+                "len:28".to_string(),
+            )
+            .unwrap()],
             ..keyring_one.clone()
         };
 

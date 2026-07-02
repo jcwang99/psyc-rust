@@ -1,10 +1,51 @@
-use std::fs;
+use std::{
+    fs,
+    io::{Read, Write},
+    net::TcpStream,
+    process::{Child, Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
 use e2v_store::BlobStore;
 use e2v_store::LocalFolderBackend;
-use e2v_sync::{PushOptions, push_head};
+use e2v_sync::{push_head, PushOptions};
 use tempfile::tempdir;
+
+fn cli_binary_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_e2v-cli") {
+        return std::path::PathBuf::from(path);
+    }
+
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("debug")
+        .join(if cfg!(windows) {
+            "e2v-cli.exe"
+        } else {
+            "e2v-cli"
+        })
+}
+
+struct ChildGuard {
+    child: Child,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 fn file_remote_spec(path: &std::path::Path) -> String {
     let absolute = if path.is_absolute() {
@@ -238,6 +279,66 @@ fn mount_branch_command_delegates_to_e2v_vfs() {
     assert!(output.contains("KernelCacheWithInvalidation"));
     assert!(output.contains("read-only"));
     assert!(output.contains("stream-only"));
+}
+
+#[test]
+fn serve_command_starts_local_web_server_and_prints_localhost_url() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let bin = cli_binary_path();
+    let child = Command::new(bin)
+        .args(["serve", "--repo", repo_root.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard::new(child);
+
+    let mut stdout = child.child.stdout.take().unwrap();
+    let mut buffer = String::new();
+    for _ in 0..40 {
+        let mut chunk = [0u8; 256];
+        let read = stdout.read(&mut chunk).unwrap_or(0);
+        if read > 0 {
+            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+            if buffer.contains('\n') {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let first_line = buffer.lines().next().unwrap_or_default().trim().to_string();
+    assert!(
+        first_line.starts_with("serving http://127.0.0.1:"),
+        "serve command should print localhost address, got stdout: {buffer:?}"
+    );
+
+    let authority = first_line
+        .strip_prefix("serving http://")
+        .expect("serve command should print serving URL")
+        .trim_end_matches('/');
+    let mut stream = TcpStream::connect(authority).unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "serve command should return 200 for home page, got: {response}"
+    );
+    assert!(response.contains("Snapshots"));
 }
 
 #[test]

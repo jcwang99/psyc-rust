@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -11,9 +11,10 @@ use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
 use e2v_store::{BackendCapability, RemoteBackend};
 use e2v_sync::{
-    gc_execute_capability_status, load_trusted_remote_state_for_repo, remote_spec::RemoteBackendRef,
+    gc_execute_capability_status, load_trusted_remote_state_for_repo,
+    remote_spec::RemoteBackendRef, serve_local_web, ServeOptions,
 };
-use e2v_vfs::{MountLaunchSummary, mount_live_branch, mount_snapshot};
+use e2v_vfs::{mount_live_branch, mount_snapshot, MountLaunchSummary};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -75,6 +76,10 @@ enum Command {
         repo: PathBuf,
         #[arg(long)]
         bundle: Option<PathBuf>,
+    },
+    Serve {
+        #[arg(long)]
+        repo: PathBuf,
     },
     Mount {
         #[command(subcommand)]
@@ -211,7 +216,11 @@ where
 }
 
 pub fn run_from_env() -> Result<()> {
-    let output = execute(Cli::parse())?;
+    let cli = Cli::parse();
+    if let Command::Serve { repo } = &cli.command {
+        return run_serve_command(repo.clone());
+    }
+    let output = execute(cli)?;
     print!("{output}");
     Ok(())
 }
@@ -288,10 +297,8 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(output)
             }
             ShareCommand::InviteMember { name, out } => {
-                let invite = sdk.share_invite_member(
-                    &repo,
-                    ShareInviteMemberRequest { display_name: name },
-                )?;
+                let invite = sdk
+                    .share_invite_member(&repo, ShareInviteMemberRequest { display_name: name })?;
                 std::fs::write(&out, &invite.bundle_bytes)?;
                 Ok(format!(
                     "wrote member invite {} to {}\n",
@@ -416,34 +423,32 @@ fn execute(cli: Cli) -> Result<String> {
                 ))
             }
         }
-        Command::Gc { command, repo } => {
-            match command {
-                GcCommand::DryRun => {
-                    let report = sdk.gc_default_remote_dry_run(&repo)?;
-                    Ok(format!(
-                        "gc dry-run: {} unreachable physical refs, {} active intents\n",
-                        report.unreachable_physical_refs.len(),
-                        report.active_intent_paths.len()
-                    ))
-                }
-                GcCommand::Execute {
-                    grace_period_days,
-                    confirm_single_writer_maintenance_window,
-                } => {
-                    let grace_period_days = parse_grace_period_days(&grace_period_days)?;
-                    let result = sdk.gc_default_remote_execute(GcExecuteRequest {
-                        repo_root: repo.clone(),
-                        grace_period_days,
-                        allow_single_writer_maintenance_window:
-                            confirm_single_writer_maintenance_window,
-                    })?;
-                    Ok(format!(
-                        "gc execute: deleted {} physical refs\n",
-                        result.deleted_physical_refs.len()
-                    ))
-                }
+        Command::Gc { command, repo } => match command {
+            GcCommand::DryRun => {
+                let report = sdk.gc_default_remote_dry_run(&repo)?;
+                Ok(format!(
+                    "gc dry-run: {} unreachable physical refs, {} active intents\n",
+                    report.unreachable_physical_refs.len(),
+                    report.active_intent_paths.len()
+                ))
             }
-        }
+            GcCommand::Execute {
+                grace_period_days,
+                confirm_single_writer_maintenance_window,
+            } => {
+                let grace_period_days = parse_grace_period_days(&grace_period_days)?;
+                let result = sdk.gc_default_remote_execute(GcExecuteRequest {
+                    repo_root: repo.clone(),
+                    grace_period_days,
+                    allow_single_writer_maintenance_window:
+                        confirm_single_writer_maintenance_window,
+                })?;
+                Ok(format!(
+                    "gc execute: deleted {} physical refs\n",
+                    result.deleted_physical_refs.len()
+                ))
+            }
+        },
         Command::Doctor { repo, bundle } => {
             let stored_remote = sdk.load_default_remote(&repo)?;
             let repo_id = read_repo_id(&repo)?;
@@ -483,6 +488,7 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(format!("{}\n", serde_json::to_string_pretty(&summary)?))
             }
         }
+        Command::Serve { .. } => anyhow::bail!("serve command requires the CLI process entrypoint"),
         Command::Mount { command, repo } => match command {
             MountCommand::Snapshot {
                 snapshot,
@@ -499,6 +505,16 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(format_mount_summary(&summary))
             }
         },
+    }
+}
+
+fn run_serve_command(repo: PathBuf) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let handle = runtime.block_on(serve_local_web(ServeOptions { repo_root: repo }))?;
+    println!("serving http://{}/", handle.local_addr());
+    std::io::stdout().flush()?;
+    loop {
+        std::thread::park();
     }
 }
 
@@ -569,7 +585,10 @@ fn redact_remote_spec(spec: &str) -> String {
     "<redacted>".to_string()
 }
 
-fn parse_default_remote_spec(sdk: &Sdk, repo_root: &std::path::Path) -> Result<e2v_sync::RemoteSpec> {
+fn parse_default_remote_spec(
+    sdk: &Sdk,
+    repo_root: &std::path::Path,
+) -> Result<e2v_sync::RemoteSpec> {
     let stored = sdk.load_default_remote(repo_root)?;
     e2v_sync::RemoteSpec::parse(&stored.spec)
 }

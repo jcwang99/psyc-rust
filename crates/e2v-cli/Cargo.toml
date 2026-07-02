@@ -14,6 +14,7 @@ e2v-core = { path = "../e2v-core" }
 e2v-sync = { path = "../e2v-sync" }
 e2v-store = { path = "../e2v-store" }
 e2v-vfs = { path = "../e2v-vfs" }
+tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]

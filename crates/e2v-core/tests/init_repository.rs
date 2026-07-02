@@ -3,8 +3,8 @@ use std::io::Write;
 
 use anyhow::Result;
 use e2v_core::testing::{
-    StableReadPolicy, TestSnapshotReader, with_snapshot_reader_and_policy_for_test,
-    with_snapshot_reader_for_test, with_stable_read_policy_for_test,
+    with_snapshot_reader_and_policy_for_test, with_snapshot_reader_for_test,
+    with_stable_read_policy_for_test, StableReadPolicy, TestSnapshotReader,
 };
 use e2v_core::{
     CheckoutOptions, CommitOptions, InitOptions, ManifestObject, ManifestSnapshotObject,
@@ -376,20 +376,16 @@ fn change_password_rejects_wrong_old_password_without_side_effects() {
             || error.to_string().contains("keyring"),
         "unexpected error: {error:#}"
     );
-    assert!(
-        !repo_root
-            .join(".e2v")
-            .join("keyring")
-            .join("keyring.2")
-            .exists()
-    );
-    assert!(
-        !repo_root
-            .join(".e2v")
-            .join("journal")
-            .join("keyring-update.json")
-            .exists()
-    );
+    assert!(!repo_root
+        .join(".e2v")
+        .join("keyring")
+        .join("keyring.2")
+        .exists());
+    assert!(!repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("keyring-update.json")
+        .exists());
 }
 
 #[test]
@@ -620,6 +616,39 @@ fn commit_restores_access_via_local_device_after_cache_clear() {
 }
 
 #[test]
+fn read_service_restores_access_via_local_device_after_cache_clear_between_steps() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "fresh-process read service".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let entries = read_service.read_dir(&snapshot, "").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "tracked.txt");
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+}
+
+#[test]
 fn create_branch_restores_access_via_local_device_after_cache_clear() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -633,11 +662,9 @@ fn create_branch_restores_access_via_local_device_after_cache_clear() {
     let branches = facade.list_branches(&repo_root).unwrap();
 
     assert_eq!(branch.name, "feature/latest");
-    assert!(
-        branches
-            .iter()
-            .any(|entry| entry.name == "feature/latest" && !entry.is_current)
-    );
+    assert!(branches
+        .iter()
+        .any(|entry| entry.name == "feature/latest" && !entry.is_current));
 }
 
 #[test]
@@ -655,7 +682,9 @@ fn list_checkout_and_delete_branch_restore_access_via_local_device_after_cache_c
     assert!(listed.iter().any(|entry| entry.name == "feature/latest"));
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
-    let checked_out = facade.checkout_branch(&repo_root, "feature/latest").unwrap();
+    let checked_out = facade
+        .checkout_branch(&repo_root, "feature/latest")
+        .unwrap();
     assert_eq!(checked_out.branch.name, "feature/latest");
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
@@ -1471,11 +1500,9 @@ fn commit_ignores_local_checkout_mapping_artifact() {
     let entries = read_service.read_dir(&snapshot, "").unwrap();
 
     assert!(entries.iter().any(|entry| entry.name == "root.txt"));
-    assert!(
-        !entries
-            .iter()
-            .any(|entry| entry.name == ".e2v-checkout-mapping.json")
-    );
+    assert!(!entries
+        .iter()
+        .any(|entry| entry.name == ".e2v-checkout-mapping.json"));
 }
 
 #[test]
@@ -3624,11 +3651,9 @@ fn manifest_store_walks_nested_tree_entries() {
     let store = ManifestStore::new(&repo_root);
     let entries = store.walk_tree(&commit.snapshot_id).unwrap();
 
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.path == "nested/hello.txt" && entry.kind == "file")
-    );
+    assert!(entries
+        .iter()
+        .any(|entry| entry.path == "nested/hello.txt" && entry.kind == "file"));
 }
 
 #[test]
@@ -4411,21 +4436,23 @@ fn share_accept_member_creates_writer_member_device() {
 
     let keyring = read_current_keyring_json(&repo_root);
     assert_eq!(keyring["generation"].as_u64(), Some(2));
-    assert!(
-        keyring["actors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
-                    && actor["role"].as_str() == Some("writer_member")
-            )
-    );
-    assert!(keyring["devices"].as_array().unwrap().iter().any(
-        |device| device["actor_id"].as_str() == Some(invite.actor_id.as_str())
-            && device["label"].as_str() == Some("alice-laptop")
-            && device["status"].as_str() == Some("active")
-    ));
+    assert!(keyring["actors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
+                && actor["role"].as_str() == Some("writer_member")
+        ));
+    assert!(keyring["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |device| device["actor_id"].as_str() == Some(invite.actor_id.as_str())
+                && device["label"].as_str() == Some("alice-laptop")
+                && device["status"].as_str() == Some("active")
+        ));
     assert!(keyring_contains_actor_envelope(&keyring, &invite.actor_id));
 }
 
@@ -4464,18 +4491,14 @@ fn share_accept_member_bootstraps_empty_recipient_repo() {
     assert!(!accepted.device_id.is_empty());
 
     let recipient_control = recipient_root.join(".e2v");
-    assert!(
-        recipient_control
-            .join("keyring")
-            .join("keyring.current")
-            .is_file()
-    );
-    assert!(
-        recipient_control
-            .join("device")
-            .join("local-device.json")
-            .is_file()
-    );
+    assert!(recipient_control
+        .join("keyring")
+        .join("keyring.current")
+        .is_file());
+    assert!(recipient_control
+        .join("device")
+        .join("local-device.json")
+        .is_file());
 
     let pointer: serde_json::Value = serde_json::from_slice(
         &fs::read(recipient_control.join("keyring").join("keyring.current")).unwrap(),
@@ -4490,21 +4513,23 @@ fn share_accept_member_bootstraps_empty_recipient_repo() {
         keyring["repo_id"].as_str(),
         read_current_keyring_json(&owner_root)["repo_id"].as_str()
     );
-    assert!(
-        keyring["actors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
-                    && actor["role"].as_str() == Some("writer_member")
-            )
-    );
-    assert!(keyring["devices"].as_array().unwrap().iter().any(
-        |device| device["device_id"].as_str() == Some(accepted.device_id.as_str())
-            && device["label"].as_str() == Some("alice-laptop")
-            && device["status"].as_str() == Some("active")
-    ));
+    assert!(keyring["actors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
+                && actor["role"].as_str() == Some("writer_member")
+        ));
+    assert!(keyring["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |device| device["device_id"].as_str() == Some(accepted.device_id.as_str())
+                && device["label"].as_str() == Some("alice-laptop")
+                && device["status"].as_str() == Some("active")
+        ));
 }
 
 #[test]
@@ -4564,24 +4589,20 @@ fn share_revoke_member_advances_active_epoch_and_removes_member_envelope() {
     let after = read_current_keyring_json(&repo_root);
     assert_eq!(after["generation"].as_u64(), Some(3));
     assert_eq!(after["active_epoch"].as_u64(), Some(before_epoch + 1));
-    assert!(
-        after["actors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
-                    && actor["role"].as_str() == Some("writer_member")
-            )
-    );
-    assert!(
-        after["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|device| device["actor_id"].as_str() == Some(invite.actor_id.as_str()))
-            .all(|device| device["status"].as_str() == Some("revoked"))
-    );
+    assert!(after["actors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |actor| actor["actor_id"].as_str() == Some(invite.actor_id.as_str())
+                && actor["role"].as_str() == Some("writer_member")
+        ));
+    assert!(after["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|device| device["actor_id"].as_str() == Some(invite.actor_id.as_str()))
+        .all(|device| device["status"].as_str() == Some("revoked")));
     assert!(!keyring_contains_actor_envelope(&after, &invite.actor_id));
 }
 
@@ -4639,14 +4660,12 @@ fn share_revoke_member_accepts_explicit_password_after_cache_clear_in_latest_flo
         .unwrap();
 
     let after = read_current_keyring_json(&repo_root);
-    assert!(
-        after["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|device| device["actor_id"].as_str() == Some(invite.actor_id.as_str()))
-            .all(|device| device["status"].as_str() == Some("revoked"))
-    );
+    assert!(after["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|device| device["actor_id"].as_str() == Some(invite.actor_id.as_str()))
+        .all(|device| device["status"].as_str() == Some("revoked")));
 }
 
 #[test]
@@ -4806,11 +4825,9 @@ fn share_invite_device_and_accept_device_adds_second_active_device_for_actor() {
         .filter(|device| device["actor_id"].as_str() == Some(accepted_member.actor_id.as_str()))
         .collect::<Vec<_>>();
     assert_eq!(actor_devices.len(), 2);
-    assert!(
-        actor_devices
-            .iter()
-            .all(|device| device["status"].as_str() == Some("active"))
-    );
+    assert!(actor_devices
+        .iter()
+        .all(|device| device["status"].as_str() == Some("active")));
     assert!(
         keyring["envelopes"]
             .as_array()
@@ -4903,26 +4920,22 @@ fn share_revoke_device_advances_epoch_and_only_revokes_target_device() {
 
     let after = read_current_keyring_json(&repo_root);
     assert_eq!(after["active_epoch"].as_u64(), Some(before_epoch + 1));
-    assert!(
-        after["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |device| device["device_id"].as_str() == Some(accepted_device.device_id.as_str())
-                    && device["status"].as_str() == Some("revoked")
-            )
-    );
-    assert!(
-        after["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |device| device["device_id"].as_str() == Some(accepted_member.device_id.as_str())
-                    && device["status"].as_str() == Some("active")
-            )
-    );
+    assert!(after["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |device| device["device_id"].as_str() == Some(accepted_device.device_id.as_str())
+                && device["status"].as_str() == Some("revoked")
+        ));
+    assert!(after["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |device| device["device_id"].as_str() == Some(accepted_member.device_id.as_str())
+                && device["status"].as_str() == Some("active")
+        ));
     assert!(
         !after["envelopes"]
             .as_array()
