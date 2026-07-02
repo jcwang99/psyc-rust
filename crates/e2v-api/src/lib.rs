@@ -7,8 +7,8 @@ use e2v_core::{
     BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry, FileHandle,
     InitOptions, ReadService, RepositoryFacade, RepositoryState, ShareAcceptDeviceOptions,
     ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle, ShareInviteDeviceOptions,
-    ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions,
-    ShareRevokeMemberOptions, SnapshotHandle, SnapshotSummary,
+    ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions, ShareRevokeMemberOptions,
+    SnapshotHandle, SnapshotSummary,
 };
 use e2v_sync::{
     CloneOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions, PushOptions, RemoteSpec,
