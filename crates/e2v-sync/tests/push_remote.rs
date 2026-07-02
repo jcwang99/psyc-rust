@@ -2990,6 +2990,81 @@ fn push_stores_pack_index_segments_as_authenticated_bytes() {
 }
 
 #[test]
+fn push_encodes_pack_index_segments_without_pretty_printed_json_whitespace() {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct PackIndexLike {
+        schema_version: u32,
+        pack_id: String,
+        data_path: String,
+        entries: Vec<PackIndexEntryLike>,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct PackIndexEntryLike {
+        object_id: String,
+        offset: u64,
+        length: u64,
+    }
+
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello packed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "compact-pack-index-segment".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex,
+            operation_id: "compact-pack-index-segment-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let index_path = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let index_bytes = remote.get_physical(&index_path).unwrap();
+    let secrets =
+        e2v_core::sync_support::open_repo_secrets_for_sync(&repo_root.join(".e2v")).unwrap();
+    let plaintext = e2v_core::sync_support::decrypt_control_record_for_sync(
+        &secrets,
+        &format!("pack-index-segment:{index_path}"),
+        "pack-index-segment",
+        &index_bytes,
+    )
+    .unwrap();
+    let index: PackIndexLike = serde_json::from_slice(&plaintext).unwrap();
+    let compact_json = serde_json::to_vec(&index).unwrap();
+
+    assert_eq!(
+        plaintext, compact_json,
+        "packed push should not spend ciphertext budget on pretty-printed pack-index segment whitespace"
+    );
+}
+
+#[test]
 fn push_rejects_invalid_pack_index_root_instead_of_falling_back_to_segment_listing() {
     let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();

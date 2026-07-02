@@ -418,7 +418,7 @@ where
             &encode_pack_index_segment_bytes_for_sync(
                 &secrets,
                 &index_path,
-                &serde_json::to_vec_pretty(&index)?,
+                &serde_json::to_vec(&index)?,
             )?,
         )?;
         *pack_batch_index += 1;

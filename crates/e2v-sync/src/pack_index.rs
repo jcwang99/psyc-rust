@@ -274,7 +274,7 @@ fn encode_pack_index_root_bytes(secrets: &RepoSecrets, root: &PackIndexRoot) -> 
         secrets,
         PACK_INDEX_ROOT_STABLE_NAME,
         PACK_INDEX_ROOT_OBJECT_TYPE,
-        &serde_json::to_vec_pretty(root)?,
+        &serde_json::to_vec(root)?,
     )
 }
 
@@ -393,7 +393,7 @@ fn build_compacted_segment_bytes<B: BlobStore>(
     encode_pack_index_segment_bytes(
         secrets,
         compacted_path,
-        &serde_json::to_vec_pretty(&compacted_index)?,
+        &serde_json::to_vec(&compacted_index)?,
     )
 }
 
@@ -1018,6 +1018,85 @@ mod tests {
             root.segments
                 .iter()
                 .any(|path| path.starts_with(PACK_INDEX_COMPACTED_SEGMENT_PREFIX))
+        );
+    }
+
+    #[test]
+    fn pack_index_root_ciphertext_uses_compact_json_plaintext() {
+        let (_temp, _control_dir, secrets) = seeded_control_dir();
+        let root = PackIndexRoot {
+            schema_version: PACK_INDEX_ROOT_SCHEMA_VERSION,
+            layout_id: "direct".to_string(),
+            layout_generation: 7,
+            generation: 7,
+            segments: vec![
+                "packs/index/op-00000000.json".to_string(),
+                "pack-index/segments/compact-00000000000000000005.json".to_string(),
+            ],
+        };
+
+        let bytes = encode_pack_index_root_bytes(&secrets, &root).unwrap();
+        let plaintext = decrypt_control_record_for_sync(
+            &secrets,
+            PACK_INDEX_ROOT_STABLE_NAME,
+            PACK_INDEX_ROOT_OBJECT_TYPE,
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plaintext,
+            serde_json::to_vec(&root).unwrap(),
+            "pack-index root should not spend ciphertext budget on pretty-printed JSON whitespace"
+        );
+    }
+
+    #[test]
+    fn compacted_pack_index_segment_ciphertext_uses_compact_json_plaintext() {
+        let (_temp, _control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        let mut segment_paths = Vec::new();
+        for index in 0..2usize {
+            let (pack_index, payload) = build_pack(
+                &format!("op-{index}"),
+                0,
+                &[(
+                    format!("{index:064x}"),
+                    format!("payload-{index}").into_bytes(),
+                )],
+            )
+            .unwrap();
+            remote
+                .put_physical(&pack_index.data_path, &payload)
+                .unwrap();
+            let segment_path = format!("packs/index/op-{index}-00000000.json");
+            remote
+                .put_physical(
+                    &segment_path,
+                    &encode_pack_index_segment_bytes(
+                        &secrets,
+                        &segment_path,
+                        &serde_json::to_vec(&pack_index).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            segment_paths.push(segment_path);
+        }
+
+        let compacted_path = "pack-index/segments/compact-00000000000000000002.json";
+        let compacted_bytes =
+            build_compacted_segment_bytes(&remote, &segment_paths, compacted_path, &secrets)
+                .unwrap();
+        let plaintext =
+            decode_pack_index_segment_plaintext(compacted_path, &compacted_bytes, Some(&secrets))
+                .unwrap();
+        let aggregate: AggregatePackIndexSegment = serde_json::from_slice(&plaintext).unwrap();
+        let compact_json = serde_json::to_vec(&aggregate).unwrap();
+
+        assert_eq!(
+            plaintext, compact_json,
+            "compacted pack-index segments should not spend ciphertext budget on pretty-printed JSON whitespace"
         );
     }
 }
