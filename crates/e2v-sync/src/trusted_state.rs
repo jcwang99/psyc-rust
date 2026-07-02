@@ -51,7 +51,7 @@ pub(crate) fn store_trusted_remote_state(state: &TrustedRemoteState) -> Result<(
     std::fs::create_dir_all(&parent)
         .with_context(|| format!("failed to create trusted state dir {}", parent.display()))?;
     let path = trusted_state_file_path(&state.repo_id)?;
-    let bytes = serde_json::to_vec_pretty(state)?;
+    let bytes = serde_json::to_vec(state)?;
     std::fs::write(&path, bytes)
         .with_context(|| format!("failed to write trusted state {}", path.display()))?;
     Ok(())
@@ -98,4 +98,32 @@ fn dirs_base_dir() -> Option<PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME").map(|home| Path::new(&home).join(".local").join("state"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn trusted_state_is_stored_as_compact_json() {
+        let temp = tempdir().unwrap();
+        let _guard = override_trusted_state_dir_for_test(temp.path().to_path_buf());
+        let state = TrustedRemoteState {
+            repo_id: "repo-123".to_string(),
+            min_layout_generation: 7,
+            min_keyring_generation: 11,
+            min_ref_generation: 13,
+        };
+
+        store_trusted_remote_state(&state).unwrap();
+
+        let bytes = std::fs::read(temp.path().join("repo-123.json")).unwrap();
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&state).unwrap(),
+            "trusted state files should not store pretty-printed JSON whitespace"
+        );
+    }
 }

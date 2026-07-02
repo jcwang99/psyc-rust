@@ -115,8 +115,7 @@ impl OperationJournal {
         operation_id: &OperationId,
         metadata: OperationMetadata,
     ) -> Result<()> {
-        let bytes =
-            serde_json::to_vec_pretty(&metadata).context("failed to encode operation metadata")?;
+        let bytes = serde_json::to_vec(&metadata).context("failed to encode operation metadata")?;
         let connection = self.open_connection()?;
         connection
             .execute(
@@ -604,6 +603,34 @@ mod tests {
             .unwrap();
 
         assert!(temp.path().join("operations.sqlite").is_file());
+    }
+
+    #[test]
+    fn journal_stores_operation_metadata_as_compact_json() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let operation_id = OperationId::new("op-metadata-json".to_string()).unwrap();
+        let metadata = OperationMetadata::push("branch-token", Some(17));
+
+        journal
+            .begin_operation(&operation_id, metadata.clone())
+            .unwrap();
+
+        let bytes: Vec<u8> = journal
+            .open_connection()
+            .unwrap()
+            .query_row(
+                "SELECT metadata_json FROM operation_metadata WHERE operation_id = ?1",
+                params![operation_id.value],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&metadata).unwrap(),
+            "operation journal should not store pretty-printed JSON whitespace in sqlite metadata blobs"
+        );
     }
 
     #[test]
