@@ -12,8 +12,9 @@ use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_
 use crate::object_type::infer_object_type_from_hint;
 use crate::pack::{ObjectPackBuilder, PackedObjectLocation, pack_paths};
 use crate::pack_index::{
-    encode_pack_index_segment_bytes_for_sync, load_remote_pack_locations_with_local_cache,
-    next_pack_index_segment_paths, publish_pack_index_root,
+    encode_pack_index_segment_bytes_for_sync, load_remote_operation_pack_locations_with_secrets,
+    load_remote_pack_locations_with_local_cache, next_pack_index_segment_paths,
+    publish_pack_index_root,
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::transaction::{PublishPlan, PublishedObject};
@@ -868,8 +869,23 @@ pub fn push_head<R: RemoteBackend + Clone>(
     }
     publisher.pre_commit_verify(&session)?;
 
-    (remote_loose_object_ids, remote_pack_locations) =
-        load_remote_object_inventory(&control_dir, remote)?;
+    if !missing_object_ids.is_empty() {
+        let current_operation_pack_locations = if pack_enabled {
+            load_remote_operation_pack_locations_with_secrets(
+                remote,
+                &operation_id.value,
+                &pack_index_secrets,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+        for object_id in &missing_object_ids {
+            if !current_operation_pack_locations.contains_key(object_id) {
+                remote_loose_object_ids.insert(object_id.clone());
+            }
+        }
+        remote_pack_locations.extend(current_operation_pack_locations);
+    }
     verify_remote_reachable_objects(
         &remote_loose_object_ids,
         &remote_pack_locations,
