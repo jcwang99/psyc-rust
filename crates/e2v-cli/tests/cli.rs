@@ -421,6 +421,170 @@ fn fetch_command_uses_the_default_remote_for_the_current_branch() {
 }
 
 #[test]
+fn pull_command_fast_forwards_the_current_branch_from_the_default_remote() {
+    let temp = tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    init_repo(&source_repo);
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let facade = RepositoryFacade::new();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+    let branch_token = facade.open(&source_repo).unwrap().branch.token_hex;
+    let remote = LocalFolderBackend::new(&remote_root);
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "cli-pull-first".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_api::Sdk::new()
+        .clone_remote(e2v_api::CloneRequest {
+            remote_spec: file_remote_spec(&remote_root),
+            target_repo_root: clone_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: branch_token.clone(),
+        })
+        .unwrap();
+    e2v_api::Sdk::new()
+        .add_remote(&clone_repo, "origin", &file_remote_spec(&remote_root))
+        .unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "beta").unwrap();
+    let second = facade
+        .commit(CommitOptions {
+            repo_root: source_repo.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "cli-pull-second".to_string(),
+        },
+    )
+    .unwrap();
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "pull",
+        "--repo",
+        clone_repo.to_str().unwrap(),
+        "--password",
+        "correct horse battery staple",
+    ])
+    .unwrap();
+
+    assert!(output.contains("pulled"));
+    assert!(output.contains(&second.snapshot_id[..8]));
+    let read = e2v_api::Sdk::new().open_read_handle(&clone_repo).unwrap();
+    let snapshot = read.resolve_branch(&branch_token).unwrap();
+    assert_eq!(snapshot.snapshot_id, second.snapshot_id);
+}
+
+#[test]
+fn pull_command_rejects_diverged_local_history_without_moving_the_current_branch() {
+    let temp = tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    init_repo(&source_repo);
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let facade = RepositoryFacade::new();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+    let branch_token = facade.open(&source_repo).unwrap().branch.token_hex;
+    let remote = LocalFolderBackend::new(&remote_root);
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "cli-pull-diverged-first".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_api::Sdk::new()
+        .clone_remote(e2v_api::CloneRequest {
+            remote_spec: file_remote_spec(&remote_root),
+            target_repo_root: clone_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: branch_token.clone(),
+        })
+        .unwrap();
+    e2v_api::Sdk::new()
+        .add_remote(&clone_repo, "origin", &file_remote_spec(&remote_root))
+        .unwrap();
+
+    fs::write(clone_repo.join("tracked.txt"), "local-only").unwrap();
+    let local_only = facade
+        .commit(CommitOptions {
+            repo_root: clone_repo.clone(),
+            message: "local-only".to_string(),
+        })
+        .unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "remote-only").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo.clone(),
+            message: "remote-only".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "cli-pull-diverged-remote".to_string(),
+        },
+    )
+    .unwrap();
+
+    let error = e2v_cli::run_cli_for_test([
+        "e2v",
+        "pull",
+        "--repo",
+        clone_repo.to_str().unwrap(),
+        "--password",
+        "correct horse battery staple",
+    ])
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("diverged") || error.to_string().contains("conflict"),
+        "unexpected error: {error:#}"
+    );
+    let read = e2v_api::Sdk::new().open_read_handle(&clone_repo).unwrap();
+    let snapshot = read.resolve_branch(&branch_token).unwrap();
+    assert_eq!(snapshot.snapshot_id, local_only.snapshot_id);
+}
+
+#[test]
 fn clone_command_clones_an_explicit_remote_spec_into_a_target_repo() {
     let temp = tempdir().unwrap();
     let source_repo = temp.path().join("source");
@@ -1153,6 +1317,7 @@ fn maintenance_commands_delegate_through_the_sdk_boundary() {
         "sdk.force_accept_default_remote_rollback(",
         "sdk.gc_default_remote_dry_run(",
         "sdk.gc_default_remote_execute(",
+        "sdk.pull_default_remote(",
     ] {
         assert!(
             source.contains(sdk_call),

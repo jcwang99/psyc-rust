@@ -122,6 +122,13 @@ pub struct CloneRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub repo_root: PathBuf,
+    pub branch_token: String,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyRemoteRequest {
     pub repo_root: PathBuf,
     pub sample_percent: u8,
@@ -284,6 +291,12 @@ pub struct FetchResponse {
 pub struct CloneResponse {
     pub branch_token: String,
     pub head_snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullResponse {
+    pub snapshot_id: String,
+    pub fast_forward_applied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -645,6 +658,42 @@ impl Sdk {
         })
         .map(clone_response_from_result)
         .map_err(map_error)
+    }
+
+    pub fn pull_default_remote(&self, request: PullRequest) -> SdkResult<PullResponse> {
+        let previous = self
+            .facade
+            .read_service(&request.repo_root)
+            .map_err(map_error)?
+            .resolve_branch(&request.branch_token)
+            .ok()
+            .map(|snapshot| snapshot.snapshot_id);
+
+        self.fetch_default_remote(FetchRequest {
+            repo_root: request.repo_root.clone(),
+            branch_token: request.branch_token.clone(),
+            password: request.password,
+        })?;
+
+        let fetched_snapshot_id = self
+            .facade
+            .default_head_snapshot_id(&request.repo_root)
+            .map_err(map_error)?
+            .ok_or_else(|| anyhow::anyhow!("remote branch ref does not point to a snapshot"))
+            .map_err(map_error)?;
+
+        self.facade
+            .update_branch_head_if_fast_forward(
+                &request.repo_root,
+                &request.branch_token,
+                Some(&fetched_snapshot_id),
+            )
+            .map_err(map_error)?;
+
+        Ok(pull_response_from_snapshot(
+            fetched_snapshot_id.clone(),
+            previous.as_deref() != Some(fetched_snapshot_id.as_str()),
+        ))
     }
 
     pub fn verify_remote(
@@ -1031,6 +1080,13 @@ fn clone_response_from_result(result: e2v_sync::CloneResult) -> CloneResponse {
     CloneResponse {
         branch_token: result.branch_token,
         head_snapshot_id: result.head_snapshot_id,
+    }
+}
+
+fn pull_response_from_snapshot(snapshot_id: String, fast_forward_applied: bool) -> PullResponse {
+    PullResponse {
+        snapshot_id,
+        fast_forward_applied,
     }
 }
 

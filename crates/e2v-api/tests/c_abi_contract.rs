@@ -934,6 +934,24 @@ fn c_abi_can_register_remote_and_run_sync_maintenance_flows() {
     let _fetch: e2v_api::FetchResponse =
         serde_json::from_str(&read_owned_string(&mut fetch_json)).unwrap();
 
+    let mut pull_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_pull_default_remote_json(
+                sdk,
+                clone_repo_c.as_ptr(),
+                c_string(&cloned.branch_token).as_ptr(),
+                c_string("correct horse battery staple").as_ptr(),
+                &mut pull_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let pulled: e2v_api::PullResponse =
+        serde_json::from_str(&read_owned_string(&mut pull_json)).unwrap();
+    assert!(!pulled.snapshot_id.is_empty());
+
     let mut verify_json = c_abi::e2v_string_t::default();
     assert_eq!(
         unsafe {
@@ -1067,6 +1085,240 @@ fn c_abi_can_register_remote_and_run_sync_maintenance_flows() {
     assert!(gc_execute.deleted_physical_refs.is_empty());
 
     unsafe {
+        c_abi::e2v_sdk_free(sdk);
+    }
+}
+
+#[test]
+fn c_abi_pull_rejects_diverged_local_history_without_moving_the_current_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = new_sdk_handle();
+    let source_repo_c = path_c_string(&source_repo);
+    let clone_repo_c = path_c_string(&clone_repo);
+    let remote_spec = format!("file://{}", remote_repo.to_string_lossy().replace('\\', "/"));
+    let remote_spec_c = c_string(&remote_spec);
+    let mut error = std::ptr::null_mut();
+    let mut init_json = c_abi::e2v_string_t::default();
+
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_init_repository_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("correct horse battery staple").as_ptr(),
+                c_string("main").as_ptr(),
+                &mut init_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let repo: RepositoryInfo = serde_json::from_str(&read_owned_string(&mut init_json)).unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let mut first_commit_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_commit_repository_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("first").as_ptr(),
+                &mut first_commit_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _first: CommitInfo =
+        serde_json::from_str(&read_owned_string(&mut first_commit_json)).unwrap();
+
+    let mut remote_reg_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_add_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("origin").as_ptr(),
+                remote_spec_c.as_ptr(),
+                &mut remote_reg_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _remote: RemoteRegistration =
+        serde_json::from_str(&read_owned_string(&mut remote_reg_json)).unwrap();
+
+    let mut push_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_push_default_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string(&repo.branch.token_hex).as_ptr(),
+                c_string("push-first").as_ptr(),
+                &mut push_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _push: e2v_api::PushResponse =
+        serde_json::from_str(&read_owned_string(&mut push_json)).unwrap();
+
+    let mut clone_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_clone_remote_json(
+                sdk,
+                remote_spec_c.as_ptr(),
+                clone_repo_c.as_ptr(),
+                c_string("correct horse battery staple").as_ptr(),
+                c_string(&repo.branch.token_hex).as_ptr(),
+                &mut clone_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let cloned: e2v_api::CloneResponse =
+        serde_json::from_str(&read_owned_string(&mut clone_json)).unwrap();
+
+    let mut clone_remote_reg_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_add_remote_json(
+                sdk,
+                clone_repo_c.as_ptr(),
+                c_string("origin").as_ptr(),
+                remote_spec_c.as_ptr(),
+                &mut clone_remote_reg_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _clone_remote: RemoteRegistration =
+        serde_json::from_str(&read_owned_string(&mut clone_remote_reg_json)).unwrap();
+
+    fs::write(clone_repo.join("tracked.txt"), "local-only").unwrap();
+    let mut local_commit_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_commit_repository_json(
+                sdk,
+                clone_repo_c.as_ptr(),
+                c_string("local-only").as_ptr(),
+                &mut local_commit_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _local_only: CommitInfo =
+        serde_json::from_str(&read_owned_string(&mut local_commit_json)).unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "remote-only").unwrap();
+    let mut remote_commit_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_commit_repository_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("remote-only").as_ptr(),
+                &mut remote_commit_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _remote_only: CommitInfo =
+        serde_json::from_str(&read_owned_string(&mut remote_commit_json)).unwrap();
+
+    let mut second_push_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_push_default_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string(&repo.branch.token_hex).as_ptr(),
+                c_string("push-remote-only").as_ptr(),
+                &mut second_push_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _second_push: e2v_api::PushResponse =
+        serde_json::from_str(&read_owned_string(&mut second_push_json)).unwrap();
+
+    let mut pull_json = c_abi::e2v_string_t::default();
+    let pull_code = unsafe {
+        c_abi::e2v_pull_default_remote_json(
+            sdk,
+            clone_repo_c.as_ptr(),
+            c_string(&cloned.branch_token).as_ptr(),
+            c_string("correct horse battery staple").as_ptr(),
+            &mut pull_json,
+            &mut error,
+        )
+    };
+    assert_eq!(pull_code, c_abi::E2V_NEEDS_REBASE);
+
+    let mut read_handle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_open_read_handle(
+                sdk,
+                clone_repo_c.as_ptr(),
+                &mut read_handle,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let mut snapshot_handle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_resolve_branch(
+                read_handle,
+                c_string(&cloned.branch_token).as_ptr(),
+                &mut snapshot_handle,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let mut file_handle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_open_file(
+                read_handle,
+                snapshot_handle,
+                c_string("tracked.txt").as_ptr(),
+                &mut file_handle,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let mut bytes = c_abi::e2v_bytes_t::default();
+    assert_eq!(
+        unsafe { c_abi::e2v_read_range(read_handle, file_handle, 0, 32, &mut bytes, &mut error) },
+        c_abi::E2V_OK
+    );
+    assert_eq!(String::from_utf8(read_owned_bytes(&mut bytes)).unwrap(), "local-only");
+
+    unsafe {
+        c_abi::e2v_file_view_free(file_handle);
+        c_abi::e2v_snapshot_view_free(snapshot_handle);
+        c_abi::e2v_read_handle_free(read_handle);
         c_abi::e2v_sdk_free(sdk);
     }
 }

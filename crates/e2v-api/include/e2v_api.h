@@ -78,6 +78,7 @@ e2v_error_code_t e2v_add_remote_json(e2v_sdk_t *sdk, const char *repo_root, cons
 e2v_error_code_t e2v_load_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_push_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, const char *branch_token, const char *operation_id, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_fetch_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, const char *branch_token, const char *password, e2v_string_t *json_out, e2v_error_t **error_out);
+e2v_error_code_t e2v_pull_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, const char *branch_token, const char *password, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_clone_remote_json(e2v_sdk_t *sdk, const char *remote_spec, const char *target_repo_root, const char *password, const char *branch_token, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_verify_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, uint8_t sample_percent, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_repair_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, e2v_string_t *json_out, e2v_error_t **error_out);

@@ -8,9 +8,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use e2v_api::{
     CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest,
-    InitRepositoryOptions, PushRequest, Sdk, ShareAcceptDeviceRequest, ShareAcceptMemberRequest,
-    ShareInviteDeviceRequest, ShareInviteMemberRequest, ShareRevokeDeviceRequest,
-    ShareRevokeMemberRequest, VerifyRemoteRequest,
+    InitRepositoryOptions, PullRequest, PushRequest, Sdk, ShareAcceptDeviceRequest,
+    ShareAcceptMemberRequest, ShareInviteDeviceRequest, ShareInviteMemberRequest,
+    ShareRevokeDeviceRequest, ShareRevokeMemberRequest, VerifyRemoteRequest,
 };
 use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
@@ -61,6 +61,12 @@ enum Command {
         repo: PathBuf,
     },
     Fetch {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    Pull {
         #[arg(long)]
         repo: PathBuf,
         #[arg(long)]
@@ -351,6 +357,18 @@ fn execute(cli: Cli) -> Result<String> {
             Ok(format!(
                 "downloaded {} objects\n",
                 fetched.downloaded_objects
+            ))
+        }
+        Command::Pull { repo, password } => {
+            let branch_token = sdk.open_repository(&repo)?.branch.token_hex;
+            let pulled = sdk.pull_default_remote(PullRequest {
+                repo_root: repo,
+                branch_token,
+                password,
+            })?;
+            Ok(format!(
+                "pulled {}\n",
+                &pulled.snapshot_id[..pulled.snapshot_id.len().min(8)]
             ))
         }
         Command::Clone {

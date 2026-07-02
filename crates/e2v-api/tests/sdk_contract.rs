@@ -3,7 +3,7 @@ use std::path::Path;
 
 use e2v_api::{
     parse_remote_spec, CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions,
-    FetchRequest, InitRepositoryOptions, PushRequest, Sdk, SdkErrorCode,
+    FetchRequest, InitRepositoryOptions, PullRequest, PushRequest, Sdk, SdkErrorCode,
 };
 
 fn file_remote_spec(path: &Path) -> String {
@@ -374,6 +374,166 @@ fn sdk_can_fetch_updates_from_registered_default_remote() {
     let file = read.open_file(&snapshot, "tracked.txt").unwrap();
     let bytes = read.read_range(&file, 0, 32).unwrap();
     assert_eq!(String::from_utf8(bytes).unwrap(), "beta");
+}
+
+#[test]
+fn sdk_can_pull_fast_forward_updates_into_the_current_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = Sdk::new();
+    let source_state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let first = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-first".to_string(),
+    })
+    .unwrap();
+
+    sdk.clone_remote(CloneRequest {
+        remote_spec: remote_spec.clone(),
+        target_repo_root: clone_repo.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_token: source_state.branch.token_hex.clone(),
+    })
+    .unwrap();
+    sdk.add_remote(&clone_repo, "origin", &remote_spec).unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "beta").unwrap();
+    let second = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-second".to_string(),
+    })
+    .unwrap();
+
+    let pulled = sdk
+        .pull_default_remote(PullRequest {
+            repo_root: clone_repo.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(pulled.snapshot_id, second.snapshot_id);
+    assert!(pulled.fast_forward_applied);
+
+    let read = sdk.open_read_handle(&clone_repo).unwrap();
+    let snapshot = read.resolve_branch(&source_state.branch.token_hex).unwrap();
+    assert_eq!(snapshot.snapshot_id, second.snapshot_id);
+    assert_ne!(snapshot.snapshot_id, first.snapshot_id);
+}
+
+#[test]
+fn sdk_pull_rejects_diverged_local_history_without_moving_the_current_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = Sdk::new();
+    let source_state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "first".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-first".to_string(),
+    })
+    .unwrap();
+
+    sdk.clone_remote(CloneRequest {
+        remote_spec: remote_spec.clone(),
+        target_repo_root: clone_repo.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_token: source_state.branch.token_hex.clone(),
+    })
+    .unwrap();
+    sdk.add_remote(&clone_repo, "origin", &remote_spec).unwrap();
+
+    fs::write(clone_repo.join("tracked.txt"), "local-only").unwrap();
+    let local_only = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: clone_repo.clone(),
+            message: "local-only".to_string(),
+        })
+        .unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "remote-only").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "remote-only".to_string(),
+    })
+    .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-remote-only".to_string(),
+    })
+    .unwrap();
+
+    let error = sdk
+        .pull_default_remote(PullRequest {
+            repo_root: clone_repo.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::NeedsRebase);
+
+    let read = sdk.open_read_handle(&clone_repo).unwrap();
+    let snapshot = read.resolve_branch(&source_state.branch.token_hex).unwrap();
+    assert_eq!(snapshot.snapshot_id, local_only.snapshot_id);
 }
 
 #[test]

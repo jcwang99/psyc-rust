@@ -1499,6 +1499,61 @@ impl RepositoryFacade {
         }
         Ok(())
     }
+
+    pub fn default_head_snapshot_id(&self, repo_root: impl AsRef<Path>) -> Result<Option<String>> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        Ok(read_default_ref(&control_dir, &repo_secrets)?.head_snapshot_id)
+    }
+
+    pub fn update_branch_head_if_fast_forward(
+        &self,
+        repo_root: impl AsRef<Path>,
+        ref_token_hex: &str,
+        next_head_snapshot_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        validate_ref_token_value(ref_token_hex)?;
+        if let Some(snapshot_id) = next_head_snapshot_id {
+            validate_object_id_value(snapshot_id).context("invalid snapshot id")?;
+        }
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let current_default_ref = read_default_ref(&control_dir, &repo_secrets)?;
+        let mut branch_ref = if let Some(branch_ref) =
+            read_branch_ref_if_exists(&control_dir, &repo_secrets, ref_token_hex)?
+        {
+            branch_ref
+        } else {
+            ensure!(
+                current_default_ref.ref_token_hex == ref_token_hex,
+                "branch ref not found for token"
+            );
+            current_default_ref.clone()
+        };
+        let previous_head_snapshot_id = branch_ref.head_snapshot_id.clone();
+
+        if previous_head_snapshot_id.as_deref() == next_head_snapshot_id {
+            return Ok(previous_head_snapshot_id);
+        }
+
+        ensure!(
+            branch_fast_forward_allowed(
+                &repo_root,
+                previous_head_snapshot_id.as_deref(),
+                next_head_snapshot_id
+            )?,
+            "pull diverged: local branch requires rebase"
+        );
+
+        branch_ref.head_snapshot_id = next_head_snapshot_id.map(ToString::to_string);
+        write_branch_ref(&control_dir, &repo_secrets, &branch_ref)?;
+        if current_default_ref.ref_token_hex == ref_token_hex {
+            write_default_ref(&control_dir, &repo_secrets, &branch_ref)?;
+        }
+        Ok(previous_head_snapshot_id)
+    }
 }
 
 impl ReadService {
@@ -2359,6 +2414,33 @@ pub(crate) fn verify_snapshot_with_secrets_for_sync(
 fn read_current_ref(control_dir: &Path) -> Result<RefRecord> {
     let secrets = open_repo_secrets(control_dir)?;
     read_default_ref(control_dir, &secrets)
+}
+
+fn branch_fast_forward_allowed(
+    repo_root: &Path,
+    previous_head_snapshot_id: Option<&str>,
+    next_head_snapshot_id: Option<&str>,
+) -> Result<bool> {
+    let Some(next_head_snapshot_id) = next_head_snapshot_id else {
+        return Ok(previous_head_snapshot_id.is_none());
+    };
+    let Some(previous_head_snapshot_id) = previous_head_snapshot_id else {
+        return Ok(true);
+    };
+    if previous_head_snapshot_id == next_head_snapshot_id {
+        return Ok(true);
+    }
+
+    let manifest_store = LocalManifestStore::new(repo_root);
+    let mut next_parent = Some(next_head_snapshot_id.to_string());
+    while let Some(snapshot_id) = next_parent {
+        if snapshot_id == previous_head_snapshot_id {
+            return Ok(true);
+        }
+        let snapshot = manifest_store.get_snapshot(&snapshot_id)?;
+        next_parent = snapshot.parent_snapshot_id;
+    }
+    Ok(false)
 }
 
 fn read_branch_ref_if_exists(

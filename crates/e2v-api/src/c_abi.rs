@@ -10,7 +10,8 @@ use serde::Serialize;
 
 use crate::{
     CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest, InitRepositoryOptions,
-    PushRequest, ReadHandle, Sdk, SdkError, SdkErrorCode, ShareAcceptDeviceRequest,
+    PullRequest, PushRequest, ReadHandle, Sdk, SdkError, SdkErrorCode,
+    ShareAcceptDeviceRequest,
     ShareAcceptMemberRequest, ShareInviteDeviceRequest, ShareInviteMemberRequest,
     ShareRevokeDeviceRequest, ShareRevokeMemberRequest, SnapshotView, VerifyRemoteRequest,
 };
@@ -944,6 +945,30 @@ pub unsafe extern "C" fn e2v_fetch_default_remote_json(
             Some(ffi_read_c_string(password, "password")?)
         };
         sdk.fetch_default_remote(FetchRequest {
+            repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
+            branch_token: ffi_read_c_string(branch_token, "branch_token")?,
+            password,
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn e2v_pull_default_remote_json(
+    sdk: *mut e2v_sdk_t,
+    repo_root: *const c_char,
+    branch_token: *const c_char,
+    password: *const c_char,
+    json_out: *mut e2v_string_t,
+    error_out: *mut *mut e2v_error_t,
+) -> e2v_error_code_t {
+    ffi_call_with_json(json_out, error_out, || {
+        let sdk = unsafe { sdk_ref(sdk)? };
+        let password = if password.is_null() {
+            None
+        } else {
+            Some(ffi_read_c_string(password, "password")?)
+        };
+        sdk.pull_default_remote(PullRequest {
             repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
             branch_token: ffi_read_c_string(branch_token, "branch_token")?,
             password,
