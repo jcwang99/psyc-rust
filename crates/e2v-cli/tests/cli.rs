@@ -714,6 +714,64 @@ fn verify_remote_command_uses_default_file_remote() {
 }
 
 #[test]
+fn verify_snapshot_command_verifies_an_explicit_snapshot_id() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let commit = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "verify",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "snapshot",
+        &commit.snapshot_id,
+    ])
+    .unwrap();
+
+    assert!(output.contains("verified snapshot"));
+    assert!(output.contains(&commit.snapshot_id[..8]));
+}
+
+#[test]
+fn verify_object_command_verifies_an_explicit_object_id_and_type() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let commit = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "verify",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "object",
+        "snapshot",
+        &commit.snapshot_id,
+    ])
+    .unwrap();
+
+    assert!(output.contains("verified object"));
+    assert!(output.contains("snapshot"));
+    assert!(output.contains(&commit.snapshot_id[..8]));
+}
+
+#[test]
 fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

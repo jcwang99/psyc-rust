@@ -147,6 +147,13 @@ enum RemoteCommand {
 
 #[derive(Debug, Subcommand)]
 enum VerifyCommand {
+    Snapshot {
+        snapshot_id: String,
+    },
+    Object {
+        expected_type: String,
+        object_id: String,
+    },
     Remote {
         #[arg(long = "sample")]
         sample_percent: String,
@@ -377,6 +384,23 @@ fn execute(cli: Cli) -> Result<String> {
             }
         },
         Command::Verify { command, repo } => match command {
+            VerifyCommand::Snapshot { snapshot_id } => {
+                facade.verify_snapshot(&repo, &snapshot_id)?;
+                Ok(format!(
+                    "verified snapshot {}\n",
+                    &snapshot_id[..snapshot_id.len().min(8)]
+                ))
+            }
+            VerifyCommand::Object {
+                expected_type,
+                object_id,
+            } => {
+                facade.verify_object(&repo, &object_id, &expected_type)?;
+                Ok(format!(
+                    "verified object {expected_type} {}\n",
+                    &object_id[..object_id.len().min(8)]
+                ))
+            }
             VerifyCommand::Remote { sample_percent } => {
                 let sample_percent = parse_percent_arg(&sample_percent)?;
                 let result = sdk.verify_default_remote(VerifyRemoteRequest {
