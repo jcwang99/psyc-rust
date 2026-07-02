@@ -12,13 +12,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 use e2v_vfs::{
-    CachePolicy, MountRequest, PlatformCapabilities, ReadOnlyVfs, VfsHostLauncher, VfsMountConfig,
-    VfsNodeKind, VfsSemantic,
+    CachePolicy, MountRequest, PlatformCapabilities, ReadOnlyVfs, VfsMountConfig, VfsNodeKind,
+    VfsSemantic,
     testing::{
         LinuxMountAdapter, MacosMountAdapter, PlatformFamily, PlatformMountAdapter,
-        WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
-        WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
-        WinfspRuntimeLibrary, WinfspVolumeParams, opened_file_cached_plaintext,
+        VfsHostLauncher, WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver,
+        WinfspHostLauncher, WinfspHostSession, WinfspInvalidator, WinfspMountContext,
+        WinfspOpenRequest, WinfspRuntimeLibrary, WinfspVolumeParams, opened_file_cached_plaintext,
         winfsp_host_session_new, winfsp_runtime_get_symbol_address,
         winfsp_runtime_paths_from_candidate_roots, winfsp_runtime_paths_from_install_root,
         winfsp_runtime_resolve_mount_exports, winfsp_session_build_native_create_request,
@@ -1206,6 +1206,22 @@ fn vfs_root_does_not_reexport_platform_adapter_test_seams() {
             );
         }
     }
+}
+
+#[test]
+fn vfs_root_does_not_expose_host_launcher_test_trait() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+    let public_surface = source.split("#[doc(hidden)]").next().unwrap_or(&source);
+
+    assert!(
+        !public_surface.contains("pub trait VfsHostLauncher"),
+        "crate root should not expose the test-only VfsHostLauncher trait"
+    );
 }
 
 #[test]

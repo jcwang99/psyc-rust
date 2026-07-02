@@ -151,10 +151,6 @@ pub struct MountRequest {
     mount_point: PathBuf,
 }
 
-pub trait VfsHostLauncher {
-    fn launch(&mut self, request: &MountRequest) -> Result<()>;
-}
-
 impl MountRequest {
     pub fn from_config(config: VfsMountConfig, mount_point: PathBuf) -> Self {
         Self {
@@ -1214,6 +1210,10 @@ pub mod testing {
         WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
         WinfspRuntimeLibrary, WinfspVolumeParams,
     };
+
+    pub trait VfsHostLauncher {
+        fn launch(&mut self, request: &super::MountRequest) -> Result<()>;
+    }
 
     pub fn opened_file_cached_plaintext(opened_file: &OpenedFile) -> Option<Vec<u8>> {
         opened_file
