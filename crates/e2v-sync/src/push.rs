@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 
 use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
-use e2v_store::local_backend::is_missing_physical_object_error;
-use e2v_store::{EncryptedRef, LayoutRoot, RefToken, RemoteBackend, validate_object_id_value};
+use e2v_store::{
+    EncryptedRef, LayoutRoot, RefToken, RemoteBackend, is_missing_physical_object_error,
+    validate_object_id_value,
+};
 
 use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_sync_identifier};
 use crate::object_type::infer_object_type_from_hint;

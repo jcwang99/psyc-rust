@@ -528,7 +528,7 @@ mod tests {
     use crate::keyring::{
         KeyringPointer, KeyringState, seal_repo_secrets, unlock_repo_secrets_uncached,
     };
-    use e2v_store::logical_object_store::LogicalObjectStore;
+    use e2v_store::LogicalObjectStore;
     use e2v_store::{EpochSecrets, RepoSecrets};
 
     fn store_for_tests() -> DirectLayoutObjectStore {

@@ -6,8 +6,7 @@ use e2v_core::sync_support::{
     decrypt_control_record_for_sync, encrypt_control_record_for_sync,
     open_or_unlock_repo_secrets_for_sync,
 };
-use e2v_store::local_backend::is_missing_physical_object_error;
-use e2v_store::{BlobStore, PhysicalObjectRef, RepoSecrets};
+use e2v_store::{BlobStore, PhysicalObjectRef, RepoSecrets, is_missing_physical_object_error};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

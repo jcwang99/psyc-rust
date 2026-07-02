@@ -3,8 +3,10 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use e2v_core::{RepositoryFacade, sync_support};
-use e2v_store::local_backend::is_missing_physical_object_error;
-use e2v_store::{BackendCapability, RefToken, RemoteBackend, validate_object_id_value};
+use e2v_store::{
+    BackendCapability, RefToken, RemoteBackend, is_missing_physical_object_error,
+    validate_object_id_value,
+};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 

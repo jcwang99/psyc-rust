@@ -1,16 +1,18 @@
-pub mod capability;
-pub mod layout;
-pub mod layout_root_store;
-pub mod local_backend;
-pub mod logical_object_store;
-pub mod memory_backend;
-pub mod opendal_backend;
-pub mod ref_store;
-pub mod storage_layout;
+mod capability;
+mod layout;
+mod layout_root_store;
+mod local_backend;
+mod logical_object_store;
+mod memory_backend;
+mod opendal_backend;
+mod ref_store;
+mod storage_layout;
 
 pub use capability::{BackendCapability, ConsistencyClass, WriterMode};
 pub use layout::LayoutRoot;
 pub use layout_root_store::{LayoutRootStore, LayoutRootVersion};
+#[doc(hidden)]
+pub use local_backend::is_missing_physical_object_error;
 pub use local_backend::{BlobStore, LocalFolderBackend, ObjectStat};
 pub use logical_object_store::{
     DirectLayoutObjectStore, EpochSecrets, LoadedObject, LogicalObjectStore, PhysicalObjectRef,

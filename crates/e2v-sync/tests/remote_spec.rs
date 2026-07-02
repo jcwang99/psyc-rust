@@ -34,6 +34,35 @@ fn store_test_probes_are_not_exposed_as_public_api_methods() {
 }
 
 #[test]
+fn store_root_uses_single_reexport_surface_instead_of_public_module_duplicates() {
+    let root_source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("e2v-store")
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for redundant_module in [
+        "pub mod capability;",
+        "pub mod layout;",
+        "pub mod layout_root_store;",
+        "pub mod local_backend;",
+        "pub mod logical_object_store;",
+        "pub mod memory_backend;",
+        "pub mod opendal_backend;",
+        "pub mod ref_store;",
+        "pub mod storage_layout;",
+    ] {
+        assert!(
+            !root_source.contains(redundant_module),
+            "e2v-store should expose a single canonical root surface instead of duplicate public module path {redundant_module}"
+        );
+    }
+}
+
+#[test]
 fn parse_remote_spec_decodes_webdav_url_into_remote_config() {
     let spec = e2v_sync::RemoteSpec::parse("webdav+https://alice:secret@example.com/repo").unwrap();
 
