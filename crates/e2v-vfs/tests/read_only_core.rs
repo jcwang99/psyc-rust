@@ -14,11 +14,12 @@ use std::os::windows::fs::OpenOptionsExt;
 use e2v_vfs::{
     CachePolicy, LinuxMountAdapter, MacosMountAdapter, MountRequest, PlatformCapabilities,
     PlatformFamily, PlatformMountAdapter, ReadOnlyVfs, VfsHostLauncher, VfsMountConfig,
-    VfsNodeKind, VfsSemantic, WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver,
-    WinfspHostLauncher, WinfspHostSession, WinfspInvalidator, WinfspMountContext,
-    WinfspOpenRequest, WinfspRuntimeLibrary, WinfspVolumeParams,
+    VfsNodeKind, VfsSemantic,
     testing::{
-        opened_file_cached_plaintext, winfsp_host_session_new, winfsp_runtime_get_symbol_address,
+        WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
+        WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
+        WinfspRuntimeLibrary, WinfspVolumeParams, opened_file_cached_plaintext,
+        winfsp_host_session_new, winfsp_runtime_get_symbol_address,
         winfsp_runtime_paths_from_candidate_roots, winfsp_runtime_paths_from_install_root,
         winfsp_runtime_resolve_mount_exports, winfsp_session_build_native_create_request,
         winfsp_session_create_filesystem_handle, winfsp_session_destroy_filesystem_handle,
@@ -1138,6 +1139,44 @@ fn winfsp_directory_callbacks_do_not_reload_the_runtime_library() {
         load_count, 1,
         "WinFSP host should load the runtime once during mount startup and reuse cached callback helpers, found {load_count} runtime loads"
     );
+}
+
+#[test]
+fn vfs_root_does_not_reexport_winfsp_host_internals() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    if let Some(start) = source.find("pub use windows::{") {
+        let export_block = &source[start..]
+            .split_once("};")
+            .map(|(block, _)| block)
+            .unwrap_or(&source[start..]);
+        for symbol in [
+            "ReadOnlyVolumeSummary",
+            "WindowsMountLauncher",
+            "WinfspHostConfig",
+            "WinfspHostDriver",
+            "WinfspHostLauncher",
+            "WinfspHostSession",
+            "WinfspInvalidationPlan",
+            "WinfspInvalidator",
+            "WinfspMountContext",
+            "WinfspOpenHandle",
+            "WinfspOpenRequest",
+            "WinfspRuntimeLibrary",
+            "WinfspRuntimePaths",
+            "WinfspVolumeParams",
+        ] {
+            assert!(
+                !export_block.contains(symbol),
+                "crate root should not publicly re-export WinFSP host internals: {symbol}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -20,12 +20,6 @@ pub use platform::{
     WindowsMountAdapter, try_mount_live_branch_on_current_platform,
     try_mount_snapshot_on_current_platform,
 };
-pub use windows::{
-    ReadOnlyVolumeSummary, WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver,
-    WinfspHostLauncher, WinfspHostSession, WinfspInvalidationPlan, WinfspInvalidator,
-    WinfspMountContext, WinfspOpenHandle, WinfspOpenRequest, WinfspRuntimeLibrary,
-    WinfspRuntimePaths, WinfspVolumeParams,
-};
 
 const DEFAULT_PLAINTEXT_MEMORY_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
@@ -1210,8 +1204,14 @@ pub mod testing {
 
     use anyhow::Result;
 
-    use super::{OpenedFile, WinfspHostSession, WinfspRuntimeLibrary, WinfspRuntimePaths};
-    use crate::windows::{WinfspMountExports, WinfspNativeCreateRequest};
+    use super::OpenedFile;
+    use crate::windows::{WinfspMountExports, WinfspNativeCreateRequest, WinfspRuntimePaths};
+
+    pub use crate::windows::{
+        WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
+        WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
+        WinfspRuntimeLibrary, WinfspVolumeParams,
+    };
 
     pub fn opened_file_cached_plaintext(opened_file: &OpenedFile) -> Option<Vec<u8>> {
         opened_file
@@ -1251,8 +1251,8 @@ pub mod testing {
 
     pub fn winfsp_host_session_new(
         runtime: WinfspRuntimeLibrary,
-        host_config: super::WinfspHostConfig,
-        volume_params: super::WinfspVolumeParams,
+        host_config: WinfspHostConfig,
+        volume_params: WinfspVolumeParams,
     ) -> Result<WinfspHostSession> {
         WinfspHostSession::new_for_test(runtime, host_config, volume_params)
     }
@@ -1281,7 +1281,7 @@ pub mod testing {
 
     pub fn winfsp_session_run_mount_lifecycle(
         session: &mut WinfspHostSession,
-        driver: &impl super::WinfspHostDriver,
+        driver: &impl WinfspHostDriver,
         mount_point: PathBuf,
         thread_count: u32,
     ) -> Result<()> {
