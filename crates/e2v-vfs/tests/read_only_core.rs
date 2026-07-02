@@ -11,8 +11,6 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
-#[cfg(windows)]
-use e2v_vfs::WindowsMountAdapter;
 use e2v_vfs::{
     CachePolicy, LinuxMountAdapter, MacosMountAdapter, MountRequest, PlatformCapabilities,
     PlatformFamily, PlatformMountAdapter, ReadOnlyVfs, VfsHostLauncher, VfsMountConfig,
@@ -1831,7 +1829,9 @@ fn winfsp_volume_params_reflect_snapshot_volume_defaults() {
     assert!(params.case_preserved_names);
     assert!(params.unicode_on_disk);
     assert!(params.read_only_volume);
-    assert!(params.um_file_context_is_full_context);
+    assert!(params.persistent_acls);
+    assert!(!params.um_file_context_is_full_context);
+    assert!(params.um_file_context_is_user_context2);
     assert_eq!(params.prefix, "");
     assert_eq!(params.filesystem_name, "e2v-ro");
 }
@@ -2988,26 +2988,48 @@ fn macos_mount_adapter_exposes_a_future_fuse_boundary() {
 
 #[cfg(windows)]
 #[test]
-fn windows_mount_adapter_exposes_a_winfsp_boundary() {
+fn windows_snapshot_mount_reads_repository_file_through_real_winfsp_mount() {
+    use std::time::{Duration, Instant};
+
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
     init_repo(&repo_root);
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
-    let request = MountRequest::from_config(
-        VfsMountConfig::snapshot(repo_root, snapshot_id),
-        PathBuf::from("W:"),
-    );
-    let adapter = WindowsMountAdapter;
-    let summary = adapter.launch(request).unwrap();
+    let mount_point = PathBuf::from("Q:");
 
-    assert_eq!(adapter.platform_family(), PlatformFamily::WindowsWinfsp);
+    let mounted =
+        e2v_vfs::start_snapshot_mount(repo_root, snapshot_id, mount_point.clone()).unwrap();
+    let summary = mounted.summary();
+    let rooted_mount_point = PathBuf::from(r"Q:\");
+
     assert_eq!(summary.mount_mode, "snapshot-pinned");
-    assert_eq!(summary.mount_point, PathBuf::from("W:"));
-    assert!(
-        summary
-            .status_message
-            .contains("winfsp adapter boundary ready")
+    assert_eq!(summary.mount_point, rooted_mount_point);
+    assert!(summary.status_message.contains("winfsp host mount active"));
+    let dir_output = std::process::Command::new("cmd")
+        .args(["/c", "dir", r"Q:\"])
+        .output()
+        .unwrap();
+    println!(
+        "dir status={:?}\nstdout={}\nstderr={}",
+        dir_output.status.code(),
+        String::from_utf8_lossy(&dir_output.stdout),
+        String::from_utf8_lossy(&dir_output.stderr)
     );
+    println!("metadata={:?}", fs::metadata(&summary.mount_point));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match fs::read_to_string(summary.mount_point.join("tracked.txt")) {
+            Ok(contents) => {
+                assert_eq!(contents, "alpha");
+                break;
+            }
+            Err(error) if Instant::now() < deadline => {
+                println!("retry read error={error:?}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("mounted file never became readable: {error:?}"),
+        }
+    }
 }

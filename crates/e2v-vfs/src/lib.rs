@@ -264,6 +264,52 @@ pub struct MountLaunchSummary {
     pub status_message: String,
 }
 
+#[derive(Debug)]
+pub enum MountedFilesystem {
+    Active(MountedFilesystemHandle),
+}
+
+impl MountedFilesystem {
+    pub fn summary(&self) -> &MountLaunchSummary {
+        match self {
+            Self::Active(handle) => handle.summary(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MountedFilesystemHandle {
+    summary: MountLaunchSummary,
+    #[cfg(windows)]
+    _windows_host: Option<crate::windows::WindowsMountedFilesystemHost>,
+}
+
+impl MountedFilesystemHandle {
+    pub fn summary(&self) -> &MountLaunchSummary {
+        &self.summary
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn from_summary(summary: MountLaunchSummary) -> Self {
+        Self {
+            summary,
+            #[cfg(windows)]
+            _windows_host: None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn with_windows_host(
+        summary: MountLaunchSummary,
+        windows_host: crate::windows::WindowsMountedFilesystemHost,
+    ) -> Self {
+        Self {
+            summary,
+            _windows_host: Some(windows_host),
+        }
+    }
+}
+
 impl ReadOnlyVfs {
     pub fn mount_snapshot(config: VfsMountConfig) -> Result<Self> {
         match config.mode {
@@ -1056,6 +1102,10 @@ impl OpenedFile {
     pub fn inode_id(&self) -> u64 {
         self.inode_id
     }
+
+    pub fn file_size(&self) -> u64 {
+        self.file.file_size()
+    }
 }
 
 fn stable_inode_id(snapshot_id: &str, logical_path: &str, file_object_id: &str) -> u64 {
@@ -1104,6 +1154,54 @@ pub fn mount_live_branch(
         VfsMountConfig::live_branch(repo_root, branch_token_hex),
         mount_point,
     )
+}
+
+pub fn start_snapshot_mount(
+    repo_root: PathBuf,
+    snapshot_id: String,
+    mount_point: PathBuf,
+) -> Result<MountedFilesystem> {
+    #[cfg(windows)]
+    {
+        crate::windows::start_snapshot_mount(
+            VfsMountConfig::snapshot(repo_root, snapshot_id),
+            mount_point,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let summary = try_mount_snapshot_on_current_platform(
+            VfsMountConfig::snapshot(repo_root, snapshot_id),
+            mount_point,
+        )?;
+        Ok(MountedFilesystem::Active(
+            MountedFilesystemHandle::from_summary(summary),
+        ))
+    }
+}
+
+pub fn start_live_branch_mount(
+    repo_root: PathBuf,
+    branch_token_hex: String,
+    mount_point: PathBuf,
+) -> Result<MountedFilesystem> {
+    #[cfg(windows)]
+    {
+        crate::windows::start_live_branch_mount(
+            VfsMountConfig::live_branch(repo_root, branch_token_hex),
+            mount_point,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let summary = try_mount_live_branch_on_current_platform(
+            VfsMountConfig::live_branch(repo_root, branch_token_hex),
+            mount_point,
+        )?;
+        Ok(MountedFilesystem::Active(
+            MountedFilesystemHandle::from_summary(summary),
+        ))
+    }
 }
 
 #[doc(hidden)]

@@ -8,14 +8,58 @@ use anyhow::Result;
 use e2v_core::DirectoryEntry;
 
 use crate::{
-    CachePolicy, MountLaunchSummary, MountMode, MountRequest, OpenedFile, ReadOnlyVfs,
-    RefreshOutcome, VfsMountConfig, VfsNodeMetadata,
+    CachePolicy, MountLaunchSummary, MountMode, MountRequest, MountedFilesystem,
+    MountedFilesystemHandle, OpenedFile, ReadOnlyVfs, RefreshOutcome, VfsMountConfig,
+    VfsNodeMetadata,
 };
 
 const DEFAULT_SECTOR_SIZE: u32 = 4096;
 const DEFAULT_TOTAL_BYTES: u64 = 1 << 40;
 const WINDOWS_ADAPTER_STATUS: &str =
     "winfsp adapter boundary ready; windows adapter not implemented yet";
+const STATUS_SUCCESS: i32 = 0;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
+const STATUS_MEDIA_WRITE_PROTECTED: i32 = 0xC000_00A2u32 as i32;
+const STATUS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
+const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+const READ_ONLY_SECURITY_DESCRIPTOR_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;WD)";
+const VOLUME_PARAMS_ALWAYS_USE_DOUBLE_BUFFERING_BIT: u32 = 1 << 12;
+const VOLUME_PARAMS_VOLUME_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 0;
+const VOLUME_PARAMS_DIR_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 1;
+const FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE: i32 = 0;
+
+#[derive(Debug)]
+pub struct WindowsMountedFilesystemHost {
+    native_filesystem: *mut NativeFspFileSystem,
+    runtime: WinfspRuntimeLibrary,
+    _interface: Box<NativeWinfspInterface>,
+    _mount_context: Box<WinfspMountContext>,
+    _security_descriptor: Arc<SecurityDescriptorBytes>,
+    stop_state: Arc<HostStopState>,
+}
+
+impl Drop for WindowsMountedFilesystemHost {
+    fn drop(&mut self) {
+        self.stop_state.request_stop();
+        let stop = self.runtime.stop_dispatcher_fn();
+        let remove_mount_point = self.runtime.remove_mount_point_fn();
+        unsafe {
+            stop(self.native_filesystem);
+            remove_mount_point(self.native_filesystem);
+        }
+        let delete = self.runtime.delete_fn();
+        unsafe {
+            delete(self.native_filesystem.cast());
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsMountLauncher {
@@ -96,6 +140,139 @@ fn mount_request(request: MountRequest) -> Result<MountLaunchSummary> {
     launcher.launch_with_host_and_describe(context, &mut host)
 }
 
+pub(crate) fn start_snapshot_mount(
+    config: VfsMountConfig,
+    mount_point: PathBuf,
+) -> Result<MountedFilesystem> {
+    start_mount_request(MountRequest::from_config(config, mount_point))
+}
+
+pub(crate) fn start_live_branch_mount(
+    config: VfsMountConfig,
+    mount_point: PathBuf,
+) -> Result<MountedFilesystem> {
+    start_mount_request(MountRequest::from_config(config, mount_point))
+}
+
+fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
+    let mount_mode = request.mount_mode_label().to_string();
+    let mount_point = normalize_windows_mount_point(request.mount_point());
+    let raw_mount_point = request.mount_point().clone();
+    let cache_policy = match &request.config.mode {
+        MountMode::SnapshotPinned { .. } => CachePolicy::KernelCacheWithInvalidation,
+        MountMode::LiveBranch { .. } => {
+            if request
+                .config
+                .platform_capabilities
+                .supports_live_branch_kernel_cache()
+            {
+                CachePolicy::KernelCacheWithInvalidation
+            } else {
+                CachePolicy::DirectIoFallback
+            }
+        }
+    };
+    let launcher = WindowsMountLauncher::from_request(&request);
+    let mut mount_context = Box::new(WinfspMountContext::from_request(request));
+    let host_config = launcher.host_config(&mount_context);
+    let volume_params = WinfspVolumeParams::from_host_config(&host_config);
+    let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+        &[
+            PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
+            PathBuf::from(r"C:\Program Files\WinFsp"),
+        ],
+        "x86_64",
+    )?;
+    let runtime = WinfspRuntimeLibrary::load(&runtime_paths)?;
+    let security_descriptor = Arc::new(SecurityDescriptorBytes::from_sddl(
+        READ_ONLY_SECURITY_DESCRIPTOR_SDDL,
+    )?);
+    let stop_state = Arc::new(HostStopState::default());
+    let interface = Box::new(NativeWinfspInterface::read_only_host());
+    let mut native_volume_params = NativeWinfspVolumeParams::from_volume_params(&volume_params);
+    let device_path = widestr_from_str("WinFsp.Disk");
+    let mut native_filesystem = std::ptr::null_mut::<c_void>();
+    let create = runtime.create_fn();
+    let status = unsafe {
+        create(
+            device_path.as_ptr() as *mut u16,
+            native_volume_params.as_raw_mut(),
+            interface.as_raw(),
+            &mut native_filesystem,
+        )
+    };
+    debug_winfsp("create_status", &format!("{status:#x}"));
+    if status != STATUS_SUCCESS {
+        anyhow::bail!("FspFileSystemCreate failed with NTSTATUS {status:#x}");
+    }
+    if native_filesystem.is_null() {
+        anyhow::bail!("FspFileSystemCreate returned a null filesystem handle");
+    }
+    unsafe {
+        native_filesystem
+            .cast::<NativeFspFileSystem>()
+            .as_mut()
+            .unwrap()
+            .set_user_context((&mut *mount_context as *mut WinfspMountContext).cast());
+    }
+    let set_operation_guard_strategy = runtime.set_operation_guard_strategy_fn();
+    unsafe {
+        set_operation_guard_strategy(
+            native_filesystem.cast::<NativeFspFileSystem>(),
+            FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE,
+        );
+    }
+    let mut mount_point_wide = widestr_from_os_path(&raw_mount_point);
+    let set_mount_point = runtime.set_mount_point_fn();
+    let status = unsafe {
+        set_mount_point(
+            native_filesystem.cast::<NativeFspFileSystem>(),
+            mount_point_wide.as_mut_ptr(),
+        )
+    };
+    debug_winfsp("set_mount_point_status", &format!("{status:#x}"));
+    if status != STATUS_SUCCESS {
+        let delete = runtime.delete_fn();
+        unsafe {
+            delete(native_filesystem.cast());
+        }
+        anyhow::bail!("FspFileSystemSetMountPoint failed with NTSTATUS {status:#x}");
+    }
+    let start_dispatcher = runtime.start_dispatcher_fn();
+    let status = unsafe { start_dispatcher(native_filesystem.cast::<NativeFspFileSystem>(), 0) };
+    debug_winfsp("start_dispatcher_status", &format!("{status:#x}"));
+    if status != STATUS_SUCCESS {
+        let remove_mount_point = runtime.remove_mount_point_fn();
+        let delete = runtime.delete_fn();
+        unsafe {
+            remove_mount_point(native_filesystem.cast::<NativeFspFileSystem>());
+            delete(native_filesystem.cast());
+        }
+        anyhow::bail!("FspFileSystemStartDispatcher failed with NTSTATUS {status:#x}");
+    }
+    let summary = MountLaunchSummary {
+        mount_mode,
+        mount_point,
+        cache_policy,
+        read_only: true,
+        stream_only: true,
+        status_message: "winfsp host mount active".to_string(),
+    };
+    Ok(MountedFilesystem::Active(
+        MountedFilesystemHandle::with_windows_host(
+            summary,
+            WindowsMountedFilesystemHost {
+                native_filesystem: native_filesystem.cast::<NativeFspFileSystem>(),
+                runtime,
+                _interface: interface,
+                _mount_context: mount_context,
+                _security_descriptor: security_descriptor,
+                stop_state,
+            },
+        ),
+    ))
+}
+
 struct SummaryOnlyHostLauncher;
 
 impl WinfspHostLauncher for SummaryOnlyHostLauncher {
@@ -153,7 +330,9 @@ pub struct WinfspVolumeParams {
     pub case_sensitive_search: bool,
     pub case_preserved_names: bool,
     pub unicode_on_disk: bool,
+    pub persistent_acls: bool,
     pub read_only_volume: bool,
+    pub um_file_context_is_user_context2: bool,
     pub um_file_context_is_full_context: bool,
     pub prefix: String,
     pub filesystem_name: String,
@@ -175,8 +354,10 @@ impl WinfspVolumeParams {
             case_sensitive_search: true,
             case_preserved_names: true,
             unicode_on_disk: true,
+            persistent_acls: true,
             read_only_volume: config.read_only,
-            um_file_context_is_full_context: true,
+            um_file_context_is_user_context2: true,
+            um_file_context_is_full_context: false,
             prefix: String::new(),
             filesystem_name: config.filesystem_name.clone(),
         }
@@ -232,10 +413,13 @@ pub struct WinfspRuntimeLibrary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WinfspMountExports {
     pub create: usize,
+    pub remove_mount_point: usize,
+    pub set_operation_guard_strategy: usize,
     pub set_mount_point: usize,
     pub start_dispatcher: usize,
     pub stop_dispatcher: usize,
     pub delete_filesystem: usize,
+    pub add_dir_info: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,11 +491,88 @@ impl WinfspRuntimeLibrary {
     pub(crate) fn resolve_mount_exports_for_test(&self) -> Result<WinfspMountExports> {
         Ok(WinfspMountExports {
             create: self.get_symbol_address_for_test("FspFileSystemCreate")?,
+            remove_mount_point: self
+                .get_symbol_address_for_test("FspFileSystemRemoveMountPoint")?,
+            set_operation_guard_strategy: self
+                .get_symbol_address_for_test("FspFileSystemSetOperationGuardStrategyF")?,
             set_mount_point: self.get_symbol_address_for_test("FspFileSystemSetMountPoint")?,
             start_dispatcher: self.get_symbol_address_for_test("FspFileSystemStartDispatcher")?,
             stop_dispatcher: self.get_symbol_address_for_test("FspFileSystemStopDispatcher")?,
             delete_filesystem: self.get_symbol_address_for_test("FspFileSystemDelete")?,
+            add_dir_info: self.get_symbol_address_for_test("FspFileSystemAddDirInfo")?,
         })
+    }
+
+    fn create_fn(&self) -> FspFileSystemCreateFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemCreate")
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn set_mount_point_fn(&self) -> FspFileSystemSetMountPointFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemSetMountPoint")
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn set_operation_guard_strategy_fn(&self) -> FspFileSystemSetOperationGuardStrategyFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemSetOperationGuardStrategyF")
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn remove_mount_point_fn(&self) -> FspFileSystemRemoveMountPointFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemRemoveMountPoint")
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn start_dispatcher_fn(&self) -> FspFileSystemStartDispatcherFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemStartDispatcher")
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn stop_dispatcher_fn(&self) -> FspFileSystemStopDispatcherFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemStopDispatcher")
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn delete_fn(&self) -> FspFileSystemDeleteFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemDelete")
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn add_dir_info_fn(&self) -> FspFileSystemAddDirInfoFn {
+        unsafe {
+            std::mem::transmute(
+                self.get_symbol_address_for_test("FspFileSystemAddDirInfo")
+                    .unwrap(),
+            )
+        }
     }
 }
 
@@ -444,7 +705,21 @@ type FspFileSystemCreateFn = unsafe extern "C" fn(
     filesystem: *mut *mut c_void,
 ) -> i32;
 
+type FspFileSystemSetMountPointFn =
+    unsafe extern "C" fn(filesystem: *mut NativeFspFileSystem, mount_point: *mut u16) -> i32;
+type FspFileSystemSetOperationGuardStrategyFn =
+    unsafe extern "C" fn(filesystem: *mut NativeFspFileSystem, guard_strategy: i32);
+type FspFileSystemRemoveMountPointFn = unsafe extern "C" fn(filesystem: *mut NativeFspFileSystem);
+type FspFileSystemStartDispatcherFn =
+    unsafe extern "C" fn(filesystem: *mut NativeFspFileSystem, thread_count: u32) -> i32;
+type FspFileSystemStopDispatcherFn = unsafe extern "C" fn(filesystem: *mut NativeFspFileSystem);
 type FspFileSystemDeleteFn = unsafe extern "C" fn(filesystem: *mut c_void);
+type FspFileSystemAddDirInfoFn = unsafe extern "C" fn(
+    dir_info: *mut NativeFspFsctlDirInfo,
+    buffer: *mut c_void,
+    length: u32,
+    bytes_transferred: *mut u32,
+) -> u8;
 
 impl WinfspMountExports {
     fn create_fn(&self) -> FspFileSystemCreateFn {
@@ -460,6 +735,105 @@ unsafe extern "system" {
     fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
     fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const i8) -> *mut c_void;
     fn FreeLibrary(h_lib_module: *mut c_void) -> i32;
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string_security_descriptor: *const u16,
+        string_sd_revision: u32,
+        security_descriptor: *mut *mut c_void,
+        security_descriptor_size: *mut u32,
+    ) -> i32;
+    fn LocalFree(memory: *mut c_void) -> *mut c_void;
+}
+
+#[repr(C)]
+struct NativeFspFileSystem {
+    _version: u16,
+    _padding: [u8; 6],
+    user_context: *mut c_void,
+}
+
+impl NativeFspFileSystem {
+    unsafe fn set_user_context(&mut self, user_context: *mut c_void) {
+        self.user_context = user_context;
+    }
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct NativeFspFsctlVolumeInfo {
+    total_size: u64,
+    free_size: u64,
+    volume_label_length: u16,
+    volume_label: [u16; 32],
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct NativeFspFsctlFileInfo {
+    file_attributes: u32,
+    reparse_tag: u32,
+    allocation_size: u64,
+    file_size: u64,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+    change_time: u64,
+    index_number: u64,
+    hard_links: u32,
+    ea_size: u32,
+}
+
+#[repr(C)]
+struct NativeFspFsctlDirInfo {
+    size: u16,
+    _padding0: [u8; 6],
+    file_info: NativeFspFsctlFileInfo,
+    _padding1: [u8; 24],
+    file_name_buf: [u16; 1],
+}
+
+#[derive(Debug, Default)]
+struct HostStopState {
+    stop_requested: Mutex<bool>,
+}
+
+impl HostStopState {
+    fn request_stop(&self) {
+        *self.stop_requested.lock().unwrap() = true;
+    }
+}
+
+#[derive(Debug)]
+struct SecurityDescriptorBytes {
+    bytes: Vec<u8>,
+}
+
+impl SecurityDescriptorBytes {
+    fn from_sddl(sddl: &str) -> Result<Self> {
+        let mut security_descriptor = std::ptr::null_mut();
+        let mut security_descriptor_size = 0u32;
+        let wide = widestr_from_str(sddl);
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SECURITY_DESCRIPTOR_REVISION,
+                &mut security_descriptor,
+                &mut security_descriptor_size,
+            )
+        };
+        if converted == 0 {
+            anyhow::bail!("failed to convert SDDL to Windows security descriptor");
+        }
+        let bytes = unsafe {
+            let slice = std::slice::from_raw_parts(
+                security_descriptor.cast::<u8>(),
+                security_descriptor_size as usize,
+            );
+            let bytes = slice.to_vec();
+            let _ = LocalFree(security_descriptor);
+            bytes
+        };
+        Ok(Self { bytes })
+    }
 }
 
 #[repr(C)]
@@ -477,7 +851,7 @@ struct NativeWinfspVolumeParams {
     bitfield_1: u32,
     prefix: [u16; 192],
     filesystem_name: [u16; 16],
-    bitfield_2: u32,
+    additional_flags: u32,
     volume_info_timeout: u32,
     dir_info_timeout: u32,
     security_timeout: u32,
@@ -504,13 +878,22 @@ impl NativeWinfspVolumeParams {
         if params.unicode_on_disk {
             bitfield_1 |= 1 << 2;
         }
-        if params.read_only_volume {
-            bitfield_1 |= 1 << 24;
+        if params.persistent_acls {
+            bitfield_1 |= 1 << 3;
         }
-        let mut bitfield_2 = 0u32;
+        bitfield_1 |= VOLUME_PARAMS_ALWAYS_USE_DOUBLE_BUFFERING_BIT;
+        if params.um_file_context_is_user_context2 {
+            bitfield_1 |= 1 << 16;
+        }
         if params.um_file_context_is_full_context {
-            bitfield_2 |= 1 << 13;
+            bitfield_1 |= 1 << 17;
         }
+        if params.read_only_volume {
+            bitfield_1 |= 1 << 9;
+        }
+        let mut additional_flags = 0u32;
+        additional_flags |= VOLUME_PARAMS_VOLUME_INFO_TIMEOUT_VALID_BIT;
+        additional_flags |= VOLUME_PARAMS_DIR_INFO_TIMEOUT_VALID_BIT;
         Self {
             version: 0,
             sector_size: params.sector_size as u16,
@@ -525,7 +908,7 @@ impl NativeWinfspVolumeParams {
             bitfield_1,
             prefix,
             filesystem_name,
-            bitfield_2,
+            additional_flags,
             volume_info_timeout: params.volume_info_timeout_ms,
             dir_info_timeout: params.dir_info_timeout_ms,
             security_timeout: 0,
@@ -543,7 +926,7 @@ impl NativeWinfspVolumeParams {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct NativeWinfspInterface {
     get_volume_info: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
     set_volume_label_w: Option<unsafe extern "C" fn(*mut c_void, *mut u16, *mut c_void) -> i32>,
@@ -609,12 +992,117 @@ struct NativeWinfspInterface {
             *mut u32,
         ) -> i32,
     >,
-    reserved: [usize; 15],
+    resolve_reparse_points: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut u16,
+            u32,
+            u8,
+            *mut c_void,
+            *mut c_void,
+            *mut usize,
+        ) -> i32,
+    >,
+    get_reparse_point: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u16, *mut c_void, *mut usize) -> i32,
+    >,
+    set_reparse_point:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u16, *mut c_void, usize) -> i32>,
+    delete_reparse_point:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u16, *mut c_void, usize) -> i32>,
+    get_stream_info:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, *mut u32) -> i32>,
+    get_dir_info_by_name: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u16, *mut NativeFspFsctlDirInfo) -> i32,
+    >,
+    control: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            u32,
+            *mut c_void,
+            u32,
+            *mut c_void,
+            u32,
+            *mut u32,
+        ) -> i32,
+    >,
+    set_delete: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u16, u8) -> i32>,
+    create_ex: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut u16,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            u64,
+            *mut c_void,
+            u32,
+            u8,
+            *mut *mut c_void,
+            *mut c_void,
+        ) -> i32,
+    >,
+    overwrite_ex: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            u32,
+            u8,
+            u64,
+            *mut c_void,
+            u32,
+            *mut c_void,
+        ) -> i32,
+    >,
+    get_ea:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, *mut u32) -> i32>,
+    set_ea: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, *mut c_void) -> i32,
+    >,
+    obsolete0: Option<unsafe extern "C" fn() -> i32>,
+    dispatcher_stopped: Option<unsafe extern "C" fn(*mut c_void, u8)>,
+    reserved: [Option<unsafe extern "C" fn() -> i32>; 31],
 }
 
 impl NativeWinfspInterface {
     fn read_only_stub() -> Self {
         Self::default()
+    }
+
+    fn read_only_host() -> Self {
+        Self {
+            get_volume_info: Some(host_get_volume_info),
+            set_volume_label_w: Some(host_set_volume_label_w),
+            get_security_by_name: Some(host_get_security_by_name),
+            control: Some(host_control),
+            overwrite_ex: Some(host_overwrite_ex),
+            create_ex: Some(host_create_ex),
+            open: Some(host_open),
+            cleanup: Some(host_cleanup),
+            close: Some(host_close),
+            read: Some(host_read),
+            write: Some(host_write),
+            flush: Some(host_flush),
+            get_file_info: Some(host_get_file_info),
+            set_basic_info: Some(host_set_basic_info),
+            set_file_size: Some(host_set_file_size),
+            get_security: Some(host_get_security),
+            set_security: Some(host_set_security),
+            read_directory: Some(host_read_directory),
+            get_reparse_point: Some(host_get_reparse_point),
+            set_reparse_point: Some(host_set_reparse_point),
+            delete_reparse_point: Some(host_delete_reparse_point),
+            resolve_reparse_points: Some(host_resolve_reparse_points),
+            get_stream_info: Some(host_get_stream_info),
+            set_delete: Some(host_set_delete),
+            rename: Some(host_rename),
+            get_ea: Some(host_get_ea),
+            set_ea: Some(host_set_ea),
+            dispatcher_stopped: Some(host_dispatcher_stopped),
+            ..Self::default()
+        }
     }
 
     fn as_raw(&self) -> *const NativeWinfspInterface {
@@ -629,6 +1117,22 @@ fn widestr_from_str(value: &str) -> Vec<u16> {
         .collect()
 }
 
+fn widestr_from_os_path(value: &std::path::Path) -> Vec<u16> {
+    value
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn normalize_windows_mount_point(path: &std::path::Path) -> PathBuf {
+    let raw = path.as_os_str().to_string_lossy();
+    if raw.len() == 2 && raw.ends_with(':') {
+        return PathBuf::from(format!(r"{raw}\"));
+    }
+    path.to_path_buf()
+}
+
 fn copy_wide_z(source: &str, target: &mut [u16]) {
     let encoded = std::ffi::OsStr::new(source)
         .encode_wide()
@@ -637,6 +1141,661 @@ fn copy_wide_z(source: &str, target: &mut [u16]) {
     for (index, value) in encoded.into_iter().enumerate() {
         target[index] = value;
     }
+}
+
+fn context_from_filesystem(filesystem: *mut c_void) -> &'static WinfspMountContext {
+    let filesystem = filesystem.cast::<NativeFspFileSystem>();
+    unsafe { &*((*filesystem).user_context.cast::<WinfspMountContext>()) }
+}
+
+fn volume_info_from_summary(summary: &ReadOnlyVolumeSummary) -> NativeFspFsctlVolumeInfo {
+    let mut volume_info = NativeFspFsctlVolumeInfo {
+        total_size: summary.total_bytes,
+        free_size: summary.free_bytes,
+        ..Default::default()
+    };
+    let label = summary
+        .volume_label
+        .encode_utf16()
+        .take(volume_info.volume_label.len())
+        .collect::<Vec<_>>();
+    for (index, value) in label.iter().enumerate() {
+        volume_info.volume_label[index] = *value;
+    }
+    volume_info.volume_label_length = (label.len() * std::mem::size_of::<u16>()) as u16;
+    volume_info
+}
+
+fn normalized_logical_path_from_windows_path(file_name: *const u16) -> String {
+    if file_name.is_null() {
+        return String::new();
+    }
+    let mut length = 0usize;
+    unsafe {
+        while *file_name.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(file_name, length))
+    }
+    .trim_start_matches('\\')
+    .replace('\\', "/")
+}
+
+fn debug_winfsp(event: &str, detail: &str) {
+    eprintln!("[e2v-winfsp] {event}: {detail}");
+}
+
+fn unsupported_winfsp_status(event: &str, status: i32) -> i32 {
+    debug_winfsp(event, &format!("unsupported {status:#x}"));
+    status
+}
+
+fn fill_file_info_from_metadata(
+    file_info: &mut NativeFspFsctlFileInfo,
+    metadata: &VfsNodeMetadata,
+) {
+    file_info.file_attributes = match metadata.kind {
+        crate::VfsNodeKind::Directory => FILE_ATTRIBUTE_DIRECTORY,
+        crate::VfsNodeKind::File => FILE_ATTRIBUTE_NORMAL,
+    };
+    file_info.reparse_tag = 0;
+    file_info.allocation_size = metadata.size_bytes;
+    file_info.file_size = metadata.size_bytes;
+    file_info.creation_time = 0;
+    file_info.last_access_time = 0;
+    file_info.last_write_time = 0;
+    file_info.change_time = 0;
+    file_info.index_number = metadata.inode_id;
+    file_info.hard_links = 1;
+    file_info.ea_size = 0;
+}
+
+fn fill_file_info_from_open_handle(
+    file_info: &mut NativeFspFsctlFileInfo,
+    handle: &WinfspOpenHandle,
+    file_size: u64,
+) {
+    file_info.file_attributes = FILE_ATTRIBUTE_NORMAL;
+    file_info.reparse_tag = 0;
+    file_info.allocation_size = file_size;
+    file_info.file_size = file_size;
+    file_info.creation_time = 0;
+    file_info.last_access_time = 0;
+    file_info.last_write_time = 0;
+    file_info.change_time = 0;
+    file_info.index_number = handle.inode_id();
+    file_info.hard_links = 1;
+    file_info.ea_size = 0;
+}
+
+unsafe extern "C" fn host_get_volume_info(
+    filesystem: *mut c_void,
+    volume_info: *mut c_void,
+) -> i32 {
+    let context = context_from_filesystem(filesystem);
+    debug_winfsp("get_volume_info", context.mount_mode_label());
+    let info = volume_info_from_summary(&context.volume_summary());
+    unsafe {
+        *(volume_info.cast::<NativeFspFsctlVolumeInfo>()) = info;
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn host_get_security_by_name(
+    filesystem: *mut c_void,
+    file_name: *mut u16,
+    file_attributes: *mut u32,
+    security_descriptor: *mut c_void,
+    security_descriptor_size: *mut usize,
+) -> i32 {
+    let context = context_from_filesystem(filesystem);
+    let logical_path = normalized_logical_path_from_windows_path(file_name);
+    debug_winfsp("get_security_by_name", &logical_path);
+    let metadata = match context.stat_path(&logical_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            debug_winfsp("get_security_by_name_err", &error.to_string());
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    if !file_attributes.is_null() {
+        unsafe {
+            *file_attributes = match metadata.kind {
+                crate::VfsNodeKind::Directory => FILE_ATTRIBUTE_DIRECTORY,
+                crate::VfsNodeKind::File => FILE_ATTRIBUTE_NORMAL,
+            };
+        }
+    }
+    let descriptor = READ_ONLY_SECURITY_DESCRIPTOR_SDDL;
+    let security_descriptor_bytes =
+        match SecurityDescriptorBytes::from_sddl(descriptor).map(|value| value.bytes) {
+            Ok(bytes) => bytes,
+            Err(_) => return STATUS_ACCESS_DENIED,
+        };
+    if !security_descriptor_size.is_null() {
+        let requested = unsafe { *security_descriptor_size };
+        unsafe {
+            *security_descriptor_size = security_descriptor_bytes.len();
+        }
+        if requested < security_descriptor_bytes.len() {
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        if !security_descriptor.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    security_descriptor_bytes.as_ptr(),
+                    security_descriptor.cast::<u8>(),
+                    security_descriptor_bytes.len(),
+                );
+            }
+        }
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn host_set_volume_label_w(
+    _filesystem: *mut c_void,
+    _volume_label: *mut u16,
+    _volume_info: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("set_volume_label_w", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_open(
+    filesystem: *mut c_void,
+    file_name: *mut u16,
+    _create_options: u32,
+    _granted_access: u32,
+    file_context: *mut *mut c_void,
+    file_info: *mut c_void,
+) -> i32 {
+    let context = context_from_filesystem(filesystem);
+    let logical_path = normalized_logical_path_from_windows_path(file_name);
+    debug_winfsp("open", &logical_path);
+    let metadata = match context.stat_path(&logical_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            debug_winfsp("open_stat_err", &error.to_string());
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    if metadata.kind == crate::VfsNodeKind::Directory {
+        let handle = Box::new(WinfspOpenHandle::from_opened_file_stub(
+            metadata.snapshot_id.clone(),
+            metadata.layout_generation,
+            metadata.logical_path.clone(),
+            "__dir__".to_string(),
+            metadata.inode_id,
+        ));
+        unsafe {
+            *file_context = Box::into_raw(handle).cast();
+            fill_file_info_from_metadata(
+                &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
+                &metadata,
+            );
+        }
+        return STATUS_SUCCESS;
+    }
+    let handle = match context.open_handle(&logical_path) {
+        Ok(handle) => handle,
+        Err(error) => {
+            debug_winfsp("open_handle_err", &error.to_string());
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    let file_size = handle
+        .opened_file
+        .as_ref()
+        .map(|opened_file| opened_file.file_size())
+        .unwrap_or(0);
+    unsafe {
+        *file_context = Box::into_raw(Box::new(handle.clone())).cast();
+        fill_file_info_from_open_handle(
+            &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
+            &handle,
+            file_size,
+        );
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn host_create_ex(
+    filesystem: *mut c_void,
+    file_name: *mut u16,
+    create_options: u32,
+    _granted_access: u32,
+    _file_attributes: u32,
+    _security_descriptor: *mut c_void,
+    _allocation_size: u64,
+    _extra_buffer: *mut c_void,
+    _extra_length: u32,
+    _extra_buffer_is_reparse_point: u8,
+    file_context: *mut *mut c_void,
+    file_info: *mut c_void,
+) -> i32 {
+    let context = context_from_filesystem(filesystem);
+    let logical_path = normalized_logical_path_from_windows_path(file_name);
+    debug_winfsp("create_ex", &logical_path);
+    let metadata = match context.stat_path(&logical_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            debug_winfsp("create_ex_stat_err", &error.to_string());
+            return STATUS_MEDIA_WRITE_PROTECTED;
+        }
+    };
+    let wants_directory = (create_options & FILE_DIRECTORY_FILE) != 0;
+    let wants_non_directory = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
+    match metadata.kind {
+        crate::VfsNodeKind::Directory if wants_non_directory => return STATUS_NOT_A_DIRECTORY,
+        crate::VfsNodeKind::File if wants_directory => return STATUS_NOT_A_DIRECTORY,
+        crate::VfsNodeKind::Directory => {
+            let handle = Box::new(WinfspOpenHandle::from_opened_file_stub(
+                metadata.snapshot_id.clone(),
+                metadata.layout_generation,
+                metadata.logical_path.clone(),
+                "__dir__".to_string(),
+                metadata.inode_id,
+            ));
+            unsafe {
+                *file_context = Box::into_raw(handle).cast();
+                fill_file_info_from_metadata(
+                    &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
+                    &metadata,
+                );
+            }
+            STATUS_SUCCESS
+        }
+        crate::VfsNodeKind::File => {
+            let handle = match context.open_handle(&logical_path) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    debug_winfsp("create_ex_open_handle_err", &error.to_string());
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
+            };
+            let file_size = handle
+                .opened_file
+                .as_ref()
+                .map(|opened_file| opened_file.file_size())
+                .unwrap_or(0);
+            unsafe {
+                *file_context = Box::into_raw(Box::new(handle.clone())).cast();
+                fill_file_info_from_open_handle(
+                    &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
+                    &handle,
+                    file_size,
+                );
+            }
+            STATUS_SUCCESS
+        }
+    }
+}
+
+unsafe extern "C" fn host_control(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _control_code: u32,
+    _input_buffer: *mut c_void,
+    _input_buffer_length: u32,
+    _output_buffer: *mut c_void,
+    _output_buffer_length: u32,
+    _bytes_transferred: *mut u32,
+) -> i32 {
+    unsupported_winfsp_status("control", STATUS_INVALID_DEVICE_REQUEST)
+}
+
+unsafe extern "C" fn host_overwrite_ex(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_attributes: u32,
+    _replace_file_attributes: u8,
+    _allocation_size: u64,
+    _ea: *mut c_void,
+    _ea_length: u32,
+    _file_info: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("overwrite_ex", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_cleanup(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_name: *mut u16,
+    _flags: u32,
+) {
+    debug_winfsp("cleanup", "");
+}
+
+unsafe extern "C" fn host_close(_filesystem: *mut c_void, file_context: *mut c_void) {
+    debug_winfsp("close", "");
+    if !file_context.is_null() {
+        unsafe {
+            drop(Box::from_raw(file_context.cast::<WinfspOpenHandle>()));
+        }
+    }
+}
+
+unsafe extern "C" fn host_read(
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
+    buffer: *mut c_void,
+    offset: u64,
+    length: u32,
+    bytes_transferred: *mut u32,
+) -> i32 {
+    let context = context_from_filesystem(filesystem);
+    let handle = unsafe { &*file_context.cast::<WinfspOpenHandle>() };
+    debug_winfsp(
+        "read",
+        &format!("{}@{}+{}", handle.logical_path(), offset, length),
+    );
+    let bytes = match context.read_handle(handle, offset as usize, length as usize) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            debug_winfsp("read_err", &error.to_string());
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), bytes.len());
+        *bytes_transferred = bytes.len() as u32;
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn host_write(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _buffer: *mut c_void,
+    _offset: u64,
+    _length: u32,
+    _write_to_end_of_file: u8,
+    _constrained_io: u8,
+    _bytes_transferred: *mut u32,
+    _file_info: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("write", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_flush(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_info: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("flush", STATUS_INVALID_DEVICE_REQUEST)
+}
+
+unsafe extern "C" fn host_get_file_info(
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
+    file_info: *mut c_void,
+) -> i32 {
+    let context = context_from_filesystem(filesystem);
+    let handle = unsafe { &*file_context.cast::<WinfspOpenHandle>() };
+    debug_winfsp("get_file_info", handle.logical_path());
+    let metadata = match context.stat_path(handle.logical_path()) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            debug_winfsp("get_file_info_err", &error.to_string());
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    unsafe {
+        fill_file_info_from_metadata(&mut *file_info.cast::<NativeFspFsctlFileInfo>(), &metadata);
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn host_get_security(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    security_descriptor: *mut c_void,
+    security_descriptor_size: *mut usize,
+) -> i32 {
+    debug_winfsp("get_security", "");
+    let security_descriptor_bytes =
+        match SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
+            .map(|value| value.bytes)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                debug_winfsp("get_security_err", &error.to_string());
+                return STATUS_ACCESS_DENIED;
+            }
+        };
+    if security_descriptor_size.is_null() {
+        return STATUS_ACCESS_DENIED;
+    }
+    let requested = unsafe { *security_descriptor_size };
+    unsafe {
+        *security_descriptor_size = security_descriptor_bytes.len();
+    }
+    if requested < security_descriptor_bytes.len() {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    if !security_descriptor.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                security_descriptor_bytes.as_ptr(),
+                security_descriptor.cast::<u8>(),
+                security_descriptor_bytes.len(),
+            );
+        }
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn host_set_basic_info(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_attributes: u32,
+    _creation_time: u64,
+    _last_access_time: u64,
+    _last_write_time: u64,
+    _change_time: u64,
+    _file_info: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("set_basic_info", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_set_file_size(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _new_size: u64,
+    _set_allocation_size: u8,
+    _file_info: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("set_file_size", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_set_security(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _security_information: u32,
+    _modification_descriptor: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("set_security", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_read_directory(
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
+    _pattern: *mut u16,
+    marker: *mut u16,
+    buffer: *mut c_void,
+    length: u32,
+    bytes_transferred: *mut u32,
+) -> i32 {
+    let context = context_from_filesystem(filesystem);
+    let handle = unsafe { &*file_context.cast::<WinfspOpenHandle>() };
+    debug_winfsp("read_directory", handle.logical_path());
+    let metadata = match context.stat_path(handle.logical_path()) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            debug_winfsp("read_directory_stat_err", &error.to_string());
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    if metadata.kind != crate::VfsNodeKind::Directory {
+        return STATUS_NOT_A_DIRECTORY;
+    }
+    unsafe {
+        *bytes_transferred = 0;
+    }
+    let entries = match context.read_directory_entries(handle.logical_path()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            debug_winfsp("read_directory_entries_err", &error.to_string());
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    };
+    let marker_name = normalized_logical_path_from_windows_path(marker);
+    let add_dir_info = match WinfspRuntimePaths::from_candidate_roots_for_test(
+        &[
+            PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
+            PathBuf::from(r"C:\Program Files\WinFsp"),
+        ],
+        "x86_64",
+    )
+    .and_then(|paths| WinfspRuntimeLibrary::load(&paths))
+    {
+        Ok(runtime) => runtime.add_dir_info_fn(),
+        Err(_) => return STATUS_ACCESS_DENIED,
+    };
+    for entry in entries {
+        if !marker_name.is_empty() && entry.name <= marker_name {
+            continue;
+        }
+        let child_logical_path = if handle.logical_path().is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{}/{}", handle.logical_path(), entry.name)
+        };
+        let child_metadata = match context.stat_path(&child_logical_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return STATUS_OBJECT_NAME_NOT_FOUND,
+        };
+        let file_name = entry.name.encode_utf16().collect::<Vec<_>>();
+        let dir_info_size = std::mem::size_of::<NativeFspFsctlDirInfo>()
+            + file_name.len().saturating_sub(1) * std::mem::size_of::<u16>();
+        let mut dir_info = vec![0u8; dir_info_size];
+        let dir_info_ptr = dir_info.as_mut_ptr().cast::<NativeFspFsctlDirInfo>();
+        unsafe {
+            (*dir_info_ptr).size = dir_info_size as u16;
+            fill_file_info_from_metadata(&mut (*dir_info_ptr).file_info, &child_metadata);
+            std::ptr::copy_nonoverlapping(
+                file_name.as_ptr(),
+                (*dir_info_ptr).file_name_buf.as_mut_ptr(),
+                file_name.len(),
+            );
+            let added = add_dir_info(dir_info_ptr, buffer, length, bytes_transferred);
+            if added == 0 {
+                break;
+            }
+        }
+    }
+    unsafe {
+        add_dir_info(std::ptr::null_mut(), buffer, length, bytes_transferred);
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn host_get_reparse_point(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_name: *mut u16,
+    _buffer: *mut c_void,
+    _size: *mut usize,
+) -> i32 {
+    unsupported_winfsp_status("get_reparse_point", STATUS_INVALID_DEVICE_REQUEST)
+}
+
+unsafe extern "C" fn host_set_reparse_point(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_name: *mut u16,
+    _buffer: *mut c_void,
+    _size: usize,
+) -> i32 {
+    unsupported_winfsp_status("set_reparse_point", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_delete_reparse_point(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_name: *mut u16,
+    _buffer: *mut c_void,
+    _size: usize,
+) -> i32 {
+    unsupported_winfsp_status("delete_reparse_point", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_resolve_reparse_points(
+    _filesystem: *mut c_void,
+    _file_name: *mut u16,
+    _reparse_point_index: u32,
+    _resolve_last_path_component: u8,
+    _io_status: *mut c_void,
+    _buffer: *mut c_void,
+    _size: *mut usize,
+) -> i32 {
+    unsupported_winfsp_status("resolve_reparse_points", STATUS_INVALID_DEVICE_REQUEST)
+}
+
+unsafe extern "C" fn host_get_stream_info(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _buffer: *mut c_void,
+    _length: u32,
+    _bytes_transferred: *mut u32,
+) -> i32 {
+    unsupported_winfsp_status("get_stream_info", STATUS_INVALID_DEVICE_REQUEST)
+}
+
+unsafe extern "C" fn host_set_delete(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_name: *mut u16,
+    _delete_file: u8,
+) -> i32 {
+    unsupported_winfsp_status("set_delete", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_rename(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _file_name: *mut u16,
+    _new_file_name: *mut u16,
+    _replace_if_exists: u8,
+) -> i32 {
+    unsupported_winfsp_status("rename", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_get_ea(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _ea: *mut c_void,
+    _ea_length: u32,
+    _bytes_transferred: *mut u32,
+) -> i32 {
+    unsupported_winfsp_status("get_ea", STATUS_INVALID_DEVICE_REQUEST)
+}
+
+unsafe extern "C" fn host_set_ea(
+    _filesystem: *mut c_void,
+    _file_context: *mut c_void,
+    _ea: *mut c_void,
+    _ea_length: u32,
+    _file_info: *mut c_void,
+) -> i32 {
+    unsupported_winfsp_status("set_ea", STATUS_MEDIA_WRITE_PROTECTED)
+}
+
+unsafe extern "C" fn host_dispatcher_stopped(_filesystem: *mut c_void, normally: u8) {
+    debug_winfsp(
+        "dispatcher_stopped",
+        if normally == 0 { "abnormal" } else { "normal" },
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
