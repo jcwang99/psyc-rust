@@ -8,9 +8,8 @@ use anyhow::Result;
 use e2v_core::DirectoryEntry;
 
 use crate::{
-    CachePolicy, MountLaunchSummary, MountMode, MountRequest, MountedFilesystem,
-    MountedFilesystemHandle, OpenedFile, ReadOnlyVfs, RefreshOutcome, VfsMountConfig,
-    VfsNodeMetadata,
+    CachePolicy, MountLaunchSummary, MountMode, MountRequest, MountedFilesystem, OpenedFile,
+    ReadOnlyVfs, RefreshOutcome, VfsMountConfig, VfsNodeMetadata,
 };
 
 const DEFAULT_SECTOR_SIZE: u32 = 4096;
@@ -255,17 +254,15 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
         stream_only: true,
         status_message: "winfsp host mount active".to_string(),
     };
-    Ok(MountedFilesystem::Active(
-        MountedFilesystemHandle::with_windows_host(
-            summary,
-            WindowsMountedFilesystemHost {
-                native_filesystem: native_filesystem.cast::<NativeFspFileSystem>(),
-                runtime,
-                _interface: interface,
-                _mount_context: mount_context,
-                stop_state,
-            },
-        ),
+    Ok(MountedFilesystem::with_windows_host(
+        summary,
+        WindowsMountedFilesystemHost {
+            native_filesystem: native_filesystem.cast::<NativeFspFileSystem>(),
+            runtime,
+            _interface: interface,
+            _mount_context: mount_context,
+            stop_state,
+        },
     ))
 }
 

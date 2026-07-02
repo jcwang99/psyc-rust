@@ -257,26 +257,13 @@ pub struct MountLaunchSummary {
 }
 
 #[derive(Debug)]
-pub enum MountedFilesystem {
-    Active(MountedFilesystemHandle),
-}
-
-impl MountedFilesystem {
-    pub fn summary(&self) -> &MountLaunchSummary {
-        match self {
-            Self::Active(handle) => handle.summary(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct MountedFilesystemHandle {
+pub struct MountedFilesystem {
     summary: MountLaunchSummary,
     #[cfg(windows)]
     _windows_host: Option<crate::windows::WindowsMountedFilesystemHost>,
 }
 
-impl MountedFilesystemHandle {
+impl MountedFilesystem {
     pub fn summary(&self) -> &MountLaunchSummary {
         &self.summary
     }
@@ -1166,9 +1153,7 @@ pub fn start_snapshot_mount(
             VfsMountConfig::snapshot(repo_root, snapshot_id),
             mount_point,
         )?;
-        Ok(MountedFilesystem::Active(
-            MountedFilesystemHandle::from_summary(summary),
-        ))
+        Ok(MountedFilesystem::from_summary(summary))
     }
 }
 
@@ -1190,9 +1175,7 @@ pub fn start_live_branch_mount(
             VfsMountConfig::live_branch(repo_root, branch_token_hex),
             mount_point,
         )?;
-        Ok(MountedFilesystem::Active(
-            MountedFilesystemHandle::from_summary(summary),
-        ))
+        Ok(MountedFilesystem::from_summary(summary))
     }
 }
 

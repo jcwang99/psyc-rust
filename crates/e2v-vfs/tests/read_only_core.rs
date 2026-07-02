@@ -1255,6 +1255,26 @@ fn platform_module_does_not_keep_an_unused_windows_adapter_marker() {
 }
 
 #[test]
+fn vfs_root_keeps_mounted_filesystem_opaque() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+    let public_surface = source.split("#[doc(hidden)]").next().unwrap_or(&source);
+
+    assert!(
+        !public_surface.contains("pub enum MountedFilesystem"),
+        "crate root should not expose MountedFilesystem as a tagged enum"
+    );
+    assert!(
+        !public_surface.contains("pub struct MountedFilesystemHandle"),
+        "crate root should not expose the internal MountedFilesystemHandle type"
+    );
+}
+
+#[test]
 fn snapshot_vfs_accepts_rooted_and_trailing_slash_paths() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
