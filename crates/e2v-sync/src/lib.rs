@@ -40,27 +40,84 @@ pub fn load_trusted_remote_state_for_repo(
 
 #[doc(hidden)]
 pub mod testing {
-    pub use crate::pack_index::{
-        decode_pack_index_root_value_for_test, decode_pack_index_segment_value_for_test,
-        encode_pack_index_root_value_for_test, encode_pack_index_segment_value_for_test,
-        load_cached_pack_physical_ref_for_object_id,
-    };
-    pub use crate::trusted_state::override_trusted_state_dir_for_test;
+    use anyhow::Result;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
 
     pub fn override_small_object_pack_threshold_for_test(
         threshold: usize,
     ) -> crate::push::SmallObjectPackThresholdGuard {
         crate::push::override_small_object_pack_threshold_for_test(threshold)
     }
+
+    pub fn decode_pack_index_root_value_for_test(
+        control_dir: &Path,
+        bytes: &[u8],
+    ) -> Result<Value> {
+        crate::pack_index::decode_pack_index_root_value_for_test(control_dir, bytes)
+    }
+
+    pub fn encode_pack_index_root_value_for_test(
+        control_dir: &Path,
+        value: &Value,
+    ) -> Result<Vec<u8>> {
+        crate::pack_index::encode_pack_index_root_value_for_test(control_dir, value)
+    }
+
+    pub fn decode_pack_index_segment_value_for_test(
+        control_dir: &Path,
+        segment_path: &str,
+        bytes: &[u8],
+    ) -> Result<Value> {
+        crate::pack_index::decode_pack_index_segment_value_for_test(
+            control_dir,
+            segment_path,
+            bytes,
+        )
+    }
+
+    pub fn encode_pack_index_segment_value_for_test(
+        control_dir: &Path,
+        segment_path: &str,
+        value: &Value,
+    ) -> Result<Vec<u8>> {
+        crate::pack_index::encode_pack_index_segment_value_for_test(
+            control_dir,
+            segment_path,
+            value,
+        )
+    }
+
+    pub fn load_cached_pack_physical_ref_for_object_id(
+        control_dir: &Path,
+        object_id: &str,
+    ) -> Result<e2v_store::PhysicalObjectRef> {
+        crate::pack_index::load_cached_pack_physical_ref_for_object_id(control_dir, object_id)
+    }
+
+    pub fn override_trusted_state_dir_for_test(
+        path: PathBuf,
+    ) -> crate::trusted_state::TrustedStateDirGuard {
+        crate::trusted_state::override_trusted_state_dir_for_test(path)
+    }
 }
 
 #[doc(hidden)]
 pub mod benchmarking {
-    pub use crate::pack_index::decode_pack_index_root_value_for_test;
+    use anyhow::Result;
+    use serde_json::Value;
+    use std::path::Path;
 
     pub fn override_small_object_pack_threshold_for_test(
         threshold: usize,
     ) -> crate::push::SmallObjectPackThresholdGuard {
         crate::push::override_small_object_pack_threshold_for_test(threshold)
+    }
+
+    pub fn decode_pack_index_root_value_for_test(
+        control_dir: &Path,
+        bytes: &[u8],
+    ) -> Result<Value> {
+        crate::pack_index::decode_pack_index_root_value_for_test(control_dir, bytes)
     }
 }

@@ -46,6 +46,26 @@ fn push_and_publisher_modules_are_not_exposed_as_public_crate_modules() {
     }
 }
 
+#[test]
+fn sync_testing_and_benchmarking_modules_do_not_reexport_internal_helpers_directly() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for legacy_reexport in [
+        "pub use crate::pack_index::",
+        "pub use crate::trusted_state::override_trusted_state_dir_for_test;",
+    ] {
+        assert!(
+            !source.contains(legacy_reexport),
+            "e2v-sync helper surfaces should wrap internal helpers instead of directly re-exporting them: {legacy_reexport}"
+        );
+    }
+}
+
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     RefToken::new(format!(
         "keyring/{}",
