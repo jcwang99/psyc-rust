@@ -294,12 +294,11 @@ fn remote_object_authenticates_for_resume<R: RemoteBackend>(
     }
 
     let control_dir = context.repo_root.join(".e2v");
-    let (remote_loose_object_ids, remote_pack_locations) =
-        ensure_remote_object_inventory_loaded(
-            &control_dir,
-            context.remote,
-            context.remote_inventory_cache,
-        )?;
+    let (remote_loose_object_ids, remote_pack_locations) = ensure_remote_object_inventory_loaded(
+        &control_dir,
+        context.remote,
+        context.remote_inventory_cache,
+    )?;
     Ok(
         inventory_has_object(remote_loose_object_ids, remote_pack_locations, object_id)
             && remote_object_authenticates_for_repo(
@@ -509,18 +508,17 @@ fn remote_keyring_matches<R: RemoteBackend>(remote: &R, keyring_files: &[PathBuf
         Some(path) => path,
         None => return false,
     };
-    let repo_id = match serde_json::from_slice::<serde_json::Value>(
-        &match std::fs::read(current_keyring) {
+    let repo_id =
+        match serde_json::from_slice::<serde_json::Value>(&match std::fs::read(current_keyring) {
             Ok(bytes) => bytes,
             Err(_) => return false,
-        },
-    ) {
-        Ok(keyring) => match keyring["repo_id"].as_str() {
-            Some(repo_id) => repo_id.to_string(),
-            None => return false,
-        },
-        Err(_) => return false,
-    };
+        }) {
+            Ok(keyring) => match keyring["repo_id"].as_str() {
+                Some(repo_id) => repo_id.to_string(),
+                None => return false,
+            },
+            Err(_) => return false,
+        };
     let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
     let remote_pointer = match remote.read_ref(&pointer_token) {
         Ok(Some(stored)) => stored.value.bytes,
@@ -634,12 +632,7 @@ fn read_remote_current_keyring_bytes<R: RemoteBackend>(
     let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
     let pointer_bytes = match remote.read_ref(&pointer_token)? {
         Some(stored) => stored.value.bytes,
-        None => {
-            if !remote.exists_physical("control/keyring/keyring.current") {
-                return Ok(None);
-            }
-            remote.get_physical("control/keyring/keyring.current")?
-        }
+        None => return Ok(None),
     };
     let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes)
         .context("failed to decode remote keyring pointer")?;

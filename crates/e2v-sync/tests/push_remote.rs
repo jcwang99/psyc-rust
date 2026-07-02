@@ -21,6 +21,15 @@ fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     ))
 }
 
+fn read_local_keyring_pointer_and_current_bytes(repo_root: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+    let keyring_dir = repo_root.join(".e2v").join("keyring");
+    let pointer_bytes = fs::read(keyring_dir.join("keyring.current")).unwrap();
+    let pointer: Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let current = pointer["current"].as_str().unwrap();
+    let current_bytes = fs::read(keyring_dir.join(current)).unwrap();
+    (pointer_bytes, current_bytes)
+}
+
 #[derive(Debug, Clone)]
 struct RefConflictBackend {
     inner: MemoryBackend,
@@ -6304,6 +6313,111 @@ fn push_rejects_remote_without_keyring_pointer_ref_even_if_physical_pointer_file
             || error.to_string().contains("keyring"),
         "unexpected error: {error:#}"
     );
+}
+
+#[test]
+fn push_does_not_merge_remote_keyring_physical_state_without_pointer_ref() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"seed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "seed-physical-keyring-only-remote".to_string(),
+        },
+    )
+    .unwrap();
+
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    let (remote_pointer_bytes, remote_keyring_bytes) =
+        read_local_keyring_pointer_and_current_bytes(&recipient_root);
+    let remote_pointer: Value = serde_json::from_slice(&remote_pointer_bytes).unwrap();
+    let remote_current = remote_pointer["current"].as_str().unwrap();
+    remote
+        .put_physical(
+            &format!("control/keyring/{remote_current}"),
+            &remote_keyring_bytes,
+        )
+        .unwrap();
+    remote
+        .put_physical("control/keyring/keyring.current", &remote_pointer_bytes)
+        .unwrap();
+
+    let (owner_pointer_before, owner_keyring_before) =
+        read_local_keyring_pointer_and_current_bytes(&owner_root);
+    let hidden_ref_remote = KeyringPointerRefHiddenRemote::new(remote.clone());
+
+    fs::write(owner_root.join("hello.txt"), b"second").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &hidden_ref_remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-with-physical-keyring-only-remote".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("keyring pointer publish conflict")
+            || error.to_string().contains("keyring pointer ref")
+            || error.to_string().contains("conflict"),
+        "unexpected error: {error:#}"
+    );
+
+    let (owner_pointer_after, owner_keyring_after) =
+        read_local_keyring_pointer_and_current_bytes(&owner_root);
+    assert_eq!(owner_pointer_after, owner_pointer_before);
+    assert_eq!(owner_keyring_after, owner_keyring_before);
 }
 
 #[test]

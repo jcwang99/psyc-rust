@@ -29,6 +29,18 @@ fn init_repo(repo_root: &std::path::Path) {
         .unwrap();
 }
 
+fn cli_lib_source_without_whitespace() -> String {
+    fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap()
+    .chars()
+    .filter(|ch| !ch.is_whitespace())
+    .collect()
+}
+
 fn init_shared_repo(repo_root: &std::path::Path) -> (RepositoryFacade, String) {
     init_repo(repo_root);
     let facade = RepositoryFacade::new();
@@ -697,12 +709,7 @@ fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
 
 #[test]
 fn maintenance_commands_delegate_through_the_sdk_boundary() {
-    let source = fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("lib.rs"),
-    )
-    .unwrap();
+    let source = cli_lib_source_without_whitespace();
 
     for legacy_call in [
         "verify_remote(",
@@ -733,12 +740,7 @@ fn maintenance_commands_delegate_through_the_sdk_boundary() {
 
 #[test]
 fn branch_and_share_commands_delegate_through_the_sdk_boundary() {
-    let source = fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("lib.rs"),
-    )
-    .unwrap();
+    let source = cli_lib_source_without_whitespace();
 
     for legacy_call in [
         "facade.list_branches(",
