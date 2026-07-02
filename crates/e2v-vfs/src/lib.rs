@@ -1057,14 +1057,6 @@ impl OpenedFile {
     pub fn inode_id(&self) -> u64 {
         self.inode_id
     }
-
-    pub fn cached_plaintext_for_test(&self) -> Option<Vec<u8>> {
-        self.plaintext_cache
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|cached| cached.bytes.clone())
-    }
 }
 
 fn stable_inode_id(snapshot_id: &str, logical_path: &str, file_object_id: &str) -> u64 {
@@ -1113,6 +1105,20 @@ pub fn mount_live_branch(
         VfsMountConfig::live_branch(repo_root, branch_token_hex),
         mount_point,
     )
+}
+
+#[doc(hidden)]
+pub mod testing {
+    use super::OpenedFile;
+
+    pub fn opened_file_cached_plaintext(opened_file: &OpenedFile) -> Option<Vec<u8>> {
+        opened_file
+            .plaintext_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cached| cached.bytes.clone())
+    }
 }
 
 #[cfg(test)]

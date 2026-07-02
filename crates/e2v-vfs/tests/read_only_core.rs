@@ -19,7 +19,7 @@ use e2v_vfs::{
     VfsNodeKind, VfsSemantic, WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver,
     WinfspHostLauncher, WinfspHostSession, WinfspInvalidator, WinfspMountContext,
     WinfspOpenRequest, WinfspRuntimeLibrary, WinfspRuntimePaths, WinfspVolumeParams,
-    try_mount_snapshot_on_current_platform,
+    testing::opened_file_cached_plaintext, try_mount_snapshot_on_current_platform,
 };
 
 enum UnreadableCacheEntryGuard {
@@ -196,7 +196,7 @@ fn repeated_reads_can_use_plaintext_memory_cache_after_local_objects_become_unre
     let first = vfs.read(&handle, 0, 5).unwrap();
     assert_eq!(String::from_utf8(first).unwrap(), "alpha");
 
-    let cached = handle.cached_plaintext_for_test().unwrap();
+    let cached = opened_file_cached_plaintext(&handle).unwrap();
     assert_eq!(String::from_utf8(cached).unwrap(), "alpha");
 
     let objects_dir = repo_root.join(".e2v").join("objects");
@@ -295,7 +295,7 @@ fn encrypted_disk_cache_hits_are_promoted_into_open_file_memory_cache() {
     let second = vfs.read(&reopened, 1, 3).unwrap();
     assert_eq!(String::from_utf8(second).unwrap(), "lph");
     assert_eq!(
-        String::from_utf8(reopened.cached_plaintext_for_test().unwrap()).unwrap(),
+        String::from_utf8(opened_file_cached_plaintext(&reopened).unwrap()).unwrap(),
         "lph"
     );
 
@@ -381,7 +381,7 @@ fn oversized_full_file_reads_are_not_retained_in_plaintext_memory_cache() {
     let first = vfs.read(&handle, 0, large_bytes.len()).unwrap();
     assert_eq!(first, large_bytes);
     assert!(
-        handle.cached_plaintext_for_test().is_none(),
+        opened_file_cached_plaintext(&handle).is_none(),
         "oversized full-file read should not remain in plaintext handle cache"
     );
 
@@ -444,7 +444,7 @@ fn oversized_first_read_that_reaches_eof_populates_cache_without_a_second_origin
     let first = vfs.read(&handle, 0, 32).unwrap();
     assert_eq!(String::from_utf8(first).unwrap(), "alpha");
     assert_eq!(
-        String::from_utf8(handle.cached_plaintext_for_test().unwrap()).unwrap(),
+        String::from_utf8(opened_file_cached_plaintext(&handle).unwrap()).unwrap(),
         "alpha"
     );
 
@@ -565,7 +565,7 @@ fn global_plaintext_cache_hits_only_promote_the_requested_slice_into_handle_cach
     let second = vfs.read(&reopened, 1, 3).unwrap();
     assert_eq!(String::from_utf8(second).unwrap(), "lph");
     assert_eq!(
-        String::from_utf8(reopened.cached_plaintext_for_test().unwrap()).unwrap(),
+        String::from_utf8(opened_file_cached_plaintext(&reopened).unwrap()).unwrap(),
         "lph"
     );
 }
@@ -589,7 +589,7 @@ fn encrypted_disk_cache_full_file_entry_can_serve_later_subrange_reads() {
     let warm_handle = vfs.open_file("tracked.txt").unwrap();
     let first = vfs.read(&warm_handle, 0, 5).unwrap();
     assert_eq!(String::from_utf8(first).unwrap(), "alpha");
-    assert!(warm_handle.cached_plaintext_for_test().is_none());
+    assert!(opened_file_cached_plaintext(&warm_handle).is_none());
 
     let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
     let snapshot = read_service
@@ -1052,6 +1052,21 @@ fn snapshot_vfs_can_stat_files_and_directories() {
     assert!(tracked.inode_id > 0);
     assert_eq!(tracked.snapshot_id, vfs.namespace_snapshot_id());
     assert!(tracked.layout_generation > 0);
+}
+
+#[test]
+fn opened_file_test_probe_is_not_exposed_as_a_public_api_method() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub fn cached_plaintext_for_test"),
+        "test-only cache probes should not remain in the public VFS API surface"
+    );
 }
 
 #[test]
