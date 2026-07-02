@@ -18,7 +18,6 @@ use crate::ref_store::{
 pub struct MemoryBackend {
     physical: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     physical_modified_at: Arc<Mutex<HashMap<String, SystemTime>>>,
-    refs: Arc<Mutex<HashMap<String, StoredRef>>>,
     layout_root: Arc<Mutex<LayoutRoot>>,
     capability: BackendCapability,
 }
@@ -43,12 +42,15 @@ impl MemoryBackend {
         format!("control/layout-roots/{generation:020}.json")
     }
 
+    fn ref_path(token: &RefToken) -> String {
+        format!("control/refs/by-token/{}.json", token.value)
+    }
+
     pub fn new() -> Self {
         let layout_root = Self::default_layout_root();
         Self {
             physical: Arc::new(Mutex::new(HashMap::new())),
             physical_modified_at: Arc::new(Mutex::new(HashMap::new())),
-            refs: Arc::new(Mutex::new(HashMap::new())),
             layout_root: Arc::new(Mutex::new(layout_root)),
             capability: BackendCapability {
                 supports_conditional_put: true,
@@ -91,20 +93,31 @@ impl MemoryBackend {
 impl RefStore for MemoryBackend {
     fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
         token.validate()?;
-        Ok(self.refs.lock().unwrap().get(&token.value).cloned())
+        let path = Self::ref_path(token);
+        if !self.exists_physical(&path) {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&self.get_physical(&path)?)?))
     }
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
         let mut listed = self
-            .refs
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(token, stored)| ListedRef {
-                token: RefToken::new(token.clone()),
-                stored: stored.clone(),
+            .list_physical("control/refs/by-token/")?
+            .into_iter()
+            .filter_map(|path| {
+                let token = path
+                    .strip_prefix("control/refs/by-token/")?
+                    .strip_suffix(".json")?
+                    .to_string();
+                Some((path, token))
             })
-            .collect::<Vec<_>>();
+            .map(|(path, token)| -> Result<ListedRef> {
+                Ok(ListedRef {
+                    token: RefToken::new(token),
+                    stored: serde_json::from_slice(&self.get_physical(&path)?)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         listed.sort_by(|left, right| left.token.value.cmp(&right.token.value));
         Ok(listed)
     }
@@ -116,8 +129,7 @@ impl RefStore for MemoryBackend {
         next: EncryptedRef,
     ) -> Result<CasResult> {
         token.validate()?;
-        let mut refs = self.refs.lock().unwrap();
-        let current = refs.get(&token.value).cloned();
+        let current = self.read_ref(token)?;
         let matches = match (&current, expected) {
             (None, None) => true,
             (Some(stored), Some(expected_version)) => stored.version == expected_version,
@@ -140,7 +152,7 @@ impl RefStore for MemoryBackend {
             version: next_version,
             value: next,
         };
-        refs.insert(token.value.clone(), stored.clone());
+        self.put_physical(&Self::ref_path(token), &serde_json::to_vec_pretty(&stored)?)?;
         Ok(CasResult {
             applied: true,
             current: Some(stored),
@@ -321,6 +333,85 @@ mod tests {
 
         assert!(!stale.applied);
         assert_eq!(backend.read_layout_root().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn compare_and_swap_ref_materializes_physical_ref_file() {
+        let backend = MemoryBackend::new();
+        let token = RefToken::new("branches/main".to_string());
+        let next = EncryptedRef::new(vec![1, 2, 3]);
+
+        let result = backend
+            .compare_and_swap_ref(&token, None, next.clone())
+            .unwrap();
+
+        assert!(result.applied);
+        assert_eq!(
+            backend
+                .get_physical("control/refs/by-token/branches/main.json")
+                .unwrap(),
+            serde_json::to_vec_pretty(&StoredRef {
+                version: RefVersion { value: 1 },
+                value: next,
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn read_ref_uses_physical_ref_bytes_when_present() {
+        let backend = MemoryBackend::new();
+        let token = RefToken::new("branches/main".to_string());
+        let stored = StoredRef {
+            version: RefVersion { value: 7 },
+            value: EncryptedRef::new(vec![9, 8, 7]),
+        };
+        backend
+            .put_physical(
+                "control/refs/by-token/branches/main.json",
+                &serde_json::to_vec_pretty(&stored).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(backend.read_ref(&token).unwrap(), Some(stored));
+    }
+
+    #[test]
+    fn list_refs_uses_physical_ref_files_when_present() {
+        let backend = MemoryBackend::new();
+        let alpha = StoredRef {
+            version: RefVersion { value: 2 },
+            value: EncryptedRef::new(vec![1]),
+        };
+        let zeta = StoredRef {
+            version: RefVersion { value: 3 },
+            value: EncryptedRef::new(vec![2]),
+        };
+        backend
+            .put_physical(
+                "control/refs/by-token/branches/zeta.json",
+                &serde_json::to_vec_pretty(&zeta).unwrap(),
+            )
+            .unwrap();
+        backend
+            .put_physical(
+                "control/refs/by-token/branches/alpha.json",
+                &serde_json::to_vec_pretty(&alpha).unwrap(),
+            )
+            .unwrap();
+
+        let listed = backend.list_refs().unwrap();
+
+        assert_eq!(
+            listed
+                .into_iter()
+                .map(|entry| (entry.token.value, entry.stored))
+                .collect::<Vec<_>>(),
+            vec![
+                ("branches/alpha".to_string(), alpha),
+                ("branches/zeta".to_string(), zeta),
+            ]
+        );
     }
 
     #[test]
