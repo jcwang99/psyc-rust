@@ -208,6 +208,88 @@ fn search_command_prints_filename_matches() {
 }
 
 #[test]
+fn init_command_creates_repository_with_explicit_password() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "init",
+        repo_root.to_str().unwrap(),
+        "--password",
+        "correct horse battery staple",
+    ])
+    .unwrap();
+
+    assert!(output.contains("initialized repository"));
+    let opened = RepositoryFacade::new().open(&repo_root).unwrap();
+    assert_eq!(opened.branch.name, "main");
+}
+
+#[test]
+fn commit_and_snapshots_commands_round_trip_repository_history() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+
+    let commit_output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "commit",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "--message",
+        "seed",
+    ])
+    .unwrap();
+    assert!(commit_output.contains("committed"));
+
+    let snapshots_output =
+        e2v_cli::run_cli_for_test(["e2v", "snapshots", "--repo", repo_root.to_str().unwrap()])
+            .unwrap();
+
+    assert!(snapshots_output.contains("seed"));
+    let committed = RepositoryFacade::new().snapshots(&repo_root).unwrap();
+    assert!(snapshots_output.contains(&committed[0].snapshot_id));
+}
+
+#[test]
+fn checkout_command_restores_an_explicit_snapshot_into_target_directory() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let checkout_root = temp.path().join("checkout");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&checkout_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let commit = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let output = e2v_cli::run_cli_for_test([
+        "e2v",
+        "checkout",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "--snapshot",
+        &commit.snapshot_id,
+        "--target",
+        checkout_root.to_str().unwrap(),
+    ])
+    .unwrap();
+
+    assert!(output.contains("checked out"));
+    assert_eq!(
+        fs::read_to_string(checkout_root.join("tracked.txt")).unwrap(),
+        "alpha"
+    );
+}
+
+#[test]
 fn mount_snapshot_command_delegates_to_e2v_vfs() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

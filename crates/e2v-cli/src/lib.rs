@@ -3,9 +3,10 @@ use std::{io::Write, path::PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use e2v_api::{
-    GcExecuteRequest, Sdk, ShareAcceptDeviceRequest, ShareAcceptMemberRequest,
-    ShareInviteDeviceRequest, ShareInviteMemberRequest, ShareRevokeDeviceRequest,
-    ShareRevokeMemberRequest, VerifyRemoteRequest,
+    CheckoutSnapshotOptions, CommitRepositoryOptions, GcExecuteRequest, InitRepositoryOptions, Sdk,
+    ShareAcceptDeviceRequest, ShareAcceptMemberRequest, ShareInviteDeviceRequest,
+    ShareInviteMemberRequest, ShareRevokeDeviceRequest, ShareRevokeMemberRequest,
+    VerifyRemoteRequest,
 };
 use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
@@ -26,6 +27,31 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Init {
+        repo: PathBuf,
+        #[arg(long)]
+        password: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+    },
+    Commit {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(short = 'm', long = "message")]
+        message: String,
+    },
+    Snapshots {
+        #[arg(long)]
+        repo: PathBuf,
+    },
+    Checkout {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long = "target")]
+        target_dir: PathBuf,
+    },
     Branch {
         #[command(subcommand)]
         command: BranchCommand,
@@ -236,6 +262,51 @@ fn execute(cli: Cli) -> Result<String> {
     let facade = RepositoryFacade::new();
     let sdk = Sdk::new();
     match cli.command {
+        Command::Init {
+            repo,
+            password,
+            branch,
+        } => {
+            let repo = sdk.init_repository(InitRepositoryOptions {
+                repo_root: repo,
+                password,
+                branch_name: branch,
+            })?;
+            Ok(format!("initialized repository {}\n", repo.branch.name))
+        }
+        Command::Commit { repo, message } => {
+            let commit = sdk.commit_repository(CommitRepositoryOptions {
+                repo_root: repo,
+                message,
+            })?;
+            Ok(format!(
+                "committed {}\n",
+                &commit.snapshot_id[..commit.snapshot_id.len().min(8)]
+            ))
+        }
+        Command::Snapshots { repo } => {
+            let snapshots = sdk.list_snapshots(&repo)?;
+            Ok(snapshots
+                .into_iter()
+                .map(|snapshot| format!("{} {}\n", snapshot.snapshot_id, snapshot.message))
+                .collect())
+        }
+        Command::Checkout {
+            repo,
+            snapshot,
+            target_dir,
+        } => {
+            sdk.checkout_snapshot(CheckoutSnapshotOptions {
+                repo_root: repo,
+                snapshot_id: snapshot.clone(),
+                target_dir: target_dir.clone(),
+            })?;
+            Ok(format!(
+                "checked out {} to {}\n",
+                &snapshot[..snapshot.len().min(8)],
+                target_dir.display()
+            ))
+        }
         Command::Branch { command, repo } => match command {
             BranchCommand::List => {
                 let branches = sdk.list_branches(&repo)?;
