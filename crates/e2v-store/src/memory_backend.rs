@@ -20,7 +20,6 @@ pub struct MemoryBackend {
     physical_modified_at: Arc<Mutex<HashMap<String, SystemTime>>>,
     refs: Arc<Mutex<HashMap<String, StoredRef>>>,
     layout_root: Arc<Mutex<LayoutRoot>>,
-    retained_layout_roots: Arc<Mutex<Vec<LayoutRoot>>>,
     capability: BackendCapability,
 }
 
@@ -31,19 +30,26 @@ impl Default for MemoryBackend {
 }
 
 impl MemoryBackend {
-    pub fn new() -> Self {
-        let layout_root = LayoutRoot {
+    fn default_layout_root() -> LayoutRoot {
+        LayoutRoot {
             schema_version: 1,
             layout_id: "direct".to_string(),
             generation: 1,
             mapping_policy: "loose".to_string(),
-        };
+        }
+    }
+
+    fn layout_history_path(generation: u64) -> String {
+        format!("control/layout-roots/{generation:020}.json")
+    }
+
+    pub fn new() -> Self {
+        let layout_root = Self::default_layout_root();
         Self {
             physical: Arc::new(Mutex::new(HashMap::new())),
             physical_modified_at: Arc::new(Mutex::new(HashMap::new())),
             refs: Arc::new(Mutex::new(HashMap::new())),
-            layout_root: Arc::new(Mutex::new(layout_root.clone())),
-            retained_layout_roots: Arc::new(Mutex::new(vec![layout_root])),
+            layout_root: Arc::new(Mutex::new(layout_root)),
             capability: BackendCapability {
                 supports_conditional_put: true,
                 supports_range_read: true,
@@ -252,9 +258,10 @@ impl LayoutRootStore for MemoryBackend {
                 current: None,
             });
         }
+        let bytes = serde_json::to_vec_pretty(&next)?;
         *self.layout_root.lock().unwrap() = next.clone();
-        self.put_physical("layout_root.json", &serde_json::to_vec_pretty(&next)?)?;
-        self.retained_layout_roots.lock().unwrap().push(next);
+        self.put_physical("layout_root.json", &bytes)?;
+        self.put_physical(&Self::layout_history_path(next.generation), &bytes)?;
         Ok(CasResult {
             applied: true,
             current: None,
@@ -262,7 +269,15 @@ impl LayoutRootStore for MemoryBackend {
     }
 
     fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
-        Ok(self.retained_layout_roots.lock().unwrap().clone())
+        let retained_paths = self.list_physical("control/layout-roots/")?;
+        if retained_paths.is_empty() {
+            return Ok(vec![self.read_layout_root()?]);
+        }
+
+        retained_paths
+            .into_iter()
+            .map(|path| serde_json::from_slice(&self.get_physical(&path)?).map_err(Into::into))
+            .collect()
     }
 }
 
@@ -330,6 +345,29 @@ mod tests {
     }
 
     #[test]
+    fn compare_and_swap_layout_root_materializes_physical_layout_root_history_file() {
+        let backend = MemoryBackend::new();
+        let next = LayoutRoot {
+            schema_version: 1,
+            layout_id: "direct".to_string(),
+            generation: 2,
+            mapping_policy: "loose".to_string(),
+        };
+
+        let result = backend
+            .compare_and_swap_layout_root(1, next.clone())
+            .unwrap();
+
+        assert!(result.applied);
+        assert_eq!(
+            backend
+                .get_physical("control/layout-roots/00000000000000000002.json")
+                .unwrap(),
+            serde_json::to_vec_pretty(&next).unwrap()
+        );
+    }
+
+    #[test]
     fn read_layout_root_uses_physical_layout_root_bytes_when_present() {
         let backend = MemoryBackend::new();
         let physical = LayoutRoot {
@@ -346,6 +384,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(backend.read_layout_root().unwrap(), physical);
+    }
+
+    #[test]
+    fn list_retained_layout_roots_uses_physical_history_when_present() {
+        let backend = MemoryBackend::new();
+        let generation_two = LayoutRoot {
+            schema_version: 1,
+            layout_id: "direct".to_string(),
+            generation: 2,
+            mapping_policy: "loose".to_string(),
+        };
+        let generation_three = LayoutRoot {
+            schema_version: 1,
+            layout_id: "direct".to_string(),
+            generation: 3,
+            mapping_policy: "loose".to_string(),
+        };
+        backend
+            .put_physical(
+                "control/layout-roots/00000000000000000002.json",
+                &serde_json::to_vec_pretty(&generation_two).unwrap(),
+            )
+            .unwrap();
+        backend
+            .put_physical(
+                "control/layout-roots/00000000000000000003.json",
+                &serde_json::to_vec_pretty(&generation_three).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            backend.list_retained_layout_roots().unwrap(),
+            vec![generation_two, generation_three]
+        );
+    }
+
+    #[test]
+    fn list_retained_layout_roots_falls_back_to_physical_current_layout_root_when_history_is_missing()
+     {
+        let backend = MemoryBackend::new();
+        let physical = LayoutRoot {
+            schema_version: 1,
+            layout_id: "direct".to_string(),
+            generation: 7,
+            mapping_policy: "loose".to_string(),
+        };
+        backend
+            .put_physical(
+                "layout_root.json",
+                &serde_json::to_vec_pretty(&physical).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            backend.list_retained_layout_roots().unwrap(),
+            vec![physical]
+        );
     }
 
     #[test]
