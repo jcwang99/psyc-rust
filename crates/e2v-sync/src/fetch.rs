@@ -659,8 +659,7 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
         }
         Err(error) => return Err(error).context("failed to decode local keyring state"),
     };
-    let remote_pointer_bytes =
-        read_remote_keyring_pointer_bytes(remote, Some(&local_state.repo_id))?;
+    let remote_pointer_bytes = read_remote_keyring_pointer_bytes(remote)?;
     let remote_pointer: KeyringPointer = serde_json::from_slice(&remote_pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
     let remote_state: KeyringStateSummary = serde_json::from_slice(
@@ -948,7 +947,7 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
     remote: &R,
     default_ref_bytes: Vec<u8>,
 ) -> Result<RemoteControlPlane> {
-    let keyring_pointer_bytes = read_remote_keyring_pointer_bytes(remote, None)?;
+    let keyring_pointer_bytes = read_remote_keyring_pointer_bytes(remote)?;
     let keyring_pointer: KeyringPointer = serde_json::from_slice(&keyring_pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
     validate_remote_relative_name(&keyring_pointer.current).map_err(|error| {
@@ -1017,31 +1016,19 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
     })
 }
 
-fn read_remote_keyring_pointer_bytes<R: RemoteBackend>(
-    remote: &R,
-    repo_id: Option<&str>,
-) -> Result<Vec<u8>> {
-    if let Some(repo_id) = repo_id {
-        let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
-        if let Some(stored) = remote.read_ref(&pointer_token)? {
-            return Ok(stored.value.bytes);
-        }
-    } else {
-        let keyring_refs = remote
-            .list_refs()?
-            .into_iter()
-            .filter(|listed| listed.token.value.starts_with("keyring/"))
-            .collect::<Vec<_>>();
-        if keyring_refs.len() == 1 {
-            return Ok(keyring_refs[0].stored.value.bytes.clone());
-        }
-        if keyring_refs.len() > 1 {
-            anyhow::bail!("ambiguous remote keyring pointer refs");
-        }
+fn read_remote_keyring_pointer_bytes<R: RemoteBackend>(remote: &R) -> Result<Vec<u8>> {
+    let keyring_refs = remote
+        .list_refs()?
+        .into_iter()
+        .filter(|listed| listed.token.value.starts_with("keyring/"))
+        .collect::<Vec<_>>();
+    if keyring_refs.len() == 1 {
+        return Ok(keyring_refs[0].stored.value.bytes.clone());
     }
-    remote
-        .get_physical("control/keyring/keyring.current")
-        .context("missing physical object control/keyring/keyring.current")
+    if keyring_refs.len() > 1 {
+        anyhow::bail!("ambiguous remote keyring pointer refs");
+    }
+    anyhow::bail!("missing remote keyring pointer ref");
 }
 
 pub(crate) fn validate_remote_branch_control_plane<R: RemoteBackend>(

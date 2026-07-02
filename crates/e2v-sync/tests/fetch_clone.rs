@@ -288,6 +288,107 @@ impl RemoteBackend for KeyringPointerHiddenFromListRemote {
 }
 
 #[derive(Clone, Debug)]
+struct KeyringPointerRefHiddenRemote {
+    inner: MemoryBackend,
+}
+
+impl KeyringPointerRefHiddenRemote {
+    fn new(inner: MemoryBackend) -> Self {
+        Self { inner }
+    }
+}
+
+impl BlobStore for KeyringPointerRefHiddenRemote {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for KeyringPointerRefHiddenRemote {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        if token.value.starts_with("keyring/") {
+            return Ok(None);
+        }
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        Ok(self
+            .inner
+            .list_refs()?
+            .into_iter()
+            .filter(|listed| !listed.token.value.starts_with("keyring/"))
+            .collect())
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: e2v_store::EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for KeyringPointerRefHiddenRemote {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for KeyringPointerRefHiddenRemote {
+    fn capability(&self) -> &e2v_store::BackendCapability {
+        self.inner.capability()
+    }
+}
+
+#[derive(Clone, Debug)]
 struct PackIndexListingForbiddenRemote {
     inner: MemoryBackend,
 }
@@ -539,6 +640,13 @@ fn fetch_downloads_remote_ref_and_missing_objects_without_touching_worktree() {
         })
         .unwrap();
     fs::write(target_repo_root.join("local-only.txt"), b"leave me alone").unwrap();
+    assert!(
+        remote
+            .read_ref(&keyring_pointer_ref_token(&target_repo_root))
+            .unwrap()
+            .is_none(),
+        "fresh local repository should not share the remote keyring ref token"
+    );
 
     let result = fetch_remote(
         &remote,
@@ -1819,6 +1927,58 @@ fn fetch_uses_keyring_pointer_ref_when_physical_pointer_file_is_missing() {
         )
         .unwrap(),
         pointer_bytes
+    );
+}
+
+#[test]
+fn fetch_rejects_remote_without_keyring_pointer_ref_even_if_physical_pointer_file_exists() {
+    let (temp, facade, source_repo_root, branch_token, remote) = seed_remote();
+    let target_repo_root = temp.path().join("clone-target");
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: branch_token.clone(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .change_password(
+            &source_repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: branch_token.clone(),
+            operation_id: "rotate-password-without-pointer-ref".to_string(),
+        },
+    )
+    .unwrap();
+    let hidden_ref_remote = KeyringPointerRefHiddenRemote::new(remote.clone());
+
+    let error = fetch_remote(
+        &hidden_ref_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("keyring pointer ref")
+            || error.to_string().contains("ambiguous")
+            || error.to_string().contains("missing"),
+        "unexpected error: {error:#}"
     );
 }
 
@@ -3289,6 +3449,30 @@ fn clone_uses_keyring_pointer_ref_when_physical_pointer_file_is_missing() {
 }
 
 #[test]
+fn clone_rejects_remote_without_keyring_pointer_ref_even_if_physical_pointer_file_exists() {
+    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let hidden_ref_remote = KeyringPointerRefHiddenRemote::new(remote.clone());
+    let clone_repo_root = temp.path().join("clone-target");
+
+    let error = clone_remote(
+        &hidden_ref_remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("keyring pointer ref")
+            || error.to_string().contains("ambiguous")
+            || error.to_string().contains("missing"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn clone_does_not_restore_remote_keyring_lock_file() {
     let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
     remote
@@ -3638,16 +3822,25 @@ fn fetch_rejects_remote_keyring_paths_that_escape_the_keyring_directory() {
 
 #[test]
 fn fetch_rejects_remote_keyring_pointer_that_references_missing_generation() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
+    let pointer_bytes = serde_json::to_vec(&serde_json::json!({
+        "generation": 2u64,
+        "current": "keyring.2"
+    }))
+    .unwrap();
+    let expected_version = remote
+        .read_ref(&keyring_pointer_ref_token(&source_repo_root))
+        .unwrap()
+        .map(|stored| stored.version);
     remote
-        .put_physical(
-            "control/keyring/keyring.current",
-            &serde_json::to_vec(&serde_json::json!({
-                "generation": 2u64,
-                "current": "keyring.2"
-            }))
-            .unwrap(),
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            expected_version,
+            e2v_store::EncryptedRef::new(pointer_bytes.clone()),
         )
+        .unwrap();
+    remote
+        .put_physical("control/keyring/keyring.current", &pointer_bytes)
         .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
@@ -4664,6 +4857,21 @@ fn sync_flows_work_with_opendal_memory_backend_adapter() {
             )
             .unwrap();
     }
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            None,
+            e2v_store::EncryptedRef::new(
+                fs::read(
+                    source_repo_root
+                        .join(".e2v")
+                        .join("keyring")
+                        .join("keyring.current"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
     let layout_root = remote.read_layout_root().unwrap();
     let next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
         &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),
@@ -4765,6 +4973,21 @@ fn fetch_and_clone_work_with_conservative_webdav_backend_adapter() {
             )
             .unwrap();
     }
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            None,
+            e2v_store::EncryptedRef::new(
+                fs::read(
+                    source_repo_root
+                        .join(".e2v")
+                        .join("keyring")
+                        .join("keyring.current"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
     let layout_root = remote.read_layout_root().unwrap();
     let next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
         &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),
@@ -4862,6 +5085,21 @@ fn fetch_rejects_remote_layout_generation_rollback_below_local_high_water() {
             )
             .unwrap();
     }
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            None,
+            e2v_store::EncryptedRef::new(
+                fs::read(
+                    source_repo_root
+                        .join(".e2v")
+                        .join("keyring")
+                        .join("keyring.current"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
     let layout_root = remote.read_layout_root().unwrap();
     let mut next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
         &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),
@@ -4977,6 +5215,21 @@ fn clone_rejects_remote_layout_generation_rollback_below_external_high_water() {
             )
             .unwrap();
     }
+    remote
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            None,
+            e2v_store::EncryptedRef::new(
+                fs::read(
+                    source_repo_root
+                        .join(".e2v")
+                        .join("keyring")
+                        .join("keyring.current"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
     let layout_root = remote.read_layout_root().unwrap();
     let next_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
         &e2v_core::sync_support::read_layout_root_bytes(&source_repo_root).unwrap(),

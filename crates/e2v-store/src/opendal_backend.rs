@@ -598,9 +598,17 @@ impl RefStore for OpendalMemoryBackend {
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
         let mut listed = self
-            .list_physical("control/refs/by-token/")?
+            .operator
+            .list_options(
+                "control/refs/by-token/",
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
             .into_iter()
-            .filter_map(|path| {
+            .filter_map(|entry: opendal::Entry| {
+                let path = entry.path().to_string();
                 let token = path
                     .strip_prefix("control/refs/by-token/")?
                     .strip_suffix(".json")?
@@ -667,9 +675,17 @@ impl RefStore for OpendalWebdavBackend {
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
         let mut listed = self
-            .list_physical("control/refs/by-token/")?
+            .operator
+            .list_options(
+                "control/refs/by-token/",
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
             .into_iter()
-            .filter_map(|path| {
+            .filter_map(|entry: opendal::Entry| {
+                let path = entry.path().to_string();
                 let token = path
                     .strip_prefix("control/refs/by-token/")?
                     .strip_suffix(".json")?
@@ -970,9 +986,17 @@ impl RefStore for OpendalS3Backend {
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
         let mut listed = self
-            .list_physical("control/refs/by-token/")?
+            .operator
+            .list_options(
+                "control/refs/by-token/",
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
             .into_iter()
-            .filter_map(|path| {
+            .filter_map(|entry: opendal::Entry| {
+                let path = entry.path().to_string();
                 let token = path
                     .strip_prefix("control/refs/by-token/")?
                     .strip_suffix(".json")?
@@ -1385,5 +1409,25 @@ mod tests {
 
         assert_eq!(bytes, vec![4, 5, 6, 7, 8]);
         assert_eq!(service.observed_ranges(), vec![4..9]);
+    }
+
+    #[test]
+    fn opendal_memory_backend_lists_refs_with_nested_tokens() {
+        let backend = OpendalMemoryBackend::new().unwrap();
+        let token = RefToken::new("keyring/repo-123".to_string());
+        let value = EncryptedRef::new(br#"{"generation":1,"current":"keyring.1"}"#.to_vec());
+
+        let cas = backend.compare_and_swap_ref(&token, None, value.clone()).unwrap();
+
+        assert!(cas.applied);
+        assert_eq!(backend.read_ref(&token).unwrap().unwrap().value, value);
+        assert!(
+            backend
+                .list_refs()
+                .unwrap()
+                .iter()
+                .any(|listed| listed.token == token),
+            "nested ref token should be discoverable via list_refs"
+        );
     }
 }
