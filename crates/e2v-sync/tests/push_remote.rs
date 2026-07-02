@@ -14,6 +14,21 @@ use e2v_sync::{
     CloneOptions, PushOptions, ResumeOptions, clone_remote, fetch_remote, push_head, resume_push,
 };
 
+#[test]
+fn push_test_threshold_override_is_not_exposed_as_a_public_api_function() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("push.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub fn override_small_object_pack_threshold_for_test"),
+        "test-only push threshold override should not remain public"
+    );
+}
+
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     RefToken::new(format!(
         "keyring/{}",

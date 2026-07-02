@@ -14,10 +14,7 @@ pub mod testing {
 
     pub use crate::chunker::override_fixed_span_bytes_for_test;
     pub use crate::facade::RepositoryFacade;
-    pub use crate::facade::override_max_file_chunks_per_object_for_test;
     pub use crate::facade::reconcile_remote_keyring_for_sync;
-    pub use crate::facade::rotate_active_epoch_for_test;
-    pub use crate::facade::unlock_with_local_device_for_test;
     pub use crate::keyring::clear_unlocked_keyring_cache_for_test;
     pub use crate::working_tree::WorkingTree as TestWorkingTree;
     pub use crate::working_tree::{SnapshotReader, StableReadPolicy};
@@ -56,6 +53,25 @@ pub mod testing {
         stable_read_policy: StableReadPolicy,
     ) -> RepositoryFacade {
         RepositoryFacade::with_snapshot_reader_and_policy(snapshot_reader, stable_read_policy)
+    }
+
+    pub fn override_max_file_chunks_per_object_for_test(
+        max_chunks: usize,
+    ) -> crate::facade::MaxFileChunksPerObjectGuard {
+        crate::facade::override_max_file_chunks_per_object_for_test(max_chunks)
+    }
+
+    pub fn rotate_active_epoch_for_test(
+        repo_root: impl AsRef<std::path::Path>,
+        password: &str,
+    ) -> Result<()> {
+        crate::facade::rotate_active_epoch_for_test(repo_root, password)
+    }
+
+    pub fn unlock_with_local_device_for_test(
+        repo_root: impl AsRef<std::path::Path>,
+    ) -> Result<crate::RepositoryState> {
+        crate::facade::unlock_with_local_device_for_test(repo_root)
     }
 
     pub fn force_large_file_sharding_for_test() -> (

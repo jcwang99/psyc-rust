@@ -45,12 +45,22 @@ pub mod testing {
         encode_pack_index_root_value_for_test, encode_pack_index_segment_value_for_test,
         load_cached_pack_physical_ref_for_object_id,
     };
-    pub use crate::push::override_small_object_pack_threshold_for_test;
     pub use crate::trusted_state::override_trusted_state_dir_for_test;
+
+    pub fn override_small_object_pack_threshold_for_test(
+        threshold: usize,
+    ) -> crate::push::SmallObjectPackThresholdGuard {
+        crate::push::override_small_object_pack_threshold_for_test(threshold)
+    }
 }
 
 #[doc(hidden)]
 pub mod benchmarking {
     pub use crate::pack_index::decode_pack_index_root_value_for_test;
-    pub use crate::push::override_small_object_pack_threshold_for_test;
+
+    pub fn override_small_object_pack_threshold_for_test(
+        threshold: usize,
+    ) -> crate::push::SmallObjectPackThresholdGuard {
+        crate::push::override_small_object_pack_threshold_for_test(threshold)
+    }
 }

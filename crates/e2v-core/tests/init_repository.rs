@@ -49,6 +49,27 @@ impl StreamingTreeWalkTestExt for ManifestStore {
 }
 
 #[test]
+fn facade_test_helpers_are_not_exposed_as_public_api_functions() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("facade.rs"),
+    )
+    .unwrap();
+
+    for legacy_helper in [
+        "pub fn override_max_file_chunks_per_object_for_test",
+        "pub fn rotate_active_epoch_for_test",
+        "pub fn unlock_with_local_device_for_test",
+    ] {
+        assert!(
+            !source.contains(legacy_helper),
+            "test-only facade helper should not remain public: {legacy_helper}"
+        );
+    }
+}
+
+#[test]
 fn init_creates_control_plane_files_for_local_direct_layout() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

@@ -52,7 +52,7 @@ thread_local! {
     static MAX_FILE_CHUNKS_PER_OBJECT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-pub fn override_max_file_chunks_per_object_for_test(
+pub(crate) fn override_max_file_chunks_per_object_for_test(
     max_chunks: usize,
 ) -> MaxFileChunksPerObjectGuard {
     let previous = MAX_FILE_CHUNKS_PER_OBJECT_OVERRIDE.with(|cell| {
@@ -1895,7 +1895,10 @@ fn random_hex_identifier() -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
-pub fn rotate_active_epoch_for_test(repo_root: impl AsRef<Path>, password: &str) -> Result<()> {
+pub(crate) fn rotate_active_epoch_for_test(
+    repo_root: impl AsRef<Path>,
+    password: &str,
+) -> Result<()> {
     let repo_root = repo_root.as_ref().to_path_buf();
     let control_dir = repo_root.join(CONTROL_DIR);
     let mut repo_secrets = unlock_repo_secrets_uncached(&control_dir, password)?;
@@ -1941,7 +1944,9 @@ pub fn rotate_active_epoch_for_test(repo_root: impl AsRef<Path>, password: &str)
     Ok(())
 }
 
-pub fn unlock_with_local_device_for_test(repo_root: impl AsRef<Path>) -> Result<RepositoryState> {
+pub(crate) fn unlock_with_local_device_for_test(
+    repo_root: impl AsRef<Path>,
+) -> Result<RepositoryState> {
     let repo_root = repo_root.as_ref().to_path_buf();
     let control_dir = repo_root.join(CONTROL_DIR);
     let secrets = unlock_repo_secrets_with_local_device(&control_dir)?;

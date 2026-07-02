@@ -67,7 +67,7 @@ fn should_pack_small_objects(object_count: usize) -> bool {
     object_count >= small_object_pack_threshold()
 }
 
-pub fn override_small_object_pack_threshold_for_test(
+pub(crate) fn override_small_object_pack_threshold_for_test(
     threshold: usize,
 ) -> SmallObjectPackThresholdGuard {
     let previous = SMALL_OBJECT_PACK_THRESHOLD_OVERRIDE.with(|override_cell| {
