@@ -25,6 +25,23 @@ pub trait BlobStore {
     fn list_physical(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
+pub fn is_missing_physical_object_error(error: &anyhow::Error) -> bool {
+    if error.to_string().contains("missing physical object") {
+        return true;
+    }
+
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+            .unwrap_or(false)
+            || cause
+                .downcast_ref::<opendal::Error>()
+                .map(|opendal_error| opendal_error.kind() == opendal::ErrorKind::NotFound)
+                .unwrap_or(false)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectStat {
     pub length: u64,

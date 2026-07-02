@@ -6,6 +6,7 @@ use e2v_core::sync_support::{
     decrypt_control_record_for_sync, encrypt_control_record_for_sync,
     open_or_unlock_repo_secrets_for_sync,
 };
+use e2v_store::local_backend::is_missing_physical_object_error;
 use e2v_store::{BlobStore, PhysicalObjectRef, RepoSecrets};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,10 +105,11 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
 }
 
 pub fn load_remote_pack_index_root_bytes<B: BlobStore>(remote: &B) -> Result<Option<Vec<u8>>> {
-    if !remote.exists_physical(PACK_INDEX_ROOT_PATH) {
-        return Ok(None);
+    match remote.get_physical(PACK_INDEX_ROOT_PATH) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if is_missing_physical_object_error(&error) => Ok(None),
+        Err(error) => Err(error),
     }
-    Ok(Some(remote.get_physical(PACK_INDEX_ROOT_PATH)?))
 }
 
 pub(crate) fn load_remote_pack_index_segment_paths<B: BlobStore>(
@@ -468,13 +470,85 @@ fn read_segment_entries(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use e2v_core::sync_support::open_repo_secrets_for_sync;
     use e2v_core::{InitOptions, RepositoryFacade};
-    use e2v_store::MemoryBackend;
+    use e2v_store::{MemoryBackend, ObjectStat};
     use tempfile::tempdir;
 
     use super::*;
     use crate::pack::build_pack;
+
+    #[derive(Debug, Clone)]
+    struct RootProbeBackend {
+        inner: MemoryBackend,
+        root_exists_calls: Arc<Mutex<usize>>,
+        root_get_calls: Arc<Mutex<usize>>,
+    }
+
+    impl RootProbeBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                root_exists_calls: Arc::new(Mutex::new(0)),
+                root_get_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn root_exists_call_count(&self) -> usize {
+            *self.root_exists_calls.lock().unwrap()
+        }
+
+        fn root_get_call_count(&self) -> usize {
+            *self.root_get_calls.lock().unwrap()
+        }
+    }
+
+    impl BlobStore for RootProbeBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            if relative_path == PACK_INDEX_ROOT_PATH {
+                *self.root_get_calls.lock().unwrap() += 1;
+            }
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            if relative_path == PACK_INDEX_ROOT_PATH {
+                *self.root_exists_calls.lock().unwrap() += 1;
+            }
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
 
     fn seeded_control_dir() -> (tempfile::TempDir, PathBuf, RepoSecrets) {
         let temp = tempdir().unwrap();
@@ -599,6 +673,25 @@ mod tests {
         assert!(
             locations.is_empty(),
             "expected missing root to suppress segment listing discovery"
+        );
+    }
+
+    #[test]
+    fn missing_pack_index_root_uses_single_get_without_exists_probe() {
+        let remote = RootProbeBackend::new();
+
+        let root_bytes = load_remote_pack_index_root_bytes(&remote).unwrap();
+
+        assert!(root_bytes.is_none());
+        assert_eq!(
+            remote.root_exists_call_count(),
+            0,
+            "missing root should not trigger a separate exists probe"
+        );
+        assert_eq!(
+            remote.root_get_call_count(),
+            1,
+            "missing root should be determined from a single get attempt"
         );
     }
 
