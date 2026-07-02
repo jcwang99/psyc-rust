@@ -397,15 +397,12 @@ impl ReadOnlyVfs {
             return Ok(cached);
         }
 
-        if let Some(cached) = self
+        if let Some(requested) = self
             .plaintext_cache
             .lock()
             .unwrap()
-            .get(&cache_key)
+            .get_range(&cache_key, offset, length)
         {
-            let start = offset;
-            let end = offset.saturating_add(length).min(cached.len());
-            let requested = cached[start..end].to_vec();
             self.replace_open_file_cache(
                 opened_file,
                 self.cacheable_plaintext_range(offset, requested.clone()),
@@ -976,11 +973,17 @@ impl PlaintextCache {
         }
     }
 
-    fn get(&mut self, key: &PlaintextCacheKey) -> Option<Vec<u8>> {
+    fn get_range(
+        &mut self,
+        key: &PlaintextCacheKey,
+        offset: usize,
+        length: usize,
+    ) -> Option<Vec<u8>> {
         let access_order = self.next_access_order();
         let entry = self.entries.get_mut(key)?;
         entry.last_access_order = access_order;
-        Some(entry.bytes.clone())
+        let end = offset.saturating_add(length).min(entry.bytes.len());
+        Some(entry.bytes.get(offset..end)?.to_vec())
     }
 
     fn insert(&mut self, key: PlaintextCacheKey, bytes: Vec<u8>) {
@@ -1116,4 +1119,18 @@ pub fn mount_live_branch(
         VfsMountConfig::live_branch(repo_root, branch_token_hex),
         mount_point,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_cache_returns_only_the_requested_slice() {
+        let mut cache = PlaintextCache::new(1024);
+        let key = ("snapshot".to_string(), "file".to_string(), 7);
+        cache.insert(key.clone(), b"alpha".to_vec());
+
+        assert_eq!(cache.get_range(&key, 1, 3).unwrap(), b"lph".to_vec());
+    }
 }
