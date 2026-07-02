@@ -911,7 +911,7 @@ fn store_gc_delete_journal(path: &std::path::Path, journal: &GcDeleteJournal) ->
         .ok_or_else(|| anyhow::anyhow!("gc delete journal path has no parent"))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create gc journal dir {}", parent.display()))?;
-    std::fs::write(path, serde_json::to_vec_pretty(journal)?)
+    std::fs::write(path, serde_json::to_vec(journal)?)
         .with_context(|| format!("failed to write gc delete journal {}", path.display()))?;
     Ok(())
 }
@@ -1336,6 +1336,38 @@ mod tests {
         assert_eq!(
             unreachable,
             vec![format!("objects/{unreachable_loose}.json")]
+        );
+    }
+
+    #[test]
+    fn gc_delete_journal_is_stored_as_compact_json() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("gc-execute.json");
+        let journal = GcDeleteJournal {
+            grace_period_days: 30,
+            fence_state: GcFenceState {
+                refs: vec![("branch/main".to_string(), 7, b"ref-bytes".to_vec())],
+                active_intent_paths: vec!["intents/intent-1.json".to_string()],
+                active_lease_paths: vec!["leases/writer-1.json".to_string()],
+                layout_root_generation: 11,
+                layout_root_bytes: br#"{"layout":"root"}"#.to_vec(),
+                pack_index_root_bytes: Some(
+                    br#"{"segments":["packs/index/op-00000000.json"]}"#.to_vec(),
+                ),
+            },
+            pending_paths: vec![
+                "objects/a.json".to_string(),
+                "packs/index/op-00000000.json".to_string(),
+            ],
+        };
+
+        store_gc_delete_journal(&path, &journal).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&journal).unwrap(),
+            "gc delete journal should not store pretty-printed JSON whitespace"
         );
     }
 }
