@@ -133,7 +133,7 @@ impl LocalFolderBackend {
         format!("control/layout-roots/{generation:020}.json")
     }
 
-    pub fn override_physical_modified_time_for_test(
+    pub(crate) fn override_physical_modified_time_for_test(
         &self,
         relative_path: &str,
         modified_at: std::time::SystemTime,

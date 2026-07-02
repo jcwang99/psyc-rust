@@ -267,15 +267,6 @@ struct DoctorBundleSummary {
     gc_execute_blockers: Vec<String>,
 }
 
-pub fn run_cli_for_test<I, S>(args: I) -> Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<std::ffi::OsString> + Clone,
-{
-    let cli = Cli::parse_from(args);
-    execute(cli)
-}
-
 pub fn run_from_env() -> Result<()> {
     let cli = Cli::parse();
     if let Command::Serve { repo } = &cli.command {
@@ -683,6 +674,23 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(format_mount_summary(&summary))
             }
         },
+    }
+}
+
+#[doc(hidden)]
+pub mod testing {
+    use anyhow::Result;
+    use clap::Parser;
+
+    use super::{Cli, execute};
+
+    pub fn run_cli<I, S>(args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = Cli::parse_from(args);
+        execute(cli)
     }
 }
 

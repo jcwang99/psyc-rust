@@ -385,7 +385,8 @@ mod tests {
                 || relative_path.starts_with("leases/")
                 || relative_path.ends_with(".probe")
             {
-                self.inner.override_physical_modified_time_for_test(
+                e2v_store::testing::override_memory_backend_modified_time(
+                    &self.inner,
                     relative_path,
                     *self.fixed_time.lock().unwrap(),
                 )?;
@@ -400,7 +401,8 @@ mod tests {
                     || relative_path.starts_with("leases/")
                     || relative_path.ends_with(".probe"))
             {
-                self.inner.override_physical_modified_time_for_test(
+                e2v_store::testing::override_memory_backend_modified_time(
+                    &self.inner,
                     relative_path,
                     *self.fixed_time.lock().unwrap(),
                 )?;
@@ -1003,13 +1005,12 @@ mod tests {
                 .as_slice(),
             )
             .unwrap();
-        remote
-            .inner
-            .override_physical_modified_time_for_test(
-                "leases/branch-token.lock",
-                fixed_time - Duration::from_secs(73 * 60 * 60),
-            )
-            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "leases/branch-token.lock",
+            fixed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,
@@ -1358,20 +1359,18 @@ mod tests {
             })
             .unwrap();
 
-        remote
-            .inner
-            .override_physical_modified_time_for_test(
-                "transactions/active/op-renew-precommit.intent",
-                renewed_time - Duration::from_secs(73 * 60 * 60),
-            )
-            .unwrap();
-        remote
-            .inner
-            .override_physical_modified_time_for_test(
-                "leases/branch-token.lock",
-                renewed_time - Duration::from_secs(73 * 60 * 60),
-            )
-            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "transactions/active/op-renew-precommit.intent",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "leases/branch-token.lock",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
         remote.set_fixed_time_for_test(renewed_time);
 
         publisher.pre_commit_verify(&session).unwrap();

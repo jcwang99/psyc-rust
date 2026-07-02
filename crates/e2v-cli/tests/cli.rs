@@ -47,6 +47,21 @@ impl Drop for ChildGuard {
     }
 }
 
+#[test]
+fn cli_test_runner_is_not_exposed_as_a_public_api_function() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub fn run_cli_for_test"),
+        "test-only CLI runner should not remain in the public API surface"
+    );
+}
+
 fn file_remote_spec(path: &std::path::Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -135,7 +150,7 @@ fn branch_commands_create_list_and_checkout() {
         })
         .unwrap();
 
-    let create_output = e2v_cli::run_cli_for_test([
+    let create_output = e2v_cli::testing::run_cli([
         "e2v",
         "branch",
         "--repo",
@@ -146,7 +161,7 @@ fn branch_commands_create_list_and_checkout() {
     .unwrap();
     assert!(create_output.contains("feature"));
 
-    let list_output = e2v_cli::run_cli_for_test([
+    let list_output = e2v_cli::testing::run_cli([
         "e2v",
         "branch",
         "--repo",
@@ -157,7 +172,7 @@ fn branch_commands_create_list_and_checkout() {
     assert!(list_output.contains("* main"));
     assert!(list_output.contains("feature"));
 
-    let checkout_output = e2v_cli::run_cli_for_test([
+    let checkout_output = e2v_cli::testing::run_cli([
         "e2v",
         "branch",
         "--repo",
@@ -168,7 +183,7 @@ fn branch_commands_create_list_and_checkout() {
     .unwrap();
     assert!(checkout_output.contains("feature"));
 
-    let list_after = e2v_cli::run_cli_for_test([
+    let list_after = e2v_cli::testing::run_cli([
         "e2v",
         "branch",
         "--repo",
@@ -194,7 +209,7 @@ fn search_command_prints_filename_matches() {
         })
         .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "search",
         "notes",
@@ -212,7 +227,7 @@ fn init_command_creates_repository_with_explicit_password() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "init",
         repo_root.to_str().unwrap(),
@@ -234,7 +249,7 @@ fn commit_and_snapshots_commands_round_trip_repository_history() {
     init_repo(&repo_root);
     fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
 
-    let commit_output = e2v_cli::run_cli_for_test([
+    let commit_output = e2v_cli::testing::run_cli([
         "e2v",
         "commit",
         "--repo",
@@ -246,7 +261,7 @@ fn commit_and_snapshots_commands_round_trip_repository_history() {
     assert!(commit_output.contains("committed"));
 
     let snapshots_output =
-        e2v_cli::run_cli_for_test(["e2v", "snapshots", "--repo", repo_root.to_str().unwrap()])
+        e2v_cli::testing::run_cli(["e2v", "snapshots", "--repo", repo_root.to_str().unwrap()])
             .unwrap();
 
     assert!(snapshots_output.contains("seed"));
@@ -270,7 +285,7 @@ fn checkout_command_restores_an_explicit_snapshot_into_target_directory() {
         })
         .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "checkout",
         "--repo",
@@ -307,7 +322,7 @@ fn push_command_uses_the_default_remote_for_the_current_branch() {
         .unwrap();
     let branch_token = facade.open(&repo_root).unwrap().branch.token_hex;
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -319,7 +334,7 @@ fn push_command_uses_the_default_remote_for_the_current_branch() {
     .unwrap();
 
     let output =
-        e2v_cli::run_cli_for_test(["e2v", "push", "--repo", repo_root.to_str().unwrap()]).unwrap();
+        e2v_cli::testing::run_cli(["e2v", "push", "--repo", repo_root.to_str().unwrap()]).unwrap();
 
     assert!(output.contains("pushed"));
     assert!(output.contains(&commit.snapshot_id[..8]));
@@ -401,7 +416,7 @@ fn fetch_command_uses_the_default_remote_for_the_current_branch() {
     )
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "fetch",
         "--repo",
@@ -480,7 +495,7 @@ fn pull_command_fast_forwards_the_current_branch_from_the_default_remote() {
     )
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "pull",
         "--repo",
@@ -565,7 +580,7 @@ fn pull_command_rejects_diverged_local_history_without_moving_the_current_branch
     )
     .unwrap();
 
-    let error = e2v_cli::run_cli_for_test([
+    let error = e2v_cli::testing::run_cli([
         "e2v",
         "pull",
         "--repo",
@@ -614,7 +629,7 @@ fn clone_command_clones_an_explicit_remote_spec_into_a_target_repo() {
     )
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "clone",
         &file_remote_spec(&remote_root),
@@ -650,7 +665,7 @@ fn mount_snapshot_command_delegates_to_e2v_vfs() {
         .unwrap()
         .snapshot_id;
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "mount",
         "--repo",
@@ -689,7 +704,7 @@ fn mount_branch_command_delegates_to_e2v_vfs() {
         .branch
         .token_hex;
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "mount",
         "--repo",
@@ -779,7 +794,7 @@ fn remote_add_persists_default_remote_spec() {
     init_repo(&repo_root);
     let spec = file_remote_spec(&remote_root);
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -804,7 +819,7 @@ fn share_list_prints_member_and_device_records() {
     fs::create_dir_all(&repo_root).unwrap();
     init_shared_repo(&repo_root);
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -833,7 +848,7 @@ fn share_member_round_trip_via_bundle_file() {
     .unwrap();
     let bundle_path = temp.path().join("invite.e2vshare");
 
-    let invite_output = e2v_cli::run_cli_for_test([
+    let invite_output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -848,7 +863,7 @@ fn share_member_round_trip_via_bundle_file() {
     assert!(invite_output.contains("invite"));
     assert!(bundle_path.is_file());
 
-    let accept_output = e2v_cli::run_cli_for_test([
+    let accept_output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -862,7 +877,7 @@ fn share_member_round_trip_via_bundle_file() {
     .unwrap();
     assert!(accept_output.contains("writer_member"));
 
-    let listing = e2v_cli::run_cli_for_test([
+    let listing = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -893,7 +908,7 @@ fn share_member_round_trip_via_bundle_file() {
             }
         })
         .unwrap();
-    let revoke_output = e2v_cli::run_cli_for_test([
+    let revoke_output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -923,7 +938,7 @@ fn share_device_round_trip_via_bundle_file() {
     .unwrap();
     let bundle_path = temp.path().join("device.e2vshare");
 
-    let invite_output = e2v_cli::run_cli_for_test([
+    let invite_output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -940,7 +955,7 @@ fn share_device_round_trip_via_bundle_file() {
     assert!(invite_output.contains("invite"));
     assert!(bundle_path.is_file());
 
-    let accept_output = e2v_cli::run_cli_for_test([
+    let accept_output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -962,7 +977,7 @@ fn share_device_round_trip_via_bundle_file() {
     )
     .unwrap();
 
-    let listing = e2v_cli::run_cli_for_test([
+    let listing = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -985,7 +1000,7 @@ fn share_device_round_trip_via_bundle_file() {
             }
         })
         .unwrap();
-    let revoke_output = e2v_cli::run_cli_for_test([
+    let revoke_output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -1015,7 +1030,7 @@ fn share_revoke_member_still_works_after_cache_clear_when_password_is_explicit()
     .unwrap();
     let bundle_path = temp.path().join("invite.e2vshare");
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -1027,7 +1042,7 @@ fn share_revoke_member_still_works_after_cache_clear_when_password_is_explicit()
         bundle_path.to_str().unwrap(),
     ])
     .unwrap();
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -1048,7 +1063,7 @@ fn share_revoke_member_still_works_after_cache_clear_when_password_is_explicit()
     )
     .unwrap();
 
-    let listing = e2v_cli::run_cli_for_test([
+    let listing = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -1070,7 +1085,7 @@ fn share_revoke_member_still_works_after_cache_clear_when_password_is_explicit()
         .unwrap();
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "share",
         "--repo",
@@ -1115,7 +1130,7 @@ fn verify_remote_command_uses_default_file_remote() {
     )
     .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1126,7 +1141,7 @@ fn verify_remote_command_uses_default_file_remote() {
     ])
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "verify",
         "--repo",
@@ -1155,7 +1170,7 @@ fn verify_snapshot_command_verifies_an_explicit_snapshot_id() {
         })
         .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "verify",
         "--repo",
@@ -1183,7 +1198,7 @@ fn verify_object_command_verifies_an_explicit_object_id_and_type() {
         })
         .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "verify",
         "--repo",
@@ -1230,14 +1245,14 @@ fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
 
     let stray = "objects/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json";
     remote.put_physical(stray, br#"{"garbage":true}"#).unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_local_backend_modified_time(
+        &remote,
+        stray,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1248,7 +1263,7 @@ fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
     ])
     .unwrap();
 
-    let verify_output = e2v_cli::run_cli_for_test([
+    let verify_output = e2v_cli::testing::run_cli([
         "e2v",
         "verify",
         "--repo",
@@ -1261,11 +1276,11 @@ fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
     assert!(verify_output.contains("sampled"));
 
     let repair_output =
-        e2v_cli::run_cli_for_test(["e2v", "repair", "--repo", repo_root.to_str().unwrap()])
+        e2v_cli::testing::run_cli(["e2v", "repair", "--repo", repo_root.to_str().unwrap()])
             .unwrap();
     assert!(repair_output.contains("repaired 0"));
 
-    let gc_error = e2v_cli::run_cli_for_test([
+    let gc_error = e2v_cli::testing::run_cli([
         "e2v",
         "gc",
         "--repo",
@@ -1280,7 +1295,7 @@ fn maintenance_commands_share_the_same_default_remote_workflow_contract() {
         "unexpected error: {gc_error:#}"
     );
 
-    let gc_output = e2v_cli::run_cli_for_test([
+    let gc_output = e2v_cli::testing::run_cli([
         "e2v",
         "gc",
         "--repo",
@@ -1406,7 +1421,7 @@ fn repair_command_uses_default_file_remote() {
         .path();
     fs::remove_file(&object_path).unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1418,7 +1433,7 @@ fn repair_command_uses_default_file_remote() {
     .unwrap();
 
     let output =
-        e2v_cli::run_cli_for_test(["e2v", "repair", "--repo", repo_root.to_str().unwrap()])
+        e2v_cli::testing::run_cli(["e2v", "repair", "--repo", repo_root.to_str().unwrap()])
             .unwrap();
 
     assert!(output.contains("repaired 1"));
@@ -1463,7 +1478,7 @@ fn repair_force_accept_remote_rollback_uses_explicit_dangerous_flag() {
         .unwrap();
     assert_ne!(remote_snapshot.snapshot_id, local_snapshot.snapshot_id);
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1474,7 +1489,7 @@ fn repair_force_accept_remote_rollback_uses_explicit_dangerous_flag() {
     ])
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "repair",
         "--repo",
@@ -1535,7 +1550,7 @@ fn repair_force_accept_remote_rollback_requires_second_confirmation_flag() {
         })
         .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1546,7 +1561,7 @@ fn repair_force_accept_remote_rollback_requires_second_confirmation_flag() {
     ])
     .unwrap();
 
-    let error = e2v_cli::run_cli_for_test([
+    let error = e2v_cli::testing::run_cli([
         "e2v",
         "repair",
         "--repo",
@@ -1600,7 +1615,7 @@ fn gc_dry_run_command_uses_default_file_remote() {
         )
         .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1611,7 +1626,7 @@ fn gc_dry_run_command_uses_default_file_remote() {
     ])
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "gc",
         "--repo",
@@ -1653,14 +1668,14 @@ fn gc_execute_command_uses_default_file_remote() {
     .unwrap();
     let stray = "objects/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json";
     remote.put_physical(stray, br#"{"garbage":true}"#).unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_local_backend_modified_time(
+        &remote,
+        stray,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1671,7 +1686,7 @@ fn gc_execute_command_uses_default_file_remote() {
     ])
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "gc",
         "--repo",
@@ -1716,7 +1731,7 @@ fn gc_execute_command_requires_confirmation_for_single_writer_file_remote() {
     )
     .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1727,7 +1742,7 @@ fn gc_execute_command_requires_confirmation_for_single_writer_file_remote() {
     ])
     .unwrap();
 
-    let error = e2v_cli::run_cli_for_test([
+    let error = e2v_cli::testing::run_cli([
         "e2v",
         "gc",
         "--repo",
@@ -1778,7 +1793,7 @@ fn doctor_command_reports_trusted_state_and_remote_gc_capabilities() {
     )
     .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1790,7 +1805,7 @@ fn doctor_command_reports_trusted_state_and_remote_gc_capabilities() {
     .unwrap();
 
     let output =
-        e2v_cli::run_cli_for_test(["e2v", "doctor", "--repo", repo_root.to_str().unwrap()])
+        e2v_cli::testing::run_cli(["e2v", "doctor", "--repo", repo_root.to_str().unwrap()])
             .unwrap();
 
     assert!(output.contains("trusted_state"));
@@ -1833,7 +1848,7 @@ fn doctor_bundle_writes_bundle_directory_with_summary_files() {
     )
     .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1844,7 +1859,7 @@ fn doctor_bundle_writes_bundle_directory_with_summary_files() {
     ])
     .unwrap();
 
-    let output = e2v_cli::run_cli_for_test([
+    let output = e2v_cli::testing::run_cli([
         "e2v",
         "doctor",
         "--repo",
@@ -1894,7 +1909,7 @@ fn doctor_bundle_redacts_plaintext_repo_and_remote_paths() {
     )
     .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1905,7 +1920,7 @@ fn doctor_bundle_redacts_plaintext_repo_and_remote_paths() {
     ])
     .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "doctor",
         "--repo",
@@ -1938,7 +1953,7 @@ fn doctor_bundle_redacts_s3_remote_credentials() {
     fs::create_dir_all(&repo_root).unwrap();
     init_repo(&repo_root);
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "remote",
         "--repo",
@@ -1949,7 +1964,7 @@ fn doctor_bundle_redacts_s3_remote_credentials() {
     ])
     .unwrap();
 
-    e2v_cli::run_cli_for_test([
+    e2v_cli::testing::run_cli([
         "e2v",
         "doctor",
         "--repo",

@@ -29,3 +29,28 @@ pub use ref_store::{
 pub use storage_layout::{
     DirectStorageLayout, LayoutObjectLocation, PackStorageLayout, StorageLayout,
 };
+
+#[doc(hidden)]
+pub mod testing {
+    use std::time::SystemTime;
+
+    use anyhow::Result;
+
+    use crate::{LocalFolderBackend, MemoryBackend};
+
+    pub fn override_local_backend_modified_time(
+        backend: &LocalFolderBackend,
+        relative_path: &str,
+        modified_at: SystemTime,
+    ) -> Result<()> {
+        backend.override_physical_modified_time_for_test(relative_path, modified_at)
+    }
+
+    pub fn override_memory_backend_modified_time(
+        backend: &MemoryBackend,
+        relative_path: &str,
+        modified_at: SystemTime,
+    ) -> Result<()> {
+        backend.override_physical_modified_time_for_test(relative_path, modified_at)
+    }
+}

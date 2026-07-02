@@ -493,8 +493,7 @@ fn gc_execute_ignores_expired_active_intent_outside_intent_expiry_window() {
         .put_physical(stray_object_path, br#"{"garbage":true}"#)
         .unwrap();
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
-    remote
-        .override_physical_modified_time_for_test(stray_object_path, old_time)
+    e2v_store::testing::override_memory_backend_modified_time(&remote, stray_object_path, old_time)
         .unwrap();
     remote
         .put_physical(
@@ -502,12 +501,12 @@ fn gc_execute_ignores_expired_active_intent_outside_intent_expiry_window() {
             br#"{"operation_id":"op-expired","writer_id":"writer:op-expired","started_at_remote_unix_ms":1,"heartbeat":{"remote_observed_at_unix_ms":1,"sequence":1},"expected_ref_version":null,"target_branch_token":"main","planned_snapshot_id":null,"client_version":"test"}"#,
         )
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            "transactions/active/op-expired.intent",
-            std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        "transactions/active/op-expired.intent",
+        std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
+    )
+    .unwrap();
 
     let result = gc_execute(
         &remote,
@@ -1934,12 +1933,12 @@ fn gc_execute_deletes_unreachable_remote_loose_object_when_safe() {
     remote
         .put_physical(stray_object_path, br#"{"garbage":true}"#)
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray_object_path,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        stray_object_path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
     let result = gc_execute(
         &remote,
@@ -2050,12 +2049,12 @@ fn gc_execute_aborts_when_active_intent_appears_after_dry_run() {
     remote
         .put_physical(stray_object_path, br#"{"garbage":true}"#)
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray_object_path,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        stray_object_path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
     let raced_remote = IntentAppearsBeforeDeleteBackend::new(remote.clone());
 
@@ -2111,12 +2110,12 @@ fn gc_execute_aborts_when_writer_lease_appears_after_dry_run() {
     remote
         .put_physical(stray_object_path, br#"{"garbage":true}"#)
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray_object_path,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        stray_object_path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
     let raced_remote = LeaseAppearsBeforeDeleteBackend::new(remote.clone());
 
@@ -2173,11 +2172,9 @@ fn gc_execute_resumes_from_local_deletion_journal_after_partial_failure() {
     remote.put_physical(stray_one, br#"{"garbage":1}"#).unwrap();
     remote.put_physical(stray_two, br#"{"garbage":2}"#).unwrap();
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
-    remote
-        .override_physical_modified_time_for_test(stray_one, old_time)
+    e2v_store::testing::override_memory_backend_modified_time(&remote, stray_one, old_time)
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(stray_two, old_time)
+    e2v_store::testing::override_memory_backend_modified_time(&remote, stray_two, old_time)
         .unwrap();
 
     let flaky_remote = FailOnceOnDeleteBackend::new(remote.clone(), stray_two);
@@ -2260,12 +2257,12 @@ fn gc_execute_ignores_candidate_that_disappears_before_delete() {
     remote
         .put_physical(stray_object_path, br#"{"garbage":true}"#)
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray_object_path,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        stray_object_path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
     let raced_remote = DisappearBeforeDeleteBackend::new(remote.clone(), stray_object_path);
 
@@ -2327,12 +2324,12 @@ fn gc_execute_ignores_candidate_that_disappears_during_delete() {
     remote
         .put_physical(stray_object_path, br#"{"garbage":true}"#)
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray_object_path,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        stray_object_path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
     let raced_remote = DisappearDuringDeleteBackend::new(remote.clone(), stray_object_path);
 
@@ -2525,12 +2522,12 @@ fn gc_dry_run_keeps_recent_unpublished_local_snapshot_chain_and_ancestors() {
     upload_local_objects_to_remote(&remote, &repo_root, &second_reachable);
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
     for object_id in &second_reachable {
-        remote
-            .override_physical_modified_time_for_test(
-                &format!("objects/{object_id}.json"),
-                old_time,
-            )
-            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote,
+            &format!("objects/{object_id}.json"),
+            old_time,
+        )
+        .unwrap();
     }
     upload_local_objects_to_remote(&remote, &repo_root, &third_reachable);
 
@@ -2652,12 +2649,12 @@ fn gc_dry_run_allows_expired_unpublished_local_snapshot_chain_to_be_collected() 
 
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
     for object_id in second_reachable.iter().chain(third_reachable.iter()) {
-        remote
-            .override_physical_modified_time_for_test(
-                &format!("objects/{object_id}.json"),
-                old_time,
-            )
-            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote,
+            &format!("objects/{object_id}.json"),
+            old_time,
+        )
+        .unwrap();
     }
 
     let report = gc_dry_run(
@@ -2823,8 +2820,7 @@ fn gc_execute_deletes_unreferenced_pack_index_segments_after_compaction() {
 
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
     for segment_path in &unreferenced_segments {
-        remote
-            .override_physical_modified_time_for_test(segment_path, old_time)
+        e2v_store::testing::override_memory_backend_modified_time(&remote, segment_path, old_time)
             .unwrap();
     }
 
@@ -2913,9 +2909,12 @@ fn gc_execute_aborts_when_pack_index_root_changes_after_dry_run() {
         .expect("expected an obsolete pack index segment after compaction");
 
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
-    remote
-        .override_physical_modified_time_for_test(&resurrected_segment, old_time)
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        &resurrected_segment,
+        old_time,
+    )
+    .unwrap();
 
     let root_segments = root["segments"].as_array_mut().unwrap();
     root_segments.push(serde_json::Value::String(resurrected_segment.clone()));
@@ -3007,9 +3006,12 @@ fn gc_execute_treats_disappearing_pack_index_root_as_fence_change() {
         .expect("expected an obsolete pack index segment after compaction");
 
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
-    remote
-        .override_physical_modified_time_for_test(&resurrected_segment, old_time)
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        &resurrected_segment,
+        old_time,
+    )
+    .unwrap();
 
     let raced_remote = PackIndexRootDisappearsDuringFenceBackend::new(remote.clone());
 
@@ -3072,12 +3074,12 @@ fn gc_execute_aborts_when_layout_root_bytes_change_after_dry_run() {
     remote
         .put_physical(stray_object_path, br#"{"garbage":true}"#)
         .unwrap();
-    remote
-        .override_physical_modified_time_for_test(
-            stray_object_path,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        stray_object_path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
 
     let mut replacement_root: serde_json::Value =
         serde_json::from_slice(&remote.get_physical("layout_root.json").unwrap()).unwrap();

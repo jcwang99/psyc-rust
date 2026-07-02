@@ -5,6 +5,35 @@ use e2v_store::{
 use std::path::PathBuf;
 
 #[test]
+fn store_test_probes_are_not_exposed_as_public_api_methods() {
+    let local_source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("e2v-store")
+            .join("src")
+            .join("local_backend.rs"),
+    )
+    .unwrap();
+    let memory_source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("e2v-store")
+            .join("src")
+            .join("memory_backend.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !local_source.contains("pub fn override_physical_modified_time_for_test"),
+        "local backend test-only modified-time override should not remain public"
+    );
+    assert!(
+        !memory_source.contains("pub fn override_physical_modified_time_for_test"),
+        "memory backend test-only modified-time override should not remain public"
+    );
+}
+
+#[test]
 fn parse_remote_spec_decodes_webdav_url_into_remote_config() {
     let spec = e2v_sync::RemoteSpec::parse("webdav+https://alice:secret@example.com/repo").unwrap();
 

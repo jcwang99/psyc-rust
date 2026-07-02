@@ -557,8 +557,11 @@ impl BlobStore for FixedRemoteTimeSingleWriterBackend {
         self.inner.put_physical(relative_path, bytes)?;
         if relative_path.starts_with("transactions/active/") || relative_path.starts_with("leases/")
         {
-            self.inner
-                .override_physical_modified_time_for_test(relative_path, self.fixed_time)?;
+            e2v_store::testing::override_memory_backend_modified_time(
+                &self.inner,
+                relative_path,
+                self.fixed_time,
+            )?;
         }
         Ok(())
     }
@@ -569,8 +572,11 @@ impl BlobStore for FixedRemoteTimeSingleWriterBackend {
             && (relative_path.starts_with("transactions/active/")
                 || relative_path.starts_with("leases/"))
         {
-            self.inner
-                .override_physical_modified_time_for_test(relative_path, self.fixed_time)?;
+            e2v_store::testing::override_memory_backend_modified_time(
+                &self.inner,
+                relative_path,
+                self.fixed_time,
+            )?;
         }
         Ok(created)
     }
@@ -1672,7 +1678,8 @@ impl AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
     }
 
     fn stamp_current_time(&self, relative_path: &str) -> anyhow::Result<()> {
-        self.inner.override_physical_modified_time_for_test(
+        e2v_store::testing::override_memory_backend_modified_time(
+            &self.inner,
             relative_path,
             *self.current_time.lock().unwrap(),
         )
@@ -4143,20 +4150,18 @@ fn resume_reacquires_expired_single_writer_lease_before_republishing_missing_ref
             .contains("simulated single-writer object upload interruption")
     );
 
-    remote
-        .inner
-        .override_physical_modified_time_for_test(
-            &format!("transactions/active/{}.intent", "resume-reacquire-lease-op"),
-            std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
-        )
-        .unwrap();
-    remote
-        .inner
-        .override_physical_modified_time_for_test(
-            &format!("leases/{}.lock", state.branch.token_hex),
-            std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
-        )
-        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote.inner,
+        &format!("transactions/active/{}.intent", "resume-reacquire-lease-op"),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
+    )
+    .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote.inner,
+        &format!("leases/{}.lock", state.branch.token_hex),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(73 * 60 * 60),
+    )
+    .unwrap();
 
     let resumed = resume_push(
         &facade,

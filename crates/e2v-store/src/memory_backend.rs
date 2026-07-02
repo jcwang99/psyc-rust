@@ -65,7 +65,7 @@ impl MemoryBackend {
         &self.capability
     }
 
-    pub fn override_physical_modified_time_for_test(
+    pub(crate) fn override_physical_modified_time_for_test(
         &self,
         relative_path: &str,
         modified_at: SystemTime,
