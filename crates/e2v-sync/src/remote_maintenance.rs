@@ -1189,13 +1189,14 @@ fn observed_remote_latest_time<R: RemoteBackend>(
                 )
             })?,
     );
-    if remote.exists_physical("pack-index/root.json") {
-        observed_times.push(
-            remote
-                .stat_physical("pack-index/root.json")?
-                .modified_at
-                .ok_or_else(|| anyhow::anyhow!("gc execute aborted: pack index root has no reliable remote modification time"))?,
-        );
+    match remote.stat_physical("pack-index/root.json") {
+        Ok(stat) => observed_times.push(stat.modified_at.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gc execute aborted: pack index root has no reliable remote modification time"
+            )
+        })?),
+        Err(error) if is_missing_physical_object_error(&error) => {}
+        Err(error) => return Err(error),
     }
     for path in remote.list_physical("transactions/active/")? {
         if !path.ends_with(".intent") {
