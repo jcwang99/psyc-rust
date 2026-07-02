@@ -563,9 +563,6 @@ pub fn gc_execute<R: RemoteBackend>(
         observed_remote_safe_horizon(remote, options.grace_period_days, &candidate_paths)?;
     let mut deleted_physical_refs = Vec::new();
     for (index, path) in candidate_paths.iter().enumerate() {
-        if !remote.exists_physical(path) {
-            continue;
-        }
         if !physical_ref_is_older_than_horizon(remote, path, safe_horizon)? {
             continue;
         }

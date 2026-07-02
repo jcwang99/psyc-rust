@@ -1958,6 +1958,204 @@ fn gc_execute_deletes_unreachable_remote_loose_object_when_safe() {
 }
 
 #[test]
+fn gc_execute_does_not_probe_candidate_existence_before_statting_it() {
+    #[derive(Clone, Debug)]
+    struct CandidateExistsProbeCountingBackend {
+        capability: BackendCapability,
+        inner: MemoryBackend,
+        target_path: &'static str,
+        target_exists_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        target_stat_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CandidateExistsProbeCountingBackend {
+        fn new(inner: MemoryBackend, target_path: &'static str) -> Self {
+            Self {
+                capability: inner.capability().clone(),
+                inner,
+                target_path,
+                target_exists_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                target_stat_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn target_exists_calls(&self) -> usize {
+            self.target_exists_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn target_stat_calls(&self) -> usize {
+            self.target_stat_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl BlobStore for CandidateExistsProbeCountingBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(
+            &self,
+            relative_path: &str,
+            bytes: &[u8],
+        ) -> anyhow::Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            if relative_path == self.target_path {
+                self.target_exists_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+            if relative_path == self.target_path {
+                self.target_stat_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl RefStore for CandidateExistsProbeCountingBackend {
+        fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+            self.inner.read_ref(token)
+        }
+
+        fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+            self.inner.list_refs()
+        }
+
+        fn compare_and_swap_ref(
+            &self,
+            token: &RefToken,
+            expected: Option<e2v_store::RefVersion>,
+            next: EncryptedRef,
+        ) -> anyhow::Result<e2v_store::CasResult> {
+            self.inner.compare_and_swap_ref(token, expected, next)
+        }
+    }
+
+    impl LayoutRootStore for CandidateExistsProbeCountingBackend {
+        fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+            self.inner.read_layout_root()
+        }
+
+        fn compare_and_swap_layout_root(
+            &self,
+            expected: e2v_store::LayoutRootVersion,
+            next: e2v_store::LayoutRoot,
+        ) -> anyhow::Result<e2v_store::CasResult> {
+            self.inner.compare_and_swap_layout_root(expected, next)
+        }
+
+        fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+            self.inner.list_retained_layout_roots()
+        }
+    }
+
+    impl e2v_store::RemoteBackend for CandidateExistsProbeCountingBackend {
+        fn capability(&self) -> &BackendCapability {
+            &self.capability
+        }
+    }
+
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-gc-candidate-probe".to_string(),
+        },
+    )
+    .unwrap();
+
+    let stray_object_path =
+        "objects/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json";
+    remote
+        .put_physical(stray_object_path, br#"{"garbage":true}"#)
+        .unwrap();
+    e2v_store::testing::override_memory_backend_modified_time(
+        &remote,
+        stray_object_path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+    )
+    .unwrap();
+
+    let counted = CandidateExistsProbeCountingBackend::new(remote.clone(), stray_object_path);
+
+    let result = gc_execute(
+        &counted,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        result.deleted_physical_refs,
+        vec![stray_object_path.to_string()]
+    );
+    assert!(
+        counted.target_stat_calls() > 0,
+        "gc execute should still stat a candidate before deleting it"
+    );
+    assert_eq!(
+        counted.target_exists_calls(),
+        0,
+        "gc execute should not probe candidate existence before statting it"
+    );
+}
+
+#[test]
 fn gc_execute_keeps_recent_unreachable_object_within_grace_period() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
