@@ -232,6 +232,11 @@ impl BlobStore for MemoryBackend {
 
 impl LayoutRootStore for MemoryBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
+        if self.exists_physical("layout_root.json") {
+            return Ok(serde_json::from_slice(
+                &self.get_physical("layout_root.json")?,
+            )?);
+        }
         Ok(self.layout_root.lock().unwrap().clone())
     }
 
@@ -240,14 +245,15 @@ impl LayoutRootStore for MemoryBackend {
         expected: LayoutRootVersion,
         next: LayoutRoot,
     ) -> Result<CasResult> {
-        let mut layout_root = self.layout_root.lock().unwrap();
-        if layout_root.generation != expected {
+        let current = self.read_layout_root()?;
+        if current.generation != expected {
             return Ok(CasResult {
                 applied: false,
                 current: None,
             });
         }
-        *layout_root = next.clone();
+        *self.layout_root.lock().unwrap() = next.clone();
+        self.put_physical("layout_root.json", &serde_json::to_vec_pretty(&next)?)?;
         self.retained_layout_roots.lock().unwrap().push(next);
         Ok(CasResult {
             applied: true,
@@ -300,6 +306,46 @@ mod tests {
 
         assert!(!stale.applied);
         assert_eq!(backend.read_layout_root().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn compare_and_swap_layout_root_materializes_physical_layout_root_file() {
+        let backend = MemoryBackend::new();
+        let next = LayoutRoot {
+            schema_version: 1,
+            layout_id: "direct".to_string(),
+            generation: 2,
+            mapping_policy: "loose".to_string(),
+        };
+
+        let result = backend
+            .compare_and_swap_layout_root(1, next.clone())
+            .unwrap();
+
+        assert!(result.applied);
+        assert_eq!(
+            backend.get_physical("layout_root.json").unwrap(),
+            serde_json::to_vec_pretty(&next).unwrap()
+        );
+    }
+
+    #[test]
+    fn read_layout_root_uses_physical_layout_root_bytes_when_present() {
+        let backend = MemoryBackend::new();
+        let physical = LayoutRoot {
+            schema_version: 1,
+            layout_id: "direct".to_string(),
+            generation: 7,
+            mapping_policy: "loose".to_string(),
+        };
+        backend
+            .put_physical(
+                "layout_root.json",
+                &serde_json::to_vec_pretty(&physical).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(backend.read_layout_root().unwrap(), physical);
     }
 
     #[test]

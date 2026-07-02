@@ -3845,7 +3845,7 @@ fn resume_restores_missing_layout_root_when_remote_ref_matches_local_head() {
 }
 
 #[test]
-fn resume_repairs_stale_layout_root_when_remote_ref_matches_local_head() {
+fn resume_rewrites_mismatched_layout_root_bytes_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -3878,8 +3878,15 @@ fn resume_repairs_stale_layout_root_when_remote_ref_matches_local_head() {
     )
     .unwrap();
 
+    let local_layout_root: e2v_store::LayoutRoot = serde_json::from_slice(
+        &e2v_core::sync_support::read_layout_root_bytes(&repo_root).unwrap(),
+    )
+    .unwrap();
     remote
-        .put_physical("layout_root.json", br#"{"stale":true}"#)
+        .put_physical(
+            "layout_root.json",
+            &serde_json::to_vec(&local_layout_root).unwrap(),
+        )
         .unwrap();
 
     let resumed = resume_push(
@@ -3897,6 +3904,64 @@ fn resume_repairs_stale_layout_root_when_remote_ref_matches_local_head() {
     assert_eq!(
         remote.get_physical("layout_root.json").unwrap(),
         e2v_core::sync_support::read_layout_root_bytes(&repo_root).unwrap()
+    );
+}
+
+#[test]
+fn resume_rejects_invalid_layout_root_when_remote_ref_matches_local_head() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "resume-invalid-layout-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-invalid-layout-root-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .put_physical("layout_root.json", br#"{"stale":true}"#)
+        .unwrap();
+
+    let error = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-invalid-layout-root-op".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("schema_version")
+            || error.to_string().contains("layout_root")
+            || error.to_string().contains("layout root")
+            || error.to_string().contains("decode"),
+        "expected invalid remote layout root error, got {error:?}"
     );
 }
 
