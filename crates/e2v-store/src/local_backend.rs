@@ -206,15 +206,37 @@ impl BlobStore for LocalFolderBackend {
             return Ok(listed);
         }
 
-        for entry in fs::read_dir(&base)
-            .with_context(|| format!("failed to list objects under {}", base.display()))?
-        {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let relative = format!("{}{}", prefix, entry.file_name().to_string_lossy());
-                listed.push(relative);
+        fn visit(base: &Path, current: &Path, prefix: &str, listed: &mut Vec<String>) -> Result<()> {
+            for entry in fs::read_dir(current)
+                .with_context(|| format!("failed to list objects under {}", current.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    visit(base, &path, prefix, listed)?;
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(base)
+                    .with_context(|| {
+                        format!(
+                            "failed to strip base {} from listed object {}",
+                            base.display(),
+                            path.display()
+                        )
+                    })?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                listed.push(format!("{prefix}{relative}"));
             }
+            Ok(())
         }
+
+        visit(&base, &base, prefix, &mut listed)?;
         listed.sort();
         Ok(listed)
     }
@@ -347,6 +369,7 @@ mod tests {
     use std::fs;
 
     use crate::capability::WriterMode;
+    use crate::ref_store::{EncryptedRef, RefStore, RefToken};
     use crate::opendal_backend::RemoteBackend;
 
     use tempfile::tempdir;
@@ -496,5 +519,28 @@ mod tests {
         assert_eq!(backend.capability().writer_mode(), WriterMode::SingleWriter);
         assert_eq!(backend.capability().push_write_mode(), WriterMode::SingleWriter);
         assert!(backend.capability().supports_safe_single_writer_push());
+    }
+
+    #[test]
+    fn list_refs_includes_nested_tokens() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let token = RefToken::new("keyring/repo-123".to_string());
+        let value = EncryptedRef::new(br#"{"generation":1,"current":"keyring.1"}"#.to_vec());
+
+        let cas = backend
+            .compare_and_swap_ref(&token, None, value.clone())
+            .unwrap();
+
+        assert!(cas.applied);
+        assert_eq!(backend.read_ref(&token).unwrap().unwrap().value, value);
+        assert!(
+            backend
+                .list_refs()
+                .unwrap()
+                .iter()
+                .any(|listed| listed.token == token),
+            "nested ref token should be discoverable via list_refs"
+        );
     }
 }
