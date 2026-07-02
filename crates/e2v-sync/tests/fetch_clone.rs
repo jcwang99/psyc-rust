@@ -489,6 +489,7 @@ struct GetTrackingBackend {
     inner: MemoryBackend,
     fetched_paths: Arc<Mutex<Vec<String>>>,
     range_read_paths: Arc<Mutex<Vec<String>>>,
+    list_paths: Arc<Mutex<Vec<String>>>,
 }
 
 impl GetTrackingBackend {
@@ -497,12 +498,14 @@ impl GetTrackingBackend {
             inner,
             fetched_paths: Arc::new(Mutex::new(Vec::new())),
             range_read_paths: Arc::new(Mutex::new(Vec::new())),
+            list_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn reset_gets(&self) {
         self.fetched_paths.lock().unwrap().clear();
         self.range_read_paths.lock().unwrap().clear();
+        self.list_paths.lock().unwrap().clear();
     }
 
     fn fetched_paths(&self) -> Vec<String> {
@@ -511,6 +514,10 @@ impl GetTrackingBackend {
 
     fn range_read_paths(&self) -> Vec<String> {
         self.range_read_paths.lock().unwrap().clone()
+    }
+
+    fn list_paths(&self) -> Vec<String> {
+        self.list_paths.lock().unwrap().clone()
     }
 }
 
@@ -557,6 +564,7 @@ impl BlobStore for GetTrackingBackend {
     }
 
     fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.list_paths.lock().unwrap().push(prefix.to_string());
         self.inner.list_physical(prefix)
     }
 }
@@ -762,6 +770,46 @@ fn fetch_does_not_read_unreachable_remote_loose_objects_when_repo_is_already_unl
             .join(format!("{stray_object_id}.json"))
             .is_file(),
         "fetch should not import unreachable remote objects into an unlocked repository"
+    );
+}
+
+#[test]
+fn fetch_noop_for_unlocked_repo_lists_remote_loose_objects_at_most_once() {
+    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let tracked_remote = GetTrackingBackend::new(remote);
+    let clone_repo_root = temp.path().join("clone-target");
+
+    clone_remote(
+        &tracked_remote,
+        CloneOptions {
+            repo_root: clone_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: branch_token.clone(),
+        },
+    )
+    .unwrap();
+
+    tracked_remote.reset_gets();
+
+    let fetched = fetch_remote(
+        &tracked_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: clone_repo_root,
+            branch_token,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fetched.downloaded_objects, 0);
+    let object_list_calls = tracked_remote
+        .list_paths()
+        .into_iter()
+        .filter(|path| path == "objects/")
+        .count();
+    assert!(
+        object_list_calls <= 1,
+        "expected no-op unlocked fetch to avoid relisting remote loose objects, saw {object_list_calls}"
     );
 }
 
@@ -5637,6 +5685,83 @@ fn accepted_member_bootstrap_can_fetch_remote_without_password() {
             .join("objects")
             .join(format!("{}.json", committed.snapshot_id))
             .is_file()
+    );
+}
+
+#[test]
+fn accepted_member_fetch_without_password_lists_remote_loose_objects_at_most_once() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"hello shared").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "shared-seed".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "shared-seed-push-list-once".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    let tracked_remote = GetTrackingBackend::new(remote);
+    let fetched = fetch_remote(
+        &tracked_remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root,
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    let object_list_calls = tracked_remote
+        .list_paths()
+        .into_iter()
+        .filter(|path| path == "objects/")
+        .count();
+    assert!(
+        object_list_calls <= 1,
+        "expected accepted-member fetch to avoid relisting remote loose objects, saw {object_list_calls}"
     );
 }
 

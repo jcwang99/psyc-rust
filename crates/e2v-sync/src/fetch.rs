@@ -359,6 +359,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             &options.repo_root,
             &requested_branch_token,
             &stored_ref_bytes,
+            Some(&remote_loose_object_ids),
             &pack_locations,
         )?;
     }
@@ -1148,6 +1149,7 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
     repo_root: &Path,
     requested_branch_token: &str,
     default_ref_bytes: &[u8],
+    remote_loose_object_ids: Option<&BTreeSet<String>>,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
 ) -> Result<()> {
     let (decoded_ref_token_hex, head_snapshot_id) =
@@ -1169,19 +1171,26 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
     );
 
     if let Some(head_snapshot_id) = head_snapshot_id {
-        let listed = _remote.list_physical("objects/")?;
-        let mut loose_object_ids = BTreeSet::new();
-        for relative_path in listed {
-            let Some(object_id) = relative_path
-                .strip_prefix("objects/")
-                .and_then(|value| value.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            if validate_object_id_value(object_id).is_ok() {
-                loose_object_ids.insert(object_id.to_string());
+        let owned_loose_object_ids;
+        let loose_object_ids = if let Some(remote_loose_object_ids) = remote_loose_object_ids {
+            remote_loose_object_ids
+        } else {
+            let listed = _remote.list_physical("objects/")?;
+            let mut derived_loose_object_ids = BTreeSet::new();
+            for relative_path in listed {
+                let Some(object_id) = relative_path
+                    .strip_prefix("objects/")
+                    .and_then(|value| value.strip_suffix(".json"))
+                else {
+                    continue;
+                };
+                if validate_object_id_value(object_id).is_ok() {
+                    derived_loose_object_ids.insert(object_id.to_string());
+                }
             }
-        }
+            owned_loose_object_ids = derived_loose_object_ids;
+            &owned_loose_object_ids
+        };
         ensure!(
             loose_object_ids.contains(&head_snapshot_id)
                 || pack_locations.contains_key(&head_snapshot_id),
@@ -1190,7 +1199,7 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
         remote_snapshot_graph_authenticates_for_repo(
             repo_root,
             _remote,
-            &loose_object_ids,
+            loose_object_ids,
             pack_locations,
             &head_snapshot_id,
         )
