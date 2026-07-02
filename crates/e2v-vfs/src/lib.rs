@@ -146,38 +146,42 @@ enum MountMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MountRequest {
+pub(crate) struct MountRequest {
     config: VfsMountConfig,
     mount_point: PathBuf,
 }
 
 impl MountRequest {
-    pub fn from_config(config: VfsMountConfig, mount_point: PathBuf) -> Self {
+    pub(crate) fn from_config(config: VfsMountConfig, mount_point: PathBuf) -> Self {
         Self {
             config,
             mount_point,
         }
     }
 
-    pub fn snapshot(repo_root: PathBuf, snapshot_id: String, mount_point: PathBuf) -> Self {
+    pub(crate) fn snapshot(repo_root: PathBuf, snapshot_id: String, mount_point: PathBuf) -> Self {
         Self::from_config(
             VfsMountConfig::snapshot(repo_root, snapshot_id),
             mount_point,
         )
     }
 
-    pub fn live_branch(repo_root: PathBuf, branch_token_hex: String, mount_point: PathBuf) -> Self {
+    pub(crate) fn live_branch(
+        repo_root: PathBuf,
+        branch_token_hex: String,
+        mount_point: PathBuf,
+    ) -> Self {
         Self::from_config(
             VfsMountConfig::live_branch(repo_root, branch_token_hex),
             mount_point,
         )
     }
 
-    pub fn mount_point(&self) -> &PathBuf {
+    pub(crate) fn mount_point(&self) -> &PathBuf {
         &self.mount_point
     }
 
-    pub fn mount_mode_label(&self) -> &'static str {
+    pub(crate) fn mount_mode_label(&self) -> &'static str {
         match self.config.mode {
             MountMode::SnapshotPinned { .. } => "snapshot-pinned",
             MountMode::LiveBranch { .. } => "live-branch",
@@ -1198,21 +1202,95 @@ pub mod testing {
 
     use anyhow::Result;
 
-    use super::OpenedFile;
+    use super::{MountLaunchSummary, OpenedFile, VfsMountConfig};
     use crate::windows::{WinfspMountExports, WinfspNativeCreateRequest, WinfspRuntimePaths};
 
-    pub use crate::platform::{
-        LinuxMountAdapter, MacosMountAdapter, PlatformFamily, PlatformMountAdapter,
-        WindowsMountAdapter,
-    };
+    pub use crate::platform::{LinuxMountAdapter, MacosMountAdapter, PlatformFamily};
     pub use crate::windows::{
         WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
         WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
         WinfspRuntimeLibrary, WinfspVolumeParams,
     };
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MountRequest(super::MountRequest);
+
+    impl MountRequest {
+        pub fn from_config(config: VfsMountConfig, mount_point: PathBuf) -> Self {
+            Self(super::MountRequest::from_config(config, mount_point))
+        }
+
+        pub fn snapshot(repo_root: PathBuf, snapshot_id: String, mount_point: PathBuf) -> Self {
+            Self(super::MountRequest::snapshot(
+                repo_root,
+                snapshot_id,
+                mount_point,
+            ))
+        }
+
+        pub fn live_branch(
+            repo_root: PathBuf,
+            branch_token_hex: String,
+            mount_point: PathBuf,
+        ) -> Self {
+            Self(super::MountRequest::live_branch(
+                repo_root,
+                branch_token_hex,
+                mount_point,
+            ))
+        }
+
+        pub fn mount_point(&self) -> &PathBuf {
+            self.0.mount_point()
+        }
+
+        pub fn mount_mode_label(&self) -> &'static str {
+            self.0.mount_mode_label()
+        }
+
+        fn as_inner(&self) -> &super::MountRequest {
+            &self.0
+        }
+
+        fn into_inner(self) -> super::MountRequest {
+            self.0
+        }
+    }
+
     pub trait VfsHostLauncher {
-        fn launch(&mut self, request: &super::MountRequest) -> Result<()>;
+        fn launch(&mut self, request: &MountRequest) -> Result<()>;
+    }
+
+    impl WindowsMountLauncher {
+        pub fn from_test_request(request: &MountRequest) -> Self {
+            Self::from_request(request.as_inner())
+        }
+    }
+
+    impl WinfspMountContext {
+        pub fn from_test_request(request: MountRequest) -> Self {
+            Self::from_request(request.into_inner())
+        }
+    }
+
+    impl LinuxMountAdapter {
+        pub fn platform_family_for_test(self) -> PlatformFamily {
+            crate::platform::PlatformMountAdapter::platform_family(&self)
+        }
+
+        pub fn launch_test_request(self, request: MountRequest) -> Result<MountLaunchSummary> {
+            crate::platform::PlatformMountAdapter::launch(&self, request.into_inner())
+        }
+    }
+
+    impl MacosMountAdapter {
+        pub fn platform_family_for_test(self) -> PlatformFamily {
+            crate::platform::PlatformMountAdapter::platform_family(&self)
+        }
+
+        pub fn launch_test_request(self, request: MountRequest) -> Result<MountLaunchSummary> {
+            crate::platform::PlatformMountAdapter::launch(&self, request.into_inner())
+        }
     }
 
     pub fn opened_file_cached_plaintext(opened_file: &OpenedFile) -> Option<Vec<u8>> {

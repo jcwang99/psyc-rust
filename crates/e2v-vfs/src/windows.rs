@@ -74,7 +74,7 @@ pub trait WinfspHostLauncher {
 }
 
 impl WindowsMountLauncher {
-    pub fn from_request(request: &MountRequest) -> Self {
+    pub(crate) fn from_request(request: &MountRequest) -> Self {
         Self {
             request: request.clone(),
         }
@@ -1818,7 +1818,7 @@ pub struct WinfspMountContext {
 }
 
 impl WinfspMountContext {
-    pub fn from_request(request: MountRequest) -> Self {
+    pub(crate) fn from_request(request: MountRequest) -> Self {
         let vfs = match &request.config.mode {
             MountMode::SnapshotPinned { .. } => ReadOnlyVfs::mount_snapshot(request.config.clone()),
             MountMode::LiveBranch { .. } => ReadOnlyVfs::mount_live_branch(request.config.clone()),

@@ -22,9 +22,6 @@ pub struct LinuxMountAdapter;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MacosMountAdapter;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct WindowsMountAdapter;
-
 impl PlatformMountAdapter for LinuxMountAdapter {
     fn platform_family(&self) -> PlatformFamily {
         PlatformFamily::LinuxFuse
@@ -66,33 +63,6 @@ impl PlatformMountAdapter for MacosMountAdapter {
             stream_only: true,
             status_message: "macos adapter not implemented yet".to_string(),
         })
-    }
-}
-
-impl PlatformMountAdapter for WindowsMountAdapter {
-    fn platform_family(&self) -> PlatformFamily {
-        PlatformFamily::WindowsWinfsp
-    }
-
-    fn launch(&self, request: MountRequest) -> Result<MountLaunchSummary> {
-        #[cfg(windows)]
-        {
-            match request.mount_mode_label() {
-                "snapshot-pinned" => {
-                    windows::mount_snapshot(request.config.clone(), request.mount_point().clone())
-                }
-                "live-branch" => windows::mount_live_branch(
-                    request.config.clone(),
-                    request.mount_point().clone(),
-                ),
-                other => anyhow::bail!("unsupported mount mode: {other}"),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = request;
-            anyhow::bail!("windows adapter is only available on Windows")
-        }
     }
 }
 

@@ -12,13 +12,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 use e2v_vfs::{
-    CachePolicy, MountRequest, PlatformCapabilities, ReadOnlyVfs, VfsMountConfig, VfsNodeKind,
-    VfsSemantic,
+    CachePolicy, PlatformCapabilities, ReadOnlyVfs, VfsMountConfig, VfsNodeKind, VfsSemantic,
     testing::{
-        LinuxMountAdapter, MacosMountAdapter, PlatformFamily, PlatformMountAdapter,
-        VfsHostLauncher, WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver,
-        WinfspHostLauncher, WinfspHostSession, WinfspInvalidator, WinfspMountContext,
-        WinfspOpenRequest, WinfspRuntimeLibrary, WinfspVolumeParams, opened_file_cached_plaintext,
+        LinuxMountAdapter, MacosMountAdapter, MountRequest, PlatformFamily, VfsHostLauncher,
+        WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
+        WinfspHostSession, WinfspInvalidator, WinfspMountContext, WinfspOpenRequest,
+        WinfspRuntimeLibrary, WinfspVolumeParams, opened_file_cached_plaintext,
         winfsp_host_session_new, winfsp_runtime_get_symbol_address,
         winfsp_runtime_paths_from_candidate_roots, winfsp_runtime_paths_from_install_root,
         winfsp_runtime_resolve_mount_exports, winfsp_session_build_native_create_request,
@@ -1225,6 +1224,37 @@ fn vfs_root_does_not_expose_host_launcher_test_trait() {
 }
 
 #[test]
+fn vfs_root_does_not_expose_mount_request_carrier() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+    let public_surface = source.split("#[doc(hidden)]").next().unwrap_or(&source);
+
+    assert!(
+        !public_surface.contains("pub struct MountRequest"),
+        "crate root should not expose the internal MountRequest carrier"
+    );
+}
+
+#[test]
+fn platform_module_does_not_keep_an_unused_windows_adapter_marker() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("platform.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub struct WindowsMountAdapter;"),
+        "platform boundary should not keep an unused WindowsMountAdapter marker type"
+    );
+}
+
+#[test]
 fn snapshot_vfs_accepts_rooted_and_trailing_slash_paths() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1729,7 +1759,7 @@ fn windows_mount_launcher_records_mount_mode_and_mount_point() {
         "branch-token".to_string(),
         PathBuf::from("Z:"),
     );
-    let launcher = WindowsMountLauncher::from_request(&request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
 
     assert_eq!(launcher.mount_mode_label(), "live-branch");
     assert_eq!(launcher.mount_point(), &PathBuf::from("Z:"));
@@ -1766,8 +1796,8 @@ fn windows_mount_launcher_can_hand_request_and_context_to_a_winfsp_host() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id.clone(), PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let mut host = RecordingHost::default();
 
     launcher.launch_with_host(context, &mut host).unwrap();
@@ -1808,8 +1838,8 @@ fn windows_mount_launcher_can_launch_through_host_and_return_a_summary() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id.clone(), PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let mut host = RecordingHost::default();
 
     let summary = launcher
@@ -1840,7 +1870,7 @@ fn winfsp_host_config_reflects_a_snapshot_read_only_volume() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
 
     let config = WinfspHostConfig::from_context(&context);
 
@@ -1876,7 +1906,7 @@ fn winfsp_host_config_enables_cache_bypass_for_direct_io_mounts() {
             .with_platform_capabilities(PlatformCapabilities::no_reliable_invalidation()),
         PathBuf::from("X:"),
     );
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
 
     let config = WinfspHostConfig::from_context(&context);
 
@@ -1915,8 +1945,8 @@ fn windows_mount_launcher_can_hand_host_config_to_a_winfsp_host() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let mut host = RecordingHost::default();
 
     launcher.launch_with_host(context, &mut host).unwrap();
@@ -1935,7 +1965,7 @@ fn winfsp_volume_params_reflect_snapshot_volume_defaults() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
     let host_config = WinfspHostConfig::from_context(&context);
 
     let params = WinfspVolumeParams::from_host_config(&host_config);
@@ -1980,7 +2010,7 @@ fn winfsp_volume_params_disable_kernel_timeouts_for_direct_io_mounts() {
             .with_platform_capabilities(PlatformCapabilities::no_reliable_invalidation()),
         PathBuf::from("X:"),
     );
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
     let host_config = WinfspHostConfig::from_context(&context);
 
     let params = WinfspVolumeParams::from_host_config(&host_config);
@@ -2122,8 +2152,8 @@ fn winfsp_host_session_can_be_built_from_runtime_and_mount_context() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
     let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
@@ -2154,8 +2184,8 @@ fn winfsp_host_session_builds_a_native_create_request() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
     let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
@@ -2187,8 +2217,8 @@ fn winfsp_host_session_can_create_and_destroy_a_native_filesystem_handle() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
     let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
@@ -2281,8 +2311,8 @@ fn winfsp_host_session_can_run_mount_lifecycle_through_a_host_driver() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
     let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
@@ -2348,8 +2378,8 @@ fn winfsp_host_session_mount_lifecycle_cleans_up_a_real_native_handle() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("W:"));
-    let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let launcher = WindowsMountLauncher::from_test_request(&request);
+    let context = WinfspMountContext::from_test_request(request);
     let host_config = launcher.host_config(&context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
     let runtime_paths = winfsp_runtime_paths_from_candidate_roots(
@@ -2383,7 +2413,7 @@ fn winfsp_mount_context_captures_mount_request_and_cache_policy() {
     init_repo(&repo_root);
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request.clone());
+    let context = WinfspMountContext::from_test_request(request.clone());
 
     assert_eq!(context.mount_mode_label(), "snapshot-pinned");
     assert_eq!(context.mount_point(), &PathBuf::from("M:"));
@@ -2402,7 +2432,7 @@ fn winfsp_mount_context_can_open_a_file_handle_from_the_vfs() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root.clone(), snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
     let handle = context.open_handle("tracked.txt").unwrap();
 
     assert_eq!(context.mount_mode_label(), "snapshot-pinned");
@@ -2422,7 +2452,7 @@ fn winfsp_mount_context_accepts_explicit_read_only_open_requests() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root.clone(), snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
     let handle = context
         .open_handle_for_request(&WinfspOpenRequest::read_only("tracked.txt"))
         .unwrap();
@@ -2440,7 +2470,7 @@ fn winfsp_mount_context_rejects_writable_open_requests() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root.clone(), snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
     let error = context
         .open_handle_for_request(&WinfspOpenRequest::writable("tracked.txt"))
         .unwrap_err();
@@ -2457,7 +2487,7 @@ fn winfsp_mount_context_can_read_bytes_from_an_open_handle() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
     let handle = context.open_handle("tracked.txt").unwrap();
 
     let bytes = context.read_handle(&handle, 0, 5).unwrap();
@@ -2483,7 +2513,7 @@ fn winfsp_mount_context_can_stat_paths_from_the_vfs() {
         .snapshot_id;
 
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
 
     let nested = context.stat_path("nested").unwrap();
     assert_eq!(nested.kind, VfsNodeKind::Directory);
@@ -2516,7 +2546,7 @@ fn winfsp_mount_context_can_list_directory_entries_from_the_vfs() {
         .snapshot_id;
 
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
 
     let root_entries = context.read_directory_entries("").unwrap();
     let root_names = root_entries
@@ -2549,7 +2579,7 @@ fn winfsp_mount_context_exposes_a_read_only_volume_summary() {
         .snapshot_id;
 
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("M:"));
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
     let summary = context.volume_summary();
 
     assert!(summary.volume_label.contains("e2v"));
@@ -2584,7 +2614,7 @@ fn winfsp_mount_context_derives_cache_policy_from_mount_request() {
             .with_platform_capabilities(PlatformCapabilities::no_reliable_invalidation()),
         PathBuf::from("M:"),
     );
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_test_request(request);
 
     assert_eq!(context.mount_mode_label(), "live-branch");
     assert_eq!(context.cache_policy(), CachePolicy::DirectIoFallback);
@@ -2604,7 +2634,7 @@ fn winfsp_mount_context_refreshes_live_branch_and_reports_invalidation_need() {
         .branch
         .token_hex;
     let request = MountRequest::live_branch(repo_root.clone(), branch_token, PathBuf::from("M:"));
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
 
     let old_handle = context.open_handle("tracked.txt").unwrap();
     commit_message(&repo_root, "second", "beta");
@@ -2637,7 +2667,7 @@ fn winfsp_mount_context_snapshot_refresh_is_a_noop() {
 
     let snapshot_id = commit_message(&repo_root, "first", "alpha");
     let request = MountRequest::snapshot(repo_root, snapshot_id, PathBuf::from("M:"));
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
 
     let refresh = context.refresh_namespace().unwrap();
     assert!(!refresh.namespace_changed);
@@ -2663,7 +2693,7 @@ fn winfsp_direct_io_refresh_skips_kernel_invalidation_plan() {
             .with_platform_capabilities(PlatformCapabilities::no_reliable_invalidation()),
         PathBuf::from("M:"),
     );
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
     let handle = context.open_handle("tracked.txt").unwrap();
 
     commit_message(&repo_root, "second", "beta");
@@ -2720,7 +2750,7 @@ fn winfsp_mount_context_can_apply_kernel_invalidation_after_live_refresh() {
         .branch
         .token_hex;
     let request = MountRequest::live_branch(repo_root.clone(), branch_token, PathBuf::from("M:"));
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
     context.stat_path("").unwrap();
     let old_handle = context.open_handle("tracked.txt").unwrap();
 
@@ -2775,7 +2805,7 @@ fn winfsp_mount_context_invalidation_plan_includes_observed_directory_inodes() {
         .branch
         .token_hex;
     let request = MountRequest::live_branch(repo_root.clone(), branch_token, PathBuf::from("M:"));
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
 
     let root = context.stat_path("").unwrap();
     let nested = context.stat_path("nested").unwrap();
@@ -2823,7 +2853,7 @@ fn winfsp_mount_context_records_normalized_directory_paths_for_invalidation() {
         .branch
         .token_hex;
     let request = MountRequest::live_branch(repo_root.clone(), branch_token, PathBuf::from("M:"));
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
 
     let metadata = context.stat_path("/nested/").unwrap();
     assert_eq!(metadata.logical_path, "nested");
@@ -2901,7 +2931,7 @@ fn winfsp_mount_context_applies_directory_entry_invalidation_per_observed_direct
         .branch
         .token_hex;
     let request = MountRequest::live_branch(repo_root.clone(), branch_token, PathBuf::from("M:"));
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
 
     context.stat_path("").unwrap();
     context.stat_path("nested").unwrap();
@@ -2972,7 +3002,7 @@ fn winfsp_mount_context_skips_kernel_invalidation_application_when_not_required(
             .with_platform_capabilities(PlatformCapabilities::no_reliable_invalidation()),
         PathBuf::from("M:"),
     );
-    let mut context = WinfspMountContext::from_request(request);
+    let mut context = WinfspMountContext::from_test_request(request);
 
     commit_message(&repo_root, "second", "beta");
 
@@ -3066,9 +3096,12 @@ fn linux_mount_adapter_exposes_a_future_fuse_boundary() {
         PathBuf::from("/mnt/e2v"),
     );
     let adapter = LinuxMountAdapter;
-    let summary = adapter.launch(request).unwrap();
+    let summary = adapter.launch_test_request(request).unwrap();
 
-    assert_eq!(adapter.platform_family(), PlatformFamily::LinuxFuse);
+    assert_eq!(
+        adapter.platform_family_for_test(),
+        PlatformFamily::LinuxFuse
+    );
     assert_eq!(summary.mount_mode, "live-branch");
     assert_eq!(summary.cache_policy, CachePolicy::DirectIoFallback);
     assert!(
@@ -3091,9 +3124,12 @@ fn macos_mount_adapter_exposes_a_future_fuse_boundary() {
         PathBuf::from("/Volumes/e2v"),
     );
     let adapter = MacosMountAdapter;
-    let summary = adapter.launch(request).unwrap();
+    let summary = adapter.launch_test_request(request).unwrap();
 
-    assert_eq!(adapter.platform_family(), PlatformFamily::MacosFuse);
+    assert_eq!(
+        adapter.platform_family_for_test(),
+        PlatformFamily::MacosFuse
+    );
     assert_eq!(summary.mount_mode, "snapshot-pinned");
     assert_eq!(
         summary.cache_policy,
