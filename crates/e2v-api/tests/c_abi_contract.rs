@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 use e2v_api::{
     BranchSummaryInfo, CommitInfo, RemoteRegistration, RepositoryInfo, ShareAcceptInfo,
@@ -70,6 +71,17 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+fn unique_ffi_smoke_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
 fn compile_ffi_smoke_program(workspace_root: &Path) -> PathBuf {
     let build_status = Command::new("cargo")
         .args(["build", "-p", "e2v-api", "--release"])
@@ -78,10 +90,17 @@ fn compile_ffi_smoke_program(workspace_root: &Path) -> PathBuf {
         .unwrap();
     assert!(build_status.success());
 
-    let compile_script = workspace_root.join("target").join("ffi-smoke-build.cmd");
+    let suffix = unique_ffi_smoke_suffix();
+    let compile_script = workspace_root
+        .join("target")
+        .join(format!("ffi-smoke-build-{suffix}.cmd"));
+    let object_name = format!("ffi_smoke-{suffix}.obj");
+    let exe_name = format!("ffi-smoke-{suffix}.exe");
     fs::write(
         &compile_script,
-        "@echo off\r\ncall \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul\r\ncl /nologo /MD /Fo:target\\ffi_smoke.obj /I crates\\e2v-api\\include crates\\e2v-api\\tests\\ffi_smoke.c /link /OUT:target\\ffi-smoke.exe target\\release\\e2v_api.dll.lib\r\n",
+        format!(
+            "@echo off\r\ncall \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul\r\ncl /nologo /MD /Fo:target\\{object_name} /I crates\\e2v-api\\include crates\\e2v-api\\tests\\ffi_smoke.c /link /OUT:target\\{exe_name} target\\release\\e2v_api.dll.lib\r\n"
+        ),
     )
     .unwrap();
 
@@ -90,9 +109,10 @@ fn compile_ffi_smoke_program(workspace_root: &Path) -> PathBuf {
         .current_dir(workspace_root)
         .status()
         .unwrap();
+    let _ = fs::remove_file(&compile_script);
     assert!(compile_status.success());
 
-    workspace_root.join("target").join("ffi-smoke.exe")
+    workspace_root.join("target").join(exe_name)
 }
 
 fn remove_legacy_ffi_smoke_roots() {
@@ -1388,4 +1408,27 @@ fn c_abi_smoke_program_compiles_links_and_runs() {
         !workspace_root.join("ffi_smoke.obj").exists(),
         "ffi smoke build should not leave ffi_smoke.obj in the workspace root"
     );
+}
+
+#[test]
+fn c_abi_smoke_program_can_be_compiled_concurrently() {
+    let workspace_root = workspace_root();
+    let first_exe = compile_ffi_smoke_program(&workspace_root);
+    let second_exe = compile_ffi_smoke_program(&workspace_root);
+
+    assert_ne!(
+        first_exe, second_exe,
+        "ffi smoke builds must use unique output paths so parallel tests do not race on Windows"
+    );
+
+    let first_root = workspace_root.clone();
+    let second_root = workspace_root.clone();
+    let first = thread::spawn(move || compile_ffi_smoke_program(&first_root));
+    let second = thread::spawn(move || compile_ffi_smoke_program(&second_root));
+
+    let first_parallel_exe = first.join().unwrap();
+    let second_parallel_exe = second.join().unwrap();
+
+    assert!(first_parallel_exe.exists());
+    assert!(second_parallel_exe.exists());
 }
