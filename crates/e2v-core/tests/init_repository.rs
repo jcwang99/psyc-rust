@@ -85,6 +85,26 @@ fn facade_module_is_not_exposed_as_a_public_crate_module() {
 }
 
 #[test]
+fn testing_module_does_not_reexport_core_facade_types_or_sync_reconcile_directly() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for legacy_reexport in [
+        "pub use crate::facade::RepositoryFacade;",
+        "pub use crate::facade::reconcile_remote_keyring_for_sync;",
+    ] {
+        assert!(
+            !source.contains(legacy_reexport),
+            "e2v-core::testing should not directly re-export internal facade items: {legacy_reexport}"
+        );
+    }
+}
+
+#[test]
 fn init_creates_control_plane_files_for_local_direct_layout() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

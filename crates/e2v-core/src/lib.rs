@@ -13,8 +13,6 @@ pub mod testing {
     use anyhow::Result;
 
     pub use crate::chunker::override_fixed_span_bytes_for_test;
-    pub use crate::facade::RepositoryFacade;
-    pub use crate::facade::reconcile_remote_keyring_for_sync;
     pub use crate::keyring::clear_unlocked_keyring_cache_for_test;
     pub use crate::working_tree::WorkingTree as TestWorkingTree;
     pub use crate::working_tree::{SnapshotReader, StableReadPolicy};
@@ -38,21 +36,24 @@ pub mod testing {
 
     pub fn with_snapshot_reader_for_test(
         snapshot_reader: Arc<dyn SnapshotReader>,
-    ) -> RepositoryFacade {
-        RepositoryFacade::with_snapshot_reader(snapshot_reader)
+    ) -> crate::RepositoryFacade {
+        crate::RepositoryFacade::with_snapshot_reader(snapshot_reader)
     }
 
     pub fn with_stable_read_policy_for_test(
         stable_read_policy: StableReadPolicy,
-    ) -> RepositoryFacade {
-        RepositoryFacade::with_stable_read_policy(stable_read_policy)
+    ) -> crate::RepositoryFacade {
+        crate::RepositoryFacade::with_stable_read_policy(stable_read_policy)
     }
 
     pub fn with_snapshot_reader_and_policy_for_test(
         snapshot_reader: Arc<dyn SnapshotReader>,
         stable_read_policy: StableReadPolicy,
-    ) -> RepositoryFacade {
-        RepositoryFacade::with_snapshot_reader_and_policy(snapshot_reader, stable_read_policy)
+    ) -> crate::RepositoryFacade {
+        crate::RepositoryFacade::with_snapshot_reader_and_policy(
+            snapshot_reader,
+            stable_read_policy,
+        )
     }
 
     pub fn override_max_file_chunks_per_object_for_test(
@@ -82,6 +83,13 @@ pub mod testing {
             crate::chunker::override_fixed_span_bytes_for_test(1024 * 1024),
             crate::facade::override_max_file_chunks_per_object_for_test(2),
         )
+    }
+
+    pub fn reconcile_remote_keyring_for_test(
+        repo_root: impl AsRef<std::path::Path>,
+        remote_keyring_bytes: &[u8],
+    ) -> Result<bool> {
+        crate::facade::reconcile_remote_keyring_for_sync(repo_root, remote_keyring_bytes)
     }
 }
 
