@@ -2860,7 +2860,7 @@ pub(crate) fn encrypt_control_record(
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
     let object_id = derive_control_object_id(secrets, stable_name, object_type, plaintext);
-    let nonce = derive_control_nonce(secrets, &object_id, object_type);
+    let nonce = derive_control_nonce(secrets, &object_id, object_type)?;
     let epoch_keys = secrets.active_epoch_keys()?;
     let cipher = XChaCha20Poly1305::new((&epoch_keys.manifest_enc_key).into());
     let mut ciphertext = plaintext.to_vec();
@@ -2959,10 +2959,12 @@ fn derive_control_object_id(
     hex::encode(blake3::keyed_hash(&secrets.repo_dedup_key, &input).as_bytes())
 }
 
-fn derive_control_nonce(secrets: &RepoSecrets, object_id: &str, object_type: &str) -> [u8; 24] {
-    let epoch_keys = secrets
-        .active_epoch_keys()
-        .expect("active epoch keys must be present");
+fn derive_control_nonce(
+    secrets: &RepoSecrets,
+    object_id: &str,
+    object_type: &str,
+) -> Result<[u8; 24]> {
+    let epoch_keys = secrets.active_epoch_keys()?;
     let mut hasher = Hasher::new_keyed(&epoch_keys.nonce_key);
     hasher.update(object_id.as_bytes());
     hasher.update(object_type.as_bytes());
@@ -2970,7 +2972,7 @@ fn derive_control_nonce(secrets: &RepoSecrets, object_id: &str, object_type: &st
     let hash = hasher.finalize();
     let mut nonce = [0u8; 24];
     nonce.copy_from_slice(&hash.as_bytes()[..24]);
-    nonce
+    Ok(nonce)
 }
 
 fn control_record_associated_data(
@@ -4242,6 +4244,34 @@ mod facade_tests {
 
         let object = read_directory_root_object(&store, &object_id).unwrap();
         assert_eq!(object.fanout, 16);
+    }
+
+    #[test]
+    fn encrypt_control_record_returns_error_when_active_epoch_keys_are_missing() {
+        let mut secrets = RepoSecrets {
+            repo_id: "repo".to_string(),
+            active_epoch: 7,
+            repo_dedup_key: [1u8; 32],
+            repo_ref_key: [2u8; 32],
+            repo_manifest_enc_key: [3u8; 32],
+            repo_nonce_key: [4u8; 32],
+            repo_path_index_key: [5u8; 32],
+            epoch_keys: std::collections::BTreeMap::new(),
+        };
+        secrets.epoch_keys.clear();
+
+        let result = std::panic::catch_unwind(|| {
+            encrypt_control_record(&secrets, "default", "ref", b"payload")
+        });
+
+        match result {
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("missing epoch keys"),
+                "unexpected error: {error:#}"
+            ),
+            Ok(Ok(_)) => panic!("expected encrypt_control_record to reject missing epoch keys"),
+            Err(_) => panic!("encrypt_control_record should not panic when epoch keys are missing"),
+        }
     }
 
     #[test]

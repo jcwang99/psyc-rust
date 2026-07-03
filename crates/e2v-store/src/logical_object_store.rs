@@ -251,11 +251,8 @@ impl DirectLayoutObjectStore {
         object_id: &str,
         object_type: &str,
         padding_policy: &str,
-    ) -> [u8; NONCE_SIZE] {
-        let epoch_keys = self
-            .secrets
-            .active_epoch_keys()
-            .expect("active epoch keys must be present");
+    ) -> Result<[u8; NONCE_SIZE]> {
+        let epoch_keys = self.secrets.active_epoch_keys()?;
         let mut hasher = Hasher::new_keyed(&epoch_keys.nonce_key);
         hasher.update(object_id.as_bytes());
         hasher.update(object_type.as_bytes());
@@ -265,7 +262,7 @@ impl DirectLayoutObjectStore {
 
         let mut nonce = [0u8; NONCE_SIZE];
         nonce.copy_from_slice(&hash.as_bytes()[..NONCE_SIZE]);
-        nonce
+        Ok(nonce)
     }
 
     fn nonce_for(
@@ -275,7 +272,7 @@ impl DirectLayoutObjectStore {
         padding_policy: &str,
     ) -> Result<[u8; NONCE_SIZE]> {
         if object_type == "chunk" || padding_policy == PADDING_POLICY_NONE {
-            return Ok(self.derive_nonce(object_id, object_type, padding_policy));
+            return self.derive_nonce(object_id, object_type, padding_policy);
         }
 
         let mut nonce = [0u8; NONCE_SIZE];
@@ -992,5 +989,24 @@ mod tests {
             error.to_string().contains("object id"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn put_object_returns_error_when_active_epoch_keys_are_missing() {
+        let temp = tempdir().unwrap();
+        let mut repo_secrets = secrets("repo-a");
+        repo_secrets.epoch_keys.clear();
+        let store = DirectLayoutObjectStore::new(temp.path(), repo_secrets);
+
+        let result = std::panic::catch_unwind(|| store.put_object("chunk", b"hello world"));
+
+        match result {
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("missing epoch keys"),
+                "unexpected error: {error:#}"
+            ),
+            Ok(Ok(_)) => panic!("expected put_object to reject missing epoch keys"),
+            Err(_) => panic!("put_object should not panic when epoch keys are missing"),
+        }
     }
 }
