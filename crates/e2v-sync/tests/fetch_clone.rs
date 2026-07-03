@@ -7041,6 +7041,80 @@ fn clone_nondefault_branch_succeeds_after_historical_rewrite_remote() {
 }
 
 #[test]
+fn clone_nondefault_branch_restores_current_branch_mirror() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let feature_clone_root = temp.path().join("feature-clone");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "clone-nondefault-mirror-main-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade.create_branch(&owner_root, "feature").unwrap();
+    let feature_state = facade.checkout_branch(&owner_root, "feature").unwrap();
+    fs::write(owner_root.join("feature.txt"), b"feature-only").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: feature_state.branch.token_hex.clone(),
+            operation_id: "clone-nondefault-mirror-feature-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: feature_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: feature_state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let branches = facade.list_branches(&feature_clone_root).unwrap();
+    let current = branches
+        .into_iter()
+        .find(|branch| branch.is_current)
+        .expect("current branch");
+    assert_eq!(current.name, "feature");
+    assert_eq!(current.token_hex, feature_state.branch.token_hex);
+}
+
+#[test]
 fn clone_remote_only_branch_succeeds_after_historical_rewrite_remote() {
     let temp = tempdir().unwrap();
     let owner_root = temp.path().join("owner");

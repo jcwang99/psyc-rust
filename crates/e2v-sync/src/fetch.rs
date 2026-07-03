@@ -510,6 +510,18 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             &control_plane.keyring_pointer_bytes,
         )?;
     }
+    if let Some(branch_mirror_secrets) = remote_current_device_secrets
+        .as_ref()
+        .or(pack_index_secrets.as_ref())
+        .or(local_repo_secrets.as_ref())
+    {
+        write_requested_branch_mirror(
+            &control_dir,
+            branch_mirror_secrets,
+            &requested_branch_token,
+            &stored_ref_bytes,
+        )?;
+    }
     if !matches!(
         sync_mode,
         RepositorySyncMode::SameRepositoryPointerUnchanged
@@ -630,6 +642,34 @@ fn persist_cached_pack_data(
         cache_pack_data_bytes(&control_dir, container_id, pack_bytes)?;
     }
     Ok(())
+}
+
+fn write_requested_branch_mirror(
+    control_dir: &Path,
+    secrets: &RepoSecrets,
+    requested_branch_token: &str,
+    default_ref_bytes: &[u8],
+) -> Result<()> {
+    validate_sync_identifier("branch token", requested_branch_token)?;
+    let plaintext = e2v_core::sync_support::decrypt_control_record_for_sync(
+        secrets,
+        "default",
+        "ref",
+        default_ref_bytes,
+    )?;
+    let branch_ref_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        secrets,
+        &format!("branch-ref:{requested_branch_token}"),
+        "ref",
+        &plaintext,
+    )?;
+    atomic_write_bytes(
+        control_dir
+            .join("refs")
+            .join("branches")
+            .join(format!("{requested_branch_token}.json")),
+        &branch_ref_bytes,
+    )
 }
 
 fn classify_repository_sync_mode<R: RemoteBackend>(
