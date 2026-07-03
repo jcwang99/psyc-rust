@@ -174,6 +174,10 @@ fn remove_path_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn path_conflict_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 impl BlobStore for LocalFolderBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
         self.put_object(relative_path, bytes)
@@ -182,8 +186,11 @@ impl BlobStore for LocalFolderBackend {
     fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
         let full_path = self.resolve_relative_path(relative_path)?;
         if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create object parent {}", parent.display()))?;
+            match ensure_directory_path(parent) {
+                Ok(()) => {}
+                Err(error) if path_conflict_exists(parent) => return Ok(false),
+                Err(error) => return Err(error),
+            }
         }
         match std::fs::OpenOptions::new()
             .write(true)
@@ -197,6 +204,10 @@ impl BlobStore for LocalFolderBackend {
                 Ok(true)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) if path_conflict_exists(&full_path) => {
+                let _ = error;
+                Ok(false)
+            }
             Err(error) => Err(error)
                 .with_context(|| format!("failed to create object {}", full_path.display())),
         }
@@ -237,12 +248,8 @@ impl BlobStore for LocalFolderBackend {
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
         let full_path = self.resolve_relative_path(relative_path)?;
-        match fs::remove_file(&full_path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to delete object {}", full_path.display())),
-        }
+        remove_path_if_exists(&full_path)
+            .with_context(|| format!("failed to delete object {}", full_path.display()))
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {
@@ -517,6 +524,19 @@ mod tests {
     }
 
     #[test]
+    fn blob_store_delete_removes_directory_path_conflict() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let blob_store: &dyn BlobStore = &backend;
+        let conflicted_path = temp.path().join("objects").join("sample.bin");
+        fs::create_dir_all(&conflicted_path).unwrap();
+
+        blob_store.delete_physical("objects/sample.bin").unwrap();
+
+        assert!(!conflicted_path.exists());
+    }
+
+    #[test]
     fn blob_store_list_returns_prefixed_objects() {
         let temp = tempdir().unwrap();
         let backend = LocalFolderBackend::new(temp.path());
@@ -610,6 +630,41 @@ mod tests {
             .unwrap();
 
         let target_path = conflicted_parent.join("sample.bin");
+        assert!(conflicted_parent.is_dir());
+        assert!(target_path.is_file());
+        assert_eq!(fs::read(&target_path).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn put_physical_if_absent_treats_target_directory_conflict_as_existing() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let blob_store: &dyn BlobStore = &backend;
+        let conflicted_path = temp.path().join("objects").join("sample.bin");
+        fs::create_dir_all(&conflicted_path).unwrap();
+
+        let created = blob_store
+            .put_physical_if_absent("objects/sample.bin", b"hello world")
+            .unwrap();
+
+        assert!(!created);
+        assert!(conflicted_path.is_dir());
+    }
+
+    #[test]
+    fn put_physical_if_absent_heals_parent_path_conflict_before_create() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let blob_store: &dyn BlobStore = &backend;
+        let conflicted_parent = temp.path().join("objects");
+        fs::write(&conflicted_parent, b"not-a-directory").unwrap();
+
+        let created = blob_store
+            .put_physical_if_absent("objects/sample.bin", b"hello world")
+            .unwrap();
+
+        let target_path = conflicted_parent.join("sample.bin");
+        assert!(created);
         assert!(conflicted_parent.is_dir());
         assert!(target_path.is_file());
         assert_eq!(fs::read(&target_path).unwrap(), b"hello world");
