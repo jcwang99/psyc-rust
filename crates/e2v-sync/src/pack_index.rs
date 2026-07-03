@@ -84,6 +84,7 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
     std::fs::create_dir_all(segment_cache_dir(control_dir))?;
 
     let Some(root_bytes) = load_remote_pack_index_root_bytes(remote)? else {
+        prune_pack_index_cache(&cache_dir)?;
         return Ok(BTreeMap::new());
     };
     let root = decode_pack_index_root_bytes(&root_bytes, secrets)?;
@@ -291,6 +292,25 @@ fn prune_stale_cached_segments(cache_dir: &Path, live_segment_paths: &[String]) 
             let _ = std::fs::remove_file(path);
         }
     }
+    Ok(())
+}
+
+fn prune_pack_index_cache(cache_dir: &Path) -> Result<()> {
+    let segment_dir = cache_dir.join("segments");
+    if segment_dir.is_dir() {
+        for entry in std::fs::read_dir(&segment_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let root_cache_path = cache_dir.join("root.json");
+    if root_cache_path.is_file() {
+        let _ = std::fs::remove_file(root_cache_path);
+    }
+
     Ok(())
 }
 
@@ -1236,6 +1256,66 @@ mod tests {
         assert!(
             !stale_cache_path.exists(),
             "pack-index cache should prune segment files that are no longer referenced by the current root"
+        );
+    }
+
+    #[test]
+    fn pack_index_cache_is_pruned_when_remote_root_disappears() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+
+        let (index, payload) =
+            build_pack("op", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index.data_path, &payload).unwrap();
+        let segment_path = "packs/index/op-00000000.json";
+        remote
+            .put_physical(
+                segment_path,
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    segment_path,
+                    &serde_json::to_vec(&index).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_path.to_string()],
+        )
+        .unwrap();
+
+        let cached =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(cached.contains_key("abc"));
+
+        let cache_dir = pack_index_cache_dir(&control_dir);
+        let cached_root_path = cache_dir.join("root.json");
+        let cached_segment_path = cached_segment_path(&cache_dir, segment_path);
+        assert!(cached_root_path.is_file());
+        assert!(cached_segment_path.is_file());
+
+        remote.delete_physical(PACK_INDEX_ROOT_PATH).unwrap();
+
+        let locations =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+
+        assert!(
+            locations.is_empty(),
+            "missing pack-index root should still suppress stale local cache restoration"
+        );
+        assert!(
+            !cached_root_path.exists(),
+            "pack-index root cache should be pruned when the remote root disappears"
+        );
+        assert!(
+            !cached_segment_path.exists(),
+            "pack-index segment cache should be pruned when the remote root disappears"
         );
     }
 
