@@ -2416,6 +2416,29 @@ fn winfsp_runtime_library_resolves_required_mount_exports() {
     assert_ne!(exports.delete_filesystem, 0);
 }
 
+#[cfg(windows)]
+#[test]
+fn winfsp_runtime_library_load_rejects_dll_without_required_winfsp_exports() {
+    let mut paths = winfsp_runtime_paths_from_candidate_roots(
+        &[
+            PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
+            PathBuf::from(r"C:\Program Files\WinFsp"),
+        ],
+        "x86_64",
+    )
+    .unwrap();
+    paths.dll_path = PathBuf::from(r"C:\Windows\System32\kernel32.dll");
+
+    let error = WinfspRuntimeLibrary::load(&paths).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to resolve WinFSP export"),
+        "unexpected error: {error:#}"
+    );
+}
+
 #[test]
 fn winfsp_host_session_can_be_built_from_runtime_and_mount_context() {
     let temp = tempdir().unwrap();

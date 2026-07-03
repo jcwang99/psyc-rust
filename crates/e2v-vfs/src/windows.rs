@@ -571,6 +571,7 @@ impl WinfspRuntimePaths {
 pub struct WinfspRuntimeLibrary {
     dll_path: PathBuf,
     handle: *mut c_void,
+    mount_exports: WinfspMountExports,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,9 +633,19 @@ impl WinfspRuntimeLibrary {
                 paths.dll_path.display()
             );
         }
+        let mount_exports = match Self::resolve_mount_exports(handle) {
+            Ok(exports) => exports,
+            Err(error) => {
+                unsafe {
+                    FreeLibrary(handle);
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             dll_path: paths.dll_path.clone(),
             handle,
+            mount_exports,
         })
     }
 
@@ -643,99 +654,68 @@ impl WinfspRuntimeLibrary {
     }
 
     pub(crate) fn get_symbol_address_for_test(&self, symbol_name: &str) -> Result<usize> {
+        Self::get_symbol_address(self.handle, symbol_name)
+    }
+
+    fn get_symbol_address(handle: *mut c_void, symbol_name: &str) -> Result<usize> {
         let symbol_name = CString::new(symbol_name)?;
-        let address = unsafe { GetProcAddress(self.handle, symbol_name.as_ptr()) };
+        let address = unsafe { GetProcAddress(handle, symbol_name.as_ptr()) };
         if address.is_null() {
             anyhow::bail!("failed to resolve WinFSP export: {symbol_name:?}");
         }
         Ok(address as usize)
     }
 
-    pub(crate) fn resolve_mount_exports_for_test(&self) -> Result<WinfspMountExports> {
+    fn resolve_mount_exports(handle: *mut c_void) -> Result<WinfspMountExports> {
         Ok(WinfspMountExports {
-            create: self.get_symbol_address_for_test("FspFileSystemCreate")?,
-            remove_mount_point: self
-                .get_symbol_address_for_test("FspFileSystemRemoveMountPoint")?,
-            set_operation_guard_strategy: self
-                .get_symbol_address_for_test("FspFileSystemSetOperationGuardStrategyF")?,
-            set_mount_point: self.get_symbol_address_for_test("FspFileSystemSetMountPoint")?,
-            start_dispatcher: self.get_symbol_address_for_test("FspFileSystemStartDispatcher")?,
-            stop_dispatcher: self.get_symbol_address_for_test("FspFileSystemStopDispatcher")?,
-            delete_filesystem: self.get_symbol_address_for_test("FspFileSystemDelete")?,
-            add_dir_info: self.get_symbol_address_for_test("FspFileSystemAddDirInfo")?,
+            create: Self::get_symbol_address(handle, "FspFileSystemCreate")?,
+            remove_mount_point: Self::get_symbol_address(handle, "FspFileSystemRemoveMountPoint")?,
+            set_operation_guard_strategy: Self::get_symbol_address(
+                handle,
+                "FspFileSystemSetOperationGuardStrategyF",
+            )?,
+            set_mount_point: Self::get_symbol_address(handle, "FspFileSystemSetMountPoint")?,
+            start_dispatcher: Self::get_symbol_address(handle, "FspFileSystemStartDispatcher")?,
+            stop_dispatcher: Self::get_symbol_address(handle, "FspFileSystemStopDispatcher")?,
+            delete_filesystem: Self::get_symbol_address(handle, "FspFileSystemDelete")?,
+            add_dir_info: Self::get_symbol_address(handle, "FspFileSystemAddDirInfo")?,
         })
     }
 
+    pub(crate) fn resolve_mount_exports_for_test(&self) -> Result<WinfspMountExports> {
+        Ok(self.mount_exports)
+    }
+
     fn create_fn(&self) -> FspFileSystemCreateFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemCreate")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.create_fn()
     }
 
     fn set_mount_point_fn(&self) -> FspFileSystemSetMountPointFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemSetMountPoint")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.set_mount_point_fn()
     }
 
     fn set_operation_guard_strategy_fn(&self) -> FspFileSystemSetOperationGuardStrategyFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemSetOperationGuardStrategyF")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.set_operation_guard_strategy_fn()
     }
 
     fn remove_mount_point_fn(&self) -> FspFileSystemRemoveMountPointFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemRemoveMountPoint")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.remove_mount_point_fn()
     }
 
     fn start_dispatcher_fn(&self) -> FspFileSystemStartDispatcherFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemStartDispatcher")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.start_dispatcher_fn()
     }
 
     fn stop_dispatcher_fn(&self) -> FspFileSystemStopDispatcherFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemStopDispatcher")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.stop_dispatcher_fn()
     }
 
     fn delete_fn(&self) -> FspFileSystemDeleteFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemDelete")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.delete_fn()
     }
 
     fn add_dir_info_fn(&self) -> FspFileSystemAddDirInfoFn {
-        unsafe {
-            std::mem::transmute(
-                self.get_symbol_address_for_test("FspFileSystemAddDirInfo")
-                    .unwrap(),
-            )
-        }
+        self.mount_exports.add_dir_info_fn()
     }
 }
 
@@ -889,8 +869,32 @@ impl WinfspMountExports {
         unsafe { std::mem::transmute(self.create) }
     }
 
+    fn set_mount_point_fn(&self) -> FspFileSystemSetMountPointFn {
+        unsafe { std::mem::transmute(self.set_mount_point) }
+    }
+
+    fn set_operation_guard_strategy_fn(&self) -> FspFileSystemSetOperationGuardStrategyFn {
+        unsafe { std::mem::transmute(self.set_operation_guard_strategy) }
+    }
+
+    fn remove_mount_point_fn(&self) -> FspFileSystemRemoveMountPointFn {
+        unsafe { std::mem::transmute(self.remove_mount_point) }
+    }
+
+    fn start_dispatcher_fn(&self) -> FspFileSystemStartDispatcherFn {
+        unsafe { std::mem::transmute(self.start_dispatcher) }
+    }
+
+    fn stop_dispatcher_fn(&self) -> FspFileSystemStopDispatcherFn {
+        unsafe { std::mem::transmute(self.stop_dispatcher) }
+    }
+
     fn delete_fn(&self) -> FspFileSystemDeleteFn {
         unsafe { std::mem::transmute(self.delete_filesystem) }
+    }
+
+    fn add_dir_info_fn(&self) -> FspFileSystemAddDirInfoFn {
+        unsafe { std::mem::transmute(self.add_dir_info) }
     }
 }
 
