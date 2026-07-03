@@ -68,6 +68,12 @@ impl MemoryBackend {
         &self.capability
     }
 
+    fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn override_physical_modified_time_for_test(
         &self,
         relative_path: &str,
@@ -79,7 +85,7 @@ impl MemoryBackend {
         );
         self.physical_modified_at
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(relative_path.to_string(), modified_at);
         Ok(())
     }
@@ -160,17 +166,17 @@ impl BlobStore for MemoryBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
         self.physical
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(relative_path.to_string(), bytes.to_vec());
         self.physical_modified_at
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(relative_path.to_string(), SystemTime::now());
         Ok(())
     }
 
     fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
-        let mut physical = self.physical.lock().unwrap();
+        let mut physical = Self::lock_or_recover(&self.physical);
         if physical.contains_key(relative_path) {
             return Ok(false);
         }
@@ -178,7 +184,7 @@ impl BlobStore for MemoryBackend {
         drop(physical);
         self.physical_modified_at
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(relative_path.to_string(), SystemTime::now());
         Ok(true)
     }
@@ -186,7 +192,7 @@ impl BlobStore for MemoryBackend {
     fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
         self.physical
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(relative_path)
             .cloned()
             .with_context(|| format!("missing physical object {relative_path}"))
@@ -205,16 +211,16 @@ impl BlobStore for MemoryBackend {
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
-        self.physical.lock().unwrap().remove(relative_path);
+        Self::lock_or_recover(&self.physical).remove(relative_path);
         self.physical_modified_at
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(relative_path);
         Ok(())
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {
-        self.physical.lock().unwrap().contains_key(relative_path)
+        Self::lock_or_recover(&self.physical).contains_key(relative_path)
     }
 
     fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
@@ -224,7 +230,7 @@ impl BlobStore for MemoryBackend {
             modified_at: self
                 .physical_modified_at
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(relative_path)
                 .copied(),
         })
@@ -234,7 +240,7 @@ impl BlobStore for MemoryBackend {
         let mut listed = self
             .physical
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keys()
             .filter(|path| path.starts_with(prefix))
             .cloned()
@@ -249,7 +255,7 @@ impl LayoutRootStore for MemoryBackend {
         match self.get_physical("layout_root.json") {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
             Err(error) if is_missing_physical_object_error(&error) => {
-                Ok(self.layout_root.lock().unwrap().clone())
+                Ok(Self::lock_or_recover(&self.layout_root).clone())
             }
             Err(error) => Err(error),
         }
@@ -268,7 +274,7 @@ impl LayoutRootStore for MemoryBackend {
             });
         }
         let bytes = serde_json::to_vec(&next)?;
-        *self.layout_root.lock().unwrap() = next.clone();
+        *Self::lock_or_recover(&self.layout_root) = next.clone();
         self.put_physical("layout_root.json", &bytes)?;
         self.put_physical(&Self::layout_history_path(next.generation), &bytes)?;
         Ok(CasResult {
@@ -292,9 +298,19 @@ impl LayoutRootStore for MemoryBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{self, AssertUnwindSafe};
+
     use crate::capability::WriterMode;
 
     use super::*;
+
+    fn poison_mutex<T>(mutex: &Arc<Mutex<T>>) {
+        let poisoned = Arc::clone(mutex);
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test mutex");
+        }));
+    }
 
     #[test]
     fn compare_and_swap_ref_rejects_stale_version() {
@@ -599,5 +615,64 @@ mod tests {
                 .to_string()
                 .contains("path")
         );
+    }
+
+    #[test]
+    fn physical_operations_recover_from_poisoned_storage_lock() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_physical("objects/sample.bin", b"hello")
+            .unwrap();
+
+        poison_mutex(&backend.physical);
+
+        backend.put_physical("objects/next.bin", b"world").unwrap();
+        assert_eq!(
+            backend.get_physical("objects/sample.bin").unwrap(),
+            b"hello"
+        );
+        assert!(backend.exists_physical("objects/next.bin"));
+        assert_eq!(
+            backend.list_physical("objects/").unwrap(),
+            vec![
+                "objects/next.bin".to_string(),
+                "objects/sample.bin".to_string()
+            ]
+        );
+        backend.delete_physical("objects/sample.bin").unwrap();
+        assert!(!backend.exists_physical("objects/sample.bin"));
+    }
+
+    #[test]
+    fn layout_root_operations_recover_from_poisoned_layout_lock() {
+        let backend = MemoryBackend::new();
+        poison_mutex(&backend.layout_root);
+
+        let current = backend.read_layout_root().unwrap();
+        assert_eq!(current.generation, 1);
+
+        let next = LayoutRoot {
+            generation: 2,
+            ..LayoutRoot::direct_default()
+        };
+        let result = backend
+            .compare_and_swap_layout_root(1, next.clone())
+            .unwrap();
+        assert!(result.applied);
+        assert_eq!(backend.read_layout_root().unwrap(), next);
+    }
+
+    #[test]
+    fn stat_recover_from_poisoned_modified_time_lock() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_physical("objects/sample.bin", b"hello")
+            .unwrap();
+
+        poison_mutex(&backend.physical_modified_at);
+
+        let stat = backend.stat_physical("objects/sample.bin").unwrap();
+        assert_eq!(stat.length, 5);
+        assert!(stat.modified_at.is_some());
     }
 }
