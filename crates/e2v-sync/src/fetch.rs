@@ -627,13 +627,26 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
 ) -> Result<RepositorySyncMode> {
     let has_local_objects = local_objects_dir_has_entries(control_dir)?;
     let local_pointer_path = control_dir.join("keyring").join("keyring.current");
-    if !local_pointer_path.is_file() {
-        if has_local_objects {
+    match std::fs::symlink_metadata(&local_pointer_path) {
+        Ok(metadata) if metadata.is_dir() => {
             anyhow::bail!(
-                "repository identity mismatch: local keyring pointer is missing while local history exists"
+                "failed to read local keyring pointer {}",
+                local_pointer_path.display()
             );
         }
-        return Ok(RepositorySyncMode::ReplaceLocalState);
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if has_local_objects {
+                anyhow::bail!(
+                    "repository identity mismatch: local keyring pointer is missing while local history exists"
+                );
+            }
+            return Ok(RepositorySyncMode::ReplaceLocalState);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", local_pointer_path.display()));
+        }
     }
 
     let local_pointer_bytes = std::fs::read(&local_pointer_path)

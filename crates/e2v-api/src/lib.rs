@@ -1430,6 +1430,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode remote keyring pointer")
         || lower.contains("failed to decode remote keyring state")
         || lower.contains("failed to decode remote branch ref")
+        || lower.contains("failed to read local keyring pointer")
         || lower.contains("failed to decode local keyring pointer")
         || lower.contains("failed to decode local keyring state")
         || lower.contains("failed to decode local keyring state for pointer ref")
@@ -1595,6 +1596,17 @@ mod tests {
     #[test]
     fn map_error_treats_corrupted_default_remote_as_corrupt_state() {
         let error = anyhow::anyhow!("failed to decode default remote: expected value at line 1");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_unreadable_local_keyring_pointer_as_corrupt_state() {
+        let error = anyhow::anyhow!(
+            "failed to read local keyring pointer C:/tmp/repo/.e2v/keyring/keyring.current"
+        );
 
         let mapped = map_error(error);
 
