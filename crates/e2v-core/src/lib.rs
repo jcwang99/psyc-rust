@@ -563,7 +563,8 @@ pub mod sync_support {
                 PACK_INDEX_ROOT_STABLE_NAME,
                 PACK_INDEX_ROOT_OBJECT_TYPE,
                 bytes,
-            )?;
+            )
+            .context("failed to decrypt authenticated pack index root")?;
             serde_json::from_slice(&plaintext)
                 .context("failed to decode authenticated pack index root")
         }
@@ -621,9 +622,11 @@ pub mod sync_support {
         let control_dir = repo_root.as_ref().join(".e2v");
         let secrets = open_repo_secrets_for_sync(&control_dir)?;
         let cache_dir = control_dir.join("cache").join("pack-index");
-        let root_bytes = std::fs::read(cache_dir.join("root.json"))
-            .context("cached pack index root is missing")?;
-        let root = decode_root(&root_bytes, &secrets)?;
+        let root_path = cache_dir.join("root.json");
+        let root_bytes = std::fs::read(&root_path).context("cached pack index root is missing")?;
+        let root = decode_root(&root_bytes, &secrets).inspect_err(|_| {
+            let _ = std::fs::remove_file(&root_path);
+        })?;
         ensure!(
             root.schema_version == PACK_INDEX_ROOT_SCHEMA_VERSION,
             "unsupported pack index root schema version {}",
@@ -641,11 +644,15 @@ pub mod sync_support {
                 "invalid pack index segment path {}",
                 segment_path
             );
-            let segment_bytes = std::fs::read(cached_segment_path(&cache_dir, segment_path))
-                .with_context(|| {
-                    format!("cached pack index segment is missing for {}", segment_path)
-                })?;
-            for entry in decode_segment(segment_path, &segment_bytes, &secrets)? {
+            let segment_cache_path = cached_segment_path(&cache_dir, segment_path);
+            let segment_bytes = std::fs::read(&segment_cache_path).with_context(|| {
+                format!("cached pack index segment is missing for {}", segment_path)
+            })?;
+            for entry in
+                decode_segment(segment_path, &segment_bytes, &secrets).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&segment_cache_path);
+                })?
+            {
                 validate_cached_pack_data_path(&entry.data_path)?;
                 if entry.object_id == object_id {
                     return CachedPackedObjectLocation {

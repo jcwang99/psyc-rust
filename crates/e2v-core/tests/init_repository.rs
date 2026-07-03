@@ -3438,6 +3438,89 @@ fn sync_support_rejects_cached_compacted_segment_with_traversing_pack_data_path(
 }
 
 #[test]
+fn sync_support_prunes_corrupted_cached_pack_index_root_after_failed_lookup() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let cache_dir = repo_root.join(".e2v").join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+    let root_path = cache_dir.join("root.json");
+    fs::write(&root_path, b"corrupt-pack-index-root").unwrap();
+
+    let error =
+        e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(&repo_root, "abc")
+            .unwrap_err();
+
+    assert!(
+        !root_path.exists(),
+        "corrupted cached pack-index root should be pruned after failed lookup: {root_path:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("pack index root")
+            || message.contains("object authentication failed")
+            || message.contains("unsupported"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn sync_support_prunes_corrupted_cached_pack_index_segment_after_failed_lookup() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["packs/index/op-00000000.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_path = cache_dir
+        .join("segments")
+        .join("packs__index__op-00000000.json");
+    fs::write(&segment_path, b"corrupt-pack-index-segment").unwrap();
+
+    let error =
+        e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(&repo_root, "abc")
+            .unwrap_err();
+
+    assert!(
+        !segment_path.exists(),
+        "corrupted cached pack-index segment should be pruned after failed lookup: {segment_path:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("pack index segment")
+            || message.contains("object authentication failed")
+            || message.contains("unsupported"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn read_range_falls_back_to_cached_pack_data_when_loose_chunk_is_missing() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

@@ -1417,6 +1417,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode ") && normalized.contains("/.e2v/keyring/keyring.")
         || lower.contains("failed to decode ") && normalized.contains("/.e2v/layout_root.json")
         || lower.contains("failed to decode authenticated pack index root")
+        || lower.contains("failed to decrypt authenticated pack index root")
         || lower.contains("failed to decode authenticated pack index segment")
         || lower.contains("failed to decrypt authenticated pack index segment")
         || lower.contains("failed to decode trusted state")
@@ -1485,6 +1486,15 @@ mod tests {
         let error = anyhow::anyhow!(
             "failed to decode authenticated pack index segment packs/index/push-invalid-pack-index-segment-op/pack-index.000000.json"
         );
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_pack_index_root_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decrypt authenticated pack index root");
 
         let mapped = map_error(error);
 
