@@ -100,8 +100,6 @@ e2v_error_code_t e2v_share_accept_device_json(e2v_sdk_t *sdk, const char *repo_r
 e2v_error_code_t e2v_share_revoke_device(e2v_sdk_t *sdk, const char *repo_root, const char *device_id, const char *password, e2v_error_t **error_out);
 e2v_error_code_t e2v_share_revoke_member(e2v_sdk_t *sdk, const char *repo_root, const char *actor_id, const char *password, e2v_error_t **error_out);
 
-e2v_error_code_t e2v_test_only_force_panic(e2v_error_t **error_out);
-
 #ifdef __cplusplus
 }
 #endif

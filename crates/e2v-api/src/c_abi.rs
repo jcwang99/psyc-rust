@@ -157,6 +157,13 @@ where
     }
 }
 
+#[doc(hidden)]
+pub fn test_only_force_panic_for_contract(error_out: *mut *mut e2v_error_t) -> e2v_error_code_t {
+    ffi_call(error_out, || -> crate::SdkResult<()> {
+        panic!("forced ffi panic");
+    })
+}
+
 fn ffi_call_with_json<T, F>(
     json_out: *mut e2v_string_t,
     error_out: *mut *mut e2v_error_t,
@@ -409,15 +416,6 @@ pub unsafe extern "C" fn e2v_bytes_free(value: *mut e2v_bytes_t) {
         }
     }
     *owned = e2v_bytes_t::default();
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn e2v_test_only_force_panic(
-    error_out: *mut *mut e2v_error_t,
-) -> e2v_error_code_t {
-    ffi_call(error_out, || -> crate::SdkResult<()> {
-        panic!("forced ffi panic");
-    })
 }
 
 #[unsafe(no_mangle)]
