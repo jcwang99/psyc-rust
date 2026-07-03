@@ -24,7 +24,8 @@ use crate::oram::{
 };
 use crate::pack::PackedObjectLocation;
 use crate::pack_cache::{
-    cache_pack_data_bytes, preload_cached_pack_data, remote_object_bytes_with_pack_cache,
+    cache_pack_data_bytes, preload_cached_pack_data, prune_stale_cached_pack_data,
+    remote_object_bytes_with_pack_cache,
 };
 use crate::pack_index::publish_pack_index_root;
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
@@ -575,6 +576,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
@@ -656,6 +658,7 @@ pub fn verify_remote<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let facade = RepositoryFacade::new();
@@ -749,6 +752,7 @@ pub fn repair_remote<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
@@ -812,6 +816,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {

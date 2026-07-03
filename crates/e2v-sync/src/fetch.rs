@@ -9,7 +9,9 @@ use crate::journal::validate_sync_identifier;
 use crate::object_type::candidate_object_types;
 use crate::oram::load_remote_active_pack_locations_with_local_cache;
 use crate::pack::{PackedObjectLocation, read_packed_object};
-use crate::pack_cache::{cache_pack_data_bytes, remote_object_bytes_with_pack_cache};
+use crate::pack_cache::{
+    cache_pack_data_bytes, prune_stale_cached_pack_data, remote_object_bytes_with_pack_cache,
+};
 use crate::trusted_state::{
     TrustedRemoteState, load_trusted_remote_state, store_trusted_remote_state,
 };
@@ -569,6 +571,7 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
         inputs.device_validation_secrets,
     )?;
     let mut pack_cache = BTreeMap::new();
+    prune_stale_cached_pack_data(&inputs.repo_root.join(".e2v"), inputs.pack_locations)?;
     let (_, head_snapshot_id) = e2v_core::sync_support::decode_default_ref_record(
         &validation_root.path,
         inputs.default_ref_bytes,

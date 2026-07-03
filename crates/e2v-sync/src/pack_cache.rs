@@ -112,6 +112,56 @@ pub(crate) fn preload_cached_pack_data(
     Ok(())
 }
 
+pub(crate) fn prune_stale_cached_pack_data(
+    control_dir: &Path,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+) -> Result<()> {
+    let cache_root = control_dir.join("cache").join("pack-data");
+    if !cache_root.is_dir() {
+        return Ok(());
+    }
+
+    let live_container_ids = pack_locations
+        .values()
+        .map(PackedObjectLocation::physical_ref)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|physical_ref| physical_ref.container_id)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut stack = vec![cache_root.clone()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let relative = match path.strip_prefix(&cache_root) {
+                Ok(relative) => relative,
+                Err(_) => continue,
+            };
+            let container_id = match cached_pack_container_id_from_relative_path(relative) {
+                Some(container_id) => container_id,
+                None => continue,
+            };
+            if live_container_ids.contains(&container_id) {
+                continue;
+            }
+            delete_cached_pack_data_bytes(control_dir, &container_id)?;
+        }
+    }
+
+    remove_empty_cache_dirs(&cache_root, &cache_root)?;
+    Ok(())
+}
+
 fn overwrite_cached_pack_data_bytes(
     control_dir: &Path,
     container_id: &str,
@@ -153,6 +203,31 @@ fn delete_cached_pack_data_bytes(control_dir: &Path, container_id: &str) -> Resu
         return Err(error.into());
     }
     Ok(())
+}
+
+fn cached_pack_container_id_from_relative_path(relative: &Path) -> Option<String> {
+    let extension = relative.extension()?.to_str()?;
+    if extension == "blake3" {
+        let mut base = relative.to_path_buf();
+        let inner_extension = base.file_stem()?.to_str()?.to_string();
+        base.set_extension(inner_extension);
+        return normalize_cached_pack_relative_path(&base);
+    }
+    normalize_cached_pack_relative_path(relative)
+}
+
+fn normalize_cached_pack_relative_path(relative: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return None;
+        };
+        parts.push(part.to_str()?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 fn pack_data_cache_path(control_dir: &Path, container_id: &str) -> std::path::PathBuf {
@@ -232,4 +307,26 @@ fn atomic_write_bytes(path: std::path::PathBuf, bytes: &[u8]) -> Result<()> {
                 .map(|_| ())
         })
         .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn remove_empty_cache_dirs(root: &Path, current: &Path) -> Result<bool> {
+    let mut is_empty = true;
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if !remove_empty_cache_dirs(root, &path)? {
+                is_empty = false;
+            }
+        } else {
+            is_empty = false;
+        }
+    }
+
+    if current != root && is_empty {
+        std::fs::remove_dir(current)?;
+        return Ok(true);
+    }
+    Ok(is_empty)
 }

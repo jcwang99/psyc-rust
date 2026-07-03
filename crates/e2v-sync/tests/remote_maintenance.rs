@@ -5156,3 +5156,140 @@ fn verify_remote_recovers_from_tampered_local_pack_data_cache_with_same_length()
     );
     assert_ne!(fs::read(&cached_pack_path).unwrap(), tampered_cache_bytes);
 }
+
+#[test]
+fn verify_remote_prunes_stale_local_pack_data_cache_after_historical_rewrite() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            repo_root.join(format!("prune-packed-{index:02}.txt")),
+            format!("prune-packed-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "epoch-one".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-pack-cache-prune-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    let tracked_remote = RangeReadTrackingBackend::new(remote.clone());
+    let first = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    assert!(first.sampled_objects > 0);
+
+    let cache_root = repo_root
+        .join(".e2v")
+        .join("cache")
+        .join("pack-data")
+        .join("packs")
+        .join("data");
+    let stale_cached_pack_paths = fs::read_dir(&cache_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(
+        !stale_cached_pack_paths.is_empty(),
+        "expected initial verify_remote run to materialize pack-data cache"
+    );
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(repo_root.join("epoch-two.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-pack-cache-prune-rotate".to_string(),
+        },
+    )
+    .unwrap();
+    historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    tracked_remote.reset_range_reads();
+
+    let second = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    assert!(second.sampled_objects > 0);
+
+    let refreshed_cached_pack_paths = fs::read_dir(&cache_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(
+        !refreshed_cached_pack_paths.is_empty(),
+        "expected rewritten verify_remote run to retain active pack-data cache"
+    );
+    for stale_path in stale_cached_pack_paths {
+        assert!(
+            !stale_path.exists(),
+            "expected verify_remote to prune stale local pack-data cache file {}",
+            stale_path.display()
+        );
+        let stale_hash_path = stale_path.with_extension(format!(
+            "{}.blake3",
+            stale_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("cache")
+        ));
+        assert!(
+            !stale_hash_path.exists(),
+            "expected verify_remote to prune stale local pack-data cache hash {}",
+            stale_hash_path.display()
+        );
+    }
+}
