@@ -236,6 +236,60 @@ fn sdk_can_list_snapshots_and_checkout_older_snapshot() {
 }
 
 #[test]
+fn sdk_checkout_snapshot_reports_corrupt_state_for_invalid_checkout_mapping() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let checkout_dir = temp.path().join("checkout");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&checkout_dir).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let first = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    sdk.checkout_snapshot(CheckoutSnapshotOptions {
+        repo_root: repo_root.clone(),
+        snapshot_id: first.snapshot_id.clone(),
+        target_dir: checkout_dir.clone(),
+    })
+    .unwrap();
+
+    fs::write(
+        checkout_dir.join(".e2v-checkout-mapping.json"),
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+
+    let error = sdk
+        .checkout_snapshot(CheckoutSnapshotOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: first.snapshot_id,
+            target_dir: checkout_dir.clone(),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error
+            .message()
+            .contains("failed to decode checkout mapping"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_read_directory_entries_through_public_read_api() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
