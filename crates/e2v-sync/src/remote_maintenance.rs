@@ -735,7 +735,7 @@ pub fn verify_remote<R: RemoteBackend>(
             .join("objects")
             .join(format!("{object_id}.json"));
         let original = std::fs::read(&local_path).ok();
-        std::fs::write(&local_path, &bytes)?;
+        overwrite_local_object_bytes(&local_path, &bytes)?;
         match facade.verify_object(&options.repo_root, object_id, expected_type) {
             Ok(()) => {
                 if original.as_deref() != Some(bytes.as_slice()) {
@@ -744,9 +744,9 @@ pub fn verify_remote<R: RemoteBackend>(
             }
             Err(error) => {
                 if let Some(original_bytes) = original {
-                    std::fs::write(&local_path, original_bytes)?;
+                    overwrite_local_object_bytes(&local_path, &original_bytes)?;
                 } else {
-                    let _ = std::fs::remove_file(&local_path);
+                    let _ = remove_path_if_exists(&local_path);
                 }
                 return Err(error).with_context(|| {
                     format!("failed to authenticate sampled remote object {object_id}")
@@ -824,7 +824,7 @@ pub fn repair_remote<R: RemoteBackend>(
             .map(|existing| existing != bytes)
             .unwrap_or(true);
         if needs_repair {
-            std::fs::write(&local_path, &bytes)?;
+            overwrite_local_object_bytes(&local_path, &bytes)?;
             repaired_objects += 1;
         }
     }
@@ -1388,6 +1388,20 @@ fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
         }
     }
     Ok(unreachable)
+}
+
+fn overwrite_local_object_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::write(path, bytes) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            remove_path_if_exists(path)?;
+            std::fs::write(path, bytes)?;
+            Ok(())
+        }
+    }
 }
 
 fn remote_physical_path_for_object(

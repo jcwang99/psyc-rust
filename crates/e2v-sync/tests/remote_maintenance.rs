@@ -390,6 +390,66 @@ fn verify_remote_sample_repairs_tampered_local_copy_when_remote_object_authentic
 }
 
 #[test]
+fn verify_remote_repairs_local_object_path_conflict_when_remote_object_authenticates() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let snapshot = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-maintenance-path-conflict".to_string(),
+        },
+    )
+    .unwrap();
+    let reachable_object_ids = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&snapshot.snapshot_id)
+        .unwrap();
+
+    let local_snapshot_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", snapshot.snapshot_id));
+    let original_bytes = fs::read(&local_snapshot_path).unwrap();
+    fs::remove_file(&local_snapshot_path).unwrap();
+    fs::create_dir_all(&local_snapshot_path).unwrap();
+
+    let verified = verify_remote(
+        &remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    let repaired_bytes = fs::read(&local_snapshot_path).unwrap();
+
+    assert_eq!(verified.sampled_objects, reachable_object_ids.len());
+    assert_eq!(verified.repaired_local_objects, 1);
+    assert_eq!(repaired_bytes, original_bytes);
+}
+
+#[test]
 fn plan_historical_rewrite_reports_old_epochs_reachable_objects_and_guidance() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -506,6 +566,67 @@ fn repair_remote_restores_missing_local_object_from_remote_head() {
 
     assert_eq!(repaired.repaired_objects, 1);
     assert_eq!(fs::read(&missing_object_path).unwrap(), original_bytes);
+}
+
+#[test]
+fn repair_remote_repairs_local_object_path_conflict_from_remote_head() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let snapshot = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let reachable_object_ids = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&snapshot.snapshot_id)
+        .unwrap();
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-repair-path-conflict".to_string(),
+        },
+    )
+    .unwrap();
+
+    let repaired_object_id = reachable_object_ids
+        .last()
+        .cloned()
+        .expect("reachable object id");
+    let repaired_object_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{repaired_object_id}.json"));
+    let original_bytes = fs::read(&repaired_object_path).unwrap();
+    fs::remove_file(&repaired_object_path).unwrap();
+    fs::create_dir_all(&repaired_object_path).unwrap();
+
+    let repaired = repair_remote(
+        &remote,
+        RepairRemoteOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(repaired.repaired_objects, 1);
+    assert_eq!(fs::read(&repaired_object_path).unwrap(), original_bytes);
 }
 
 #[test]
