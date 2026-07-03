@@ -62,6 +62,143 @@ pub struct WindowsMountedFilesystemHost {
     stop_state: Arc<HostStopState>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::panic::{self, AssertUnwindSafe};
+
+    use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
+    use tempfile::tempdir;
+
+    fn init_repo(repo_root: &std::path::Path) {
+        RepositoryFacade::new()
+            .init(InitOptions {
+                repo_root: repo_root.to_path_buf(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+    }
+
+    fn commit_message(repo_root: &std::path::Path, message: &str, body: &str) -> String {
+        fs::write(repo_root.join("tracked.txt"), body).unwrap();
+        RepositoryFacade::new()
+            .commit(CommitOptions {
+                repo_root: repo_root.to_path_buf(),
+                message: message.to_string(),
+            })
+            .unwrap()
+            .snapshot_id
+    }
+
+    fn live_branch_context(repo_root: &std::path::Path) -> WinfspMountContext {
+        let branch_token = RepositoryFacade::new()
+            .open(repo_root)
+            .unwrap()
+            .branch
+            .token_hex;
+        WinfspMountContext::from_request(MountRequest::live_branch(
+            repo_root.to_path_buf(),
+            branch_token,
+            PathBuf::from("M:"),
+        ))
+        .unwrap()
+    }
+
+    fn poison_mutex<T>(mutex: &Arc<Mutex<T>>) {
+        let poisoned = Arc::clone(mutex);
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test mutex");
+        }));
+    }
+
+    fn poison_writable_vfs(context: &WinfspMountContext) {
+        let WinfspVfs::Writable(vfs) = &context.vfs else {
+            panic!("expected writable WinFSP context");
+        };
+        poison_mutex(vfs);
+    }
+
+    #[test]
+    fn cached_namespace_identity_survives_poisoned_writable_vfs_lock() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+        commit_message(&repo_root, "first", "alpha");
+        let context = live_branch_context(&repo_root);
+
+        let snapshot_id = context.namespace_snapshot_id();
+        poison_writable_vfs(&context);
+
+        let overlay = context.new_overlay_file_handle("created.txt", true);
+        assert_eq!(context.namespace_snapshot_id(), snapshot_id);
+        assert_eq!(overlay.snapshot_id(), snapshot_id);
+        assert!(overlay.layout_generation() > 0);
+    }
+
+    #[test]
+    fn open_handle_returns_error_after_poisoned_writable_vfs_lock() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+        commit_message(&repo_root, "first", "alpha");
+        let context = live_branch_context(&repo_root);
+
+        poison_writable_vfs(&context);
+
+        let error = context.open_handle("tracked.txt").unwrap_err();
+        assert!(error.to_string().contains("poison"));
+    }
+
+    #[test]
+    fn refresh_namespace_returns_error_after_poisoned_writable_vfs_lock() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+        commit_message(&repo_root, "first", "alpha");
+        let mut context = live_branch_context(&repo_root);
+
+        poison_writable_vfs(&context);
+
+        let error = context.refresh_namespace().unwrap_err();
+        assert!(error.to_string().contains("poison"));
+    }
+
+    #[test]
+    fn build_invalidation_plan_recovers_from_poisoned_observer_sets() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+        let snapshot_id = commit_message(&repo_root, "first", "alpha");
+        let context = WinfspMountContext::from_request(MountRequest::snapshot(
+            repo_root,
+            snapshot_id,
+            PathBuf::from("M:"),
+        ))
+        .unwrap();
+
+        context.remember_inode(7);
+        context.remember_directory_path("nested");
+        poison_mutex(&context.observed_inode_ids);
+        poison_mutex(&context.observed_directory_paths);
+
+        let plan = context
+            .build_invalidation_plan(&RefreshOutcome {
+                namespace_changed: true,
+                requires_invalidation: true,
+            })
+            .expect("expected invalidation plan");
+        assert_eq!(plan.inode_ids, vec![7]);
+        assert_eq!(plan.directory_paths, vec!["nested".to_string()]);
+    }
+}
+
 impl Drop for WindowsMountedFilesystemHost {
     fn drop(&mut self) {
         self.stop_state.request_stop();
@@ -76,6 +213,19 @@ impl Drop for WindowsMountedFilesystemHost {
             delete(self.native_filesystem.cast());
         }
     }
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_writable_vfs(
+    vfs: &Arc<Mutex<WritableVfs>>,
+) -> Result<std::sync::MutexGuard<'_, WritableVfs>> {
+    vfs.lock()
+        .map_err(|_| anyhow::anyhow!("WinFSP writable VFS state is poisoned"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -811,7 +961,7 @@ struct HostStopState {
 
 impl HostStopState {
     fn request_stop(&self) {
-        *self.stop_requested.lock().unwrap() = true;
+        *lock_or_recover(&self.stop_requested) = true;
     }
 }
 
@@ -1880,14 +2030,17 @@ unsafe extern "C" fn host_set_delete(
     let WinfspVfs::Writable(vfs) = &context.vfs else {
         return unsupported_winfsp_status("set_delete", STATUS_MEDIA_WRITE_PROTECTED);
     };
+    let mut vfs = match lock_writable_vfs(vfs) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            debug_winfsp("set_delete_err", &error.to_string());
+            return STATUS_ACCESS_DENIED;
+        }
+    };
     let result = if handle.is_directory() {
-        vfs.lock()
-            .unwrap()
-            .delete_directory_and_writeback(handle.logical_path(), "winfsp rmdir")
+        vfs.delete_directory_and_writeback(handle.logical_path(), "winfsp rmdir")
     } else {
-        vfs.lock()
-            .unwrap()
-            .delete_file_and_writeback(handle.logical_path(), "winfsp delete")
+        vfs.delete_file_and_writeback(handle.logical_path(), "winfsp delete")
     };
     if let Err(error) = result {
         debug_winfsp("set_delete_err", &error.to_string());
@@ -1914,11 +2067,16 @@ unsafe extern "C" fn host_rename(
     let WinfspVfs::Writable(vfs) = &context.vfs else {
         return unsupported_winfsp_status("rename", STATUS_MEDIA_WRITE_PROTECTED);
     };
-    if let Err(error) = vfs.lock().unwrap().rename_and_writeback(
-        handle.logical_path(),
-        &target_logical_path,
-        "winfsp rename",
-    ) {
+    let mut vfs = match lock_writable_vfs(vfs) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            debug_winfsp("rename_err", &error.to_string());
+            return STATUS_ACCESS_DENIED;
+        }
+    };
+    if let Err(error) =
+        vfs.rename_and_writeback(handle.logical_path(), &target_logical_path, "winfsp rename")
+    {
         debug_winfsp("rename_err", &error.to_string());
         return STATUS_ACCESS_DENIED;
     }
@@ -1997,6 +2155,8 @@ pub trait WinfspInvalidator {
 pub struct WinfspMountContext {
     request: MountRequest,
     cache_policy: CachePolicy,
+    namespace_snapshot_id: String,
+    namespace_layout_generation: u64,
     observed_inode_ids: Arc<Mutex<BTreeSet<u64>>>,
     observed_directory_paths: Arc<Mutex<BTreeSet<String>>>,
     add_dir_info: Option<FspFileSystemAddDirInfoFn>,
@@ -2022,7 +2182,20 @@ impl WinfspMountContext {
         };
         let cache_policy = match &vfs {
             WinfspVfs::ReadOnly(vfs) => vfs.cache_policy(),
-            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().cache_policy(),
+            WinfspVfs::Writable(vfs) => lock_writable_vfs(vfs)?.cache_policy(),
+        };
+        let (namespace_snapshot_id, namespace_layout_generation) = match &vfs {
+            WinfspVfs::ReadOnly(vfs) => (
+                vfs.namespace_snapshot_id(),
+                vfs.namespace_layout_generation(),
+            ),
+            WinfspVfs::Writable(vfs) => {
+                let vfs = lock_writable_vfs(vfs)?;
+                (
+                    vfs.namespace_snapshot_id(),
+                    vfs.namespace_layout_generation(),
+                )
+            }
         };
         let security_descriptor = if matches!(vfs, WinfspVfs::Writable(_)) {
             Arc::clone(
@@ -2040,6 +2213,8 @@ impl WinfspMountContext {
         Ok(Self {
             request,
             cache_policy,
+            namespace_snapshot_id,
+            namespace_layout_generation,
             observed_inode_ids: Arc::new(Mutex::new(BTreeSet::new())),
             observed_directory_paths: Arc::new(Mutex::new(BTreeSet::new())),
             add_dir_info: None,
@@ -2061,16 +2236,21 @@ impl WinfspMountContext {
     }
 
     pub fn namespace_snapshot_id(&self) -> String {
-        match &self.vfs {
-            WinfspVfs::ReadOnly(vfs) => vfs.namespace_snapshot_id(),
-            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().namespace_snapshot_id(),
-        }
+        self.namespace_snapshot_id.clone()
     }
 
     pub fn refresh_namespace(&mut self) -> Result<RefreshOutcome> {
         match &mut self.vfs {
             WinfspVfs::ReadOnly(vfs) => vfs.refresh_live_branch(),
-            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().refresh_live_branch(),
+            WinfspVfs::Writable(vfs) => {
+                let refresh = lock_writable_vfs(vfs)?.refresh_live_branch()?;
+                if refresh.namespace_changed {
+                    let vfs = lock_writable_vfs(vfs)?;
+                    self.namespace_snapshot_id = vfs.namespace_snapshot_id();
+                    self.namespace_layout_generation = vfs.namespace_layout_generation();
+                }
+                Ok(refresh)
+            }
         }
     }
 
@@ -2089,14 +2269,14 @@ impl WinfspMountContext {
         let inode_ids = self
             .observed_inode_ids
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .copied()
             .collect::<Vec<_>>();
         let directory_paths = self
             .observed_directory_paths
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -2148,7 +2328,7 @@ impl WinfspMountContext {
     ) -> Result<WinfspOpenHandle> {
         let opened = match &self.vfs {
             WinfspVfs::ReadOnly(vfs) => vfs.open_file(logical_path)?,
-            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().open_file(logical_path)?,
+            WinfspVfs::Writable(vfs) => lock_writable_vfs(vfs)?.open_file(logical_path)?,
         };
         let handle = WinfspOpenHandle::from_opened_file(opened).with_writable(writable);
         self.remember_inode(handle.inode_id());
@@ -2161,10 +2341,9 @@ impl WinfspMountContext {
                 WinfspVfs::ReadOnly(vfs) => {
                     vfs.require_semantic(crate::VfsSemantic::WritableHandles)?
                 }
-                WinfspVfs::Writable(vfs) => vfs
-                    .lock()
-                    .unwrap()
-                    .require_semantic(crate::VfsSemantic::WritableHandles)?,
+                WinfspVfs::Writable(vfs) => {
+                    lock_writable_vfs(vfs)?.require_semantic(crate::VfsSemantic::WritableHandles)?
+                }
             }
         }
         self.open_handle_with_options(&request.logical_path, request.writable)
@@ -2187,7 +2366,7 @@ impl WinfspMountContext {
         }
         match &self.vfs {
             WinfspVfs::ReadOnly(vfs) => vfs.read(opened_file, offset, length),
-            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().read(opened_file, offset, length),
+            WinfspVfs::Writable(vfs) => lock_writable_vfs(vfs)?.read(opened_file, offset, length),
         }
     }
 
@@ -2199,14 +2378,14 @@ impl WinfspMountContext {
         }
         match &self.vfs {
             WinfspVfs::ReadOnly(vfs) => vfs.read_dir(logical_path),
-            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().read_dir(logical_path),
+            WinfspVfs::Writable(vfs) => lock_writable_vfs(vfs)?.read_dir(logical_path),
         }
     }
 
     pub fn stat_path(&self, logical_path: &str) -> Result<VfsNodeMetadata> {
         let metadata = match &self.vfs {
             WinfspVfs::ReadOnly(vfs) => vfs.stat_path(logical_path)?,
-            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().stat_path(logical_path)?,
+            WinfspVfs::Writable(vfs) => lock_writable_vfs(vfs)?.stat_path(logical_path)?,
         };
         self.remember_inode(metadata.inode_id);
         if metadata.kind == crate::VfsNodeKind::Directory {
@@ -2240,14 +2419,11 @@ impl WinfspMountContext {
     }
 
     fn remember_inode(&self, inode_id: u64) {
-        self.observed_inode_ids.lock().unwrap().insert(inode_id);
+        lock_or_recover(&self.observed_inode_ids).insert(inode_id);
     }
 
     fn remember_directory_path(&self, logical_path: &str) {
-        self.observed_directory_paths
-            .lock()
-            .unwrap()
-            .insert(logical_path.to_string());
+        lock_or_recover(&self.observed_directory_paths).insert(logical_path.to_string());
     }
 
     fn mount_is_writable(&self) -> bool {
@@ -2260,13 +2436,10 @@ impl WinfspMountContext {
                 vfs.namespace_snapshot_id(),
                 vfs.namespace_layout_generation(),
             ),
-            WinfspVfs::Writable(vfs) => {
-                let vfs = vfs.lock().unwrap();
-                (
-                    vfs.namespace_snapshot_id(),
-                    vfs.namespace_layout_generation(),
-                )
-            }
+            WinfspVfs::Writable(_) => (
+                self.namespace_snapshot_id.clone(),
+                self.namespace_layout_generation,
+            ),
         };
         WinfspOpenHandle {
             opened_file: None,
@@ -2289,9 +2462,7 @@ impl WinfspMountContext {
         let WinfspVfs::Writable(vfs) = &self.vfs else {
             anyhow::bail!("directory creation is not available for read-only mounts");
         };
-        vfs.lock()
-            .unwrap()
-            .create_directory_and_writeback(logical_path, "winfsp mkdir")?;
+        lock_writable_vfs(vfs)?.create_directory_and_writeback(logical_path, "winfsp mkdir")?;
         let metadata = self.stat_path(logical_path)?;
         Ok(WinfspOpenHandle::from_opened_file_stub(
             metadata.snapshot_id,
@@ -2312,7 +2483,7 @@ impl WinfspMountContext {
                     WinfspVfs::ReadOnly(vfs) => {
                         vfs.read(opened_file, 0, opened_file.file_size() as usize)?
                     }
-                    WinfspVfs::Writable(vfs) => vfs.lock().unwrap().read(
+                    WinfspVfs::Writable(vfs) => lock_writable_vfs(vfs)?.read(
                         opened_file,
                         0,
                         opened_file.file_size() as usize,
@@ -2363,7 +2534,7 @@ impl WinfspMountContext {
         let WinfspVfs::Writable(vfs) = &self.vfs else {
             anyhow::bail!("write staging is not available for read-only mounts");
         };
-        let mut vfs = vfs.lock().unwrap();
+        let mut vfs = lock_writable_vfs(vfs)?;
         vfs.write_file(handle.logical_path(), bytes)?;
         let _ = vfs.writeback("winfsp writeback")?;
         let reopened = vfs.open_file(handle.logical_path())?;
