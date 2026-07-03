@@ -93,8 +93,7 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
         &root.segments,
         &mut locations,
     )?;
-
-    std::fs::write(cache_dir.join("root.json"), root_bytes)?;
+    persist_root_cache_if_changed(&cache_dir.join("root.json"), &root_bytes)?;
     Ok(locations)
 }
 
@@ -279,6 +278,19 @@ fn prune_stale_cached_segments(cache_dir: &Path, live_segment_paths: &[String]) 
             let _ = std::fs::remove_file(path);
         }
     }
+    Ok(())
+}
+
+fn persist_root_cache_if_changed(cache_path: &Path, root_bytes: &[u8]) -> Result<()> {
+    if let Ok(existing_bytes) = std::fs::read(cache_path)
+        && existing_bytes == root_bytes
+    {
+        return Ok(());
+    }
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cache_path, root_bytes)?;
     Ok(())
 }
 
@@ -965,7 +977,9 @@ mod tests {
 
         let (index_one, payload_one) =
             build_pack("op-1", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
-        remote.put_physical(&index_one.data_path, &payload_one).unwrap();
+        remote
+            .put_physical(&index_one.data_path, &payload_one)
+            .unwrap();
         let segment_one = "packs/index/op-1-00000000.json";
         remote
             .put_physical(
@@ -987,12 +1001,15 @@ mod tests {
         )
         .unwrap();
         load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets)).unwrap();
-        let stale_cache_path = cached_segment_path(&pack_index_cache_dir(&control_dir), segment_one);
+        let stale_cache_path =
+            cached_segment_path(&pack_index_cache_dir(&control_dir), segment_one);
         assert!(stale_cache_path.is_file());
 
         let (index_two, payload_two) =
             build_pack("op-2", 0, &[("def".to_string(), b"world".to_vec())]).unwrap();
-        remote.put_physical(&index_two.data_path, &payload_two).unwrap();
+        remote
+            .put_physical(&index_two.data_path, &payload_two)
+            .unwrap();
         let segment_two = "packs/index/op-2-00000000.json";
         remote
             .put_physical(
@@ -1023,6 +1040,59 @@ mod tests {
         assert!(
             !stale_cache_path.exists(),
             "pack-index cache should prune segment files that are no longer referenced by the current root"
+        );
+    }
+
+    #[test]
+    fn unchanged_pack_index_root_cache_is_not_rewritten() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        let (index, payload) =
+            build_pack("op", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index.data_path, &payload).unwrap();
+        let segment_path = "packs/index/op-00000000.json";
+        let segment_bytes =
+            encode_pack_index_segment_bytes(&secrets, segment_path, &serde_json::to_vec(&index).unwrap())
+                .unwrap();
+        remote.put_physical(segment_path, &segment_bytes).unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_path.to_string()],
+        )
+        .unwrap();
+
+        let first =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(first.contains_key("abc"));
+
+        let root_cache_path = pack_index_cache_dir(&control_dir).join("root.json");
+        let original_root_bytes = std::fs::read(&root_cache_path).unwrap();
+        std::fs::write(&root_cache_path, b"sentinel-root-cache").unwrap();
+
+        let second =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(second.contains_key("abc"));
+        assert_eq!(
+            std::fs::read(&root_cache_path).unwrap(),
+            original_root_bytes,
+            "pack-index loader should refresh the cached root bytes when the cache file diverges"
+        );
+
+        std::fs::write(&root_cache_path, &original_root_bytes).unwrap();
+        let unchanged_before = std::fs::metadata(&root_cache_path).unwrap().modified().unwrap();
+        let third =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(third.contains_key("abc"));
+        let unchanged_after = std::fs::metadata(&root_cache_path).unwrap().modified().unwrap();
+        assert_eq!(
+            unchanged_after, unchanged_before,
+            "pack-index loader should avoid rewriting an unchanged cached root file"
         );
     }
 
