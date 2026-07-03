@@ -96,7 +96,9 @@ impl RefStore for MemoryBackend {
         token.validate()?;
         let path = Self::ref_path(token);
         match self.get_physical(&path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .context("failed to decode remote branch ref")
+                .map(Some),
             Err(error) if is_missing_physical_object_error(&error) => Ok(None),
             Err(error) => Err(error),
         }
