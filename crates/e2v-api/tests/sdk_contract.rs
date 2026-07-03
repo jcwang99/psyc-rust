@@ -7,6 +7,7 @@ use e2v_api::{
     InitRepositoryOptions, ObliviousLayoutPlanRequest, PullRequest, PushRequest,
     ReshuffleObliviousLayoutRequest, Sdk, SdkErrorCode, parse_remote_spec,
 };
+use e2v_core::RepositoryFacade;
 
 fn file_remote_spec(path: &Path) -> String {
     format!("file://{}", path.to_string_lossy().replace('\\', "/"))
@@ -276,6 +277,46 @@ fn sdk_can_read_directory_entries_through_public_read_api() {
         .map(|entry| entry.name)
         .collect::<Vec<_>>();
     assert_eq!(nested_names, vec!["base.txt".to_string()]);
+}
+
+#[test]
+fn sdk_reports_missing_local_chunk_as_corrupt_state_instead_of_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), "hello sdk").unwrap();
+    let commit = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let read = sdk.open_read_handle(&repo_root).unwrap();
+    let snapshot = read.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read.open_file(&snapshot, "hello.txt").unwrap();
+
+    let core_read = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let core_snapshot = core_read.open_snapshot(&commit.snapshot_id).unwrap();
+    let core_file = core_read.open_file(&core_snapshot, "hello.txt").unwrap();
+    let chunk_id = core_file.debug_chunk_ids()[0].clone();
+    let chunk_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{chunk_id}.json"));
+    fs::remove_file(&chunk_path).unwrap();
+
+    let error = read.read_range(&file, 0, 64).unwrap_err();
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
 }
 
 #[test]

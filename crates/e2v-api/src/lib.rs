@@ -1389,7 +1389,15 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
 
-    let code = if lower.contains("unsupported remote spec")
+    let code = if lower.contains("authentication failed")
+        || lower.contains("tampered")
+        || lower.contains("stale-layout fallback unavailable")
+        || lower.contains("missing physical chunk")
+        || lower.contains("cached pack index has no entry")
+        || lower.contains("corrupt")
+    {
+        SdkErrorCode::CorruptState
+    } else if lower.contains("unsupported remote spec")
         || lower.contains("unsupported remote url scheme")
         || lower.contains("path traversal")
         || lower.contains("must not be empty")
@@ -1420,11 +1428,6 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         SdkErrorCode::RollbackDetected
     } else if lower.contains("unsupported") {
         SdkErrorCode::Unsupported
-    } else if lower.contains("corrupt")
-        || lower.contains("tampered")
-        || lower.contains("authentication failed")
-    {
-        SdkErrorCode::CorruptState
     } else if lower.contains("conflict") {
         SdkErrorCode::Conflict
     } else if lower.contains("io error")
