@@ -248,32 +248,6 @@ pub mod sync_support {
             Ok(expected.trim() == hasher.finalize().to_hex().to_string())
         }
 
-        fn cached_pack_data_path(repo_root: &Path, container_id: &str) -> Result<PathBuf> {
-            let relative = Path::new(container_id);
-            ensure!(
-                !container_id.is_empty(),
-                "cached pack container id must not be empty"
-            );
-            ensure!(
-                !relative.is_absolute(),
-                "cached pack container id must be relative"
-            );
-            ensure!(
-                relative
-                    .components()
-                    .all(|component| matches!(component, Component::Normal(_))),
-                "cached pack container path traversal is not allowed"
-            );
-            let mut path = repo_root.join(".e2v").join("cache").join("pack-data");
-            for segment in relative.components() {
-                let Component::Normal(segment) = segment else {
-                    unreachable!("validated above")
-                };
-                path.push(segment);
-            }
-            Ok(path)
-        }
-
         let physical_ref = load_cached_pack_physical_ref_for_object_id(&repo_root, object_id)?;
         let offset = usize::try_from(physical_ref.offset.unwrap_or(0))
             .map_err(|_| anyhow::anyhow!("cached pack offset is too large to read"))?;
