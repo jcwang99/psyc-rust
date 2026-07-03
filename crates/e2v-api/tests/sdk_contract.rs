@@ -1705,6 +1705,72 @@ fn sdk_historical_rewrite_plan_reports_corrupt_state_for_invalid_current_keyring
 }
 
 #[test]
+fn sdk_historical_rewrite_execute_reports_corrupt_state_for_invalid_checkpoint_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-invalid-history-rewrite-checkpoint".to_string(),
+    })
+    .unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets =
+        e2v_core::sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir).unwrap();
+    let checkpoint_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "history-rewrite-checkpoint",
+        "history_rewrite_checkpoint",
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+    let checkpoint_path = control_dir
+        .join("journal")
+        .join("sync")
+        .join("history-rewrite.checkpoint");
+    fs::create_dir_all(checkpoint_path.parent().unwrap()).unwrap();
+    fs::write(&checkpoint_path, checkpoint_bytes).unwrap();
+
+    let error = sdk
+        .historical_rewrite_default_remote_execute(HistoricalRewriteExecuteRequest {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error
+            .message()
+            .contains("failed to decode historical rewrite checkpoint"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

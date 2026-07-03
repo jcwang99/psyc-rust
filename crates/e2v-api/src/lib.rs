@@ -1396,6 +1396,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     } else if lower.contains("authentication failed")
         || lower.contains("tampered")
         || lower.contains("stale-layout fallback unavailable")
+        || lower.contains("failed to decode historical rewrite checkpoint")
         || lower.contains("failed to decode remote layout root")
         || lower.contains("failed to decode remote keyring pointer")
         || lower.contains("failed to decode remote keyring state")
@@ -1502,6 +1503,15 @@ mod tests {
     #[test]
     fn map_error_treats_corrupted_current_keyring_pointer_as_corrupt_state() {
         let error = anyhow::anyhow!("failed to decode current keyring pointer");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_historical_rewrite_checkpoint_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decode historical rewrite checkpoint");
 
         let mapped = map_error(error);
 
