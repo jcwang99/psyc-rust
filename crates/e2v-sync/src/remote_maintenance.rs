@@ -1325,7 +1325,8 @@ fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
     }
     for (object_id, location) in pack_locations {
         if reachable.contains_object_id(object_id)? {
-            reachable.insert_physical_ref(&location.physical_ref().container_id)?;
+            let physical_ref = location.physical_ref()?;
+            reachable.insert_physical_ref(&physical_ref.container_id)?;
         }
     }
     for segment_path in pack_index_segment_paths {
@@ -1365,7 +1366,14 @@ fn remote_physical_path_for_object(
     }
     pack_locations
         .get(object_id)
-        .map(|location| location.physical_ref().container_id)
+        .map(|location| {
+            location
+                .physical_ref()
+                .map(|physical_ref| physical_ref.container_id)
+        })
+        .transpose()
+        .ok()
+        .flatten()
 }
 
 fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> {

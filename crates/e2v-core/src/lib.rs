@@ -465,6 +465,26 @@ pub mod sync_support {
                 .join(segment_path.replace('/', "__"))
         }
 
+        fn validate_cached_pack_data_path(data_path: &str) -> Result<()> {
+            ensure!(
+                data_path.starts_with(REMOTE_PACK_DATA_PREFIX),
+                "invalid aggregate pack data path {}",
+                data_path
+            );
+            let relative = data_path
+                .strip_prefix(REMOTE_PACK_DATA_PREFIX)
+                .unwrap_or_default();
+            let relative_path = Path::new(relative);
+            ensure!(!relative.is_empty(), "pack data path must not be empty");
+            ensure!(
+                relative_path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+                "pack data path traversal is not allowed"
+            );
+            Ok(())
+        }
+
         fn decode_root(bytes: &[u8], secrets: &RepoSecrets) -> Result<CachedPackIndexRoot> {
             let plaintext = decrypt_control_record_for_sync(
                 secrets,
@@ -503,6 +523,7 @@ pub mod sync_support {
                     "invalid pack data path {}",
                     index.data_path
                 );
+                validate_cached_pack_data_path(&index.data_path)?;
                 return Ok(index
                     .entries
                     .into_iter()
@@ -553,11 +574,7 @@ pub mod sync_support {
                     format!("cached pack index segment is missing for {}", segment_path)
                 })?;
             for entry in decode_segment(segment_path, &segment_bytes, &secrets)? {
-                ensure!(
-                    entry.data_path.starts_with(REMOTE_PACK_DATA_PREFIX),
-                    "invalid aggregate pack data path {}",
-                    entry.data_path
-                );
+                validate_cached_pack_data_path(&entry.data_path)?;
                 if entry.object_id == object_id {
                     return CachedPackedObjectLocation {
                         data_path: entry.data_path,

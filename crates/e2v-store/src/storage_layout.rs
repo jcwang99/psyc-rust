@@ -1,3 +1,5 @@
+use std::path::{Component, Path};
+
 use anyhow::{Result, ensure};
 
 use crate::logical_object_store::{PhysicalObjectRef, validate_object_id_value};
@@ -135,6 +137,15 @@ impl StorageLayout for PackStorageLayout {
                     container_id.starts_with("packs/data/"),
                     "pack storage layout requires pack data container ids"
                 );
+                let relative = container_id.strip_prefix("packs/data/").unwrap_or_default();
+                let relative_path = Path::new(relative);
+                ensure!(!relative.is_empty(), "pack data path must not be empty");
+                ensure!(
+                    relative_path
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                    "pack data path traversal is not allowed"
+                );
                 Ok(PhysicalObjectRef::pack(
                     container_id.to_string(),
                     offset,
@@ -213,6 +224,24 @@ mod tests {
         assert_eq!(reference.container_id, "packs/data/pack-01.bin");
         assert_eq!(reference.offset, Some(128));
         assert_eq!(reference.length, 4096);
+    }
+
+    #[test]
+    fn pack_storage_layout_rejects_traversing_pack_container_paths() {
+        let layout = PackStorageLayout;
+
+        let error = layout
+            .resolve(LayoutObjectLocation::PackedObject {
+                container_id: "packs/data/../escape.bin",
+                offset: 0,
+                length: 5,
+            })
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("path traversal"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

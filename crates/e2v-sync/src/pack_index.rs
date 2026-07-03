@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::journal::validate_sync_identifier;
 use crate::pack::{
-    ObjectPackIndex, PackedObjectLocation, REMOTE_PACK_DATA_PREFIX, REMOTE_PACK_INDEX_PREFIX,
+    ObjectPackIndex, PackedObjectLocation, REMOTE_PACK_INDEX_PREFIX,
     append_pack_index_locations_from_bytes, pack_paths,
 };
 
@@ -448,23 +448,17 @@ fn append_segment_locations<B: BlobStore>(
     );
     for entry in aggregate.entries {
         ensure!(
-            entry.data_path.starts_with(REMOTE_PACK_DATA_PREFIX),
-            "invalid aggregate pack data path {}",
-            entry.data_path
-        );
-        ensure!(
             !locations.contains_key(&entry.object_id),
             "duplicate packed object id {}",
             entry.object_id
         );
-        locations.insert(
-            entry.object_id,
-            PackedObjectLocation {
-                data_path: entry.data_path,
-                offset: entry.offset as usize,
-                length: entry.length as usize,
-            },
-        );
+        let location = PackedObjectLocation {
+            data_path: entry.data_path,
+            offset: entry.offset as usize,
+            length: entry.length as usize,
+        };
+        location.validate()?;
+        locations.insert(entry.object_id, location);
     }
     Ok(())
 }
@@ -1127,6 +1121,53 @@ mod tests {
         assert_eq!(
             plaintext, compact_json,
             "compacted pack-index segments should not spend ciphertext budget on pretty-printed JSON whitespace"
+        );
+    }
+
+    #[test]
+    fn compacted_pack_index_segment_rejects_traversing_pack_data_paths() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        let segment_path = "pack-index/segments/compact-00000000000000000001.json";
+        let aggregate = AggregatePackIndexSegment {
+            schema_version: PACK_INDEX_ROOT_SCHEMA_VERSION,
+            entries: vec![AggregatePackIndexEntry {
+                object_id: "abc".to_string(),
+                data_path: "packs/data/../escape.bin".to_string(),
+                offset: 0,
+                length: 5,
+            }],
+        };
+        remote
+            .put_physical(
+                segment_path,
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    segment_path,
+                    &serde_json::to_vec(&aggregate).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_path.to_string()],
+        )
+        .unwrap();
+
+        let error =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("path traversal")
+                || error
+                    .to_string()
+                    .contains("invalid aggregate pack data path"),
+            "unexpected error: {error:#}"
         );
     }
 }

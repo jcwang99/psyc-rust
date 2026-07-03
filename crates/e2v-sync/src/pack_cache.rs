@@ -23,7 +23,7 @@ pub(crate) fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
     let Some(location) = pack_locations.get(object_id) else {
         return Ok(None);
     };
-    let physical_ref = location.physical_ref();
+    let physical_ref = location.physical_ref()?;
     let offset = usize::try_from(physical_ref.offset.unwrap_or(0))
         .map_err(|_| anyhow::anyhow!("pack offset is too large to read on this platform"))?;
     let length = usize::try_from(physical_ref.length)
@@ -100,7 +100,8 @@ pub(crate) fn preload_cached_pack_data(
     pack_cache: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
     for location in pack_locations.values() {
-        let container_id = &location.physical_ref().container_id;
+        let physical_ref = location.physical_ref()?;
+        let container_id = &physical_ref.container_id;
         if pack_cache.contains_key(container_id) {
             continue;
         }

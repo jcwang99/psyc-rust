@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use e2v_store::{
     BlobStore, LayoutObjectLocation, PackStorageLayout, PhysicalObjectRef, StorageLayout,
 };
@@ -36,14 +36,29 @@ pub struct PackedObjectLocation {
 }
 
 impl PackedObjectLocation {
-    pub fn physical_ref(&self) -> PhysicalObjectRef {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.data_path.starts_with(REMOTE_PACK_DATA_PREFIX),
+            "invalid pack data path {}",
+            self.data_path
+        );
+        validate_pack_relative_path(
+            self.data_path
+                .strip_prefix(REMOTE_PACK_DATA_PREFIX)
+                .unwrap_or_default(),
+        )?;
+        Ok(())
+    }
+
+    pub fn physical_ref(&self) -> Result<PhysicalObjectRef> {
+        self.validate()?;
         PackStorageLayout
             .resolve(LayoutObjectLocation::PackedObject {
                 container_id: &self.data_path,
                 offset: self.offset as u64,
                 length: self.length as u64,
             })
-            .expect("packed object locations must resolve through pack storage layout")
+            .context("packed object locations must resolve through pack storage layout")
     }
 }
 
@@ -302,7 +317,7 @@ mod tests {
             length: 64,
         };
 
-        let physical_ref = location.physical_ref();
+        let physical_ref = location.physical_ref().unwrap();
 
         assert_eq!(physical_ref.layout_id, "pack");
         assert_eq!(physical_ref.container_id, "packs/data/op-00000000.bin");

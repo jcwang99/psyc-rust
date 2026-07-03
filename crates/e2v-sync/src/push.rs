@@ -167,7 +167,10 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
     }
 
     if let Some(location) = pack_locations.get(object_id) {
-        let physical_ref = location.physical_ref();
+        let physical_ref = match location.physical_ref() {
+            Ok(physical_ref) => physical_ref,
+            Err(_) => return false,
+        };
         if !pack_cache.contains_key(&physical_ref.container_id) {
             let pack_len = match remote.stat_physical(&physical_ref.container_id) {
                 Ok(stat) => match usize::try_from(stat.length) {

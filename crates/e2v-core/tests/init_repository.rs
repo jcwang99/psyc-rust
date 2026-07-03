@@ -3334,6 +3334,75 @@ fn sync_support_stops_scanning_cached_segments_after_resolving_target_object() {
 }
 
 #[test]
+fn sync_support_rejects_cached_compacted_segment_with_traversing_pack_data_path() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["pack-index/segments/compact-00000000000000000007.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "entries": [
+            {
+                "object_id": "abc",
+                "data_path": "packs/data/../escape.bin",
+                "offset": 3u64,
+                "length": 5u64,
+            }
+        ],
+    });
+    let segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:pack-index/segments/compact-00000000000000000007.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("pack-index__segments__compact-00000000000000000007.json"),
+        segment_bytes,
+    )
+    .unwrap();
+
+    let error =
+        e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(&repo_root, "abc")
+            .unwrap_err();
+
+    assert!(
+        error.to_string().contains("path traversal")
+            || error
+                .to_string()
+                .contains("invalid aggregate pack data path"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn read_range_falls_back_to_cached_pack_data_when_loose_chunk_is_missing() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
