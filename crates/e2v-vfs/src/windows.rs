@@ -39,20 +39,18 @@ const VOLUME_PARAMS_VOLUME_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 0;
 const VOLUME_PARAMS_DIR_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 1;
 const FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE: i32 = 0;
 
-static READ_ONLY_SECURITY_DESCRIPTOR_BYTES: LazyLock<Arc<SecurityDescriptorBytes>> =
+static READ_ONLY_SECURITY_DESCRIPTOR_BYTES: LazyLock<Result<Arc<SecurityDescriptorBytes>>> =
     LazyLock::new(|| {
-        Arc::new(
-            SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
-                .expect("WinFSP read-only security descriptor should be valid"),
-        )
+        SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
+            .map(Arc::new)
+            .map_err(|error| error.context("failed to parse WinFSP read-only security descriptor"))
     });
 
-static WRITABLE_SECURITY_DESCRIPTOR_BYTES: LazyLock<Arc<SecurityDescriptorBytes>> =
+static WRITABLE_SECURITY_DESCRIPTOR_BYTES: LazyLock<Result<Arc<SecurityDescriptorBytes>>> =
     LazyLock::new(|| {
-        Arc::new(
-            SecurityDescriptorBytes::from_sddl(WRITABLE_SECURITY_DESCRIPTOR_SDDL)
-                .expect("WinFSP writable security descriptor should be valid"),
-        )
+        SecurityDescriptorBytes::from_sddl(WRITABLE_SECURITY_DESCRIPTOR_SDDL)
+            .map(Arc::new)
+            .map_err(|error| error.context("failed to parse WinFSP writable security descriptor"))
     });
 
 #[derive(Debug)]
@@ -2027,9 +2025,17 @@ impl WinfspMountContext {
             WinfspVfs::Writable(vfs) => vfs.lock().unwrap().cache_policy(),
         };
         let security_descriptor = if matches!(vfs, WinfspVfs::Writable(_)) {
-            Arc::clone(&WRITABLE_SECURITY_DESCRIPTOR_BYTES)
+            Arc::clone(
+                WRITABLE_SECURITY_DESCRIPTOR_BYTES
+                    .as_ref()
+                    .map_err(|error| anyhow::anyhow!("{error:#}"))?,
+            )
         } else {
-            Arc::clone(&READ_ONLY_SECURITY_DESCRIPTOR_BYTES)
+            Arc::clone(
+                READ_ONLY_SECURITY_DESCRIPTOR_BYTES
+                    .as_ref()
+                    .map_err(|error| anyhow::anyhow!("{error:#}"))?,
+            )
         };
         Ok(Self {
             request,

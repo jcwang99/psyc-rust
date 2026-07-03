@@ -1161,7 +1161,7 @@ fn winfsp_security_callbacks_reuse_a_single_cached_descriptor_parse() {
         "WinFSP host should parse each static security descriptor once and reuse cached bytes, found {parse_count} parses"
     );
     assert!(
-        source.contains("LazyLock<Arc<SecurityDescriptorBytes>>"),
+        source.contains("LazyLock<Result<Arc<SecurityDescriptorBytes>>>"),
         "WinFSP host should cache parsed security descriptors behind LazyLock statics"
     );
 }
@@ -3429,13 +3429,40 @@ fn windows_mount_context_source_keeps_security_descriptor_parsing_behind_lazy_ca
     .unwrap();
 
     assert!(
-        source.contains("LazyLock<Arc<SecurityDescriptorBytes>>"),
+        source.contains("LazyLock<Result<Arc<SecurityDescriptorBytes>>>"),
         "WinFSP mount context should keep parsed security descriptors behind a LazyLock cache"
     );
+    let security_descriptor_selection = source
+        .split("let security_descriptor = if matches!(vfs, WinfspVfs::Writable(_)) {")
+        .nth(1)
+        .and_then(|rest| rest.split("        Ok(Self {").next())
+        .expect("WinFSP mount context should select a cached security descriptor");
     assert!(
-        source.contains("Arc::clone(&READ_ONLY_SECURITY_DESCRIPTOR_BYTES)")
-            || source.contains("Arc::clone(&WRITABLE_SECURITY_DESCRIPTOR_BYTES)"),
+        security_descriptor_selection.contains("READ_ONLY_SECURITY_DESCRIPTOR_BYTES")
+            && security_descriptor_selection.contains("WRITABLE_SECURITY_DESCRIPTOR_BYTES")
+            && security_descriptor_selection.contains(".as_ref()")
+            && security_descriptor_selection.contains("map_err(|error| anyhow::anyhow!(\"{error:#}\"))?"),
         "WinFSP mount context should reuse cached security descriptor bytes instead of reparsing SDDL per request"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_mount_context_source_does_not_expect_security_descriptor_parse_success() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("expect(\"WinFSP read-only security descriptor should be valid\")"),
+        "WinFSP mount setup should surface read-only security descriptor parse failures as errors instead of panicking"
+    );
+    assert!(
+        !source.contains("expect(\"WinFSP writable security descriptor should be valid\")"),
+        "WinFSP mount setup should surface writable security descriptor parse failures as errors instead of panicking"
     );
 }
 
