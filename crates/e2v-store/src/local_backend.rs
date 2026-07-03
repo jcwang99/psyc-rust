@@ -304,7 +304,8 @@ impl RefStore for LocalFolderBackend {
             .map(|(path, token)| -> Result<ListedRef> {
                 Ok(ListedRef {
                     token: RefToken::new(token),
-                    stored: serde_json::from_slice(&self.get_physical(&path)?)?,
+                    stored: serde_json::from_slice(&self.get_physical(&path)?)
+                        .context("failed to decode remote branch ref")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

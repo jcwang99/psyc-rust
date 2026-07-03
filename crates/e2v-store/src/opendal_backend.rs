@@ -630,7 +630,8 @@ impl RefStore for OpendalMemoryBackend {
             .map(|(path, token)| -> Result<ListedRef> {
                 Ok(ListedRef {
                     token: RefToken::new(token),
-                    stored: serde_json::from_slice(&self.get_physical(&path)?)?,
+                    stored: serde_json::from_slice(&self.get_physical(&path)?)
+                        .context("failed to decode remote branch ref")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -710,7 +711,8 @@ impl RefStore for OpendalWebdavBackend {
             .map(|(path, token)| -> Result<ListedRef> {
                 Ok(ListedRef {
                     token: RefToken::new(token),
-                    stored: serde_json::from_slice(&self.get_physical(&path)?)?,
+                    stored: serde_json::from_slice(&self.get_physical(&path)?)
+                        .context("failed to decode remote branch ref")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1031,7 +1033,8 @@ impl RefStore for OpendalS3Backend {
             .map(|(path, token)| -> Result<ListedRef> {
                 Ok(ListedRef {
                     token: RefToken::new(token),
-                    stored: serde_json::from_slice(&self.get_physical(&path)?)?,
+                    stored: serde_json::from_slice(&self.get_physical(&path)?)
+                        .context("failed to decode remote branch ref")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

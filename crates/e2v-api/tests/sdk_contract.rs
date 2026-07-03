@@ -1402,6 +1402,63 @@ fn sdk_verify_default_remote_reports_corrupt_state_for_invalid_remote_branch_ref
 }
 
 #[test]
+fn sdk_verify_default_remote_reports_corrupt_state_for_invalid_keyring_pointer_ref_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-invalid-keyring-pointer-ref-record".to_string(),
+    })
+    .unwrap();
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).unwrap();
+    let keyring_ref_path = remote_root
+        .join("control")
+        .join("refs")
+        .join("by-token")
+        .join("keyring")
+        .join(format!("{repo_id}.json"));
+    fs::write(&keyring_ref_path, br#"{"broken":true"#).unwrap();
+
+    let error = sdk
+        .verify_default_remote(e2v_api::VerifyRemoteRequest {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error
+            .message()
+            .contains("failed to decode remote branch ref"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
