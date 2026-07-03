@@ -1649,6 +1649,70 @@ fn force_accept_remote_rollback_rebuilds_local_fact_view_from_remote_head() {
 }
 
 #[test]
+fn force_accept_remote_rollback_repairs_local_object_path_conflict() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"remote base").unwrap();
+    let remote_snapshot = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "remote-base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-rollback-path-conflict".to_string(),
+        },
+    )
+    .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"local ahead").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "local-ahead".to_string(),
+        })
+        .unwrap();
+
+    let object_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{}.json", remote_snapshot.snapshot_id));
+    let original_bytes = fs::read(&object_path).unwrap();
+    fs::remove_file(&object_path).unwrap();
+    fs::create_dir_all(&object_path).unwrap();
+
+    let repaired = force_accept_remote_rollback(
+        &remote,
+        RepairRemoteOptions {
+            repo_root: repo_root.clone(),
+        },
+        "correct horse battery staple",
+    )
+    .unwrap();
+
+    assert!(repaired.repaired_objects > 0);
+    assert_eq!(fs::read(&object_path).unwrap(), original_bytes);
+    facade.verify_ref(&repo_root).unwrap();
+}
+
+#[test]
 fn force_accept_remote_rollback_rewrites_current_branch_mirror_to_remote_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

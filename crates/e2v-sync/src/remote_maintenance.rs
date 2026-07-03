@@ -650,7 +650,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
             .map(|existing| existing != bytes)
             .unwrap_or(true);
         if needs_repair {
-            std::fs::write(&local_path, &bytes)?;
+            overwrite_local_object_bytes(&local_path, &bytes)?;
             repaired_objects += 1;
         }
     }
