@@ -1240,8 +1240,11 @@ fn c_abi_can_plan_and_execute_historical_rewrite_on_default_remote() {
     let plan: e2v_api::HistoricalRewritePlanResponse =
         serde_json::from_str(&read_owned_string(&mut plan_json)).unwrap();
     assert!(plan.reachable_object_count > 0);
+    assert_eq!(plan.remote_loose_object_count, plan.reachable_object_count);
+    assert_eq!(plan.remote_pack_object_count, 0);
     assert_eq!(plan.old_epoch_count, 1);
     assert!(plan.requires_remote_credential_revocation_guidance);
+    assert!(plan.large_repo_advisory.is_none());
 
     let mut execute_json = c_abi::e2v_string_t::default();
     assert_eq!(

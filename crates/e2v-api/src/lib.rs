@@ -361,9 +361,11 @@ pub struct GcExecuteResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoricalRewritePlanResponse {
     pub reachable_object_count: usize,
+    pub remote_loose_object_count: usize,
+    pub remote_pack_object_count: usize,
     pub old_epoch_count: usize,
+    pub large_repo_advisory: Option<String>,
     pub requires_remote_credential_revocation_guidance: bool,
-    pub advisory_messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1342,10 +1344,12 @@ fn historical_rewrite_plan_response_from_result(
 ) -> HistoricalRewritePlanResponse {
     HistoricalRewritePlanResponse {
         reachable_object_count: result.reachable_object_count,
+        remote_loose_object_count: result.remote_loose_object_count,
+        remote_pack_object_count: result.remote_pack_object_count,
         old_epoch_count: result.old_epoch_count,
+        large_repo_advisory: result.large_repo_advisory,
         requires_remote_credential_revocation_guidance: result
             .requires_remote_credential_revocation_guidance,
-        advisory_messages: result.advisory_messages,
     }
 }
 

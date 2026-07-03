@@ -1477,6 +1477,8 @@ fn historical_rewrite_commands_require_confirmation_and_surface_plan_guidance() 
     .unwrap();
     assert!(plan_output.contains("historical strong revocation"));
     assert!(plan_output.contains("future-only revocation"));
+    assert!(plan_output.contains("remote loose objects:"));
+    assert!(plan_output.contains("remote packed objects:"));
     assert!(plan_output.contains("remote storage credentials"));
 
     let execute_error = e2v_cli::testing::run_cli([

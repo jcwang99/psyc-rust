@@ -2425,11 +2425,35 @@ fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote()
         })
         .unwrap();
     assert!(default_plan.reachable_object_count > 0);
+    assert_eq!(
+        default_plan.remote_loose_object_count,
+        default_plan.reachable_object_count
+    );
+    assert_eq!(default_plan.remote_pack_object_count, 0);
     assert_eq!(default_plan.old_epoch_count, 1);
     assert!(default_plan.requires_remote_credential_revocation_guidance);
-    assert!(default_plan.advisory_messages.iter().any(|message| {
-        message.contains("remote storage credentials") && message.contains("large repositories")
-    }));
+    assert!(default_plan.large_repo_advisory.is_none());
+
+    let explicit_plan = sdk
+        .historical_rewrite_remote_plan(
+            &remote_spec,
+            HistoricalRewritePlanRequest {
+                repo_root: repo_root.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        explicit_plan.reachable_object_count,
+        default_plan.reachable_object_count
+    );
+    assert_eq!(
+        explicit_plan.remote_loose_object_count,
+        default_plan.remote_loose_object_count
+    );
+    assert_eq!(
+        explicit_plan.remote_pack_object_count,
+        default_plan.remote_pack_object_count
+    );
 
     let default_execute = sdk
         .historical_rewrite_default_remote_execute(HistoricalRewriteExecuteRequest {
@@ -2456,18 +2480,13 @@ fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote()
     let bytes = read.read_range(&file, 0, 32).unwrap();
     assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
 
-    let explicit_plan = sdk
-        .historical_rewrite_remote_plan(
-            &remote_spec,
-            HistoricalRewritePlanRequest {
-                repo_root: repo_root.clone(),
-            },
-        )
+    let post_rewrite_plan = sdk
+        .historical_rewrite_default_remote_plan(HistoricalRewritePlanRequest {
+            repo_root: repo_root.clone(),
+        })
         .unwrap();
-    assert_eq!(
-        explicit_plan.reachable_object_count,
-        default_plan.reachable_object_count
-    );
+    assert_eq!(post_rewrite_plan.remote_loose_object_count, 0);
+    assert!(post_rewrite_plan.remote_pack_object_count > 0);
 
     let explicit_error = sdk
         .historical_rewrite_remote_execute(

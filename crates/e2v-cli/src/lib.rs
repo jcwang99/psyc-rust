@@ -677,11 +677,19 @@ fn execute(cli: Cli) -> Result<String> {
                     "note: future-only revocation stops new access, while historical strong revocation rewrites reachable history onto the active epoch.\n",
                 );
                 output.push_str(&format!(
-                    "reachable objects: {}\nold epochs: {}\n",
-                    plan.reachable_object_count, plan.old_epoch_count
+                    "reachable objects: {}\nremote loose objects: {}\nremote packed objects: {}\nold epochs: {}\n",
+                    plan.reachable_object_count,
+                    plan.remote_loose_object_count,
+                    plan.remote_pack_object_count,
+                    plan.old_epoch_count
                 ));
-                for advisory in plan.advisory_messages {
+                if let Some(advisory) = plan.large_repo_advisory {
                     output.push_str(&format!("advisory: {advisory}\n"));
+                }
+                if plan.requires_remote_credential_revocation_guidance {
+                    output.push_str(
+                        "advisory: revoke remote storage credentials first for previously shared backends or large repositories.\n",
+                    );
                 }
                 Ok(output)
             }

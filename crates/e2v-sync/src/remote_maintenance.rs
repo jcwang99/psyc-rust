@@ -113,9 +113,11 @@ pub struct GcExecuteCapabilityStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoricalRewritePlan {
     pub reachable_object_count: usize,
+    pub remote_loose_object_count: usize,
+    pub remote_pack_object_count: usize,
     pub old_epoch_count: usize,
+    pub large_repo_advisory: Option<String>,
     pub requires_remote_credential_revocation_guidance: bool,
-    pub advisory_messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,7 +247,7 @@ impl RemoteReachabilityRecorder for GcReachabilityStore {
 }
 
 pub fn plan_historical_rewrite<R: RemoteBackend>(
-    _remote: &R,
+    remote: &R,
     options: HistoricalRewritePlanOptions,
 ) -> Result<HistoricalRewritePlan> {
     let facade = RepositoryFacade::new();
@@ -274,22 +276,30 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
             Err(error) if error.to_string().contains("head snapshot is missing") => 0,
             Err(error) => return Err(error),
         };
-    let requires_remote_credential_revocation_guidance =
-        old_epoch_count > 0 || reachable_object_count >= 10_000;
-    let mut advisory_messages = vec![format!(
-        "Historical strong revocation will rewrite {reachable_object_count} reachable objects onto the active epoch."
-    )];
-    if requires_remote_credential_revocation_guidance {
-        advisory_messages.push(
-            "Revoke remote storage credentials first for large repositories or previously shared backends."
+    let remote_loose_object_count = load_push_remote_loose_object_ids(remote)?.len();
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+    let remote_pack_object_count =
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?.len();
+    let large_repo_advisory = if reachable_object_count >= 10_000
+        || remote_loose_object_count >= 10_000
+        || remote_pack_object_count >= 10_000
+    {
+        Some(
+            "Large repository detected; revoke remote storage credentials first and treat full repository re-encryption as an expensive maintenance action."
                 .to_string(),
-        );
-    }
+        )
+    } else {
+        None
+    };
+    let requires_remote_credential_revocation_guidance =
+        old_epoch_count > 0 || large_repo_advisory.is_some();
     Ok(HistoricalRewritePlan {
         reachable_object_count,
+        remote_loose_object_count,
+        remote_pack_object_count,
         old_epoch_count,
+        large_repo_advisory,
         requires_remote_credential_revocation_guidance,
-        advisory_messages,
     })
 }
 
