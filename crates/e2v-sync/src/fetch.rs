@@ -401,7 +401,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
                     }
                 }
                 LocalObjectHealth::LockedEnvelopeInvalid | LocalObjectHealth::Unhealthy => {
-                    std::fs::write(&target_path, bytes)?;
+                    overwrite_local_object_bytes(&target_path, &bytes)?;
                     downloaded_objects += 1;
                 }
             }
@@ -416,7 +416,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             let target_path = objects_dir.join(file_name);
             if !target_path.exists() {
                 let bytes = remote.get_physical(&relative_path)?;
-                std::fs::write(&target_path, bytes)?;
+                overwrite_local_object_bytes(&target_path, &bytes)?;
                 downloaded_objects += 1;
                 continue;
             }
@@ -433,12 +433,12 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
                 }
                 LocalObjectHealth::LockedEnvelopeInvalid => {
                     let bytes = remote.get_physical(&relative_path)?;
-                    std::fs::write(&target_path, bytes)?;
+                    overwrite_local_object_bytes(&target_path, &bytes)?;
                     downloaded_objects += 1;
                 }
                 LocalObjectHealth::Unhealthy => {
                     let bytes = remote.get_physical(&relative_path)?;
-                    std::fs::write(&target_path, bytes)?;
+                    overwrite_local_object_bytes(&target_path, &bytes)?;
                     downloaded_objects += 1;
                 }
             }
@@ -476,7 +476,7 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
                 Some(&control_dir),
                 object_id,
             )? {
-                std::fs::write(&target_path, bytes)?;
+                overwrite_local_object_bytes(&target_path, &bytes)?;
                 downloaded_objects += 1;
             }
         }
@@ -762,6 +762,21 @@ fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn overwrite_local_object_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_directory_path(parent)?;
+    }
+    match std::fs::write(path, bytes) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            remove_path_if_exists(path)?;
+            std::fs::write(path, bytes)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(())
+        }
+    }
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {

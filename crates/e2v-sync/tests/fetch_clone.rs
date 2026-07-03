@@ -1285,6 +1285,77 @@ fn fetch_reuses_local_pack_data_cache_when_remote_pack_ranges_are_unavailable() 
 }
 
 #[test]
+fn fetch_repairs_local_object_path_conflict_using_cached_pack_data() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo_root.join("hello.txt"), b"hello packed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "seed-packed-path-conflict".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "fetch-path-conflict-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+
+    let target_repo_root = temp.path().join("clone");
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let conflicted_object_path = fs::read_dir(target_repo_root.join(".e2v").join("objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .next()
+        .unwrap();
+    let original_bytes = fs::read(&conflicted_object_path).unwrap();
+    fs::remove_file(&conflicted_object_path).unwrap();
+    fs::create_dir_all(&conflicted_object_path).unwrap();
+
+    let guarded_remote = PackDataRangeReadForbiddenRemote::new(remote);
+    let fetched = fetch_remote(
+        &guarded_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    assert_eq!(fs::read(&conflicted_object_path).unwrap(), original_bytes);
+}
+
+#[test]
 fn fetch_rejects_invalid_pack_index_root_instead_of_falling_back_to_segment_listing() {
     let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
