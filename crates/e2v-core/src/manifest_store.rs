@@ -506,10 +506,7 @@ fn validate_tree_shard_object(tree_shard: &TreeShardObject) -> Result<()> {
         );
         return Ok(());
     };
-    let last = tree_shard
-        .entries
-        .last()
-        .expect("first entry implies last entry");
+    let last = &tree_shard.entries[tree_shard.entries.len() - 1];
     ensure!(
         tree_shard.range_start == first.name,
         "tree_shard range_start does not match the first entry name"

@@ -156,6 +156,21 @@ fn sync_support_module_is_kept_doc_hidden_as_an_internal_sync_boundary() {
 }
 
 #[test]
+fn manifest_store_source_does_not_expect_last_entry_after_non_empty_check() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("manifest_store.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("expect(\"first entry implies last entry\")"),
+        "manifest store should validate shard range metadata without relying on panic-based last-entry assumptions"
+    );
+}
+
+#[test]
 fn init_creates_control_plane_files_for_local_direct_layout() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
