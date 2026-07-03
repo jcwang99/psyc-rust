@@ -293,6 +293,69 @@ fn historical_rewrite_remote_retires_local_old_epochs_before_remote_publish() {
 }
 
 #[test]
+fn historical_rewrite_remote_records_checkpoint_with_target_layout_generation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-checkpoint".to_string(),
+        },
+    )
+    .unwrap();
+
+    let result = historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let state = journal
+        .read_rewrite_state(&e2v_sync::OperationId::new("history-rewrite".to_string()).unwrap())
+        .unwrap()
+        .expect("rewrite checkpoint");
+
+    assert_eq!(result.next_layout_generation, 2);
+    assert_eq!(state.stage, "local_rewrite_completed");
+    assert_eq!(state.target_layout_generation, 2);
+    assert!(
+        !state.rewritten_object_ids.is_empty(),
+        "expected checkpoint to remember rewritten objects"
+    );
+}
+
+#[test]
 fn force_accept_remote_rollback_rebuilds_local_fact_view_from_remote_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

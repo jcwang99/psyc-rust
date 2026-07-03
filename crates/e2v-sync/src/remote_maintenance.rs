@@ -17,6 +17,7 @@ use crate::fetch::{
     read_remote_control_plane, update_trusted_remote_state_from_control_plane,
     write_remote_control_plane_to_validation_root,
 };
+use crate::journal::{OperationId, OperationJournal, OperationMetadata, RewriteJournalState};
 use crate::object_type::candidate_object_types;
 use crate::pack::PackedObjectLocation;
 use crate::pack_index::{
@@ -280,8 +281,25 @@ pub fn historical_rewrite_remote<R: RemoteBackend>(
         !options.password.trim().is_empty(),
         "historical rewrite password must not be empty"
     );
-    let local_result = RepositoryFacade::new()
-        .rewrite_history_to_active_epoch(&options.repo_root, &options.password)?;
+    let facade = RepositoryFacade::new();
+    let local_result =
+        facade.rewrite_history_to_active_epoch(&options.repo_root, &options.password)?;
+    let repo_state = facade.open(&options.repo_root)?;
+    let operation_id = OperationId::new("history-rewrite".to_string())?;
+    let journal =
+        OperationJournal::new(options.repo_root.join(".e2v").join("journal").join("sync"))?;
+    journal.begin_operation(
+        &operation_id,
+        OperationMetadata::push(repo_state.branch.token_hex.clone(), None),
+    )?;
+    journal.write_rewrite_state(
+        &operation_id,
+        &RewriteJournalState {
+            stage: "local_rewrite_completed".to_string(),
+            target_layout_generation: repo_state.layout_generation,
+            rewritten_object_ids: local_result.rewritten_object_ids.clone(),
+        },
+    )?;
     let plan = plan_historical_rewrite(
         remote,
         HistoricalRewritePlanOptions {
@@ -295,7 +313,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend>(
             .max(plan.reachable_object_count),
         retired_epoch_count: local_result.retired_epoch_count,
         deleted_stale_remote_refs: Vec::new(),
-        next_layout_generation: 0,
+        next_layout_generation: repo_state.layout_generation,
     })
 }
 
