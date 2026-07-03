@@ -960,15 +960,6 @@ pub fn verify_remote<R: RemoteBackend>(
     let default_ref = remote
         .read_ref(&RefToken::new(branch_token.clone()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-    let (_, head_snapshot_id) =
-        sync_support::decode_default_ref_record(&options.repo_root, &default_ref.value.bytes)?;
-    let Some(head_snapshot_id) = head_snapshot_id else {
-        return Ok(VerifyRemoteResult {
-            sampled_objects: 0,
-            repaired_local_objects: 0,
-        });
-    };
-
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
@@ -986,16 +977,29 @@ pub fn verify_remote<R: RemoteBackend>(
         cache_control_dir: Some(control_dir.clone()),
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
-    let reachable_object_ids = collect_remote_reachable_object_ids(
+    let mut traversal = RemoteReachabilityTraversal {
         remote,
-        &remote_loose_object_ids,
-        &pack_locations,
-        &validation_root,
-        &secrets,
-        &mut pack_cache,
-        &head_snapshot_id,
+        remote_loose_object_ids: &remote_loose_object_ids,
+        pack_locations: &pack_locations,
+        validation_root: &validation_root,
+        validation_secrets: &secrets,
+        pack_cache: &mut pack_cache,
+    };
+    let reachable_store = GcReachabilityStore::new(&options.repo_root)?;
+    let mut reachable_store = reachable_store;
+    collect_all_remote_reachable_object_ids(
+        &options.repo_root,
+        &mut traversal,
+        &mut reachable_store,
     )?;
     persist_cached_pack_data(&control_dir, &pack_cache)?;
+    let mut statement = reachable_store
+        .sqlite
+        .prepare("SELECT object_id FROM reachable_objects ORDER BY object_id")?;
+    let reachable_object_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
     let sampled_object_ids = sample_object_ids(&reachable_object_ids, options.sample_percent);
     let validation_object_store =
         DirectLayoutObjectStore::new(validation_root.control_dir(), secrets.clone());
@@ -1055,14 +1059,6 @@ pub fn repair_remote<R: RemoteBackend>(
     let default_ref = remote
         .read_ref(&RefToken::new(branch_token.clone()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-    let (_, head_snapshot_id) =
-        sync_support::decode_default_ref_record(&options.repo_root, &default_ref.value.bytes)?;
-    let Some(head_snapshot_id) = head_snapshot_id else {
-        return Ok(RepairRemoteResult {
-            repaired_objects: 0,
-        });
-    };
-
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
@@ -1077,18 +1073,31 @@ pub fn repair_remote<R: RemoteBackend>(
         cache_control_dir: Some(control_dir.clone()),
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
-    let reachable_object_ids = collect_remote_reachable_object_ids(
+    let mut traversal = RemoteReachabilityTraversal {
         remote,
-        &remote_loose_object_ids,
-        &pack_locations,
-        &validation_root,
-        &secrets,
-        &mut pack_cache,
-        &head_snapshot_id,
+        remote_loose_object_ids: &remote_loose_object_ids,
+        pack_locations: &pack_locations,
+        validation_root: &validation_root,
+        validation_secrets: &secrets,
+        pack_cache: &mut pack_cache,
+    };
+    let reachable_store = GcReachabilityStore::new(&options.repo_root)?;
+    let mut reachable_store = reachable_store;
+    collect_all_remote_reachable_object_ids(
+        &options.repo_root,
+        &mut traversal,
+        &mut reachable_store,
     )?;
     persist_cached_pack_data(&control_dir, &pack_cache)?;
 
     let mut repaired_objects = 0usize;
+    let mut statement = reachable_store
+        .sqlite
+        .prepare("SELECT object_id FROM reachable_objects ORDER BY object_id")?;
+    let reachable_object_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
     for object_id in &reachable_object_ids {
         let bytes = remote_object_bytes_with_pack_cache(
             remote,

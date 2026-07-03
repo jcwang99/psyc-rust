@@ -1005,6 +1005,234 @@ fn repair_remote_repairs_local_object_path_conflict_from_remote_head() {
 }
 
 #[test]
+fn repair_remote_restores_missing_object_reachable_from_other_remote_branch_ref() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("base.txt"), b"base").unwrap();
+    let base = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+    facade.create_branch(&repo_root, "feature").unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-repair-other-ref-base".to_string(),
+        },
+    )
+    .unwrap();
+
+    let feature_checkout = facade.checkout_branch(&repo_root, "feature").unwrap();
+    fs::write(repo_root.join("feature.txt"), b"feature only").unwrap();
+    let feature = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: feature_checkout.branch.token_hex.clone(),
+            operation_id: "push-op-repair-other-ref-feature".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade.checkout_branch(&repo_root, "main").unwrap();
+    fs::write(repo_root.join("main.txt"), b"main only").unwrap();
+    let main = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "main".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-repair-other-ref-main".to_string(),
+        },
+    )
+    .unwrap();
+
+    let base_reachable = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&base.snapshot_id)
+        .unwrap();
+    let main_reachable = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&main.snapshot_id)
+        .unwrap();
+    let feature_reachable = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&feature.snapshot_id)
+        .unwrap();
+    let feature_only_object_id = feature_reachable
+        .iter()
+        .find(|object_id| {
+            !main_reachable.contains(*object_id) && !base_reachable.contains(*object_id)
+        })
+        .cloned()
+        .expect("object only reachable from feature branch");
+    let feature_only_object_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{feature_only_object_id}.json"));
+    let original_bytes = fs::read(&feature_only_object_path).unwrap();
+    fs::remove_file(&feature_only_object_path).unwrap();
+
+    let repaired = repair_remote(
+        &remote,
+        RepairRemoteOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        repaired.repaired_objects >= 1,
+        "repair should restore objects reachable from other remote branch refs"
+    );
+    assert_eq!(fs::read(&feature_only_object_path).unwrap(), original_bytes);
+}
+
+#[test]
+fn verify_remote_samples_objects_reachable_from_other_remote_branch_refs() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("base.txt"), b"base").unwrap();
+    let base = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+    facade.create_branch(&repo_root, "feature").unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-verify-other-ref-base".to_string(),
+        },
+    )
+    .unwrap();
+
+    let feature_checkout = facade.checkout_branch(&repo_root, "feature").unwrap();
+    fs::write(repo_root.join("feature.txt"), b"feature only").unwrap();
+    let feature = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: feature_checkout.branch.token_hex.clone(),
+            operation_id: "push-op-verify-other-ref-feature".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade.checkout_branch(&repo_root, "main").unwrap();
+    fs::write(repo_root.join("main.txt"), b"main only").unwrap();
+    let main = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "main".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-verify-other-ref-main".to_string(),
+        },
+    )
+    .unwrap();
+
+    let base_reachable = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&base.snapshot_id)
+        .unwrap();
+    let main_reachable = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&main.snapshot_id)
+        .unwrap();
+    let feature_reachable = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&feature.snapshot_id)
+        .unwrap();
+    let feature_only_object_id = feature_reachable
+        .iter()
+        .find(|object_id| {
+            !main_reachable.contains(*object_id) && !base_reachable.contains(*object_id)
+        })
+        .cloned()
+        .expect("object only reachable from feature branch");
+    let feature_only_object_path = repo_root
+        .join(".e2v")
+        .join("objects")
+        .join(format!("{feature_only_object_id}.json"));
+    let original_bytes = fs::read(&feature_only_object_path).unwrap();
+    fs::remove_file(&feature_only_object_path).unwrap();
+    fs::write(&feature_only_object_path, b"tampered").unwrap();
+
+    let verified = verify_remote(
+        &remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        verified.sampled_objects >= feature_reachable.len(),
+        "verify should sample objects from other remote branch refs when sampling 100%"
+    );
+    assert!(
+        verified.repaired_local_objects >= 1,
+        "verify should repair tampered objects reachable from other remote branch refs"
+    );
+    assert_eq!(fs::read(&feature_only_object_path).unwrap(), original_bytes);
+}
+
+#[test]
 fn historical_rewrite_remote_retires_local_old_epochs_before_remote_publish() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
