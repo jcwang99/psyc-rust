@@ -124,9 +124,10 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
                     );
                 }
                 let lease_bytes = self.remote_backend.get_physical(&lease_path)?;
-                let existing: RemoteWriterLeaseMarker = serde_json::from_slice(&lease_bytes)
-                    .context("writer lease acquisition failed: invalid existing lease marker")?;
-                if existing.target_branch_token != plan.target_branch_token {
+                if let Ok(existing) =
+                    serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes)
+                    && existing.target_branch_token != plan.target_branch_token
+                {
                     anyhow::bail!(
                         "writer lease acquisition failed for {}",
                         plan.target_branch_token
@@ -1223,6 +1224,45 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("lease"));
+    }
+
+    #[test]
+    fn begin_reacquires_expired_single_writer_lease_after_corrupted_stale_marker() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path().join("journal")).unwrap();
+        let remote_root = temp.path().join("remote");
+        std::fs::create_dir_all(&remote_root).unwrap();
+        let remote = e2v_store::LocalFolderBackend::new(&remote_root);
+        remote
+            .put_physical("leases/branch-token.lock", br#"{"broken":true"#)
+            .unwrap();
+        e2v_store::testing::override_local_backend_modified_time(
+            &remote,
+            "leases/branch-token.lock",
+            UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("new-operation".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(session.writer_mode, WriterMode::SingleWriter);
+        assert_eq!(lease["operation_id"], "new-operation");
+        assert_eq!(lease["writer_id"], "writer:new-operation");
     }
 
     #[test]
