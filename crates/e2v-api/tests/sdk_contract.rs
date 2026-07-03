@@ -363,6 +363,72 @@ fn sdk_open_repository_reports_corrupt_state_for_invalid_local_keyring_state_fil
 }
 
 #[test]
+fn sdk_open_repository_reports_corrupt_state_for_invalid_local_keyring_pointer_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let _ = sdk
+        .unlock_repository(&repo_root, "wrong password")
+        .unwrap_err();
+
+    let error = sdk.open_repository(&repo_root).unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to decode") && error.message().contains("keyring.current"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn sdk_open_repository_reports_corrupt_state_for_invalid_local_layout_root_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    fs::write(
+        repo_root.join(".e2v").join("layout_root.json"),
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+
+    let error = sdk.open_repository(&repo_root).unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to decode")
+            && error.message().contains("layout_root.json"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_read_directory_entries_through_public_read_api() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

@@ -1388,6 +1388,7 @@ fn gc_execute_response_from_result(result: e2v_sync::GcExecuteResult) -> GcExecu
 pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
+    let normalized = lower.replace('\\', "/");
 
     let code = if lower.contains("critical_rollback_detected")
         || lower.contains(" rollback detected")
@@ -1411,8 +1412,10 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode local keyring state for pointer ref")
         || lower.contains("failed to decode current keyring pointer")
         || lower.contains("failed to decode current keyring state")
-        || lower.contains("failed to decode ") && lower.contains("/.e2v/keyring/keyring.")
-        || lower.contains("failed to decode ") && lower.contains("\\.e2v\\keyring\\keyring.")
+        || lower.contains("failed to decode ")
+            && normalized.contains("/.e2v/keyring/keyring.current")
+        || lower.contains("failed to decode ") && normalized.contains("/.e2v/keyring/keyring.")
+        || lower.contains("failed to decode ") && normalized.contains("/.e2v/layout_root.json")
         || lower.contains("failed to decode authenticated pack index root")
         || lower.contains("failed to decode authenticated pack index segment")
         || lower.contains("failed to decrypt authenticated pack index segment")
@@ -1567,6 +1570,34 @@ mod tests {
     fn map_error_treats_corrupted_local_keyring_generation_file_as_corrupt_state() {
         let error =
             anyhow::anyhow!("failed to decode C:\\repo\\.e2v\\keyring\\keyring.7-bootstrap-device");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_local_keyring_pointer_file_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decode C:\\repo\\.e2v\\keyring\\keyring.current");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_local_keyring_pointer_file_with_mixed_separators_as_corrupt_state()
+     {
+        let error = anyhow::anyhow!("failed to decode C:\\repo\\.e2v\\keyring/keyring.current");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_local_layout_root_file_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decode C:\\repo\\.e2v\\layout_root.json");
 
         let mapped = map_error(error);
 
