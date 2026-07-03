@@ -6087,6 +6087,453 @@ fn revoked_device_cannot_fetch_future_remote_head() {
 }
 
 #[test]
+fn fetch_rejects_wrong_password_when_remote_pointer_changed_and_device_unlock_is_revoked() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let owner_credential_bytes = fs::read(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &source_repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let member = facade
+        .share_accept_member(
+            &source_repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fs::write(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes.clone(),
+    )
+    .unwrap();
+    let device_invite = facade
+        .share_invite_device(
+            &source_repo_root,
+            e2v_core::ShareInviteDeviceOptions {
+                actor_id: member.actor_id.clone(),
+                device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let device = facade
+        .share_accept_device(
+            &source_repo_root,
+            e2v_core::ShareAcceptDeviceOptions {
+                invite_bytes: device_invite.bundle_bytes,
+                local_device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let revoked_device_credential_bytes = fs::read(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("before-{index:02}.txt")),
+            format!("before-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "before-revoke-packed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-before-device-revoke-packed".to_string(),
+        },
+    )
+    .unwrap();
+
+    let revoked_clone_root = temp.path().join("revoked-clone");
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: revoked_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    fs::write(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+
+    facade
+        .share_revoke_device(
+            &source_repo_root,
+            e2v_core::ShareRevokeDeviceOptions {
+                device_id: device.device_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("after-{index:02}.txt")),
+            format!("after-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "after-revoke-packed".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-after-device-revoke-packed".to_string(),
+        },
+    )
+    .unwrap();
+
+    let member_device_credential =
+        serde_json::from_slice::<serde_json::Value>(&revoked_device_credential_bytes).unwrap();
+    assert_eq!(
+        member_device_credential["device_id"].as_str(),
+        Some(device.device_id.as_str())
+    );
+    let member_keyring_files = fs::read_dir(source_repo_root.join(".e2v").join("keyring"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    for path in member_keyring_files {
+        let file_name = path.file_name().unwrap();
+        fs::copy(
+            &path,
+            revoked_clone_root
+                .join(".e2v")
+                .join("keyring")
+                .join(file_name),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(revoked_clone_root.join(".e2v").join("device")).unwrap();
+    fs::write(
+        revoked_clone_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        serde_json::to_vec_pretty(&member_device_credential).unwrap(),
+    )
+    .unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&revoked_clone_root.join(".e2v"));
+    let original_pointer = fs::read(
+        revoked_clone_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+    )
+    .unwrap();
+    let original_default_ref = fs::read(
+        revoked_clone_root
+            .join(".e2v")
+            .join("refs")
+            .join("default.json"),
+    )
+    .unwrap();
+
+    let error = fetch_remote(
+        &remote,
+        FetchOptions {
+            repo_root: revoked_clone_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: Some("definitely wrong password".to_string()),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("wrong password")
+            || error.to_string().contains("unlock")
+            || error
+                .to_string()
+                .contains("current local device cannot unlock remote keyring"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        fs::read(
+            revoked_clone_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap(),
+        original_pointer
+    );
+    assert_eq!(
+        fs::read(
+            revoked_clone_root
+                .join(".e2v")
+                .join("refs")
+                .join("default.json")
+        )
+        .unwrap(),
+        original_default_ref
+    );
+}
+
+#[test]
+fn fetch_prefers_supplied_password_over_stale_cached_secrets_after_pointer_change() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    let owner_credential_bytes = fs::read(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let member_invite = facade
+        .share_invite_member(
+            &source_repo_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let member = facade
+        .share_accept_member(
+            &source_repo_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: member_invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fs::write(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes.clone(),
+    )
+    .unwrap();
+    let device_invite = facade
+        .share_invite_device(
+            &source_repo_root,
+            e2v_core::ShareInviteDeviceOptions {
+                actor_id: member.actor_id.clone(),
+                device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let device = facade
+        .share_accept_device(
+            &source_repo_root,
+            e2v_core::ShareAcceptDeviceOptions {
+                invite_bytes: device_invite.bundle_bytes,
+                local_device_label: "alice-phone".to_string(),
+            },
+        )
+        .unwrap();
+    let revoked_device_credential_bytes = fs::read(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("before-{index:02}.txt")),
+            format!("before-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "before-revoke-packed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-before-device-revoke-packed-password-priority".to_string(),
+        },
+    )
+    .unwrap();
+
+    let revoked_clone_root = temp.path().join("revoked-clone");
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: revoked_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    RepositoryFacade::new()
+        .unlock(&revoked_clone_root, "correct horse battery staple")
+        .unwrap();
+
+    fs::write(
+        source_repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        owner_credential_bytes,
+    )
+    .unwrap();
+    facade
+        .share_revoke_device(
+            &source_repo_root,
+            e2v_core::ShareRevokeDeviceOptions {
+                device_id: device.device_id.clone(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("after-{index:02}.txt")),
+            format!("after-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    let committed = facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "after-revoke-packed".to_string(),
+        })
+        .unwrap();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-after-device-revoke-packed-password-priority".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+
+    let member_device_credential =
+        serde_json::from_slice::<serde_json::Value>(&revoked_device_credential_bytes).unwrap();
+    assert_eq!(
+        member_device_credential["device_id"].as_str(),
+        Some(device.device_id.as_str())
+    );
+    let member_keyring_files = fs::read_dir(source_repo_root.join(".e2v").join("keyring"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    for path in member_keyring_files {
+        let file_name = path.file_name().unwrap();
+        fs::copy(
+            &path,
+            revoked_clone_root
+                .join(".e2v")
+                .join("keyring")
+                .join(file_name),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(revoked_clone_root.join(".e2v").join("device")).unwrap();
+    fs::write(
+        revoked_clone_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+        serde_json::to_vec_pretty(&member_device_credential).unwrap(),
+    )
+    .unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            repo_root: revoked_clone_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    assert!(
+        revoked_clone_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{}.json", committed.snapshot_id))
+            .is_file()
+    );
+    RepositoryFacade::new()
+        .unlock(&revoked_clone_root, "correct horse battery staple")
+        .unwrap();
+}
+
+#[test]
 fn accepted_member_bootstrap_can_fetch_remote_without_password() {
     let temp = tempdir().unwrap();
     let owner_root = temp.path().join("owner");

@@ -264,18 +264,17 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         control_dir.join("keyring").join(current_keyring_name),
     )?)
     .context("failed to decode current keyring state")?;
-    let local_old_epoch_count = keyring["epochs"]
-        .as_array()
-        .map(|epochs| epochs.len().saturating_sub(1))
-        .unwrap_or(0);
+    let local_old_epoch_count =
+        keyring_epoch_count(&keyring, "current local keyring state")?.saturating_sub(1);
     let remote_old_epoch_count =
         match crate::push::read_remote_current_keyring_bytes(remote, &options.repo_root)? {
             Some(bytes) => Some(
-                serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .context("failed to decode remote current keyring state")?["epochs"]
-                    .as_array()
-                    .map(|epochs| epochs.len().saturating_sub(1))
-                    .unwrap_or(0),
+                keyring_epoch_count(
+                    &serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .context("failed to decode remote current keyring state")?,
+                    "remote current keyring state",
+                )?
+                .saturating_sub(1),
             ),
             None => None,
         };
@@ -315,6 +314,13 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         large_repo_advisory,
         requires_remote_credential_revocation_guidance,
     })
+}
+
+fn keyring_epoch_count(keyring: &serde_json::Value, context: &str) -> Result<usize> {
+    keyring["epochs"]
+        .as_array()
+        .map(|epochs| epochs.len())
+        .ok_or_else(|| anyhow::anyhow!("{context} is missing an epochs array"))
 }
 
 pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
@@ -1547,18 +1553,16 @@ fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> 
 
 fn list_remote_branch_refs<R: RemoteBackend>(
     remote: &R,
-    repo_root: &std::path::Path,
+    _repo_root: &std::path::Path,
 ) -> Result<Vec<e2v_store::ListedRef>> {
     let mut refs = Vec::new();
     for listed_ref in remote.list_refs()? {
         if listed_ref.token.value.starts_with("keyring/") {
             continue;
         }
-        if sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)
-            .is_ok()
-        {
-            refs.push(listed_ref);
-        }
+        crate::journal::validate_sync_identifier("branch token", &listed_ref.token.value)
+            .with_context(|| format!("invalid remote branch token {}", listed_ref.token.value))?;
+        refs.push(listed_ref);
     }
     Ok(refs)
 }

@@ -645,6 +645,68 @@ fn plan_historical_rewrite_rejects_corrupted_remote_current_keyring_pointer() {
 }
 
 #[test]
+fn plan_historical_rewrite_rejects_remote_current_keyring_with_invalid_epochs_shape() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-plan-invalid-epochs-shape".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pointer_bytes = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let current_name = pointer["current"].as_str().unwrap();
+    let mut current_keyring: serde_json::Value = serde_json::from_slice(
+        &remote
+            .get_physical(&format!("control/keyring/{current_name}"))
+            .unwrap(),
+    )
+    .unwrap();
+    current_keyring["epochs"] = serde_json::json!({"broken": true});
+    remote
+        .put_physical(
+            &format!("control/keyring/{current_name}"),
+            &serde_json::to_vec(&current_keyring).unwrap(),
+        )
+        .unwrap();
+
+    let error =
+        plan_historical_rewrite(&remote, HistoricalRewritePlanOptions { repo_root }).unwrap_err();
+
+    assert!(
+        error.to_string().contains("epochs"),
+        "unexpected planning error: {error:#}"
+    );
+}
+
+#[test]
 fn repair_remote_restores_missing_local_object_from_remote_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -4637,6 +4699,83 @@ fn gc_dry_run_keeps_objects_reachable_from_other_remote_branch_refs() {
             .unreachable_physical_refs
             .contains(&format!("objects/{feature_only_object_id}.json")),
         "gc dry-run should respect all remote refs, not just the local default branch"
+    );
+}
+
+#[test]
+fn gc_dry_run_rejects_corrupted_remote_branch_ref() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+    facade.create_branch(&repo_root, "feature").unwrap();
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-gc-corrupt-ref-main".to_string(),
+        },
+    )
+    .unwrap();
+
+    let feature_checkout = facade.checkout_branch(&repo_root, "feature").unwrap();
+    fs::write(repo_root.join("feature.txt"), b"feature only").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: feature_checkout.branch.token_hex.clone(),
+            operation_id: "push-op-gc-corrupt-ref-feature".to_string(),
+        },
+    )
+    .unwrap();
+
+    remote
+        .compare_and_swap_ref(
+            &RefToken::new(feature_checkout.branch.token_hex),
+            Some(e2v_store::RefVersion { value: 1 }),
+            EncryptedRef::new(br#"{"broken":true"#.to_vec()),
+        )
+        .unwrap();
+
+    let error = gc_dry_run(
+        &remote,
+        GcDryRunOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to decode remote branch ref"),
+        "unexpected gc dry-run error: {error:#}"
     );
 }
 
