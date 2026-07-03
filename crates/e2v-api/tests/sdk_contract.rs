@@ -332,6 +332,37 @@ fn sdk_list_branches_reports_corrupt_state_for_invalid_local_branch_ref_record()
 }
 
 #[test]
+fn sdk_open_repository_reports_corrupt_state_for_invalid_local_keyring_state_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    let keyring_dir = repo_root.join(".e2v").join("keyring");
+    let pointer_bytes = fs::read(keyring_dir.join("keyring.current")).unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let current_keyring_name = pointer["current"].as_str().unwrap();
+    fs::write(keyring_dir.join(current_keyring_name), br#"{"broken":true"#).unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let error = sdk.open_repository(&repo_root).unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to decode")
+            && error.message().contains(current_keyring_name),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_read_directory_entries_through_public_read_api() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
