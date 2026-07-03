@@ -1121,6 +1121,63 @@ fn sdk_can_run_maintenance_with_explicit_remote_spec_without_default_remote_regi
 }
 
 #[test]
+fn sdk_gc_execute_reports_corrupt_state_for_invalid_delete_journal() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-invalid-gc-delete-journal".to_string(),
+    })
+    .unwrap();
+
+    let journal_path = repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("gc")
+        .join("gc-execute.json");
+    fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+    fs::write(&journal_path, br#"{"broken":true"#).unwrap();
+
+    let error = sdk
+        .gc_default_remote_execute(e2v_api::GcExecuteRequest {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error
+            .message()
+            .contains("failed to decode gc delete journal"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_verify_default_remote_reports_corrupt_state_for_invalid_remote_layout_root() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
