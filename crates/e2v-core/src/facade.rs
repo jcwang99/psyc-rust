@@ -2655,11 +2655,14 @@ fn collect_reachable_object_ids_into(
     head_snapshot_id: Option<&str>,
     reachable_object_ids: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let Some(head_snapshot_id) = head_snapshot_id else {
-        return Ok(());
-    };
-    for object_id in manifest_store.collect_reachable_object_ids(head_snapshot_id)? {
-        reachable_object_ids.insert(object_id);
+    let mut next_snapshot_id = head_snapshot_id.map(ToString::to_string);
+    while let Some(snapshot_id) = next_snapshot_id {
+        for object_id in manifest_store.collect_reachable_object_ids(&snapshot_id)? {
+            reachable_object_ids.insert(object_id);
+        }
+        next_snapshot_id = manifest_store
+            .get_snapshot(&snapshot_id)?
+            .parent_snapshot_id;
     }
     Ok(())
 }

@@ -11,7 +11,10 @@ use e2v_store::{
 };
 use tempfile::tempdir;
 
-use e2v_sync::{CloneOptions, FetchOptions, PushOptions, clone_remote, fetch_remote, push_head};
+use e2v_sync::{
+    CloneOptions, FetchOptions, HistoricalRewriteOptions, PushOptions, clone_remote, fetch_remote,
+    historical_rewrite_remote, push_head,
+};
 
 fn seed_remote() -> (
     tempfile::TempDir,
@@ -5869,6 +5872,270 @@ fn accepted_member_published_keyring_can_fetch_future_epoch_after_owner_rotation
             repo_root: owner_root.clone(),
             branch_token: state.branch.token_hex.clone(),
             operation_id: "future-epoch-owner-rotate".to_string(),
+        },
+    )
+    .unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    let reopened = e2v_core::testing::unlock_with_local_device_for_test(&recipient_root).unwrap();
+    assert_eq!(reopened.branch.token_hex, state.branch.token_hex);
+}
+
+#[test]
+fn accepted_member_can_fetch_after_historical_rewrite_remote() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"epoch-one").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-one".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "historical-rewrite-bootstrap-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "historical-rewrite-recipient-publish".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(owner_root.join("future.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "historical-rewrite-owner-rotate".to_string(),
+        },
+    )
+    .unwrap();
+    let owner_secrets = e2v_core::sync_support::unlock_repo_secrets_for_sync(
+        owner_root.join(".e2v"),
+        "correct horse battery staple",
+    )
+    .unwrap();
+    assert!(owner_secrets.epoch_keys.contains_key(&1));
+    assert!(owner_secrets.epoch_keys.contains_key(&2));
+    let repo_id = e2v_core::sync_support::read_repo_id(&owner_root).unwrap();
+    let remote_pointer = remote
+        .read_ref(&e2v_store::RefToken::new(format!("keyring/{repo_id}")))
+        .unwrap()
+        .unwrap();
+    let remote_pointer_json: serde_json::Value =
+        serde_json::from_slice(&remote_pointer.value.bytes).unwrap();
+    let remote_current = remote_pointer_json["current"].as_str().unwrap();
+    let remote_keyring_bytes = remote
+        .get_physical(&format!("control/keyring/{remote_current}"))
+        .unwrap();
+    e2v_core::testing::reconcile_remote_keyring_for_test(&owner_root, &remote_keyring_bytes)
+        .unwrap();
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&owner_root.join(".e2v"));
+    let reconciled_owner_secrets = e2v_core::sync_support::unlock_repo_secrets_for_sync(
+        owner_root.join(".e2v"),
+        "correct horse battery staple",
+    )
+    .unwrap();
+    assert!(reconciled_owner_secrets.epoch_keys.contains_key(&1));
+    assert!(reconciled_owner_secrets.epoch_keys.contains_key(&2));
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&owner_root.join(".e2v"));
+    historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    let reopened = e2v_core::testing::unlock_with_local_device_for_test(&recipient_root).unwrap();
+    assert_eq!(reopened.branch.token_hex, state.branch.token_hex);
+}
+
+#[test]
+fn fetch_prefers_remote_current_device_secrets_when_keyring_pointer_changes() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"epoch-one").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-one".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "fetch-prefers-remote-device-secrets-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: None,
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "fetch-prefers-remote-device-secrets-recipient-publish".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(owner_root.join("future.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "fetch-prefers-remote-device-secrets-owner-rotate".to_string(),
+        },
+    )
+    .unwrap();
+
+    historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: owner_root,
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
         },
     )
     .unwrap();

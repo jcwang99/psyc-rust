@@ -17,19 +17,30 @@ use crate::fetch::{
     read_remote_control_plane, update_trusted_remote_state_from_control_plane,
     write_remote_control_plane_to_validation_root,
 };
-use crate::journal::{OperationId, OperationJournal, OperationMetadata, RewriteJournalState};
+use crate::journal::{OperationId, OperationJournal, RewriteJournalState};
 use crate::object_type::candidate_object_types;
 use crate::pack::PackedObjectLocation;
 use crate::pack_index::{
     load_remote_pack_index_segment_paths, load_remote_pack_locations_with_local_cache,
+    publish_pack_index_root,
+};
+use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
+use crate::push::{
+    cleanup_completed_operation_markers, list_operation_pack_index_segment_paths,
+    load_remote_loose_object_ids as load_push_remote_loose_object_ids,
+    mirror_remote_keyring_pointer, publish_remote_keyring_pointer_with_retry,
+    reconcile_local_keyring_with_remote_if_needed, upload_objects_as_pack_segments,
+    upload_remote_keyring_generations,
 };
 use crate::remote_markers::{
     INTENT_EXPIRY_HOURS, marker_is_fresh_at, observe_remote_now_with_probe,
 };
+use crate::transaction::{PublishPlan, PublishSession};
 use e2v_store::DirectLayoutObjectStore;
 use tempfile::TempDir;
 
 const UNPUBLISHED_SNAPSHOT_GRACE_PERIOD_DAYS: u64 = 30;
+const HISTORY_REWRITE_CHECKPOINT_FILE: &str = "history-rewrite.checkpoint";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyRemoteOptions {
@@ -108,6 +119,14 @@ pub struct HistoricalRewriteResult {
     pub retired_epoch_count: usize,
     pub deleted_stale_remote_refs: Vec<String>,
     pub next_layout_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoricalRewriteCheckpoint {
+    stage: String,
+    target_layout_generation: u64,
+    rewritten_object_ids: Vec<String>,
+    retired_epoch_count: usize,
 }
 
 struct MaintenanceReachabilityContext<'a, R: RemoteBackend> {
@@ -269,7 +288,7 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
     })
 }
 
-pub fn historical_rewrite_remote<R: RemoteBackend>(
+pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     remote: &R,
     options: HistoricalRewriteOptions,
 ) -> Result<HistoricalRewriteResult> {
@@ -281,40 +300,252 @@ pub fn historical_rewrite_remote<R: RemoteBackend>(
         !options.password.trim().is_empty(),
         "historical rewrite password must not be empty"
     );
-    let facade = RepositoryFacade::new();
-    let local_result =
-        facade.rewrite_history_to_active_epoch(&options.repo_root, &options.password)?;
-    let repo_state = facade.open(&options.repo_root)?;
+    let control_dir = options.repo_root.join(".e2v");
     let operation_id = OperationId::new("history-rewrite".to_string())?;
-    let journal =
-        OperationJournal::new(options.repo_root.join(".e2v").join("journal").join("sync"))?;
-    journal.begin_operation(
-        &operation_id,
-        OperationMetadata::push(repo_state.branch.token_hex.clone(), None),
-    )?;
-    journal.write_rewrite_state(
-        &operation_id,
-        &RewriteJournalState {
+    let journal = OperationJournal::new(control_dir.join("journal").join("sync"))?;
+    let facade = RepositoryFacade::new();
+    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let mut rewrite_state = load_historical_rewrite_checkpoint(&control_dir)?;
+    if rewrite_state.is_none() {
+        let local_result =
+            facade.rewrite_history_to_active_epoch(&options.repo_root, &options.password)?;
+        let state = RewriteJournalState {
             stage: "local_rewrite_completed".to_string(),
-            target_layout_generation: repo_state.layout_generation,
+            target_layout_generation: facade.open(&options.repo_root)?.layout_generation,
             rewritten_object_ids: local_result.rewritten_object_ids.clone(),
-        },
+            retired_epoch_count: local_result.retired_epoch_count,
+        };
+        store_historical_rewrite_checkpoint(&control_dir, &state)?;
+        rewrite_state = Some(state);
+    }
+    let rewrite_state = rewrite_state.expect("rewrite state initialized");
+    let repo_state = facade.open(&options.repo_root)?;
+    let keyring_files = sync_support::list_keyring_files(&options.repo_root)?;
+    let layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;
+    let layout_root: e2v_store::LayoutRoot = serde_json::from_slice(&layout_root_bytes)?;
+    let default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
+    let current_remote_ref =
+        remote.read_ref(&RefToken::new(repo_state.branch.token_hex.clone()))?;
+    let remote_ref_matches_local = current_remote_ref
+        .as_ref()
+        .map(|stored_ref| stored_ref.value.bytes.as_slice() == default_ref_bytes.as_slice())
+        .unwrap_or(false);
+
+    let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
+    let mut stale_loose_paths = rewrite_state
+        .rewritten_object_ids
+        .iter()
+        .filter(|object_id| remote_loose_object_ids.contains(*object_id))
+        .map(|object_id| format!("objects/{object_id}.json"))
+        .collect::<Vec<_>>();
+    stale_loose_paths.sort();
+    let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+    let publisher = SimpleTransactionPublisher::new(
+        remote.capability().clone(),
+        journal.clone(),
+        (*remote).clone(),
+    );
+    let session = publisher.begin(PublishPlan {
+        operation_id: operation_id.clone(),
+        target_branch_token: repo_state.branch.token_hex.clone(),
+        expected_ref_version: current_remote_ref
+            .as_ref()
+            .map(|stored| stored.version.value),
+        planned_snapshot_id: sync_support::decode_ref_head_snapshot_id(
+            &options.repo_root,
+            &default_ref_bytes,
+        )?,
+        writer_mode: remote.capability().push_write_mode(),
+    })?;
+    let session = PublishSession {
+        next_layout_root: Some(layout_root.clone()),
+        next_layout_root_bytes: Some(layout_root_bytes.clone()),
+        ..session
+    };
+
+    let published_pack_index_segments = upload_rewrite_segments_with_resume(
+        remote,
+        &options.repo_root,
+        &operation_id,
+        &rewrite_state.rewritten_object_ids,
+        &publisher,
+        &session,
     )?;
+
+    upload_remote_keyring_generations(remote, &keyring_files)?;
+    publisher.publish_layout_if_needed(&session)?;
+    if !published_pack_index_segments.is_empty() {
+        publish_pack_index_root(
+            remote,
+            &pack_index_secrets,
+            &layout_root.layout_id,
+            layout_root.generation,
+            published_pack_index_segments.clone(),
+        )?;
+    }
+    publisher.pre_commit_verify(&session)?;
+    let pointer_bytes = publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
+    if !remote_ref_matches_local {
+        let publish_result =
+            publisher.publish_ref(&session, e2v_store::EncryptedRef::new(default_ref_bytes))?;
+        if !publish_result.applied {
+            anyhow::bail!("historical rewrite requires needs-rebase recovery");
+        }
+    }
+    mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
+    for stale_path in &stale_loose_paths {
+        match remote.delete_physical(stale_path) {
+            Ok(()) => {}
+            Err(error) if is_missing_physical_object_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    publisher.complete(session)?;
+    cleanup_completed_operation_markers(remote, &operation_id, &repo_state.branch.token_hex)?;
+    clear_historical_rewrite_checkpoint(&control_dir)?;
+    remove_local_index_if_present(&options.repo_root)?;
     let plan = plan_historical_rewrite(
         remote,
         HistoricalRewritePlanOptions {
-            repo_root: options.repo_root,
+            repo_root: options.repo_root.clone(),
         },
     )?;
     Ok(HistoricalRewriteResult {
-        rewritten_objects: local_result
+        rewritten_objects: rewrite_state
             .rewritten_object_ids
             .len()
             .max(plan.reachable_object_count),
-        retired_epoch_count: local_result.retired_epoch_count,
-        deleted_stale_remote_refs: Vec::new(),
+        retired_epoch_count: rewrite_state.retired_epoch_count,
+        deleted_stale_remote_refs: stale_loose_paths,
         next_layout_generation: repo_state.layout_generation,
     })
+}
+
+fn upload_rewrite_segments_with_resume<R: RemoteBackend + Clone>(
+    remote: &R,
+    repo_root: &Path,
+    operation_id: &OperationId,
+    rewritten_object_ids: &[String],
+    publisher: &SimpleTransactionPublisher<R>,
+    session: &PublishSession,
+) -> Result<Vec<String>> {
+    let existing_rewrite_segments = list_operation_pack_index_segment_paths(remote, operation_id)?;
+    let total_batches = rewritten_object_ids.len().div_ceil(256);
+    let mut published_segments =
+        Vec::with_capacity(total_batches.max(existing_rewrite_segments.len()));
+
+    for batch_index in 0..total_batches {
+        let batch_start = batch_index * 256;
+        let batch_end = ((batch_index + 1) * 256).min(rewritten_object_ids.len());
+        let batch_object_ids = &rewritten_object_ids[batch_start..batch_end];
+        let expected_index_path = crate::pack::pack_paths(&operation_id.value, batch_index)?.2;
+        if existing_rewrite_segments.contains(&expected_index_path) {
+            published_segments.push(expected_index_path);
+            continue;
+        }
+        let uploaded = upload_objects_as_pack_segments(
+            remote,
+            repo_root,
+            operation_id,
+            batch_object_ids,
+            |_object_id| {
+                publisher.heartbeat(session)?;
+                Ok(())
+            },
+        )?;
+        published_segments.extend(uploaded);
+    }
+    published_segments.sort();
+    Ok(published_segments)
+}
+
+fn historical_rewrite_checkpoint_path(control_dir: &Path) -> PathBuf {
+    control_dir
+        .join("journal")
+        .join("sync")
+        .join(HISTORY_REWRITE_CHECKPOINT_FILE)
+}
+
+fn load_historical_rewrite_checkpoint(control_dir: &Path) -> Result<Option<RewriteJournalState>> {
+    let path = historical_rewrite_checkpoint_path(control_dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).with_context(|| {
+        format!(
+            "failed to read historical rewrite checkpoint {}",
+            path.display()
+        )
+    })?;
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(control_dir)?;
+    let plaintext = sync_support::decrypt_control_record_for_sync(
+        &secrets,
+        "history-rewrite-checkpoint",
+        "history_rewrite_checkpoint",
+        &bytes,
+    )?;
+    let checkpoint: HistoricalRewriteCheckpoint = serde_json::from_slice(&plaintext)
+        .context("failed to decode historical rewrite checkpoint")?;
+    Ok(Some(RewriteJournalState {
+        stage: checkpoint.stage,
+        target_layout_generation: checkpoint.target_layout_generation,
+        rewritten_object_ids: checkpoint.rewritten_object_ids,
+        retired_epoch_count: checkpoint.retired_epoch_count,
+    }))
+}
+
+fn store_historical_rewrite_checkpoint(
+    control_dir: &Path,
+    state: &RewriteJournalState,
+) -> Result<()> {
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(control_dir)?;
+    let checkpoint = HistoricalRewriteCheckpoint {
+        stage: state.stage.clone(),
+        target_layout_generation: state.target_layout_generation,
+        rewritten_object_ids: state.rewritten_object_ids.clone(),
+        retired_epoch_count: state.retired_epoch_count,
+    };
+    let plaintext = serde_json::to_vec(&checkpoint)
+        .context("failed to encode historical rewrite checkpoint")?;
+    let bytes = sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "history-rewrite-checkpoint",
+        "history_rewrite_checkpoint",
+        &plaintext,
+    )?;
+    let path = historical_rewrite_checkpoint_path(control_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write_bytes(path, &bytes)
+}
+
+fn clear_historical_rewrite_checkpoint(control_dir: &Path) -> Result<()> {
+    let path = historical_rewrite_checkpoint_path(control_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove historical rewrite checkpoint {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("tmp")
+    ));
+    std::fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, &path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
 }
 
 pub fn force_accept_remote_rollback<R: RemoteBackend>(
@@ -999,6 +1230,16 @@ fn rewrite_local_control_plane_from_remote(
     )?;
     e2v_core::clear_unlocked_keyring_cache(control_dir);
     Ok(())
+}
+
+fn remove_local_index_if_present(repo_root: &Path) -> Result<()> {
+    let index_path = repo_root.join(".e2v").join("index.sqlite3");
+    match std::fs::remove_file(&index_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove local index {}", index_path.display())),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -4826,6 +4826,101 @@ fn rewrite_history_to_active_epoch_bumps_layout_generation() {
 }
 
 #[test]
+fn rewrite_history_to_active_epoch_rewrites_parent_snapshot_chain_before_retiring_old_epochs() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "v1").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "v2").unwrap();
+    let second_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    facade
+        .rewrite_history_to_active_epoch(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let snapshots = facade.snapshots(&repo_root).unwrap();
+
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].snapshot_id, second_commit.snapshot_id);
+    assert_eq!(snapshots[1].snapshot_id, first_commit.snapshot_id);
+}
+
+#[test]
+fn rewrite_history_to_active_epoch_prevents_old_epoch_keys_from_decrypting_current_ref() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "v1").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets_before_rotation = e2v_core::sync_support::unlock_repo_secrets_for_sync(
+        &control_dir,
+        "correct horse battery staple",
+    )
+    .unwrap();
+    let old_epoch_keys = secrets_before_rotation.epoch_keys(1).unwrap().clone();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    facade
+        .rewrite_history_to_active_epoch(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let current_ref_bytes = fs::read(control_dir.join("refs").join("default.json")).unwrap();
+    let wrong_epoch_secrets = e2v_store::RepoSecrets {
+        repo_id: secrets_before_rotation.repo_id.clone(),
+        active_epoch: 1,
+        repo_dedup_key: secrets_before_rotation.repo_dedup_key,
+        repo_ref_key: secrets_before_rotation.repo_ref_key,
+        repo_manifest_enc_key: old_epoch_keys.manifest_enc_key,
+        repo_nonce_key: old_epoch_keys.nonce_key,
+        repo_path_index_key: secrets_before_rotation.repo_path_index_key,
+        epoch_keys: std::collections::BTreeMap::from([(1, old_epoch_keys)]),
+    };
+
+    let error = e2v_core::sync_support::decrypt_control_record_for_sync(
+        &wrong_epoch_secrets,
+        "default",
+        "ref",
+        &current_ref_bytes,
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("missing epoch keys")
+            || error.to_string().contains("authentication failed")
+            || error.to_string().contains("ref authentication failed"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn sync_support_decode_object_bytes_accepts_objects_from_previous_epoch() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

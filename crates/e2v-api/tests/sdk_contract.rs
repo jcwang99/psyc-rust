@@ -3,7 +3,8 @@ use std::path::Path;
 
 use e2v_api::{
     CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest,
-    InitRepositoryOptions, PullRequest, PushRequest, Sdk, SdkErrorCode, parse_remote_spec,
+    HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest, InitRepositoryOptions,
+    PullRequest, PushRequest, Sdk, SdkErrorCode, parse_remote_spec,
 };
 
 fn file_remote_spec(path: &Path) -> String {
@@ -1074,6 +1075,111 @@ fn sdk_can_run_maintenance_with_explicit_remote_spec_without_default_remote_regi
             .join("default.json")
             .exists(),
         "explicit remote maintenance should not require default remote registration"
+    );
+}
+
+#[test]
+fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    let clone_root = temp.path().join("clone");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-historical-default".to_string(),
+    })
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let default_plan = sdk
+        .historical_rewrite_default_remote_plan(HistoricalRewritePlanRequest {
+            repo_root: repo_root.clone(),
+        })
+        .unwrap();
+    assert!(default_plan.reachable_object_count > 0);
+    assert_eq!(default_plan.old_epoch_count, 1);
+    assert!(default_plan.requires_remote_credential_revocation_guidance);
+    assert!(default_plan.advisory_messages.iter().any(|message| {
+        message.contains("remote storage credentials") && message.contains("large repositories")
+    }));
+
+    let default_execute = sdk
+        .historical_rewrite_default_remote_execute(HistoricalRewriteExecuteRequest {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        })
+        .unwrap();
+    assert!(default_execute.rewritten_objects > 0);
+    assert_eq!(default_execute.retired_epoch_count, 1);
+    assert!(default_execute.next_layout_generation >= 2);
+
+    let cloned = sdk
+        .clone_remote(CloneRequest {
+            remote_spec: remote_spec.clone(),
+            target_repo_root: clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        })
+        .unwrap();
+    let read = sdk.open_read_handle(&clone_root).unwrap();
+    let snapshot = read.resolve_branch(&cloned.branch_token).unwrap();
+    let file = read.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read.read_range(&file, 0, 32).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+
+    let explicit_plan = sdk
+        .historical_rewrite_remote_plan(
+            &remote_spec,
+            HistoricalRewritePlanRequest {
+                repo_root: repo_root.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        explicit_plan.reachable_object_count,
+        default_plan.reachable_object_count
+    );
+
+    let explicit_error = sdk
+        .historical_rewrite_remote_execute(
+            &remote_spec,
+            HistoricalRewriteExecuteRequest {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                confirm_full_reencryption: false,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(explicit_error.code(), SdkErrorCode::InvalidArgument);
+    assert!(
+        explicit_error
+            .message()
+            .contains("full re-encryption confirmation"),
+        "unexpected error: {explicit_error:?}"
     );
 }
 

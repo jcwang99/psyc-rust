@@ -1425,6 +1425,115 @@ fn maintenance_commands_delegate_through_the_sdk_boundary() {
 }
 
 #[test]
+fn historical_rewrite_commands_require_confirmation_and_surface_plan_guidance() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let facade = RepositoryFacade::new();
+    let branch_state = facade.open(&repo_root).unwrap().branch;
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let remote = LocalFolderBackend::new(&remote_root);
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: branch_state.token_hex.clone(),
+            operation_id: "cli-history-rewrite-seed".to_string(),
+        },
+    )
+    .unwrap();
+    e2v_cli::testing::run_cli([
+        "e2v",
+        "remote",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "add",
+        "origin",
+        &file_remote_spec(&remote_root),
+    ])
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let plan_output = e2v_cli::testing::run_cli([
+        "e2v",
+        "historical-rewrite",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "plan",
+    ])
+    .unwrap();
+    assert!(plan_output.contains("historical strong revocation"));
+    assert!(plan_output.contains("future-only revocation"));
+    assert!(plan_output.contains("remote storage credentials"));
+
+    let execute_error = e2v_cli::testing::run_cli([
+        "e2v",
+        "historical-rewrite",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "execute",
+        "--password",
+        "correct horse battery staple",
+    ])
+    .unwrap_err();
+    assert!(
+        execute_error
+            .to_string()
+            .contains("confirm-full-reencryption"),
+        "unexpected error: {execute_error:#}"
+    );
+
+    let execute_output = e2v_cli::testing::run_cli([
+        "e2v",
+        "historical-rewrite",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "execute",
+        "--password",
+        "correct horse battery staple",
+        "--confirm-full-reencryption",
+    ])
+    .unwrap();
+    assert!(execute_output.contains("historical strong revocation complete"));
+    assert!(execute_output.contains("rewritten"));
+}
+
+#[test]
+fn historical_rewrite_commands_delegate_through_the_sdk_boundary() {
+    let source = cli_lib_source_without_whitespace();
+
+    for legacy_call in ["plan_historical_rewrite(", "historical_rewrite_remote("] {
+        assert!(
+            !source.contains(legacy_call),
+            "expected CLI historical rewrite commands to delegate through e2v_api::Sdk instead of {legacy_call}"
+        );
+    }
+
+    for sdk_call in [
+        "sdk.historical_rewrite_default_remote_plan(",
+        "sdk.historical_rewrite_default_remote_execute(",
+    ] {
+        assert!(
+            source.contains(sdk_call),
+            "expected CLI historical rewrite commands to use SDK call {sdk_call}"
+        );
+    }
+}
+
+#[test]
 fn branch_and_share_commands_delegate_through_the_sdk_boundary() {
     let source = cli_lib_source_without_whitespace();
 

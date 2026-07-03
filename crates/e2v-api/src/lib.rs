@@ -11,8 +11,9 @@ use e2v_core::{
     SnapshotHandle, SnapshotSummary,
 };
 use e2v_sync::{
-    CloneOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions, PushOptions, RemoteSpec,
-    RepairRemoteOptions, VerifyRemoteOptions,
+    CloneOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions, HistoricalRewriteOptions,
+    HistoricalRewritePlanOptions, PushOptions, RemoteSpec, RepairRemoteOptions,
+    VerifyRemoteOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +133,18 @@ pub struct PullRequest {
 pub struct VerifyRemoteRequest {
     pub repo_root: PathBuf,
     pub sample_percent: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRewritePlanRequest {
+    pub repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRewriteExecuteRequest {
+    pub repo_root: PathBuf,
+    pub password: String,
+    pub confirm_full_reencryption: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +339,22 @@ pub struct GcExecuteRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcExecuteResponse {
     pub deleted_physical_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRewritePlanResponse {
+    pub reachable_object_count: usize,
+    pub old_epoch_count: usize,
+    pub requires_remote_credential_revocation_guidance: bool,
+    pub advisory_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRewriteExecuteResponse {
+    pub rewritten_objects: usize,
+    pub retired_epoch_count: usize,
+    pub deleted_stale_remote_refs: Vec<String>,
+    pub next_layout_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -726,6 +755,60 @@ impl Sdk {
         self.verify_remote(&stored.spec, request)
     }
 
+    pub fn historical_rewrite_remote_plan(
+        &self,
+        remote_spec: &str,
+        request: HistoricalRewritePlanRequest,
+    ) -> SdkResult<HistoricalRewritePlanResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::plan_historical_rewrite(
+                backend,
+                HistoricalRewritePlanOptions {
+                    repo_root: request.repo_root.clone(),
+                },
+            )
+        })
+        .map(historical_rewrite_plan_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn historical_rewrite_default_remote_plan(
+        &self,
+        request: HistoricalRewritePlanRequest,
+    ) -> SdkResult<HistoricalRewritePlanResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.historical_rewrite_remote_plan(&stored.spec, request)
+    }
+
+    pub fn historical_rewrite_remote_execute(
+        &self,
+        remote_spec: &str,
+        request: HistoricalRewriteExecuteRequest,
+    ) -> SdkResult<HistoricalRewriteExecuteResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::historical_rewrite_remote(
+                backend,
+                HistoricalRewriteOptions {
+                    repo_root: request.repo_root.clone(),
+                    password: request.password.clone(),
+                    confirm_full_reencryption: request.confirm_full_reencryption,
+                },
+            )
+        })
+        .map(historical_rewrite_execute_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn historical_rewrite_default_remote_execute(
+        &self,
+        request: HistoricalRewriteExecuteRequest,
+    ) -> SdkResult<HistoricalRewriteExecuteResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.historical_rewrite_remote_execute(&stored.spec, request)
+    }
+
     pub fn repair_remote(
         &self,
         remote_spec: &str,
@@ -1099,6 +1182,29 @@ fn verify_remote_response_from_result(
     }
 }
 
+fn historical_rewrite_plan_response_from_result(
+    result: e2v_sync::HistoricalRewritePlan,
+) -> HistoricalRewritePlanResponse {
+    HistoricalRewritePlanResponse {
+        reachable_object_count: result.reachable_object_count,
+        old_epoch_count: result.old_epoch_count,
+        requires_remote_credential_revocation_guidance: result
+            .requires_remote_credential_revocation_guidance,
+        advisory_messages: result.advisory_messages,
+    }
+}
+
+fn historical_rewrite_execute_response_from_result(
+    result: e2v_sync::HistoricalRewriteResult,
+) -> HistoricalRewriteExecuteResponse {
+    HistoricalRewriteExecuteResponse {
+        rewritten_objects: result.rewritten_objects,
+        retired_epoch_count: result.retired_epoch_count,
+        deleted_stale_remote_refs: result.deleted_stale_remote_refs,
+        next_layout_generation: result.next_layout_generation,
+    }
+}
+
 fn repair_remote_response_from_result(
     result: e2v_sync::RepairRemoteResult,
 ) -> RepairRemoteResponse {
@@ -1128,6 +1234,8 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("unsupported remote url scheme")
         || lower.contains("path traversal")
         || lower.contains("must not be empty")
+        || lower.contains("full re-encryption confirmation")
+        || lower.contains("confirm-full-reencryption")
         || lower.contains("maintenance window")
         || lower.contains("invalid")
         || lower.contains("bad request")

@@ -279,9 +279,9 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             .ok()
         }),
         RepositorySyncMode::SameRepositoryPointerUnchanged
-        | RepositorySyncMode::SameRepositoryPointerChanged => local_repo_secrets
+        | RepositorySyncMode::SameRepositoryPointerChanged => remote_current_device_secrets
             .clone()
-            .or_else(|| remote_current_device_secrets.clone())
+            .or_else(|| local_repo_secrets.clone())
             .or_else(|| {
                 options
                     .password

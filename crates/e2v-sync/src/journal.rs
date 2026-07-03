@@ -100,6 +100,7 @@ pub struct RewriteJournalState {
     pub stage: String,
     pub target_layout_generation: u64,
     pub rewritten_object_ids: Vec<String>,
+    pub retired_epoch_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +374,29 @@ impl OperationJournal {
                 serde_json::from_slice(&bytes).context("failed to decode rewrite journal state")
             })
             .transpose()
+    }
+
+    pub fn clear_operation(&self, operation_id: &OperationId) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection
+            .execute(
+                "DELETE FROM rewrite_state WHERE operation_id = ?1",
+                params![operation_id.value],
+            )
+            .context("failed to delete rewrite journal state")?;
+        connection
+            .execute(
+                "DELETE FROM object_states WHERE operation_id = ?1",
+                params![operation_id.value],
+            )
+            .context("failed to delete object upload states")?;
+        connection
+            .execute(
+                "DELETE FROM operation_metadata WHERE operation_id = ?1",
+                params![operation_id.value],
+            )
+            .context("failed to delete operation metadata")?;
+        Ok(())
     }
 
     fn latest_records(&self, operation_id: &OperationId) -> Result<Vec<ObjectUploadRecord>> {
@@ -697,6 +721,7 @@ mod tests {
             stage: "rewrite_objects".to_string(),
             target_layout_generation: 9,
             rewritten_object_ids: vec!["abc".to_string(), "def".to_string()],
+            retired_epoch_count: 2,
         };
 
         journal.write_rewrite_state(&operation_id, &state).unwrap();
@@ -721,10 +746,42 @@ mod tests {
                 stage: "rewrite_objects".to_string(),
                 target_layout_generation: 9,
                 rewritten_object_ids: vec!["abc".to_string(), "def".to_string()],
+                retired_epoch_count: 2,
             })
             .unwrap(),
             "rewrite journal state should not store pretty-printed JSON whitespace"
         );
+    }
+
+    #[test]
+    fn clear_operation_removes_rewrite_state_metadata_and_object_rows() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let operation_id = OperationId::new("op-rewrite".to_string()).unwrap();
+        journal
+            .begin_operation(
+                &operation_id,
+                OperationMetadata::push("branch-token", Some(17)),
+            )
+            .unwrap();
+        journal.plan_object(&operation_id, "abc", "object").unwrap();
+        journal
+            .write_rewrite_state(
+                &operation_id,
+                &RewriteJournalState {
+                    stage: "rewrite_objects".to_string(),
+                    target_layout_generation: 9,
+                    rewritten_object_ids: vec!["abc".to_string()],
+                    retired_epoch_count: 1,
+                },
+            )
+            .unwrap();
+
+        journal.clear_operation(&operation_id).unwrap();
+
+        assert!(journal.operation_metadata(&operation_id).unwrap().is_none());
+        assert!(journal.read_rewrite_state(&operation_id).unwrap().is_none());
+        assert!(journal.pending_objects(&operation_id).unwrap().is_empty());
     }
 
     #[test]

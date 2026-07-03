@@ -8,9 +8,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use e2v_api::{
     CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest,
-    InitRepositoryOptions, PullRequest, PushRequest, Sdk, ShareAcceptDeviceRequest,
-    ShareAcceptMemberRequest, ShareInviteDeviceRequest, ShareInviteMemberRequest,
-    ShareRevokeDeviceRequest, ShareRevokeMemberRequest, VerifyRemoteRequest,
+    HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest, InitRepositoryOptions,
+    PullRequest, PushRequest, Sdk, ShareAcceptDeviceRequest, ShareAcceptMemberRequest,
+    ShareInviteDeviceRequest, ShareInviteMemberRequest, ShareRevokeDeviceRequest,
+    ShareRevokeMemberRequest, VerifyRemoteRequest,
 };
 use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
@@ -127,6 +128,12 @@ enum Command {
         #[arg(long)]
         repo: PathBuf,
     },
+    HistoricalRewrite {
+        #[command(subcommand)]
+        command: HistoricalRewriteCommand,
+        #[arg(long)]
+        repo: PathBuf,
+    },
     Doctor {
         #[arg(long)]
         repo: PathBuf,
@@ -229,6 +236,17 @@ enum GcCommand {
             default_value_t = false
         )]
         confirm_single_writer_maintenance_window: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoricalRewriteCommand {
+    Plan,
+    Execute {
+        #[arg(long)]
+        password: String,
+        #[arg(long = "confirm-full-reencryption", default_value_t = false)]
+        confirm_full_reencryption: bool,
     },
 }
 
@@ -623,6 +641,49 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(format!(
                     "gc execute: deleted {} physical refs\n",
                     result.deleted_physical_refs.len()
+                ))
+            }
+        },
+        Command::HistoricalRewrite { command, repo } => match command {
+            HistoricalRewriteCommand::Plan => {
+                let plan =
+                    sdk.historical_rewrite_default_remote_plan(HistoricalRewritePlanRequest {
+                        repo_root: repo.clone(),
+                    })?;
+                let mut output = String::new();
+                output.push_str("historical strong revocation plan\n");
+                output.push_str(
+                    "note: future-only revocation stops new access, while historical strong revocation rewrites reachable history onto the active epoch.\n",
+                );
+                output.push_str(&format!(
+                    "reachable objects: {}\nold epochs: {}\n",
+                    plan.reachable_object_count, plan.old_epoch_count
+                ));
+                for advisory in plan.advisory_messages {
+                    output.push_str(&format!("advisory: {advisory}\n"));
+                }
+                Ok(output)
+            }
+            HistoricalRewriteCommand::Execute {
+                password,
+                confirm_full_reencryption,
+            } => {
+                anyhow::ensure!(
+                    confirm_full_reencryption,
+                    "--confirm-full-reencryption is required for historical strong revocation"
+                );
+                let result = sdk.historical_rewrite_default_remote_execute(
+                    HistoricalRewriteExecuteRequest {
+                        repo_root: repo,
+                        password,
+                        confirm_full_reencryption,
+                    },
+                )?;
+                Ok(format!(
+                    "historical strong revocation complete: rewritten {} objects, retired {} old epochs, deleted {} stale remote refs\n",
+                    result.rewritten_objects,
+                    result.retired_epoch_count,
+                    result.deleted_stale_remote_refs.len()
                 ))
             }
         },

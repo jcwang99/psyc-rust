@@ -107,7 +107,9 @@ fn inventory_has_object(
     loose_object_ids.contains(object_id) || pack_locations.contains_key(object_id)
 }
 
-fn load_remote_loose_object_ids<R: RemoteBackend>(remote: &R) -> Result<BTreeSet<String>> {
+pub(crate) fn load_remote_loose_object_ids<R: RemoteBackend>(
+    remote: &R,
+) -> Result<BTreeSet<String>> {
     let mut object_ids = BTreeSet::new();
     for relative_path in remote.list_physical("objects/")? {
         let Some(object_id) = relative_path
@@ -433,7 +435,7 @@ where
     Ok(None)
 }
 
-fn upload_objects_with_policy<R, F>(
+pub(crate) fn upload_objects_with_policy<R, F>(
     remote: &R,
     repo_root: &Path,
     operation_id: &OperationId,
@@ -470,6 +472,52 @@ where
     Ok(published_pack_index_segments)
 }
 
+pub(crate) fn upload_objects_as_pack_segments<R, F>(
+    remote: &R,
+    repo_root: &Path,
+    operation_id: &OperationId,
+    object_ids: &[String],
+    mut on_uploaded: F,
+) -> Result<Vec<String>>
+where
+    R: RemoteBackend,
+    F: FnMut(&str) -> Result<()>,
+{
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+    let mut pack_batch_index = next_pack_batch_index(remote, operation_id)?;
+    let mut published_pack_index_segments = Vec::new();
+    for object_batch in object_ids.chunks(SMALL_OBJECT_PACK_BATCH_SIZE) {
+        let mut pack_builder = ObjectPackBuilder::new(&operation_id.value, pack_batch_index)?;
+        for object_id in object_batch {
+            validate_object_id_value(object_id)?;
+            let bytes = std::fs::read(local_object_path(repo_root, object_id))?;
+            pack_builder.push_object(object_id.clone(), &bytes);
+        }
+        let (index, payload) = pack_builder.finish();
+        let (_, data_path, index_path) = pack_paths(&operation_id.value, pack_batch_index)?;
+        remote.put_physical(&data_path, &payload)?;
+        remote.put_physical(
+            &index_path,
+            &encode_pack_index_segment_bytes_for_sync(
+                &secrets,
+                &index_path,
+                &serde_json::to_vec(&index)?,
+            )?,
+        )?;
+        pack_batch_index += 1;
+        for object_id in object_batch {
+            on_uploaded(object_id)?;
+        }
+        published_pack_index_segments.push(index_path);
+    }
+    Ok(published_pack_index_segments)
+}
+
 fn remote_physical_matches<R: RemoteBackend>(
     remote: &R,
     relative_path: &str,
@@ -481,11 +529,17 @@ fn remote_physical_matches<R: RemoteBackend>(
         .unwrap_or(false)
 }
 
-fn remote_control_plane_matches<R: RemoteBackend>(remote: &R, layout_root_bytes: &[u8]) -> bool {
+pub(crate) fn remote_control_plane_matches<R: RemoteBackend>(
+    remote: &R,
+    layout_root_bytes: &[u8],
+) -> bool {
     remote_physical_matches(remote, "layout_root.json", layout_root_bytes)
 }
 
-fn remote_keyring_matches<R: RemoteBackend>(remote: &R, keyring_files: &[PathBuf]) -> bool {
+pub(crate) fn remote_keyring_matches<R: RemoteBackend>(
+    remote: &R,
+    keyring_files: &[PathBuf],
+) -> bool {
     let pointer_file = match keyring_files
         .iter()
         .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("keyring.current"))
@@ -549,7 +603,7 @@ fn remote_keyring_matches<R: RemoteBackend>(remote: &R, keyring_files: &[PathBuf
     })
 }
 
-fn upload_remote_keyring_generations<R: RemoteBackend>(
+pub(crate) fn upload_remote_keyring_generations<R: RemoteBackend>(
     remote: &R,
     keyring_files: &[PathBuf],
 ) -> Result<()> {
@@ -616,7 +670,10 @@ fn publish_remote_keyring_pointer<R: RemoteBackend>(
     Ok(bytes)
 }
 
-fn mirror_remote_keyring_pointer<R: RemoteBackend>(remote: &R, pointer_bytes: &[u8]) -> Result<()> {
+pub(crate) fn mirror_remote_keyring_pointer<R: RemoteBackend>(
+    remote: &R,
+    pointer_bytes: &[u8],
+) -> Result<()> {
     if remote
         .get_physical("control/keyring/keyring.current")
         .map(|bytes| bytes == pointer_bytes)
@@ -650,7 +707,7 @@ fn read_remote_current_keyring_bytes<R: RemoteBackend>(
     }
 }
 
-fn reconcile_local_keyring_with_remote_if_needed<R: RemoteBackend>(
+pub(crate) fn reconcile_local_keyring_with_remote_if_needed<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
 ) -> Result<()> {
@@ -660,7 +717,7 @@ fn reconcile_local_keyring_with_remote_if_needed<R: RemoteBackend>(
     Ok(())
 }
 
-fn publish_remote_keyring_pointer_with_retry<R: RemoteBackend>(
+pub(crate) fn publish_remote_keyring_pointer_with_retry<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
 ) -> Result<Vec<u8>> {
@@ -684,7 +741,7 @@ fn publish_remote_keyring_pointer_with_retry<R: RemoteBackend>(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("keyring pointer publish conflict")))
 }
 
-fn cleanup_completed_operation_markers<R: RemoteBackend>(
+pub(crate) fn cleanup_completed_operation_markers<R: RemoteBackend>(
     remote: &R,
     operation_id: &OperationId,
     branch_token: &str,
@@ -717,6 +774,20 @@ fn cleanup_completed_operation_markers<R: RemoteBackend>(
     }
 
     Ok(())
+}
+
+pub(crate) fn list_operation_pack_index_segment_paths<R: RemoteBackend>(
+    remote: &R,
+    operation_id: &OperationId,
+) -> Result<Vec<String>> {
+    let prefix = format!("packs/index/{}-", operation_id.value);
+    let mut paths = remote
+        .list_physical("packs/index/")?
+        .into_iter()
+        .filter(|path| path.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
 }
 
 pub fn push_head<R: RemoteBackend + Clone>(

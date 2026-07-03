@@ -1131,6 +1131,157 @@ fn c_abi_can_register_remote_and_run_sync_maintenance_flows() {
 }
 
 #[test]
+fn c_abi_can_plan_and_execute_historical_rewrite_on_default_remote() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = new_sdk_handle();
+    let source_repo_c = path_c_string(&source_repo);
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    let remote_spec_c = c_string(&remote_spec);
+    let mut error = std::ptr::null_mut();
+    let mut init_json = c_abi::e2v_string_t::default();
+
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_init_repository_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("correct horse battery staple").as_ptr(),
+                c_string("main").as_ptr(),
+                &mut init_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let repo: RepositoryInfo = serde_json::from_str(&read_owned_string(&mut init_json)).unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let mut commit_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_commit_repository_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("seed").as_ptr(),
+                &mut commit_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _seed: CommitInfo = serde_json::from_str(&read_owned_string(&mut commit_json)).unwrap();
+
+    let mut add_remote_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_add_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("origin").as_ptr(),
+                remote_spec_c.as_ptr(),
+                &mut add_remote_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _added_remote: RemoteRegistration =
+        serde_json::from_str(&read_owned_string(&mut add_remote_json)).unwrap();
+
+    let mut push_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_push_default_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string(&repo.branch.token_hex).as_ptr(),
+                c_string("push-history-1").as_ptr(),
+                &mut push_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _push: e2v_api::PushResponse =
+        serde_json::from_str(&read_owned_string(&mut push_json)).unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&source_repo, "correct horse battery staple")
+        .unwrap();
+
+    let mut plan_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_historical_rewrite_default_remote_plan_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                &mut plan_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let plan: e2v_api::HistoricalRewritePlanResponse =
+        serde_json::from_str(&read_owned_string(&mut plan_json)).unwrap();
+    assert!(plan.reachable_object_count > 0);
+    assert_eq!(plan.old_epoch_count, 1);
+    assert!(plan.requires_remote_credential_revocation_guidance);
+
+    let mut execute_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_historical_rewrite_default_remote_execute_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("correct horse battery staple").as_ptr(),
+                false,
+                &mut execute_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_INVALID_ARGUMENT
+    );
+    let execute_error = error_message_from_ptr(error);
+    assert!(
+        execute_error.contains("full re-encryption confirmation"),
+        "unexpected error: {execute_error}"
+    );
+    unsafe {
+        c_abi::e2v_error_free(error);
+    }
+    error = std::ptr::null_mut();
+
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_historical_rewrite_default_remote_execute_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("correct horse battery staple").as_ptr(),
+                true,
+                &mut execute_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let rewritten: e2v_api::HistoricalRewriteExecuteResponse =
+        serde_json::from_str(&read_owned_string(&mut execute_json)).unwrap();
+    assert!(rewritten.rewritten_objects > 0);
+    assert_eq!(rewritten.retired_epoch_count, 1);
+
+    unsafe {
+        c_abi::e2v_sdk_free(sdk);
+    }
+}
+
+#[test]
 fn c_abi_pull_rejects_diverged_local_history_without_moving_the_current_branch() {
     let temp = tempfile::tempdir().unwrap();
     let source_repo = temp.path().join("source");

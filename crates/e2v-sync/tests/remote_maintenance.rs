@@ -9,10 +9,10 @@ use e2v_store::{BlobStore, MemoryBackend};
 use tempfile::tempdir;
 
 use e2v_sync::{
-    GcDryRunOptions, GcExecuteOptions, HistoricalRewriteOptions, HistoricalRewritePlanOptions,
-    PushOptions, RepairRemoteOptions, VerifyRemoteOptions, force_accept_remote_rollback,
-    gc_dry_run, gc_execute, historical_rewrite_remote, plan_historical_rewrite, push_head,
-    repair_remote, verify_remote,
+    CloneOptions, GcDryRunOptions, GcExecuteOptions, HistoricalRewriteOptions,
+    HistoricalRewritePlanOptions, PushOptions, RepairRemoteOptions, VerifyRemoteOptions,
+    clone_remote, fetch_remote, force_accept_remote_rollback, gc_dry_run, gc_execute,
+    historical_rewrite_remote, plan_historical_rewrite, push_head, repair_remote, verify_remote,
 };
 
 #[test]
@@ -155,9 +155,9 @@ fn plan_historical_rewrite_reports_old_epochs_reachable_objects_and_guidance() {
     assert_eq!(plan.old_epoch_count, 1);
     assert!(plan.requires_remote_credential_revocation_guidance);
     assert!(
-        plan.advisory_messages
-            .iter()
-            .any(|message| message.contains("remote storage credentials")),
+        plan.advisory_messages.iter().any(|message| {
+            message.contains("remote storage credentials") && message.contains("large repositories")
+        }),
         "expected remote credential revocation guidance, saw {:?}",
         plan.advisory_messages
     );
@@ -293,7 +293,7 @@ fn historical_rewrite_remote_retires_local_old_epochs_before_remote_publish() {
 }
 
 #[test]
-fn historical_rewrite_remote_records_checkpoint_with_target_layout_generation() {
+fn historical_rewrite_remote_clears_checkpoint_after_successful_publish() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -341,18 +341,772 @@ fn historical_rewrite_remote_records_checkpoint_with_target_layout_generation() 
     let journal =
         e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
             .unwrap();
-    let state = journal
-        .read_rewrite_state(&e2v_sync::OperationId::new("history-rewrite".to_string()).unwrap())
-        .unwrap()
-        .expect("rewrite checkpoint");
+    let operation_id = e2v_sync::OperationId::new("history-rewrite".to_string()).unwrap();
 
     assert_eq!(result.next_layout_generation, 2);
-    assert_eq!(state.stage, "local_rewrite_completed");
-    assert_eq!(state.target_layout_generation, 2);
+    assert!(journal.read_rewrite_state(&operation_id).unwrap().is_none());
+    assert!(journal.operation_metadata(&operation_id).unwrap().is_none());
+    assert!(journal.pending_objects(&operation_id).unwrap().is_empty());
+}
+
+#[test]
+fn historical_rewrite_remote_reconcile_keeps_password_unlockable_old_epochs() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"epoch-one").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-one".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-rewrite-reconcile-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote,
+        e2v_sync::FetchOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: None,
+        },
+    )
+    .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-rewrite-reconcile-recipient-publish".to_string(),
+        },
+    )
+    .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
+
+    let remote_keyring_bytes = remote
+        .get_physical(&format!(
+            "control/keyring/{}",
+            serde_json::from_slice::<serde_json::Value>(
+                &remote
+                    .read_ref(&RefToken::new(format!(
+                        "keyring/{}",
+                        e2v_core::sync_support::read_repo_id(&owner_root).unwrap()
+                    )))
+                    .unwrap()
+                    .unwrap()
+                    .value
+                    .bytes
+            )
+            .unwrap()["current"]
+                .as_str()
+                .unwrap()
+        ))
+        .unwrap();
+    e2v_core::testing::reconcile_remote_keyring_for_test(&owner_root, &remote_keyring_bytes)
+        .unwrap();
+
+    let secrets = e2v_core::sync_support::unlock_repo_secrets_for_sync(
+        owner_root.join(".e2v"),
+        "correct horse battery staple",
+    )
+    .unwrap();
+
     assert!(
-        !state.rewritten_object_ids.is_empty(),
-        "expected checkpoint to remember rewritten objects"
+        secrets.epoch_keys.contains_key(&1),
+        "password unlock should still retain pre-rewrite epoch keys after remote reconcile"
     );
+    assert!(secrets.epoch_keys.contains_key(&2));
+}
+
+#[test]
+fn historical_rewrite_remote_preserves_remote_active_device_envelopes() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"epoch-one").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-one".to_string(),
+        })
+        .unwrap();
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-rewrite-envelope-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+
+    let accepted = facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes,
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+    fetch_remote(
+        &remote,
+        e2v_sync::FetchOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: None,
+        },
+    )
+    .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: recipient_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-rewrite-envelope-recipient-publish".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(owner_root.join("future.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-rewrite-envelope-owner-rotate".to_string(),
+        },
+    )
+    .unwrap();
+    historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&owner_root).unwrap();
+    let pointer = remote
+        .read_ref(&RefToken::new(format!("keyring/{repo_id}")))
+        .unwrap()
+        .unwrap();
+    let pointer_json: serde_json::Value = serde_json::from_slice(&pointer.value.bytes).unwrap();
+    let current = pointer_json["current"].as_str().unwrap();
+    let keyring: serde_json::Value = serde_json::from_slice(
+        &remote
+            .get_physical(&format!("control/keyring/{current}"))
+            .unwrap(),
+    )
+    .unwrap();
+    let device_actor_ids = keyring["envelopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|envelope| envelope["kind"].as_str() == Some("device"))
+        .filter_map(|envelope| envelope["actor_id"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        device_actor_ids.contains(&accepted.actor_id.as_str()),
+        "remote historical rewrite should preserve active shared device envelopes, saw {:?}",
+        device_actor_ids
+    );
+}
+
+#[test]
+fn historical_rewrite_remote_publishes_new_pack_view_and_purges_stale_loose_refs() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello rewrite").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let reachable_object_ids = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&first_commit.snapshot_id)
+        .unwrap();
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-remote-view".to_string(),
+        },
+    )
+    .unwrap();
+
+    let mut old_loose_paths = reachable_object_ids
+        .iter()
+        .map(|object_id| format!("objects/{object_id}.json"))
+        .collect::<Vec<_>>();
+    old_loose_paths.sort();
+    for path in &old_loose_paths {
+        assert!(
+            remote.exists_physical(path),
+            "expected seed push to publish loose object {path}"
+        );
+    }
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+
+    let result = historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.next_layout_generation, 2);
+    assert_eq!(result.deleted_stale_remote_refs, old_loose_paths);
+    assert!(
+        !repo_root.join(".e2v").join("index.sqlite3").exists(),
+        "historical rewrite should invalidate the local sqlite index after publication"
+    );
+
+    let pack_root_bytes = remote
+        .get_physical("pack-index/root.json")
+        .expect("historical rewrite should publish a pack index root");
+    let pack_root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &pack_root_bytes,
+    )
+    .unwrap();
+    let segments = pack_root["segments"]
+        .as_array()
+        .expect("segments array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        !segments.is_empty(),
+        "historical rewrite should publish new pack index segments"
+    );
+    assert!(
+        segments
+            .iter()
+            .all(|path| path.starts_with("packs/index/history-rewrite-")),
+        "historical rewrite should replace the current pack view with rewrite-owned segments: {:?}",
+        segments
+    );
+
+    for path in &old_loose_paths {
+        assert!(
+            !remote.exists_physical(path),
+            "historical rewrite should purge stale loose object carrier {path}"
+        );
+    }
+
+    let fetched_root = temp.path().join("fetched");
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: fetched_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    let read_service = facade.read_service(&fetched_root).unwrap();
+    let snapshot = read_service
+        .open_snapshot(&first_commit.snapshot_id)
+        .unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+    assert_eq!(bytes, b"hello rewrite");
+}
+
+#[test]
+fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello resume").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let reachable_object_ids = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&first_commit.snapshot_id)
+        .unwrap();
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-resume".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+
+    let mut stale_loose_paths = reachable_object_ids
+        .iter()
+        .map(|object_id| format!("objects/{object_id}.json"))
+        .collect::<Vec<_>>();
+    stale_loose_paths.sort();
+    let interrupted_remote =
+        FailOnceOnDeleteBackend::new(remote.clone(), stale_loose_paths[0].clone());
+
+    let first_error = historical_rewrite_remote(
+        &interrupted_remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        first_error.to_string().contains("injected delete failure"),
+        "unexpected interruption error: {first_error:#}"
+    );
+
+    let layout_after_interruption = remote.read_layout_root().unwrap();
+    assert_eq!(layout_after_interruption.generation, 2);
+    let ref_version_after_interruption = remote
+        .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+        .unwrap()
+        .expect("remote branch ref after interruption")
+        .version
+        .value;
+
+    let resumed = historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.next_layout_generation, 2);
+    assert_eq!(resumed.deleted_stale_remote_refs, stale_loose_paths);
+    assert_eq!(remote.read_layout_root().unwrap().generation, 2);
+    assert_eq!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .expect("remote branch ref after resume")
+            .version
+            .value,
+        ref_version_after_interruption,
+        "resume should not republish the current branch ref once the rewrite view is already published"
+    );
+    for path in &stale_loose_paths {
+        assert!(
+            !remote.exists_physical(path),
+            "resumed historical rewrite should eventually purge stale loose ref {path}"
+        );
+    }
+}
+
+#[test]
+fn historical_rewrite_remote_stores_rewrite_checkpoint_without_plaintext_object_ids_or_stage() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello encrypted checkpoint").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let reachable_object_ids = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&first_commit.snapshot_id)
+        .unwrap();
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-encrypted-checkpoint".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let stale_path = format!("objects/{}.json", reachable_object_ids[0]);
+    let interrupted_remote = FailOnceOnDeleteBackend::new(remote.clone(), stale_path);
+
+    let first_error = historical_rewrite_remote(
+        &interrupted_remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        first_error.to_string().contains("injected delete failure"),
+        "unexpected interruption error: {first_error:#}"
+    );
+
+    let checkpoint_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("journal")
+            .join("sync")
+            .join("history-rewrite.checkpoint"),
+    )
+    .unwrap();
+    let checkpoint_text = String::from_utf8_lossy(&checkpoint_bytes);
+    let sqlite_bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("journal")
+            .join("sync")
+            .join("operations.sqlite"),
+    )
+    .unwrap();
+    let sqlite_path = repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("sync")
+        .join("operations.sqlite");
+    let sqlite = rusqlite::Connection::open(&sqlite_path).unwrap();
+    let history_rewrite_metadata_rows: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM operation_metadata WHERE operation_id = ?1",
+            rusqlite::params!["history-rewrite"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let history_rewrite_object_rows: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM object_states WHERE operation_id = ?1",
+            rusqlite::params!["history-rewrite"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let history_rewrite_state_rows: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM rewrite_state WHERE operation_id = ?1",
+            rusqlite::params!["history-rewrite"],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(
+        !checkpoint_text.contains("local_rewrite_completed"),
+        "rewrite checkpoint should not leak plaintext stage names"
+    );
+    for object_id in &reachable_object_ids {
+        assert!(
+            !checkpoint_text.contains(object_id),
+            "rewrite checkpoint should not leak plaintext object id {object_id}"
+        );
+    }
+    assert!(
+        !String::from_utf8_lossy(&sqlite_bytes).contains("local_rewrite_completed"),
+        "historical rewrite journaling should not leak plaintext stage names into operations sqlite"
+    );
+    assert_eq!(history_rewrite_metadata_rows, 0);
+    assert_eq!(history_rewrite_object_rows, 0);
+    assert_eq!(history_rewrite_state_rows, 0);
+}
+
+#[test]
+fn historical_rewrite_remote_resumes_after_pack_segment_upload_interruption() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..300usize {
+        fs::write(
+            repo_root.join(format!("tracked-{index:03}.txt")),
+            format!("payload-{index:03}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-pack-resume".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let interrupted_remote =
+        FailOnceOnPutBackend::for_history_rewrite_index_batch(remote.clone(), 1);
+
+    let first_error = historical_rewrite_remote(
+        &interrupted_remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("injected put failure for history rewrite batch"),
+        "unexpected interruption error: {first_error:#}"
+    );
+    let expected_segment_count = plan_historical_rewrite(
+        &remote,
+        HistoricalRewritePlanOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap()
+    .reachable_object_count
+    .div_ceil(256);
+    let interrupted_segments = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .filter(|path| path.starts_with("packs/index/history-rewrite-"))
+        .collect::<Vec<_>>();
+    assert!(
+        interrupted_segments.len() < expected_segment_count,
+        "interrupted rewrite should leave fewer published segments than the complete rewrite would require"
+    );
+
+    let resumed = historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+    assert!(resumed.rewritten_objects > 256);
+
+    let pack_root_bytes = remote.get_physical("pack-index/root.json").unwrap();
+    let pack_root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &pack_root_bytes,
+    )
+    .unwrap();
+    let segments = pack_root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        segments.len(),
+        expected_segment_count,
+        "resumed historical rewrite should publish every rewrite-owned segment after a later-batch upload interruption"
+    );
+    assert!(
+        segments
+            .iter()
+            .all(|path| path.starts_with("packs/index/history-rewrite-")),
+        "unexpected rewrite pack segments: {segments:?}"
+    );
+}
+
+#[test]
+fn historical_rewrite_remote_clears_local_rewrite_journal_after_success() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello cleanup").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-cleanup".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id = e2v_sync::OperationId::new("history-rewrite".to_string()).unwrap();
+
+    assert!(journal.read_rewrite_state(&operation_id).unwrap().is_none());
+    assert!(journal.operation_metadata(&operation_id).unwrap().is_none());
+    assert!(journal.pending_objects(&operation_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1594,6 +2348,114 @@ impl LayoutRootStore for FailOnceOnDeleteBackend {
 }
 
 impl e2v_store::RemoteBackend for FailOnceOnDeleteBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailOnceOnPutBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    target_path: String,
+    failed_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FailOnceOnPutBackend {
+    fn for_history_rewrite_index_batch(inner: MemoryBackend, batch_index: usize) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            target_path: format!("packs/index/history-rewrite-{batch_index:08}.json"),
+            failed_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl BlobStore for FailOnceOnPutBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        if relative_path == self.target_path
+            && !self
+                .failed_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected put failure for history rewrite batch {relative_path}");
+        }
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for FailOnceOnPutBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for FailOnceOnPutBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for FailOnceOnPutBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }

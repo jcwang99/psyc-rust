@@ -9,7 +9,8 @@ use std::ptr;
 use serde::Serialize;
 
 use crate::{
-    CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest, InitRepositoryOptions,
+    CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest,
+    HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest, InitRepositoryOptions,
     PullRequest, PushRequest, ReadHandle, Sdk, SdkError, SdkErrorCode, ShareAcceptDeviceRequest,
     ShareAcceptMemberRequest, ShareInviteDeviceRequest, ShareInviteMemberRequest,
     ShareRevokeDeviceRequest, ShareRevokeMemberRequest, SnapshotView, VerifyRemoteRequest,
@@ -1071,6 +1072,40 @@ pub unsafe extern "C" fn e2v_gc_default_remote_execute_json(
             repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
             grace_period_days,
             allow_single_writer_maintenance_window,
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn e2v_historical_rewrite_default_remote_plan_json(
+    sdk: *mut e2v_sdk_t,
+    repo_root: *const c_char,
+    json_out: *mut e2v_string_t,
+    error_out: *mut *mut e2v_error_t,
+) -> e2v_error_code_t {
+    ffi_call_with_json(json_out, error_out, || {
+        let sdk = unsafe { sdk_ref(sdk)? };
+        sdk.historical_rewrite_default_remote_plan(HistoricalRewritePlanRequest {
+            repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn e2v_historical_rewrite_default_remote_execute_json(
+    sdk: *mut e2v_sdk_t,
+    repo_root: *const c_char,
+    password: *const c_char,
+    confirm_full_reencryption: bool,
+    json_out: *mut e2v_string_t,
+    error_out: *mut *mut e2v_error_t,
+) -> e2v_error_code_t {
+    ffi_call_with_json(json_out, error_out, || {
+        let sdk = unsafe { sdk_ref(sdk)? };
+        sdk.historical_rewrite_default_remote_execute(HistoricalRewriteExecuteRequest {
+            repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
+            password: ffi_read_c_string(password, "password")?,
+            confirm_full_reencryption,
         })
     })
 }
