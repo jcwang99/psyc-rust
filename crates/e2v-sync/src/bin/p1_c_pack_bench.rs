@@ -58,6 +58,12 @@ fn run_benchmark() -> Result<String> {
     let pack_remote_written = !remote.list_physical("packs/data/")?.is_empty()
         && !remote.list_physical("packs/index/")?.is_empty()
         && remote.exists_physical("pack-index/root.json");
+    let remote_pack_bytes = total_remote_bytes(&remote, "packs/data/")?;
+    let remote_pack_index_bytes = total_remote_bytes(&remote, "packs/index/")?
+        + remote
+            .stat_physical("pack-index/root.json")
+            .map(|stat| stat.length)
+            .unwrap_or(0);
 
     let clone_repo_root = temp.path().join("clone");
     let clone_start = Instant::now();
@@ -124,6 +130,20 @@ fn run_benchmark() -> Result<String> {
     let cached_fetch_ms = cached_fetch_start.elapsed().as_millis();
     let cache_reuse_verified = deleted_object_path.is_file();
     let cached_fetch_without_remote_segments = cache_reuse_remote.blocked_segment_reads() == 0;
+    let fetch_local_object_bytes =
+        total_directory_bytes(&fetch_target_root.join(".e2v").join("objects"))?;
+    let fetch_pack_index_cache_bytes = total_directory_bytes(
+        &fetch_target_root
+            .join(".e2v")
+            .join("cache")
+            .join("pack-index"),
+    )?;
+    let fetch_pack_data_cache_bytes = total_directory_bytes(
+        &fetch_target_root
+            .join(".e2v")
+            .join("cache")
+            .join("pack-data"),
+    )?;
 
     let compact_start = Instant::now();
     let mut compaction_triggered = false;
@@ -158,7 +178,7 @@ fn run_benchmark() -> Result<String> {
     let segment_count = read_root_segment_count(&source_repo_root.join(".e2v"), &remote)?;
 
     Ok(format!(
-        "p1-c-pack-bench packed_push_ms={packed_push_ms} packed_clone_ms={packed_clone_ms} pack_index_warmup_ms={pack_index_warmup_ms} cached_fetch_ms={cached_fetch_ms} compaction_path_ms={compaction_path_ms} pack_range_reads={pack_range_reads} distinct_pack_paths={distinct_pack_path_count} pack_range_reuse_verified={pack_range_reuse_verified} pack_remote_written={pack_remote_written} clone_head_verified={clone_head_verified} cached_fetch_without_remote_segments={cached_fetch_without_remote_segments} root_segments={segment_count} compaction_triggered={compaction_triggered} cache_reuse_verified={cache_reuse_verified}"
+        "p1-c-pack-bench packed_push_ms={packed_push_ms} packed_clone_ms={packed_clone_ms} pack_index_warmup_ms={pack_index_warmup_ms} cached_fetch_ms={cached_fetch_ms} compaction_path_ms={compaction_path_ms} remote_pack_bytes={remote_pack_bytes} remote_pack_index_bytes={remote_pack_index_bytes} fetch_local_object_bytes={fetch_local_object_bytes} fetch_pack_index_cache_bytes={fetch_pack_index_cache_bytes} fetch_pack_data_cache_bytes={fetch_pack_data_cache_bytes} pack_range_reads={pack_range_reads} distinct_pack_paths={distinct_pack_path_count} pack_range_reuse_verified={pack_range_reuse_verified} pack_remote_written={pack_remote_written} clone_head_verified={clone_head_verified} cached_fetch_without_remote_segments={cached_fetch_without_remote_segments} root_segments={segment_count} compaction_triggered={compaction_triggered} cache_reuse_verified={cache_reuse_verified}"
     ))
 }
 
@@ -202,6 +222,36 @@ fn read_root_segment_count(control_dir: &Path, remote: &MemoryBackend) -> Result
 
 fn has_compacted_segments(remote: &MemoryBackend) -> Result<bool> {
     Ok(!remote.list_physical("pack-index/segments/")?.is_empty())
+}
+
+fn total_remote_bytes(remote: &MemoryBackend, prefix: &str) -> Result<u64> {
+    remote
+        .list_physical(prefix)?
+        .into_iter()
+        .map(|path| remote.stat_physical(&path).map(|stat| stat.length))
+        .try_fold(0u64, |total, length| Ok(total + length?))
+}
+
+fn total_directory_bytes(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                stack.push(entry_path);
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[derive(Debug, Clone)]

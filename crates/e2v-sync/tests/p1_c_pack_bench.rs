@@ -22,6 +22,11 @@ fn p1_c_pack_bench_reports_p1_c_critical_paths() {
         "pack_index_warmup_ms=",
         "cached_fetch_ms=",
         "compaction_path_ms=",
+        "remote_pack_bytes=",
+        "remote_pack_index_bytes=",
+        "fetch_local_object_bytes=",
+        "fetch_pack_index_cache_bytes=",
+        "fetch_pack_data_cache_bytes=",
         "pack_range_reads=",
         "distinct_pack_paths=",
         "pack_range_reuse_verified=",
@@ -67,6 +72,20 @@ fn p1_c_pack_bench_reports_p1_c_critical_paths() {
             .is_some(),
         "expected benchmark to report a numeric pack_index_warmup_ms, got:\n{stdout}"
     );
+    for metric in [
+        "remote_pack_bytes",
+        "remote_pack_index_bytes",
+        "fetch_local_object_bytes",
+        "fetch_pack_index_cache_bytes",
+        "fetch_pack_data_cache_bytes",
+    ] {
+        assert!(
+            extract_metric(&stdout, metric)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some(),
+            "expected benchmark to report a numeric {metric}, got:\n{stdout}"
+        );
+    }
     let pack_range_reads = extract_metric(&stdout, "pack_range_reads")
         .expect("benchmark should report pack_range_reads")
         .parse::<usize>()
@@ -87,6 +106,42 @@ fn p1_c_pack_bench_reports_p1_c_critical_paths() {
     assert!(
         root_segments <= 4,
         "expected benchmark root segment count to stay bounded, got {root_segments}\n{stdout}"
+    );
+
+    let remote_pack_bytes = extract_metric(&stdout, "remote_pack_bytes")
+        .expect("benchmark should report remote_pack_bytes")
+        .parse::<u64>()
+        .expect("remote_pack_bytes should be numeric");
+    assert!(
+        remote_pack_bytes > 0,
+        "expected benchmark to report non-zero remote pack bytes, got:\n{stdout}"
+    );
+
+    let remote_pack_index_bytes = extract_metric(&stdout, "remote_pack_index_bytes")
+        .expect("benchmark should report remote_pack_index_bytes")
+        .parse::<u64>()
+        .expect("remote_pack_index_bytes should be numeric");
+    assert!(
+        remote_pack_index_bytes > 0,
+        "expected benchmark to report non-zero remote pack index bytes, got:\n{stdout}"
+    );
+
+    let fetch_pack_index_cache_bytes = extract_metric(&stdout, "fetch_pack_index_cache_bytes")
+        .expect("benchmark should report fetch_pack_index_cache_bytes")
+        .parse::<u64>()
+        .expect("fetch_pack_index_cache_bytes should be numeric");
+    assert!(
+        fetch_pack_index_cache_bytes > 0,
+        "expected benchmark to report non-zero fetch pack-index cache bytes, got:\n{stdout}"
+    );
+
+    let fetch_pack_data_cache_bytes = extract_metric(&stdout, "fetch_pack_data_cache_bytes")
+        .expect("benchmark should report fetch_pack_data_cache_bytes")
+        .parse::<u64>()
+        .expect("fetch_pack_data_cache_bytes should be numeric");
+    assert!(
+        fetch_pack_data_cache_bytes > 0,
+        "expected benchmark to report non-zero fetch pack-data cache bytes, got:\n{stdout}"
     );
 }
 

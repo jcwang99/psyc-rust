@@ -360,6 +360,7 @@ fn read_directory_entries(
     let directory_root: DirectoryRootObject =
         postcard_from_bytes(&loaded.plaintext).context("failed to decode object plaintext")?;
     validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
+    validate_directory_root_object(&directory_root)?;
     let mut entries = Vec::new();
     for shard_id in directory_root.shards {
         let shard = read_tree_shard_object(object_store, &shard_id)?;
@@ -415,6 +416,7 @@ fn read_tree_shard_object(
 ) -> Result<TreeShardObject> {
     let tree_shard: TreeShardObject = read_stored_object(object_store, object_id, "tree_shard")?;
     validate_manifest_schema_version("tree_shard", tree_shard.schema_version)?;
+    validate_tree_shard_object(&tree_shard)?;
     Ok(tree_shard)
 }
 
@@ -440,6 +442,7 @@ fn collect_tree_object_ids(
             let directory_root: DirectoryRootObject = postcard_from_bytes(&loaded.plaintext)
                 .context("failed to decode object plaintext")?;
             validate_manifest_schema_version("directory_root", directory_root.schema_version)?;
+            validate_directory_root_object(&directory_root)?;
             for shard_id in directory_root.shards {
                 if !push_reachable_id(reachable, seen, shard_id.clone()) {
                     continue;
@@ -484,6 +487,37 @@ fn collect_tree_entries(
             }
         }
     }
+    Ok(())
+}
+
+fn validate_directory_root_object(directory_root: &DirectoryRootObject) -> Result<()> {
+    ensure!(
+        directory_root.fanout as usize == directory_root.shards.len(),
+        "directory_root fanout does not match shard count"
+    );
+    Ok(())
+}
+
+fn validate_tree_shard_object(tree_shard: &TreeShardObject) -> Result<()> {
+    let Some(first) = tree_shard.entries.first() else {
+        ensure!(
+            tree_shard.range_start.is_empty() && tree_shard.range_end.is_empty(),
+            "tree_shard range metadata must be empty when the shard has no entries"
+        );
+        return Ok(());
+    };
+    let last = tree_shard
+        .entries
+        .last()
+        .expect("first entry implies last entry");
+    ensure!(
+        tree_shard.range_start == first.name,
+        "tree_shard range_start does not match the first entry name"
+    );
+    ensure!(
+        tree_shard.range_end == last.name,
+        "tree_shard range_end does not match the last entry name"
+    );
     Ok(())
 }
 
@@ -629,8 +663,8 @@ mod tests {
                 "tree_shard",
                 &postcard::to_stdvec(&TreeShardObject {
                     schema_version: REPO_FORMAT_VERSION,
-                    range_start: "a".to_string(),
-                    range_end: "c".to_string(),
+                    range_start: String::new(),
+                    range_end: String::new(),
                     entries: vec![],
                 })
                 .unwrap(),
@@ -638,7 +672,7 @@ mod tests {
             .unwrap();
 
         let object = read_tree_shard_object(&store, &object_id).unwrap();
-        assert_eq!(object.range_start, "a");
+        assert_eq!(object.range_start, "");
     }
 
     #[test]
@@ -649,8 +683,8 @@ mod tests {
                 "tree_shard",
                 &postcard::to_stdvec(&TreeShardObject {
                     schema_version: REPO_FORMAT_VERSION,
-                    range_start: "a".to_string(),
-                    range_end: "c".to_string(),
+                    range_start: String::new(),
+                    range_end: String::new(),
                     entries: vec![],
                 })
                 .unwrap(),
@@ -660,7 +694,7 @@ mod tests {
 
         let object = read_tree_shard_object(trait_store, &object_id).unwrap();
 
-        assert_eq!(object.range_end, "c");
+        assert_eq!(object.range_end, "");
     }
 
     #[test]
@@ -671,8 +705,8 @@ mod tests {
                 "tree_shard",
                 &postcard::to_stdvec(&TreeShardObject {
                     schema_version: REPO_FORMAT_VERSION,
-                    range_start: "a".to_string(),
-                    range_end: "z".to_string(),
+                    range_start: "nested.txt".to_string(),
+                    range_end: "nested.txt".to_string(),
                     entries: vec![TreeEntry {
                         name: "nested.txt".to_string(),
                         kind: "file".to_string(),
@@ -700,6 +734,67 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "nested.txt");
         assert_eq!(counting_store.get_load_count(&directory_root_id), 1);
+    }
+
+    #[test]
+    fn read_directory_entries_rejects_directory_root_with_mismatched_fanout() {
+        let store = store_for_tests();
+        let shard_id = store
+            .put_object(
+                "tree_shard",
+                &postcard::to_stdvec(&TreeShardObject {
+                    schema_version: REPO_FORMAT_VERSION,
+                    range_start: "a".to_string(),
+                    range_end: "z".to_string(),
+                    entries: vec![],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let directory_root_id = store
+            .put_object(
+                "directory_root",
+                &postcard::to_stdvec(&DirectoryRootObject {
+                    schema_version: REPO_FORMAT_VERSION,
+                    fanout: 2,
+                    shards: vec![shard_id],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let error = read_directory_entries(&store, &directory_root_id).unwrap_err();
+        assert!(
+            error.to_string().contains("fanout"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn read_tree_shard_object_rejects_range_metadata_mismatch() {
+        let store = store_for_tests();
+        let object_id = store
+            .put_object(
+                "tree_shard",
+                &postcard::to_stdvec(&TreeShardObject {
+                    schema_version: REPO_FORMAT_VERSION,
+                    range_start: "b".to_string(),
+                    range_end: "y".to_string(),
+                    entries: vec![TreeEntry {
+                        name: "a".to_string(),
+                        kind: "file".to_string(),
+                        object_id: "child".to_string(),
+                    }],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let error = read_tree_shard_object(&store, &object_id).unwrap_err();
+        assert!(
+            error.to_string().contains("range"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

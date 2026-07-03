@@ -780,6 +780,12 @@ impl WritableVfs {
             self.directory_exists(&parent),
             "parent directory does not exist: {parent}"
         );
+        if let Ok(metadata) = self.inner.stat_path(&normalized) {
+            anyhow::ensure!(
+                metadata.kind != VfsNodeKind::Directory,
+                "path already exists as directory: {normalized}"
+            );
+        }
         if self.overlay_directory_exists(&normalized) {
             anyhow::bail!("path already exists as directory: {normalized}");
         }

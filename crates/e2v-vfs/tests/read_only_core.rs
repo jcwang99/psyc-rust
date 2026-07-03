@@ -1892,6 +1892,37 @@ fn writable_live_branch_keeps_overlay_when_writeback_conflicts() {
 }
 
 #[test]
+fn writable_live_branch_rejects_overlay_file_when_snapshot_path_is_directory() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("child.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mut vfs = e2v_vfs::WritableVfs::mount_live_branch(VfsMountConfig::live_branch(
+        repo_root,
+        branch_token,
+    ))
+    .unwrap();
+
+    let error = vfs.write_file("nested", b"beta".to_vec()).unwrap_err();
+    assert!(error.to_string().contains("directory"));
+}
+
+#[test]
 fn mount_requests_stop_at_the_platform_boundary_with_explicit_status() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -3564,14 +3595,11 @@ fn windows_live_branch_mount_creates_new_repository_file_through_real_winfsp_mou
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let snapshot = read_service.resolve_branch(&branch_token).unwrap();
-        match read_service.open_file(&snapshot, "new.txt") {
-            Ok(file) => {
-                let bytes = read_service.read_range(&file, 0, 16).unwrap();
-                if String::from_utf8(bytes).unwrap() == "delta" {
-                    break;
-                }
+        if let Ok(file) = read_service.open_file(&snapshot, "new.txt") {
+            let bytes = read_service.read_range(&file, 0, 16).unwrap();
+            if String::from_utf8(bytes).unwrap() == "delta" {
+                break;
             }
-            Err(_) => {}
         }
         assert!(Instant::now() < deadline, "mounted create never committed");
         std::thread::sleep(Duration::from_millis(100));
