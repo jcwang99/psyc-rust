@@ -4,6 +4,7 @@ mod layout_root_store;
 mod local_backend;
 mod logical_object_store;
 mod memory_backend;
+mod oblivious_layout;
 mod opendal_backend;
 mod ref_store;
 mod storage_layout;
@@ -21,6 +22,7 @@ pub use logical_object_store::{
     RepoSecrets, validate_object_id_value,
 };
 pub use memory_backend::MemoryBackend;
+pub use oblivious_layout::{ObliviousObjectPlacement, ObliviousStorageLayout};
 pub use opendal_backend::{
     OpendalMemoryBackend, OpendalS3Backend, OpendalWebdavBackend, RemoteBackend,
     S3CompatibleMockBackend, S3RemoteConfig, WebdavAlistMockBackend, WebdavFlavor,
