@@ -1710,7 +1710,7 @@ pub mod testing {
     }
 
     impl WinfspMountContext {
-        pub fn from_test_request(request: MountRequest) -> Self {
+        pub fn from_test_request(request: MountRequest) -> anyhow::Result<Self> {
             Self::from_request(request.into_inner())
         }
     }

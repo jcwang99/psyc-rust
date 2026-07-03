@@ -138,7 +138,7 @@ pub(crate) fn mount_live_branch(
 
 fn mount_request(request: MountRequest) -> Result<MountLaunchSummary> {
     let launcher = WindowsMountLauncher::from_request(&request);
-    let context = WinfspMountContext::from_request(request);
+    let context = WinfspMountContext::from_request(request)?;
     let mut host = SummaryOnlyHostLauncher;
     launcher.launch_with_host_and_describe(context, &mut host)
 }
@@ -176,7 +176,7 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
         }
     };
     let launcher = WindowsMountLauncher::from_request(&request);
-    let mut mount_context = Box::new(WinfspMountContext::from_request(request));
+    let mut mount_context = Box::new(WinfspMountContext::from_request(request)?);
     let host_config = launcher.host_config(&mount_context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
     let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
@@ -1996,15 +1996,13 @@ enum WinfspVfs {
 }
 
 impl WinfspMountContext {
-    pub(crate) fn from_request(request: MountRequest) -> Self {
+    pub(crate) fn from_request(request: MountRequest) -> Result<Self> {
         let vfs = match &request.config.mode {
-            MountMode::SnapshotPinned { .. } => WinfspVfs::ReadOnly(
-                ReadOnlyVfs::mount_snapshot(request.config.clone())
-                    .expect("mount request should resolve to a readable VFS context"),
-            ),
+            MountMode::SnapshotPinned { .. } => {
+                WinfspVfs::ReadOnly(ReadOnlyVfs::mount_snapshot(request.config.clone())?)
+            }
             MountMode::LiveBranch { .. } => WinfspVfs::Writable(Arc::new(Mutex::new(
-                WritableVfs::mount_live_branch(request.config.clone())
-                    .expect("mount request should resolve to a readable VFS context"),
+                WritableVfs::mount_live_branch(request.config.clone())?,
             ))),
         };
         let cache_policy = match &vfs {
@@ -2016,7 +2014,7 @@ impl WinfspMountContext {
         } else {
             READ_ONLY_SECURITY_DESCRIPTOR_SDDL
         };
-        Self {
+        Ok(Self {
             request,
             cache_policy,
             observed_inode_ids: Arc::new(Mutex::new(BTreeSet::new())),
@@ -2027,7 +2025,7 @@ impl WinfspMountContext {
                     .expect("WinFSP security descriptor should be valid"),
             ),
             vfs,
-        }
+        })
     }
 
     pub fn mount_mode_label(&self) -> &'static str {
