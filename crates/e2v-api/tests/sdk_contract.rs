@@ -1579,6 +1579,76 @@ fn sdk_verify_default_remote_reports_corrupt_state_for_invalid_trusted_state_fil
 }
 
 #[test]
+fn sdk_fetch_default_remote_reports_corrupt_state_for_invalid_local_keyring_pointer() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-invalid-local-keyring-pointer".to_string(),
+    })
+    .unwrap();
+
+    let cloned = sdk
+        .clone_remote(CloneRequest {
+            remote_spec: remote_spec.clone(),
+            target_repo_root: clone_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        })
+        .unwrap();
+    sdk.add_remote(&clone_repo, "origin", &remote_spec).unwrap();
+
+    fs::write(
+        clone_repo
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+
+    let error = sdk
+        .fetch_default_remote(FetchRequest {
+            repo_root: clone_repo.clone(),
+            branch_token: cloned.branch_token,
+            password: Some("correct horse battery staple".to_string()),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error
+            .message()
+            .contains("failed to decode local keyring pointer"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

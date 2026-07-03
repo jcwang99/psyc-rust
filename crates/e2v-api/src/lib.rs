@@ -1400,6 +1400,9 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode remote keyring pointer")
         || lower.contains("failed to decode remote keyring state")
         || lower.contains("failed to decode remote branch ref")
+        || lower.contains("failed to decode local keyring pointer")
+        || lower.contains("failed to decode local keyring state")
+        || lower.contains("failed to decode local keyring state for pointer ref")
         || lower.contains("failed to decode authenticated pack index root")
         || lower.contains("failed to decode authenticated pack index segment")
         || lower.contains("failed to decrypt authenticated pack index segment")
@@ -1479,6 +1482,15 @@ mod tests {
     fn map_error_treats_corrupted_trusted_state_as_corrupt_state() {
         let error =
             anyhow::anyhow!("failed to decode trusted state C:/tmp/e2v/trusted-state/repo.json");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_local_keyring_pointer_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decode local keyring pointer");
 
         let mapped = map_error(error);
 

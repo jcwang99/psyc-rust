@@ -529,7 +529,7 @@ fn local_keyring_is_newer_than_remote(
     }
     let local_pointer: KeyringPointer =
         serde_json::from_slice(&std::fs::read(&local_pointer_path)?)
-            .with_context(|| format!("failed to decode {}", local_pointer_path.display()))?;
+            .context("failed to decode local keyring pointer")?;
     if local_pointer.generation <= control_plane.keyring_pointer.generation {
         return Ok(false);
     }
@@ -641,8 +641,7 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
             return Ok(RepositorySyncMode::ReplaceLocalState);
         }
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to decode {}", local_pointer_path.display()));
+            return Err(error).context("failed to decode local keyring pointer");
         }
     };
     let local_keyring_path = control_dir.join("keyring").join(&local_pointer.current);
