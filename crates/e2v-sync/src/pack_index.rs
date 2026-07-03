@@ -207,21 +207,27 @@ pub fn load_cached_pack_physical_ref_for_object_id(
 }
 
 #[doc(hidden)]
-pub fn decode_pack_index_root_value_for_test(control_dir: &Path, bytes: &[u8]) -> Result<Value> {
+pub(crate) fn decode_pack_index_root_value_for_test(
+    control_dir: &Path,
+    bytes: &[u8],
+) -> Result<Value> {
     let secrets = open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let root = decode_pack_index_root_bytes(bytes, Some(&secrets))?;
     serde_json::to_value(root).map_err(Into::into)
 }
 
 #[doc(hidden)]
-pub fn encode_pack_index_root_value_for_test(control_dir: &Path, value: &Value) -> Result<Vec<u8>> {
+pub(crate) fn encode_pack_index_root_value_for_test(
+    control_dir: &Path,
+    value: &Value,
+) -> Result<Vec<u8>> {
     let secrets = open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let root: PackIndexRoot = serde_json::from_value(value.clone())?;
     encode_pack_index_root_bytes(&secrets, &root)
 }
 
 #[doc(hidden)]
-pub fn decode_pack_index_segment_value_for_test(
+pub(crate) fn decode_pack_index_segment_value_for_test(
     control_dir: &Path,
     segment_path: &str,
     bytes: &[u8],
@@ -235,7 +241,7 @@ pub fn decode_pack_index_segment_value_for_test(
 }
 
 #[doc(hidden)]
-pub fn encode_pack_index_segment_value_for_test(
+pub(crate) fn encode_pack_index_segment_value_for_test(
     control_dir: &Path,
     segment_path: &str,
     value: &Value,

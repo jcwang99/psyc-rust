@@ -12,8 +12,6 @@ pub mod testing {
 
     use anyhow::Result;
 
-    pub use crate::chunker::override_fixed_span_bytes_for_test;
-    pub use crate::keyring::clear_unlocked_keyring_cache_for_test;
     pub use crate::working_tree::WorkingTree as TestWorkingTree;
     pub use crate::working_tree::{SnapshotReader, StableReadPolicy};
 
@@ -60,6 +58,16 @@ pub mod testing {
         max_chunks: usize,
     ) -> crate::facade::MaxFileChunksPerObjectGuard {
         crate::facade::override_max_file_chunks_per_object_for_test(max_chunks)
+    }
+
+    pub fn override_fixed_span_bytes_for_test(
+        span_bytes: usize,
+    ) -> crate::chunker::FixedSpanBytesGuard {
+        crate::chunker::override_fixed_span_bytes_for_test(span_bytes)
+    }
+
+    pub fn clear_unlocked_keyring_cache_for_test(control_dir: &std::path::Path) {
+        crate::keyring::clear_unlocked_keyring_cache_for_test(control_dir);
     }
 
     pub fn rotate_active_epoch_for_test(

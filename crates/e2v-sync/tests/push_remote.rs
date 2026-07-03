@@ -68,6 +68,38 @@ fn sync_testing_and_benchmarking_modules_do_not_reexport_internal_helpers_direct
 }
 
 #[test]
+fn sync_internal_test_helpers_are_not_left_public_inside_internal_modules() {
+    let pack_index_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("pack_index.rs"),
+    )
+    .unwrap();
+    let trusted_state_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("trusted_state.rs"),
+    )
+    .unwrap();
+
+    for legacy_public_helper in [
+        "pub fn decode_pack_index_root_value_for_test",
+        "pub fn encode_pack_index_root_value_for_test",
+        "pub fn decode_pack_index_segment_value_for_test",
+        "pub fn encode_pack_index_segment_value_for_test",
+    ] {
+        assert!(
+            !pack_index_source.contains(legacy_public_helper),
+            "pack-index test helper should not remain public inside the internal module: {legacy_public_helper}"
+        );
+    }
+    assert!(
+        !trusted_state_source.contains("pub fn override_trusted_state_dir_for_test"),
+        "trusted-state test override should not remain public inside the internal module"
+    );
+}
+
+#[test]
 fn sync_exposes_a_single_doc_hidden_probe_surface() {
     let source = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

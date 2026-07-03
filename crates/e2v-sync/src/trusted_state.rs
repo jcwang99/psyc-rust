@@ -15,7 +15,7 @@ pub struct TrustedRemoteState {
 }
 
 #[doc(hidden)]
-pub fn override_trusted_state_dir_for_test(path: PathBuf) -> TrustedStateDirGuard {
+pub(crate) fn override_trusted_state_dir_for_test(path: PathBuf) -> TrustedStateDirGuard {
     let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
     let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = slot.replace(path);

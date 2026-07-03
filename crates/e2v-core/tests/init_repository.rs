@@ -130,6 +130,26 @@ fn testing_module_does_not_reexport_core_facade_types_or_sync_reconcile_directly
 }
 
 #[test]
+fn testing_module_wraps_chunker_and_keyring_test_helpers_instead_of_reexporting_them() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for legacy_reexport in [
+        "pub use crate::chunker::override_fixed_span_bytes_for_test;",
+        "pub use crate::keyring::clear_unlocked_keyring_cache_for_test;",
+    ] {
+        assert!(
+            !source.contains(legacy_reexport),
+            "e2v-core::testing should wrap internal test helpers instead of directly re-exporting them: {legacy_reexport}"
+        );
+    }
+}
+
+#[test]
 fn sync_support_module_is_kept_doc_hidden_as_an_internal_sync_boundary() {
     let source = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

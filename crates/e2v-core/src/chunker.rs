@@ -67,7 +67,7 @@ impl FastCdcChunker {
     }
 }
 
-pub fn override_fixed_span_bytes_for_test(span_bytes: usize) -> FixedSpanBytesGuard {
+pub(crate) fn override_fixed_span_bytes_for_test(span_bytes: usize) -> FixedSpanBytesGuard {
     let previous = FIXED_SPAN_BYTES_OVERRIDE.with(|cell| {
         let previous = cell.get();
         cell.set(Some(span_bytes));

@@ -155,7 +155,7 @@ pub fn clear_unlocked_keyring_cache(control_dir: &Path) {
     }
 }
 
-pub fn clear_unlocked_keyring_cache_for_test(control_dir: &Path) {
+pub(crate) fn clear_unlocked_keyring_cache_for_test(control_dir: &Path) {
     clear_unlocked_keyring_cache(control_dir);
 }
 
