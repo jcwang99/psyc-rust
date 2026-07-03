@@ -81,7 +81,7 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
     secrets: Option<&RepoSecrets>,
 ) -> Result<BTreeMap<String, PackedObjectLocation>> {
     let cache_dir = pack_index_cache_dir(control_dir);
-    std::fs::create_dir_all(segment_cache_dir(control_dir))?;
+    ensure_pack_index_cache_layout(control_dir)?;
 
     let Some(root_bytes) = load_remote_pack_index_root_bytes(remote)? else {
         prune_pack_index_cache(&cache_dir)?;
@@ -110,7 +110,7 @@ pub(crate) fn load_remote_pack_locations_from_segment_paths_with_local_cache<B: 
     segment_paths: &[String],
 ) -> Result<BTreeMap<String, PackedObjectLocation>> {
     let cache_dir = pack_index_cache_dir(control_dir);
-    std::fs::create_dir_all(segment_cache_dir(control_dir))?;
+    ensure_pack_index_cache_layout(control_dir)?;
     prune_stale_cached_segments(&cache_dir, segment_paths)?;
 
     let mut locations = BTreeMap::new();
@@ -259,10 +259,51 @@ fn segment_cache_dir(control_dir: &Path) -> PathBuf {
     pack_index_cache_dir(control_dir).join("segments")
 }
 
+fn ensure_pack_index_cache_layout(control_dir: &Path) -> Result<()> {
+    let cache_dir = pack_index_cache_dir(control_dir);
+    ensure_directory_path(&cache_dir)?;
+    ensure_directory_path(&segment_cache_dir(control_dir))
+}
+
 fn cached_segment_path(cache_dir: &Path, segment_path: &str) -> PathBuf {
     cache_dir
         .join("segments")
         .join(segment_path.replace('/', "__"))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(_) => {
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn ensure_directory_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && parent != path
+    {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)?;
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn prepare_cache_file_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)
 }
 
 fn prune_stale_cached_segments(cache_dir: &Path, live_segment_paths: &[String]) -> Result<()> {
@@ -310,9 +351,7 @@ fn persist_root_cache_if_changed(cache_path: &Path, root_bytes: &[u8]) -> Result
     {
         return Ok(());
     }
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    prepare_cache_file_path(cache_path)?;
     std::fs::write(cache_path, root_bytes)?;
     Ok(())
 }
@@ -340,18 +379,21 @@ fn load_segment_bytes_with_cache_recovery<B: BlobStore>(
     cache_path: &Path,
     secrets: Option<&RepoSecrets>,
 ) -> Result<Vec<u8>> {
-    if cache_path.is_file() {
-        let cached_bytes = std::fs::read(cache_path)?;
-        if read_segment_entries(segment_path, &cached_bytes, secrets).is_ok() {
-            return Ok(cached_bytes);
+    match std::fs::read(cache_path) {
+        Ok(cached_bytes) => {
+            if read_segment_entries(segment_path, &cached_bytes, secrets).is_ok() {
+                return Ok(cached_bytes);
+            }
+            let _ = remove_path_if_exists(cache_path);
         }
-        let _ = std::fs::remove_file(cache_path);
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            let _ = remove_path_if_exists(cache_path);
+        }
     }
 
     let bytes = remote.get_physical(segment_path)?;
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    prepare_cache_file_path(cache_path)?;
     std::fs::write(cache_path, &bytes)?;
     Ok(bytes)
 }
@@ -1176,6 +1218,128 @@ mod tests {
                 .unwrap();
         assert!(refreshed.contains_key("abc"));
         assert_eq!(std::fs::read(cache_path).unwrap(), segment_bytes);
+    }
+
+    #[test]
+    fn cached_pack_index_segment_path_conflict_is_healed_before_refetch() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        let (index, payload) =
+            build_pack("op", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index.data_path, &payload).unwrap();
+        let segment_path = "packs/index/op-00000000.json";
+        let segment_plaintext = serde_json::to_vec(&index).unwrap();
+        let segment_bytes =
+            encode_pack_index_segment_bytes(&secrets, segment_path, &segment_plaintext).unwrap();
+        remote.put_physical(segment_path, &segment_bytes).unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_path.to_string()],
+        )
+        .unwrap();
+
+        let first =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(first.contains_key("abc"));
+
+        let cache_path = cached_segment_path(&pack_index_cache_dir(&control_dir), segment_path);
+        std::fs::remove_file(&cache_path).unwrap();
+        std::fs::create_dir(&cache_path).unwrap();
+
+        let refreshed =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(refreshed.contains_key("abc"));
+        assert!(cache_path.is_file());
+        assert_eq!(std::fs::read(cache_path).unwrap(), segment_bytes);
+    }
+
+    #[test]
+    fn pack_index_segment_cache_directory_path_conflict_is_healed_before_refetch() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        let (index, payload) =
+            build_pack("op", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index.data_path, &payload).unwrap();
+        let segment_path = "packs/index/op-00000000.json";
+        let segment_plaintext = serde_json::to_vec(&index).unwrap();
+        let segment_bytes =
+            encode_pack_index_segment_bytes(&secrets, segment_path, &segment_plaintext).unwrap();
+        remote.put_physical(segment_path, &segment_bytes).unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_path.to_string()],
+        )
+        .unwrap();
+
+        let first =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(first.contains_key("abc"));
+
+        let cache_dir = pack_index_cache_dir(&control_dir);
+        let segment_dir = segment_cache_dir(&control_dir);
+        let cache_path = cached_segment_path(&cache_dir, segment_path);
+        std::fs::remove_file(&cache_path).unwrap();
+        std::fs::remove_dir(&segment_dir).unwrap();
+        std::fs::write(&segment_dir, b"not-a-directory").unwrap();
+
+        let refreshed =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(refreshed.contains_key("abc"));
+        assert!(segment_dir.is_dir());
+        assert!(cache_path.is_file());
+        assert_eq!(std::fs::read(cache_path).unwrap(), segment_bytes);
+    }
+
+    #[test]
+    fn pack_index_root_cache_path_conflict_is_healed_after_segment_restore() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        let (index, payload) =
+            build_pack("op", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index.data_path, &payload).unwrap();
+        let segment_path = "packs/index/op-00000000.json";
+        let segment_bytes = encode_pack_index_segment_bytes(
+            &secrets,
+            segment_path,
+            &serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        remote.put_physical(segment_path, &segment_bytes).unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_path.to_string()],
+        )
+        .unwrap();
+
+        let first =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(first.contains_key("abc"));
+
+        let root_cache_path = pack_index_cache_dir(&control_dir).join("root.json");
+        let expected_root_bytes = remote.get_physical(PACK_INDEX_ROOT_PATH).unwrap();
+        std::fs::remove_file(&root_cache_path).unwrap();
+        std::fs::create_dir(&root_cache_path).unwrap();
+
+        let refreshed =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+        assert!(refreshed.contains_key("abc"));
+        assert!(root_cache_path.is_file());
+        assert_eq!(std::fs::read(root_cache_path).unwrap(), expected_root_bytes);
     }
 
     #[test]
