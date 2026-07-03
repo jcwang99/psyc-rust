@@ -1083,6 +1083,9 @@ impl EncryptedRangeCache {
             plaintext.len(),
         );
         let ciphertext = self.encrypt_blob(offset, plaintext)?;
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(cache_path, ciphertext)?;
         let _ = self.record_range_index_entry(
             snapshot_id,
@@ -1270,6 +1273,9 @@ impl EncryptedRangeCache {
         let path = self.range_index_path(snapshot_id, file_object_id, layout_generation);
         let encoded = Self::encode_range_index_entries(entries)?;
         let ciphertext = self.encrypt_blob(0, &encoded)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(path, ciphertext)?;
         Ok(())
     }

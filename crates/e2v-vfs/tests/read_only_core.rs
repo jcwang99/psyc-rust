@@ -312,6 +312,49 @@ fn encrypted_disk_cache_hits_are_promoted_into_open_file_memory_cache() {
 }
 
 #[test]
+fn encrypted_disk_cache_recreates_cache_directory_after_external_removal() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let cache_dir = temp.path().join("encrypted-cache");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root.clone(), snapshot_id)
+            .with_encrypted_disk_cache_dir(cache_dir.clone())
+            .with_plaintext_memory_cache_budget_bytes(0),
+    )
+    .unwrap();
+
+    let warm_handle = vfs.open_file("tracked.txt").unwrap();
+    let first = vfs.read(&warm_handle, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(first).unwrap(), "lph");
+    assert!(
+        fs::read_dir(&cache_dir).unwrap().next().is_some(),
+        "expected encrypted cache warm-up to populate {cache_dir:?}"
+    );
+
+    fs::remove_dir_all(&cache_dir).unwrap();
+    assert!(
+        !cache_dir.exists(),
+        "expected test to remove encrypted cache directory"
+    );
+
+    let reopened = vfs.open_file("tracked.txt").unwrap();
+    let second = vfs.read(&reopened, 1, 3).unwrap();
+    assert_eq!(String::from_utf8(second).unwrap(), "lph");
+    assert!(
+        cache_dir.is_dir(),
+        "encrypted cache directory should be recreated after external removal"
+    );
+    assert!(
+        fs::read_dir(&cache_dir).unwrap().next().is_some(),
+        "expected reread to repopulate encrypted cache after directory recreation"
+    );
+}
+
+#[test]
 fn encrypted_disk_cache_remains_readable_after_repo_moves_to_a_new_path() {
     let temp = tempdir().unwrap();
     let original_repo_root = temp.path().join("repo-original");
