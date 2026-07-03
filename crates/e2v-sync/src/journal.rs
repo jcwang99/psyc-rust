@@ -95,6 +95,13 @@ pub struct ObjectStateBatch {
     pub next_cursor: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewriteJournalState {
+    pub stage: String,
+    pub target_layout_generation: u64,
+    pub rewritten_object_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OperationJournal {
     root: PathBuf,
@@ -330,6 +337,44 @@ impl OperationJournal {
             .transpose()
     }
 
+    pub fn write_rewrite_state(
+        &self,
+        operation_id: &OperationId,
+        state: &RewriteJournalState,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(state).context("failed to encode rewrite journal state")?;
+        let connection = self.open_connection()?;
+        connection
+            .execute(
+                "INSERT INTO rewrite_state(operation_id, state_json)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(operation_id) DO UPDATE SET state_json = excluded.state_json",
+                params![operation_id.value, bytes],
+            )
+            .context("failed to upsert rewrite journal state")?;
+        Ok(())
+    }
+
+    pub fn read_rewrite_state(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<RewriteJournalState>> {
+        let connection = self.open_connection()?;
+        let bytes: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT state_json FROM rewrite_state WHERE operation_id = ?1",
+                params![operation_id.value],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read rewrite journal state")?;
+        bytes
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).context("failed to decode rewrite journal state")
+            })
+            .transpose()
+    }
+
     fn latest_records(&self, operation_id: &OperationId) -> Result<Vec<ObjectUploadRecord>> {
         let connection = self.open_connection()?;
         let mut stmt = connection
@@ -400,6 +445,10 @@ impl OperationJournal {
                     object_type TEXT NOT NULL,
                     state TEXT NOT NULL,
                     PRIMARY KEY(operation_id, object_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS rewrite_state (
+                    operation_id TEXT PRIMARY KEY,
+                    state_json BLOB NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS idx_object_states_operation
                     ON object_states(operation_id, object_id);",
@@ -630,6 +679,51 @@ mod tests {
             bytes,
             serde_json::to_vec(&metadata).unwrap(),
             "operation journal should not store pretty-printed JSON whitespace in sqlite metadata blobs"
+        );
+    }
+
+    #[test]
+    fn journal_persists_rewrite_state_as_compact_json() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let operation_id = OperationId::new("op-rewrite".to_string()).unwrap();
+        journal
+            .begin_operation(
+                &operation_id,
+                OperationMetadata::push("branch-token", Some(17)),
+            )
+            .unwrap();
+        let state = RewriteJournalState {
+            stage: "rewrite_objects".to_string(),
+            target_layout_generation: 9,
+            rewritten_object_ids: vec!["abc".to_string(), "def".to_string()],
+        };
+
+        journal.write_rewrite_state(&operation_id, &state).unwrap();
+
+        let bytes: Vec<u8> = journal
+            .open_connection()
+            .unwrap()
+            .query_row(
+                "SELECT state_json FROM rewrite_state WHERE operation_id = ?1",
+                params![operation_id.value],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            journal.read_rewrite_state(&operation_id).unwrap(),
+            Some(state)
+        );
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&RewriteJournalState {
+                stage: "rewrite_objects".to_string(),
+                target_layout_generation: 9,
+                rewritten_object_ids: vec!["abc".to_string(), "def".to_string()],
+            })
+            .unwrap(),
+            "rewrite journal state should not store pretty-printed JSON whitespace"
         );
     }
 
