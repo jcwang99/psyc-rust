@@ -4,6 +4,7 @@ mod journal;
 mod object_type;
 mod oram;
 mod pack;
+mod pack_cache;
 mod pack_index;
 mod publisher;
 mod push;

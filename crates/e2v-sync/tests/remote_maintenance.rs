@@ -5049,3 +5049,95 @@ fn verify_remote_recovers_from_corrupted_local_pack_data_cache() {
     );
     assert_ne!(fs::read(&cached_pack_path).unwrap(), b"corrupt-pack-cache");
 }
+
+#[test]
+fn verify_remote_recovers_from_tampered_local_pack_data_cache_with_same_length() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            repo_root.join(format!("tampered-packed-{index:02}.txt")),
+            format!("tampered-packed-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "packed-cache-tamper-recovery".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-maintenance-pack-cache-tamper".to_string(),
+        },
+    )
+    .unwrap();
+
+    let tracked_remote = RangeReadTrackingBackend::new(remote);
+    let first = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    assert!(first.sampled_objects > 0);
+
+    let cache_root = repo_root
+        .join(".e2v")
+        .join("cache")
+        .join("pack-data")
+        .join("packs")
+        .join("data");
+    let cached_pack_path = fs::read_dir(&cache_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .next()
+        .expect("expected verify_remote to materialize pack-data cache");
+    let mut tampered_cache_bytes = fs::read(&cached_pack_path).unwrap();
+    let flip_index = tampered_cache_bytes.len() / 2;
+    tampered_cache_bytes[flip_index] ^= 0x01;
+    fs::write(&cached_pack_path, &tampered_cache_bytes).unwrap();
+
+    tracked_remote.reset_range_reads();
+
+    let second = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    assert_eq!(second.sampled_objects, first.sampled_objects);
+
+    let second_range_reads = tracked_remote
+        .range_read_paths()
+        .into_iter()
+        .filter(|path| path.starts_with("packs/data/"))
+        .collect::<Vec<_>>();
+    assert!(
+        !second_range_reads.is_empty(),
+        "expected tampered local pack-data cache to trigger remote pack range reread"
+    );
+    assert_ne!(fs::read(&cached_pack_path).unwrap(), tampered_cache_bytes);
+}
