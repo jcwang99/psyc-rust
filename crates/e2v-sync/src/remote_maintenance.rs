@@ -527,16 +527,12 @@ fn store_historical_rewrite_checkpoint(
 
 fn clear_historical_rewrite_checkpoint(control_dir: &Path) -> Result<()> {
     let path = historical_rewrite_checkpoint_path(control_dir);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to remove historical rewrite checkpoint {}",
-                path.display()
-            )
-        }),
-    }
+    remove_path_if_exists(&path).with_context(|| {
+        format!(
+            "failed to remove historical rewrite checkpoint {}",
+            path.display()
+        )
+    })
 }
 
 fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
@@ -546,10 +542,47 @@ fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
             .and_then(|ext| ext.to_str())
             .unwrap_or("tmp")
     ));
+    if let Some(parent) = path.parent() {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(&temp_path)?;
     std::fs::write(&temp_path, bytes)
         .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    std::fs::rename(&temp_path, &path)
-        .with_context(|| format!("failed to publish {}", path.display()))?;
+    match std::fs::rename(&temp_path, &path) {
+        Ok(()) => {}
+        Err(error) if cfg!(windows) => {
+            remove_path_if_exists(&path)?;
+            std::fs::rename(&temp_path, &path)
+                .with_context(|| format!("failed to publish {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to publish {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn ensure_directory_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && parent != path
+    {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)?;
+    std::fs::create_dir_all(path)?;
     Ok(())
 }
 
@@ -1169,21 +1202,16 @@ fn load_gc_delete_journal(path: &std::path::Path) -> Result<Option<GcDeleteJourn
 }
 
 fn store_gc_delete_journal(path: &std::path::Path, journal: &GcDeleteJournal) -> Result<()> {
-    let parent = path
+    let _parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("gc delete journal path has no parent"))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create gc journal dir {}", parent.display()))?;
-    std::fs::write(path, serde_json::to_vec(journal)?)
-        .with_context(|| format!("failed to write gc delete journal {}", path.display()))?;
-    Ok(())
+    atomic_write_bytes(path.to_path_buf(), &serde_json::to_vec(journal)?)
+        .with_context(|| format!("failed to write gc delete journal {}", path.display()))
 }
 
 fn remove_gc_delete_journal(path: &std::path::Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove gc delete journal {}", path.display()))?;
-    }
+    remove_path_if_exists(path)
+        .with_context(|| format!("failed to remove gc delete journal {}", path.display()))?;
     Ok(())
 }
 
