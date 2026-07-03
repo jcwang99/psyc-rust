@@ -111,7 +111,7 @@ pub struct OperationJournal {
 impl OperationJournal {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        std::fs::create_dir_all(&root)
+        ensure_directory_path(&root)
             .with_context(|| format!("failed to create journal dir {}", root.display()))?;
         let journal = Self { root };
         journal.ensure_schema()?;
@@ -456,43 +456,108 @@ impl OperationJournal {
     }
 
     fn ensure_schema(&self) -> Result<()> {
-        let connection = self.open_connection()?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS operation_metadata (
-                    operation_id TEXT PRIMARY KEY,
-                    metadata_json BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS object_states (
-                    operation_id TEXT NOT NULL,
-                    object_id TEXT NOT NULL,
-                    object_type TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    PRIMARY KEY(operation_id, object_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS rewrite_state (
-                    operation_id TEXT PRIMARY KEY,
-                    state_json BLOB NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_object_states_operation
-                    ON object_states(operation_id, object_id);",
-            )
-            .context("failed to initialize journal schema")?;
+        let _connection = self.open_connection()?;
         Ok(())
     }
 
     fn open_connection(&self) -> Result<Connection> {
-        Connection::open(self.sqlite_path()).with_context(|| {
-            format!(
-                "failed to open journal sqlite {}",
-                self.sqlite_path().display()
-            )
-        })
+        let sqlite_path = self.sqlite_path();
+        ensure_directory_path(&self.root)
+            .with_context(|| format!("failed to create journal dir {}", self.root.display()))?;
+        let mut reset_attempted = false;
+        loop {
+            let result = Connection::open(&sqlite_path)
+                .with_context(|| format!("failed to open journal sqlite {}", sqlite_path.display()))
+                .and_then(|connection| {
+                    connection
+                        .execute_batch(
+                            "CREATE TABLE IF NOT EXISTS operation_metadata (
+                                operation_id TEXT PRIMARY KEY,
+                                metadata_json BLOB NOT NULL
+                             );
+                             CREATE TABLE IF NOT EXISTS object_states (
+                                operation_id TEXT NOT NULL,
+                                object_id TEXT NOT NULL,
+                                object_type TEXT NOT NULL,
+                                state TEXT NOT NULL,
+                                PRIMARY KEY(operation_id, object_id)
+                             );
+                             CREATE TABLE IF NOT EXISTS rewrite_state (
+                                operation_id TEXT PRIMARY KEY,
+                                state_json BLOB NOT NULL
+                             );
+                             CREATE INDEX IF NOT EXISTS idx_object_states_operation
+                                ON object_states(operation_id, object_id);",
+                        )
+                        .context("failed to initialize journal schema")?;
+                    Ok(connection)
+                });
+            match result {
+                Ok(connection) => return Ok(connection),
+                Err(error) if !reset_attempted && is_recoverable_journal_error(&error) => {
+                    reset_attempted = true;
+                    reset_sqlite_path(&sqlite_path)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn sqlite_path(&self) -> PathBuf {
         self.root.join("operations.sqlite")
     }
+}
+
+fn is_recoverable_journal_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(sql_error, _))
+                if matches!(
+                    sql_error.code,
+                    rusqlite::ffi::ErrorCode::CannotOpen
+                        | rusqlite::ffi::ErrorCode::DatabaseCorrupt
+                        | rusqlite::ffi::ErrorCode::NotADatabase
+                )
+        )
+    })
+}
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os_string = db_path.as_os_str().to_os_string();
+    os_string.push(suffix);
+    PathBuf::from(os_string)
+}
+
+fn reset_sqlite_path(path: &Path) -> Result<()> {
+    remove_path_if_exists(path)?;
+    remove_path_if_exists(&sqlite_sidecar_path(path, "-wal"))?;
+    remove_path_if_exists(&sqlite_sidecar_path(path, "-shm"))?;
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn ensure_directory_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && parent != path
+    {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)?;
+    std::fs::create_dir_all(path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -676,6 +741,56 @@ mod tests {
             .unwrap();
 
         assert!(temp.path().join("operations.sqlite").is_file());
+    }
+
+    #[test]
+    fn journal_recovers_when_sqlite_path_is_a_directory() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let operation_id = OperationId::new("op-dir-conflict".to_string()).unwrap();
+        journal
+            .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
+            .unwrap();
+
+        let sqlite_path = temp.path().join("operations.sqlite");
+        std::fs::remove_file(&sqlite_path).unwrap();
+        std::fs::create_dir(&sqlite_path).unwrap();
+
+        let reopened = OperationJournal::new(temp.path()).unwrap();
+        reopened
+            .begin_operation(
+                &operation_id,
+                OperationMetadata::push("branch-token", Some(7)),
+            )
+            .unwrap();
+
+        assert!(sqlite_path.is_file());
+    }
+
+    #[test]
+    fn journal_rebuilds_corrupted_sqlite_database() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let operation_id = OperationId::new("op-corrupt-sqlite".to_string()).unwrap();
+        journal
+            .begin_operation(&operation_id, OperationMetadata::push("branch-token", None))
+            .unwrap();
+
+        let sqlite_path = temp.path().join("operations.sqlite");
+        std::fs::write(&sqlite_path, b"not-a-sqlite-database").unwrap();
+
+        let reopened = OperationJournal::new(temp.path()).unwrap();
+        reopened
+            .begin_operation(
+                &operation_id,
+                OperationMetadata::push("branch-token", Some(9)),
+            )
+            .unwrap();
+
+        assert_ne!(
+            std::fs::read(&sqlite_path).unwrap(),
+            b"not-a-sqlite-database"
+        );
     }
 
     #[test]
