@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::fetch::{
     RemoteReachabilityRecorder, RemoteReachabilityTraversal, RemoteValidationRoot,
     assert_remote_generations_meet_local_floor, collect_remote_reachable_object_ids,
-    collect_remote_reachable_object_ids_with_recorder, next_validation_root,
-    read_remote_control_plane, update_trusted_remote_state_from_control_plane,
-    write_remote_control_plane_to_validation_root,
+    collect_remote_reachable_object_ids_with_recorder, fetch_remote_object_into_validation_root,
+    next_validation_root, read_remote_control_plane,
+    update_trusted_remote_state_from_control_plane, write_remote_control_plane_to_validation_root,
 };
 use crate::journal::{OperationId, OperationJournal, RewriteJournalState};
 use crate::object_type::candidate_object_types;
@@ -342,6 +342,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let mut rewrite_state = load_historical_rewrite_checkpoint(&control_dir)?;
     if rewrite_state.is_none() {
+        hydrate_remote_branch_history_for_rewrite(remote, &options.repo_root)?;
         let local_result =
             facade.rewrite_history_to_active_epoch(&options.repo_root, &options.password)?;
         let state = RewriteJournalState {
@@ -366,6 +367,8 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         .as_ref()
         .map(|stored_ref| stored_ref.value.bytes.as_slice() == default_ref_bytes.as_slice())
         .unwrap_or(false);
+    let local_branch_refs = collect_local_branch_ref_bytes(&options.repo_root)?;
+    let remote_branch_refs = list_remote_branch_refs(remote, &options.repo_root)?;
 
     let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
     let mut stale_loose_paths = rewrite_state
@@ -428,6 +431,12 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
             anyhow::bail!("historical rewrite requires needs-rebase recovery");
         }
     }
+    publish_remote_branch_refs(
+        remote,
+        &local_branch_refs,
+        &remote_branch_refs,
+        &repo_state.branch.token_hex,
+    )?;
     mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
     for stale_path in &stale_loose_paths {
         match remote.delete_physical(stale_path) {
@@ -455,6 +464,162 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         deleted_stale_remote_refs: stale_loose_paths,
         next_layout_generation: repo_state.layout_generation,
     })
+}
+
+fn collect_local_branch_ref_bytes(repo_root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    let branches = RepositoryFacade::new().list_branches(repo_root)?;
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(repo_root.join(".e2v"))?;
+    let branch_dir = repo_root.join(".e2v").join("refs").join("branches");
+    let mut refs = BTreeMap::new();
+    for branch in branches {
+        let local_bytes = std::fs::read(branch_dir.join(format!("{}.json", branch.token_hex)))
+            .with_context(|| format!("failed to read local branch ref {}", branch.token_hex))?;
+        let plaintext = sync_support::decrypt_control_record_for_sync(
+            &secrets,
+            &format!("branch-ref:{}", branch.token_hex),
+            "ref",
+            &local_bytes,
+        )?;
+        let remote_bytes =
+            sync_support::encrypt_control_record_for_sync(&secrets, "default", "ref", &plaintext)?;
+        refs.insert(branch.token_hex, remote_bytes);
+    }
+    Ok(refs)
+}
+
+fn publish_remote_branch_refs<R: RemoteBackend>(
+    remote: &R,
+    local_branch_refs: &BTreeMap<String, Vec<u8>>,
+    remote_branch_refs: &[e2v_store::ListedRef],
+    current_branch_token: &str,
+) -> Result<()> {
+    for listed_ref in remote_branch_refs {
+        if listed_ref.token.value == current_branch_token {
+            continue;
+        }
+        let Some(next_bytes) = local_branch_refs.get(&listed_ref.token.value) else {
+            continue;
+        };
+        if listed_ref.stored.value.bytes.as_slice() == next_bytes.as_slice() {
+            continue;
+        }
+        let cas = remote.compare_and_swap_ref(
+            &listed_ref.token,
+            Some(listed_ref.stored.version.clone()),
+            e2v_store::EncryptedRef::new(next_bytes.clone()),
+        )?;
+        anyhow::ensure!(
+            cas.applied,
+            "historical rewrite requires needs-rebase recovery for branch {}",
+            listed_ref.token.value
+        );
+    }
+    Ok(())
+}
+
+fn hydrate_remote_branch_history_for_rewrite<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<()> {
+    let remote_branch_refs = list_remote_branch_refs(remote, repo_root)?;
+    if remote_branch_refs.is_empty() {
+        return Ok(());
+    }
+
+    let control_dir = repo_root.join(".e2v");
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+    let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
+    let pack_locations =
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
+    let validation_root = RemoteValidationRoot {
+        path: next_validation_root(repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
+    };
+    let mut pack_cache = BTreeMap::new();
+
+    for listed_ref in remote_branch_refs {
+        let control_plane =
+            read_remote_control_plane(remote, listed_ref.stored.value.bytes.clone())?;
+        assert_remote_generations_meet_local_floor(&listed_ref.stored, &control_plane)?;
+        write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
+        let (decoded_branch_token, head_snapshot_id) =
+            sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)?;
+        anyhow::ensure!(
+            decoded_branch_token == listed_ref.token.value,
+            "remote ref token mismatch: listed {}, decoded {}",
+            listed_ref.token.value,
+            decoded_branch_token
+        );
+
+        if let Some(head_snapshot_id) = head_snapshot_id {
+            let reachable_object_ids = collect_remote_reachable_object_ids(
+                remote,
+                &remote_loose_object_ids,
+                &pack_locations,
+                &validation_root,
+                &secrets,
+                &mut pack_cache,
+                &head_snapshot_id,
+            )?;
+            for object_id in reachable_object_ids {
+                fetch_remote_object_into_validation_root(
+                    remote,
+                    &remote_loose_object_ids,
+                    &pack_locations,
+                    &validation_root,
+                    &mut pack_cache,
+                    &object_id,
+                )?;
+                let source = validation_root.object_path(&object_id);
+                let target = repo_root
+                    .join(".e2v")
+                    .join("objects")
+                    .join(format!("{object_id}.json"));
+                if !target.exists() {
+                    let bytes = std::fs::read(&source).with_context(|| {
+                        format!(
+                            "failed to read hydrated remote object {} from {}",
+                            object_id,
+                            source.display()
+                        )
+                    })?;
+                    overwrite_local_object_bytes(&target, &bytes)?;
+                }
+            }
+        }
+
+        let branch_ref_path = control_dir
+            .join("refs")
+            .join("branches")
+            .join(format!("{}.json", listed_ref.token.value));
+        let plaintext = sync_support::decrypt_control_record_for_sync(
+            &secrets,
+            "default",
+            "ref",
+            &listed_ref.stored.value.bytes,
+        )?;
+        let local_branch_ref_bytes = sync_support::encrypt_control_record_for_sync(
+            &secrets,
+            &format!("branch-ref:{}", listed_ref.token.value),
+            "ref",
+            &plaintext,
+        )?;
+        overwrite_local_object_bytes(&branch_ref_path, &local_branch_ref_bytes)?;
+    }
+
+    cache_pack_data_from_map(&control_dir, &pack_cache)?;
+    Ok(())
+}
+
+fn cache_pack_data_from_map(
+    control_dir: &Path,
+    pack_cache: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    for (container_id, pack_bytes) in pack_cache {
+        cache_pack_data_bytes(control_dir, container_id, pack_bytes)?;
+    }
+    Ok(())
 }
 
 fn upload_rewrite_segments_with_resume<R: RemoteBackend + Clone>(

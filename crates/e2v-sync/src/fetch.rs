@@ -1571,7 +1571,7 @@ fn materialize_remote_objects_into_validation_root<R: RemoteBackend>(
     Ok(())
 }
 
-fn fetch_remote_object_into_validation_root<R: RemoteBackend>(
+pub(crate) fn fetch_remote_object_into_validation_root<R: RemoteBackend>(
     remote: &R,
     remote_loose_object_ids: &BTreeSet<String>,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
