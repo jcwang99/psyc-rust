@@ -17,7 +17,7 @@ pub struct TrustedRemoteState {
 #[doc(hidden)]
 pub fn override_trusted_state_dir_for_test(path: PathBuf) -> TrustedStateDirGuard {
     let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
-    let mut slot = lock.lock().unwrap();
+    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = slot.replace(path);
     TrustedStateDirGuard { previous }
 }
@@ -30,7 +30,7 @@ pub struct TrustedStateDirGuard {
 impl Drop for TrustedStateDirGuard {
     fn drop(&mut self) {
         let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
-        *lock.lock().unwrap() = self.previous.take();
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous.take();
     }
 }
 
@@ -69,7 +69,7 @@ fn trusted_state_root() -> Result<PathBuf> {
     if let Some(path) = TRUSTED_STATE_DIR_OVERRIDE
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
     {
         return Ok(path);
@@ -102,9 +102,24 @@ fn dirs_base_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::drop;
+    use std::panic::{self, AssertUnwindSafe};
     use tempfile::tempdir;
 
     use super::*;
+
+    fn set_override_path(path: Option<PathBuf>) {
+        let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+    }
+
+    fn poison_override_lock() {
+        let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("poison trusted state override lock");
+        }));
+    }
 
     #[test]
     fn trusted_state_is_stored_as_compact_json() {
@@ -125,5 +140,37 @@ mod tests {
             serde_json::to_vec(&state).unwrap(),
             "trusted state files should not store pretty-printed JSON whitespace"
         );
+    }
+
+    #[test]
+    fn trusted_state_root_recovers_from_poisoned_override_lock() {
+        let temp = tempdir().unwrap();
+        let expected = temp.path().to_path_buf();
+        set_override_path(Some(expected.clone()));
+
+        poison_override_lock();
+
+        let result = panic::catch_unwind(AssertUnwindSafe(trusted_state_root));
+        assert!(result.is_ok(), "trusted_state_root should not panic");
+        assert_eq!(result.unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn trusted_state_guard_drop_recovers_from_poisoned_override_lock() {
+        let temp_one = tempdir().unwrap();
+        let temp_two = tempdir().unwrap();
+        set_override_path(Some(temp_two.path().to_path_buf()));
+        let guard = TrustedStateDirGuard {
+            previous: Some(temp_one.path().to_path_buf()),
+        };
+
+        poison_override_lock();
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| drop(guard)));
+        assert!(
+            result.is_ok(),
+            "TrustedStateDirGuard::drop should not panic"
+        );
+        assert_eq!(trusted_state_root().unwrap(), temp_one.path().to_path_buf());
     }
 }
