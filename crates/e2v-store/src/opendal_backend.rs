@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::{
     BackendCapability, BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot,
@@ -793,7 +793,9 @@ impl LayoutRootStore for WebdavAlistMockBackend {
 impl LayoutRootStore for OpendalMemoryBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
         match self.get_physical("layout_root.json") {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).context("failed to decode remote layout root")
+            }
             Err(error) if is_missing_physical_object_error(&error) => {
                 Ok(Self::default_layout_root())
             }
@@ -839,7 +841,9 @@ impl LayoutRootStore for OpendalMemoryBackend {
 impl LayoutRootStore for OpendalWebdavBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
         match self.get_physical("layout_root.json") {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).context("failed to decode remote layout root")
+            }
             Err(error) if is_missing_physical_object_error(&error) => {
                 Ok(OpendalMemoryBackend::default_layout_root())
             }
@@ -1072,7 +1076,9 @@ impl RefStore for OpendalS3Backend {
 impl LayoutRootStore for OpendalS3Backend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
         match self.get_physical("layout_root.json") {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).context("failed to decode remote layout root")
+            }
             Err(error) if is_missing_physical_object_error(&error) => {
                 Ok(OpendalMemoryBackend::default_layout_root())
             }
@@ -1279,6 +1285,23 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("path")
+        );
+    }
+
+    #[test]
+    fn opendal_memory_backend_reports_corrupt_layout_root_bytes() {
+        let backend = OpendalMemoryBackend::new().unwrap();
+        backend
+            .put_physical("layout_root.json", br#"{"invalid":true"#)
+            .unwrap();
+
+        let error = backend.read_layout_root().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode remote layout root"),
+            "unexpected error: {error:#}"
         );
     }
 
