@@ -655,7 +655,8 @@ fn publish_remote_keyring_pointer<R: RemoteBackend>(
         .context("local keyring state is missing repo_id")?
         .to_string();
     let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
-    if let Some(current) = remote.read_ref(&pointer_token)?
+    let current_pointer = remote.read_ref(&pointer_token)?;
+    if let Some(current) = &current_pointer
         && current.value.bytes == bytes
     {
         ensure!(
@@ -664,9 +665,7 @@ fn publish_remote_keyring_pointer<R: RemoteBackend>(
         );
         return Ok(bytes);
     }
-    let expected = remote
-        .read_ref(&pointer_token)?
-        .map(|stored| stored.version);
+    let expected = current_pointer.map(|stored| stored.version);
     let cas =
         remote.compare_and_swap_ref(&pointer_token, expected, EncryptedRef::new(bytes.clone()))?;
     ensure!(cas.applied, "keyring pointer publish conflict");
@@ -1294,17 +1293,146 @@ pub fn resume_push<R: RemoteBackend + Clone>(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Arc, Mutex};
 
     use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
-    use e2v_store::{BlobStore, LocalFolderBackend, MemoryBackend};
+    use e2v_store::{
+        BackendCapability, BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot,
+        LayoutRootStore, ListedRef, LocalFolderBackend, MemoryBackend, RefStore, RefToken,
+        RefVersion, RemoteBackend, StoredRef,
+    };
     use tempfile::tempdir;
 
     use super::{
-        PackedObjectLocation, PushOptions, push_head, read_remote_current_keyring_bytes,
-        remote_object_authenticates_for_repo, remote_snapshot_graph_authenticates_for_repo,
-        should_pack_small_objects, upload_object_batch,
+        PackedObjectLocation, PushOptions, publish_remote_keyring_pointer, push_head,
+        read_remote_current_keyring_bytes, remote_object_authenticates_for_repo,
+        remote_snapshot_graph_authenticates_for_repo, should_pack_small_objects,
+        upload_object_batch,
     };
     use crate::journal::OperationId;
+
+    #[derive(Debug, Clone)]
+    struct KeyringPointerReadCountingBackend {
+        inner: MemoryBackend,
+        capability: BackendCapability,
+        keyring_pointer_ref_reads: Arc<Mutex<usize>>,
+    }
+
+    impl KeyringPointerReadCountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                capability: BackendCapability {
+                    supports_conditional_put: true,
+                    supports_range_read: true,
+                    supports_atomic_rename: true,
+                    supports_paged_list: true,
+                    consistency_class: ConsistencyClass::StrongWhitelisted,
+                    supports_remote_lock_or_lease: true,
+                    supports_atomic_create_if_absent: true,
+                    supports_transaction_markers: true,
+                    supports_reliable_remote_time: true,
+                    supports_object_generation_or_etag: true,
+                    supports_layout_root_cas: true,
+                    supports_oblivious_access_schedule: false,
+                },
+                keyring_pointer_ref_reads: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn keyring_pointer_ref_read_count(&self) -> usize {
+            *self.keyring_pointer_ref_reads.lock().unwrap()
+        }
+    }
+
+    impl BlobStore for KeyringPointerReadCountingBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(
+            &self,
+            relative_path: &str,
+            bytes: &[u8],
+        ) -> anyhow::Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl RefStore for KeyringPointerReadCountingBackend {
+        fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+            if token.value.starts_with("keyring/") {
+                *self.keyring_pointer_ref_reads.lock().unwrap() += 1;
+            }
+            self.inner.read_ref(token)
+        }
+
+        fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+            self.inner.list_refs()
+        }
+
+        fn compare_and_swap_ref(
+            &self,
+            token: &RefToken,
+            expected: Option<RefVersion>,
+            next: EncryptedRef,
+        ) -> anyhow::Result<CasResult> {
+            self.inner.compare_and_swap_ref(token, expected, next)
+        }
+    }
+
+    impl LayoutRootStore for KeyringPointerReadCountingBackend {
+        fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+            self.inner.read_layout_root()
+        }
+
+        fn compare_and_swap_layout_root(
+            &self,
+            expected: u64,
+            next: LayoutRoot,
+        ) -> anyhow::Result<CasResult> {
+            self.inner.compare_and_swap_layout_root(expected, next)
+        }
+
+        fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+            self.inner.list_retained_layout_roots()
+        }
+    }
+
+    impl RemoteBackend for KeyringPointerReadCountingBackend {
+        fn capability(&self) -> &BackendCapability {
+            &self.capability
+        }
+    }
 
     #[test]
     fn default_small_object_pack_threshold_starts_at_100k() {
@@ -1510,6 +1638,41 @@ mod tests {
         assert!(
             remote_keyring_bytes.is_none(),
             "missing remote keyring generation should be treated as absent state"
+        );
+    }
+
+    #[test]
+    fn publish_remote_keyring_pointer_reads_remote_ref_once_when_pointer_differs() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+
+        let keyring_files = e2v_core::sync_support::list_keyring_files(&repo_root).unwrap();
+        let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).unwrap();
+        let remote = KeyringPointerReadCountingBackend::new();
+        remote
+            .compare_and_swap_ref(
+                &RefToken::new(format!("keyring/{repo_id}")),
+                None,
+                EncryptedRef::new(br#"{"generation":999,"current":"keyring.999"}"#.to_vec()),
+            )
+            .unwrap();
+
+        publish_remote_keyring_pointer(&remote, &keyring_files).unwrap();
+
+        assert_eq!(
+            remote.keyring_pointer_ref_read_count(),
+            1,
+            "publish_remote_keyring_pointer should reuse the first remote ref read instead of re-reading the same keyring pointer ref before CAS"
         );
     }
 }
