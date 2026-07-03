@@ -9,7 +9,7 @@ use e2v_core::DirectoryEntry;
 
 use crate::{
     CachePolicy, MountLaunchSummary, MountMode, MountRequest, MountedFilesystem, OpenedFile,
-    ReadOnlyVfs, RefreshOutcome, VfsMountConfig, VfsNodeMetadata,
+    ReadOnlyVfs, RefreshOutcome, VfsMountConfig, VfsNodeMetadata, WritableVfs,
 };
 
 const DEFAULT_SECTOR_SIZE: u32 = 4096;
@@ -27,8 +27,12 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const FILE_WRITE_DATA: u32 = 0x0000_0002;
+const FILE_APPEND_DATA: u32 = 0x0000_0004;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const READ_ONLY_SECURITY_DESCRIPTOR_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;WD)";
+const WRITABLE_SECURITY_DESCRIPTOR_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
 const VOLUME_PARAMS_ALWAYS_USE_DOUBLE_BUFFERING_BIT: u32 = 1 << 12;
 const VOLUME_PARAMS_VOLUME_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 0;
 const VOLUME_PARAMS_DIR_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 1;
@@ -105,12 +109,13 @@ impl WindowsMountLauncher {
         host: &mut impl WinfspHostLauncher,
     ) -> Result<MountLaunchSummary> {
         let cache_policy = context.cache_policy();
+        let read_only = context.volume_summary().read_only;
         host.launch(self, context)?;
         Ok(MountLaunchSummary {
             mount_mode: self.mount_mode_label().to_string(),
             mount_point: self.mount_point().clone(),
             cache_policy,
-            read_only: true,
+            read_only,
             stream_only: true,
             status_message: WINDOWS_ADAPTER_STATUS.to_string(),
         })
@@ -250,7 +255,7 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
         mount_mode,
         mount_point,
         cache_policy,
-        read_only: true,
+        read_only: host_config.read_only,
         stream_only: true,
         status_message: "winfsp host mount active".to_string(),
     };
@@ -1248,6 +1253,28 @@ fn fill_file_info_from_open_handle(
     file_info.ea_size = 0;
 }
 
+fn fill_file_info_from_handle(file_info: &mut NativeFspFsctlFileInfo, handle: &WinfspOpenHandle) {
+    if handle.is_directory() {
+        file_info.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+        file_info.reparse_tag = 0;
+        file_info.allocation_size = 0;
+        file_info.file_size = 0;
+        file_info.creation_time = 0;
+        file_info.last_access_time = 0;
+        file_info.last_write_time = 0;
+        file_info.change_time = 0;
+        file_info.index_number = handle.inode_id();
+        file_info.hard_links = 1;
+        file_info.ea_size = 0;
+    } else {
+        fill_file_info_from_open_handle(file_info, handle, handle.current_file_size());
+    }
+}
+
+fn granted_access_requests_write(granted_access: u32) -> bool {
+    granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES) != 0
+}
+
 unsafe extern "C" fn host_get_volume_info(
     filesystem: *mut c_void,
     volume_info: *mut c_void,
@@ -1305,7 +1332,7 @@ unsafe extern "C" fn host_open(
     filesystem: *mut c_void,
     file_name: *mut u16,
     _create_options: u32,
-    _granted_access: u32,
+    granted_access: u32,
     file_context: *mut *mut c_void,
     file_info: *mut c_void,
 ) -> i32 {
@@ -1336,25 +1363,18 @@ unsafe extern "C" fn host_open(
         }
         return STATUS_SUCCESS;
     }
-    let handle = match context.open_handle(&logical_path) {
+    let handle = match context
+        .open_handle_with_options(&logical_path, granted_access_requests_write(granted_access))
+    {
         Ok(handle) => handle,
         Err(error) => {
             debug_winfsp("open_handle_err", &error.to_string());
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
     };
-    let file_size = handle
-        .opened_file
-        .as_ref()
-        .map(|opened_file| opened_file.file_size())
-        .unwrap_or(0);
     unsafe {
         *file_context = Box::into_raw(Box::new(handle.clone())).cast();
-        fill_file_info_from_open_handle(
-            &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
-            &handle,
-            file_size,
-        );
+        fill_file_info_from_handle(&mut *file_info.cast::<NativeFspFsctlFileInfo>(), &handle);
     }
     STATUS_SUCCESS
 }
@@ -1363,7 +1383,7 @@ unsafe extern "C" fn host_create_ex(
     filesystem: *mut c_void,
     file_name: *mut u16,
     create_options: u32,
-    _granted_access: u32,
+    granted_access: u32,
     _file_attributes: u32,
     _security_descriptor: *mut c_void,
     _allocation_size: u64,
@@ -1380,7 +1400,39 @@ unsafe extern "C" fn host_create_ex(
         Ok(metadata) => metadata,
         Err(error) => {
             debug_winfsp("create_ex_stat_err", &error.to_string());
-            return STATUS_MEDIA_WRITE_PROTECTED;
+            if !context.mount_is_writable() {
+                return STATUS_MEDIA_WRITE_PROTECTED;
+            }
+            if (create_options & FILE_DIRECTORY_FILE) != 0 {
+                match context.create_directory_and_commit(&logical_path) {
+                    Ok(handle) => {
+                        unsafe {
+                            *file_context = Box::into_raw(Box::new(handle.clone())).cast();
+                            fill_file_info_from_handle(
+                                &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
+                                &handle,
+                            );
+                        }
+                        return STATUS_SUCCESS;
+                    }
+                    Err(create_error) => {
+                        debug_winfsp("create_ex_mkdir_err", &create_error.to_string());
+                        return STATUS_MEDIA_WRITE_PROTECTED;
+                    }
+                }
+            }
+            let handle = context.new_overlay_file_handle(
+                &logical_path,
+                granted_access_requests_write(granted_access),
+            );
+            unsafe {
+                *file_context = Box::into_raw(Box::new(handle.clone())).cast();
+                fill_file_info_from_handle(
+                    &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
+                    &handle,
+                );
+            }
+            return STATUS_SUCCESS;
         }
     };
     let wants_directory = (create_options & FILE_DIRECTORY_FILE) != 0;
@@ -1406,24 +1458,21 @@ unsafe extern "C" fn host_create_ex(
             STATUS_SUCCESS
         }
         crate::VfsNodeKind::File => {
-            let handle = match context.open_handle(&logical_path) {
+            let handle = match context.open_handle_with_options(
+                &logical_path,
+                granted_access_requests_write(granted_access),
+            ) {
                 Ok(handle) => handle,
                 Err(error) => {
                     debug_winfsp("create_ex_open_handle_err", &error.to_string());
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 }
             };
-            let file_size = handle
-                .opened_file
-                .as_ref()
-                .map(|opened_file| opened_file.file_size())
-                .unwrap_or(0);
             unsafe {
                 *file_context = Box::into_raw(Box::new(handle.clone())).cast();
-                fill_file_info_from_open_handle(
+                fill_file_info_from_handle(
                     &mut *file_info.cast::<NativeFspFsctlFileInfo>(),
                     &handle,
-                    file_size,
                 );
             }
             STATUS_SUCCESS
@@ -1445,16 +1494,34 @@ unsafe extern "C" fn host_control(
 }
 
 unsafe extern "C" fn host_overwrite_ex(
-    _filesystem: *mut c_void,
-    _file_context: *mut c_void,
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
     _file_attributes: u32,
     _replace_file_attributes: u8,
     _allocation_size: u64,
     _ea: *mut c_void,
     _ea_length: u32,
-    _file_info: *mut c_void,
+    file_info: *mut c_void,
 ) -> i32 {
-    unsupported_winfsp_status("overwrite_ex", STATUS_MEDIA_WRITE_PROTECTED)
+    let context = context_from_filesystem(filesystem);
+    let handle = unsafe { &mut *file_context.cast::<WinfspOpenHandle>() };
+    if !context.mount_is_writable() || !handle.writable() || handle.is_directory() {
+        return unsupported_winfsp_status("overwrite_ex", STATUS_MEDIA_WRITE_PROTECTED);
+    }
+    let new_size = match usize::try_from(_allocation_size) {
+        Ok(size) => size,
+        Err(_) => return STATUS_ACCESS_DENIED,
+    };
+    if let Err(error) = context.resize_handle_bytes(handle, new_size) {
+        debug_winfsp("overwrite_ex_err", &error.to_string());
+        return STATUS_ACCESS_DENIED;
+    }
+    if !file_info.is_null() {
+        unsafe {
+            fill_file_info_from_handle(&mut *file_info.cast::<NativeFspFsctlFileInfo>(), handle);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 unsafe extern "C" fn host_cleanup(
@@ -1466,11 +1533,16 @@ unsafe extern "C" fn host_cleanup(
     debug_winfsp("cleanup", "");
 }
 
-unsafe extern "C" fn host_close(_filesystem: *mut c_void, file_context: *mut c_void) {
+unsafe extern "C" fn host_close(filesystem: *mut c_void, file_context: *mut c_void) {
     debug_winfsp("close", "");
     if !file_context.is_null() {
+        let context = context_from_filesystem(filesystem);
         unsafe {
-            drop(Box::from_raw(file_context.cast::<WinfspOpenHandle>()));
+            let mut handle = Box::from_raw(file_context.cast::<WinfspOpenHandle>());
+            if let Err(error) = context.flush_handle(&mut handle) {
+                debug_winfsp("close_flush_err", &error.to_string());
+            }
+            drop(handle);
         }
     }
 }
@@ -1504,25 +1576,64 @@ unsafe extern "C" fn host_read(
 }
 
 unsafe extern "C" fn host_write(
-    _filesystem: *mut c_void,
-    _file_context: *mut c_void,
-    _buffer: *mut c_void,
-    _offset: u64,
-    _length: u32,
-    _write_to_end_of_file: u8,
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
+    buffer: *mut c_void,
+    offset: u64,
+    length: u32,
+    write_to_end_of_file: u8,
     _constrained_io: u8,
-    _bytes_transferred: *mut u32,
-    _file_info: *mut c_void,
+    bytes_transferred: *mut u32,
+    file_info: *mut c_void,
 ) -> i32 {
-    unsupported_winfsp_status("write", STATUS_MEDIA_WRITE_PROTECTED)
+    let context = context_from_filesystem(filesystem);
+    let handle = unsafe { &mut *file_context.cast::<WinfspOpenHandle>() };
+    if !context.mount_is_writable() || !handle.writable() || handle.is_directory() {
+        return unsupported_winfsp_status("write", STATUS_MEDIA_WRITE_PROTECTED);
+    }
+    let write_len = length as usize;
+    let write_bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), write_len) };
+    let written = match context.write_handle_bytes(
+        handle,
+        offset as usize,
+        write_to_end_of_file != 0,
+        write_bytes,
+    ) {
+        Ok(written) => written,
+        Err(error) => {
+            debug_winfsp("write_err", &error.to_string());
+            return STATUS_ACCESS_DENIED;
+        }
+    };
+    unsafe {
+        *bytes_transferred = written as u32;
+        if !file_info.is_null() {
+            fill_file_info_from_handle(&mut *file_info.cast::<NativeFspFsctlFileInfo>(), handle);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 unsafe extern "C" fn host_flush(
-    _filesystem: *mut c_void,
-    _file_context: *mut c_void,
-    _file_info: *mut c_void,
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
+    file_info: *mut c_void,
 ) -> i32 {
-    unsupported_winfsp_status("flush", STATUS_INVALID_DEVICE_REQUEST)
+    if file_context.is_null() {
+        return STATUS_SUCCESS;
+    }
+    let context = context_from_filesystem(filesystem);
+    let handle = unsafe { &mut *file_context.cast::<WinfspOpenHandle>() };
+    if let Err(error) = context.flush_handle(handle) {
+        debug_winfsp("flush_err", &error.to_string());
+        return STATUS_ACCESS_DENIED;
+    }
+    unsafe {
+        if !file_info.is_null() {
+            fill_file_info_from_handle(&mut *file_info.cast::<NativeFspFsctlFileInfo>(), handle);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 unsafe extern "C" fn host_get_file_info(
@@ -1575,13 +1686,31 @@ unsafe extern "C" fn host_set_basic_info(
 }
 
 unsafe extern "C" fn host_set_file_size(
-    _filesystem: *mut c_void,
-    _file_context: *mut c_void,
-    _new_size: u64,
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
+    new_size: u64,
     _set_allocation_size: u8,
-    _file_info: *mut c_void,
+    file_info: *mut c_void,
 ) -> i32 {
-    unsupported_winfsp_status("set_file_size", STATUS_MEDIA_WRITE_PROTECTED)
+    let context = context_from_filesystem(filesystem);
+    let handle = unsafe { &mut *file_context.cast::<WinfspOpenHandle>() };
+    if !context.mount_is_writable() || !handle.writable() || handle.is_directory() {
+        return unsupported_winfsp_status("set_file_size", STATUS_MEDIA_WRITE_PROTECTED);
+    }
+    let new_size = match usize::try_from(new_size) {
+        Ok(size) => size,
+        Err(_) => return STATUS_ACCESS_DENIED,
+    };
+    if let Err(error) = context.resize_handle_bytes(handle, new_size) {
+        debug_winfsp("set_file_size_err", &error.to_string());
+        return STATUS_ACCESS_DENIED;
+    }
+    unsafe {
+        if !file_info.is_null() {
+            fill_file_info_from_handle(&mut *file_info.cast::<NativeFspFsctlFileInfo>(), handle);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 unsafe extern "C" fn host_set_security(
@@ -1720,22 +1849,68 @@ unsafe extern "C" fn host_get_stream_info(
 }
 
 unsafe extern "C" fn host_set_delete(
-    _filesystem: *mut c_void,
-    _file_context: *mut c_void,
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
     _file_name: *mut u16,
-    _delete_file: u8,
+    delete_file: u8,
 ) -> i32 {
-    unsupported_winfsp_status("set_delete", STATUS_MEDIA_WRITE_PROTECTED)
+    if delete_file == 0 {
+        return STATUS_SUCCESS;
+    }
+    let context = context_from_filesystem(filesystem);
+    if !context.mount_is_writable() {
+        return unsupported_winfsp_status("set_delete", STATUS_MEDIA_WRITE_PROTECTED);
+    }
+    let handle = unsafe { &mut *file_context.cast::<WinfspOpenHandle>() };
+    let WinfspVfs::Writable(vfs) = &context.vfs else {
+        return unsupported_winfsp_status("set_delete", STATUS_MEDIA_WRITE_PROTECTED);
+    };
+    let result = if handle.is_directory() {
+        vfs.lock()
+            .unwrap()
+            .delete_directory_and_writeback(handle.logical_path(), "winfsp rmdir")
+    } else {
+        vfs.lock()
+            .unwrap()
+            .delete_file_and_writeback(handle.logical_path(), "winfsp delete")
+    };
+    if let Err(error) = result {
+        debug_winfsp("set_delete_err", &error.to_string());
+        return STATUS_ACCESS_DENIED;
+    }
+    handle.opened_file = None;
+    handle.pending_bytes = None;
+    STATUS_SUCCESS
 }
 
 unsafe extern "C" fn host_rename(
-    _filesystem: *mut c_void,
-    _file_context: *mut c_void,
+    filesystem: *mut c_void,
+    file_context: *mut c_void,
     _file_name: *mut u16,
-    _new_file_name: *mut u16,
+    new_file_name: *mut u16,
     _replace_if_exists: u8,
 ) -> i32 {
-    unsupported_winfsp_status("rename", STATUS_MEDIA_WRITE_PROTECTED)
+    let context = context_from_filesystem(filesystem);
+    if !context.mount_is_writable() {
+        return unsupported_winfsp_status("rename", STATUS_MEDIA_WRITE_PROTECTED);
+    }
+    let handle = unsafe { &mut *file_context.cast::<WinfspOpenHandle>() };
+    let target_logical_path = normalized_logical_path_from_windows_path(new_file_name);
+    let WinfspVfs::Writable(vfs) = &context.vfs else {
+        return unsupported_winfsp_status("rename", STATUS_MEDIA_WRITE_PROTECTED);
+    };
+    if let Err(error) = vfs.lock().unwrap().rename_and_writeback(
+        handle.logical_path(),
+        &target_logical_path,
+        "winfsp rename",
+    ) {
+        debug_winfsp("rename_err", &error.to_string());
+        return STATUS_ACCESS_DENIED;
+    }
+    handle.logical_path = target_logical_path.clone();
+    handle.file_object_id = format!("overlay:{target_logical_path}");
+    handle.pending_bytes = None;
+    STATUS_SUCCESS
 }
 
 unsafe extern "C" fn host_get_ea(
@@ -1811,17 +1986,36 @@ pub struct WinfspMountContext {
     observed_directory_paths: Arc<Mutex<BTreeSet<String>>>,
     add_dir_info: Option<FspFileSystemAddDirInfoFn>,
     security_descriptor: Arc<SecurityDescriptorBytes>,
-    vfs: ReadOnlyVfs,
+    vfs: WinfspVfs,
+}
+
+#[derive(Debug, Clone)]
+enum WinfspVfs {
+    ReadOnly(ReadOnlyVfs),
+    Writable(Arc<Mutex<WritableVfs>>),
 }
 
 impl WinfspMountContext {
     pub(crate) fn from_request(request: MountRequest) -> Self {
         let vfs = match &request.config.mode {
-            MountMode::SnapshotPinned { .. } => ReadOnlyVfs::mount_snapshot(request.config.clone()),
-            MountMode::LiveBranch { .. } => ReadOnlyVfs::mount_live_branch(request.config.clone()),
-        }
-        .expect("mount request should resolve to a readable VFS context");
-        let cache_policy = vfs.cache_policy();
+            MountMode::SnapshotPinned { .. } => WinfspVfs::ReadOnly(
+                ReadOnlyVfs::mount_snapshot(request.config.clone())
+                    .expect("mount request should resolve to a readable VFS context"),
+            ),
+            MountMode::LiveBranch { .. } => WinfspVfs::Writable(Arc::new(Mutex::new(
+                WritableVfs::mount_live_branch(request.config.clone())
+                    .expect("mount request should resolve to a readable VFS context"),
+            ))),
+        };
+        let cache_policy = match &vfs {
+            WinfspVfs::ReadOnly(vfs) => vfs.cache_policy(),
+            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().cache_policy(),
+        };
+        let security_descriptor_sddl = if matches!(vfs, WinfspVfs::Writable(_)) {
+            WRITABLE_SECURITY_DESCRIPTOR_SDDL
+        } else {
+            READ_ONLY_SECURITY_DESCRIPTOR_SDDL
+        };
         Self {
             request,
             cache_policy,
@@ -1829,8 +2023,8 @@ impl WinfspMountContext {
             observed_directory_paths: Arc::new(Mutex::new(BTreeSet::new())),
             add_dir_info: None,
             security_descriptor: Arc::new(
-                SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
-                    .expect("read-only security descriptor should be valid"),
+                SecurityDescriptorBytes::from_sddl(security_descriptor_sddl)
+                    .expect("WinFSP security descriptor should be valid"),
             ),
             vfs,
         }
@@ -1849,11 +2043,17 @@ impl WinfspMountContext {
     }
 
     pub fn namespace_snapshot_id(&self) -> String {
-        self.vfs.namespace_snapshot_id()
+        match &self.vfs {
+            WinfspVfs::ReadOnly(vfs) => vfs.namespace_snapshot_id(),
+            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().namespace_snapshot_id(),
+        }
     }
 
     pub fn refresh_namespace(&mut self) -> Result<RefreshOutcome> {
-        self.vfs.refresh_live_branch()
+        match &mut self.vfs {
+            WinfspVfs::ReadOnly(vfs) => vfs.refresh_live_branch(),
+            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().refresh_live_branch(),
+        }
     }
 
     fn set_add_dir_info_fn(&mut self, add_dir_info: FspFileSystemAddDirInfoFn) {
@@ -1920,18 +2120,36 @@ impl WinfspMountContext {
     }
 
     pub fn open_handle(&self, logical_path: &str) -> Result<WinfspOpenHandle> {
-        let opened = self.vfs.open_file(logical_path)?;
-        let handle = WinfspOpenHandle::from_opened_file(opened);
+        self.open_handle_with_options(logical_path, false)
+    }
+
+    pub fn open_handle_with_options(
+        &self,
+        logical_path: &str,
+        writable: bool,
+    ) -> Result<WinfspOpenHandle> {
+        let opened = match &self.vfs {
+            WinfspVfs::ReadOnly(vfs) => vfs.open_file(logical_path)?,
+            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().open_file(logical_path)?,
+        };
+        let handle = WinfspOpenHandle::from_opened_file(opened).with_writable(writable);
         self.remember_inode(handle.inode_id());
         Ok(handle)
     }
 
     pub fn open_handle_for_request(&self, request: &WinfspOpenRequest) -> Result<WinfspOpenHandle> {
         if request.writable {
-            self.vfs
-                .require_semantic(crate::VfsSemantic::WritableHandles)?;
+            match &self.vfs {
+                WinfspVfs::ReadOnly(vfs) => {
+                    vfs.require_semantic(crate::VfsSemantic::WritableHandles)?
+                }
+                WinfspVfs::Writable(vfs) => vfs
+                    .lock()
+                    .unwrap()
+                    .require_semantic(crate::VfsSemantic::WritableHandles)?,
+            }
         }
-        self.open_handle(&request.logical_path)
+        self.open_handle_with_options(&request.logical_path, request.writable)
     }
 
     pub fn read_handle(
@@ -1944,20 +2162,34 @@ impl WinfspMountContext {
             .opened_file
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WinFSP handle does not carry readable file state"))?;
-        self.vfs.read(opened_file, offset, length)
+        if let Some(bytes) = &handle.pending_bytes {
+            anyhow::ensure!(offset <= bytes.len(), "range offset out of bounds");
+            let end = offset.saturating_add(length).min(bytes.len());
+            return Ok(bytes[offset..end].to_vec());
+        }
+        match &self.vfs {
+            WinfspVfs::ReadOnly(vfs) => vfs.read(opened_file, offset, length),
+            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().read(opened_file, offset, length),
+        }
     }
 
     pub fn read_directory_entries(&self, logical_path: &str) -> Result<Vec<DirectoryEntry>> {
-        let metadata = self.vfs.stat_path(logical_path)?;
+        let metadata = self.stat_path(logical_path)?;
         if metadata.kind == crate::VfsNodeKind::Directory {
             self.remember_inode(metadata.inode_id);
             self.remember_directory_path(&metadata.logical_path);
         }
-        self.vfs.read_dir(logical_path)
+        match &self.vfs {
+            WinfspVfs::ReadOnly(vfs) => vfs.read_dir(logical_path),
+            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().read_dir(logical_path),
+        }
     }
 
     pub fn stat_path(&self, logical_path: &str) -> Result<VfsNodeMetadata> {
-        let metadata = self.vfs.stat_path(logical_path)?;
+        let metadata = match &self.vfs {
+            WinfspVfs::ReadOnly(vfs) => vfs.stat_path(logical_path)?,
+            WinfspVfs::Writable(vfs) => vfs.lock().unwrap().stat_path(logical_path)?,
+        };
         self.remember_inode(metadata.inode_id);
         if metadata.kind == crate::VfsNodeKind::Directory {
             self.remember_directory_path(&metadata.logical_path);
@@ -1966,13 +2198,18 @@ impl WinfspMountContext {
     }
 
     pub fn volume_summary(&self) -> ReadOnlyVolumeSummary {
+        let writable = matches!(self.vfs, WinfspVfs::Writable(_));
         ReadOnlyVolumeSummary {
             volume_label: format!("e2v {}", self.mount_mode_label()),
-            filesystem_name: "e2v-ro".to_string(),
+            filesystem_name: if writable {
+                "e2v-rw".to_string()
+            } else {
+                "e2v-ro".to_string()
+            },
             total_bytes: DEFAULT_TOTAL_BYTES,
             free_bytes: DEFAULT_TOTAL_BYTES,
             sector_size: DEFAULT_SECTOR_SIZE,
-            read_only: true,
+            read_only: !writable,
         }
     }
 
@@ -1994,6 +2231,139 @@ impl WinfspMountContext {
             .unwrap()
             .insert(logical_path.to_string());
     }
+
+    fn mount_is_writable(&self) -> bool {
+        matches!(self.vfs, WinfspVfs::Writable(_))
+    }
+
+    fn new_overlay_file_handle(&self, logical_path: &str, writable: bool) -> WinfspOpenHandle {
+        let (snapshot_id, layout_generation) = match &self.vfs {
+            WinfspVfs::ReadOnly(vfs) => (
+                vfs.namespace_snapshot_id(),
+                vfs.namespace_layout_generation(),
+            ),
+            WinfspVfs::Writable(vfs) => {
+                let vfs = vfs.lock().unwrap();
+                (
+                    vfs.namespace_snapshot_id(),
+                    vfs.namespace_layout_generation(),
+                )
+            }
+        };
+        WinfspOpenHandle {
+            opened_file: None,
+            snapshot_id: snapshot_id.clone(),
+            layout_generation,
+            logical_path: logical_path.to_string(),
+            file_object_id: format!("overlay:{logical_path}"),
+            inode_id: crate::stable_inode_id(
+                &snapshot_id,
+                logical_path,
+                &format!("overlay:{logical_path}"),
+            ),
+            writable,
+            is_directory: false,
+            pending_bytes: Some(Vec::new()),
+        }
+    }
+
+    fn create_directory_and_commit(&self, logical_path: &str) -> Result<WinfspOpenHandle> {
+        let WinfspVfs::Writable(vfs) = &self.vfs else {
+            anyhow::bail!("directory creation is not available for read-only mounts");
+        };
+        vfs.lock()
+            .unwrap()
+            .create_directory_and_writeback(logical_path, "winfsp mkdir")?;
+        let metadata = self.stat_path(logical_path)?;
+        Ok(WinfspOpenHandle::from_opened_file_stub(
+            metadata.snapshot_id,
+            metadata.layout_generation,
+            metadata.logical_path,
+            "__dir__".to_string(),
+            metadata.inode_id,
+        ))
+    }
+
+    fn ensure_pending_bytes<'a>(
+        &self,
+        handle: &'a mut WinfspOpenHandle,
+    ) -> Result<&'a mut Vec<u8>> {
+        if handle.pending_bytes.is_none() {
+            let bytes = if let Some(opened_file) = &handle.opened_file {
+                match &self.vfs {
+                    WinfspVfs::ReadOnly(vfs) => {
+                        vfs.read(opened_file, 0, opened_file.file_size() as usize)?
+                    }
+                    WinfspVfs::Writable(vfs) => vfs.lock().unwrap().read(
+                        opened_file,
+                        0,
+                        opened_file.file_size() as usize,
+                    )?,
+                }
+            } else {
+                Vec::new()
+            };
+            handle.pending_bytes = Some(bytes);
+        }
+        Ok(handle.pending_bytes.as_mut().unwrap())
+    }
+
+    fn resize_handle_bytes(&self, handle: &mut WinfspOpenHandle, new_size: usize) -> Result<()> {
+        let bytes = self.ensure_pending_bytes(handle)?;
+        bytes.resize(new_size, 0);
+        Ok(())
+    }
+
+    fn write_handle_bytes(
+        &self,
+        handle: &mut WinfspOpenHandle,
+        offset: usize,
+        write_to_end_of_file: bool,
+        bytes_to_write: &[u8],
+    ) -> Result<usize> {
+        let bytes = self.ensure_pending_bytes(handle)?;
+        let start = if write_to_end_of_file {
+            bytes.len()
+        } else {
+            offset
+        };
+        if start > bytes.len() {
+            bytes.resize(start, 0);
+        }
+        let end = start.saturating_add(bytes_to_write.len());
+        if end > bytes.len() {
+            bytes.resize(end, 0);
+        }
+        bytes[start..end].copy_from_slice(bytes_to_write);
+        Ok(bytes_to_write.len())
+    }
+
+    fn stage_handle_bytes(&self, handle: &mut WinfspOpenHandle) -> Result<()> {
+        let Some(bytes) = handle.pending_bytes.clone() else {
+            return Ok(());
+        };
+        let WinfspVfs::Writable(vfs) = &self.vfs else {
+            anyhow::bail!("write staging is not available for read-only mounts");
+        };
+        let mut vfs = vfs.lock().unwrap();
+        vfs.write_file(handle.logical_path(), bytes)?;
+        let _ = vfs.writeback("winfsp writeback")?;
+        let reopened = vfs.open_file(handle.logical_path())?;
+        handle.snapshot_id = reopened.snapshot_id().to_string();
+        handle.layout_generation = reopened.layout_generation();
+        handle.file_object_id = reopened.file_object_id().to_string();
+        handle.inode_id = reopened.inode_id();
+        handle.opened_file = Some(reopened);
+        handle.pending_bytes = None;
+        Ok(())
+    }
+
+    fn flush_handle(&self, handle: &mut WinfspOpenHandle) -> Result<u64> {
+        if handle.writable() && !handle.is_directory() && handle.pending_bytes.is_some() {
+            self.stage_handle_bytes(handle)?;
+        }
+        Ok(handle.current_file_size())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2004,6 +2374,9 @@ pub struct WinfspOpenHandle {
     logical_path: String,
     file_object_id: String,
     inode_id: u64,
+    writable: bool,
+    is_directory: bool,
+    pending_bytes: Option<Vec<u8>>,
 }
 
 impl WinfspOpenHandle {
@@ -2015,6 +2388,9 @@ impl WinfspOpenHandle {
             file_object_id: opened_file.file_object_id().to_string(),
             inode_id: opened_file.inode_id(),
             opened_file: Some(opened_file),
+            writable: false,
+            is_directory: false,
+            pending_bytes: None,
         }
     }
 
@@ -2025,6 +2401,7 @@ impl WinfspOpenHandle {
         file_object_id: String,
         inode_id: u64,
     ) -> Self {
+        let is_directory = file_object_id == "__dir__";
         Self {
             opened_file: None,
             snapshot_id,
@@ -2032,6 +2409,9 @@ impl WinfspOpenHandle {
             logical_path,
             file_object_id,
             inode_id,
+            writable: false,
+            is_directory,
+            pending_bytes: None,
         }
     }
 
@@ -2053,5 +2433,29 @@ impl WinfspOpenHandle {
 
     pub fn inode_id(&self) -> u64 {
         self.inode_id
+    }
+
+    fn with_writable(mut self, writable: bool) -> Self {
+        self.writable = writable;
+        self
+    }
+
+    fn writable(&self) -> bool {
+        self.writable
+    }
+
+    fn is_directory(&self) -> bool {
+        self.is_directory
+    }
+
+    fn current_file_size(&self) -> u64 {
+        if let Some(bytes) = &self.pending_bytes {
+            bytes.len() as u64
+        } else {
+            self.opened_file
+                .as_ref()
+                .map(|opened_file| opened_file.file_size())
+                .unwrap_or(0)
+        }
     }
 }

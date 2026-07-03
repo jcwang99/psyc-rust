@@ -1735,6 +1735,163 @@ fn stream_only_mount_rejects_writeback_cache_semantics() {
 }
 
 #[test]
+fn live_branch_mount_accepts_writable_handle_semantics() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    commit_message(&repo_root, "first", "alpha");
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let vfs = e2v_vfs::WritableVfs::mount_live_branch(VfsMountConfig::live_branch(
+        repo_root,
+        branch_token,
+    ))
+    .unwrap();
+
+    vfs.require_semantic(VfsSemantic::WritableHandles).unwrap();
+    let error = vfs
+        .require_semantic(VfsSemantic::WritebackCaching)
+        .unwrap_err();
+    assert!(error.to_string().contains("writeback"));
+}
+
+#[test]
+fn writable_live_branch_overlay_is_visible_before_writeback() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    commit_message(&repo_root, "first", "alpha");
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mut vfs = e2v_vfs::WritableVfs::mount_live_branch(VfsMountConfig::live_branch(
+        repo_root.clone(),
+        branch_token,
+    ))
+    .unwrap();
+
+    vfs.create_directory("nested").unwrap();
+    vfs.write_file("nested/new.txt", b"beta".to_vec()).unwrap();
+
+    let handle = vfs.open_file("nested/new.txt").unwrap();
+    let bytes = vfs.read(&handle, 0, 4).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "beta");
+
+    let root_entries = vfs.read_dir("").unwrap();
+    assert!(root_entries.iter().any(|entry| entry.name == "nested"));
+    let nested_entries = vfs.read_dir("nested").unwrap();
+    assert!(nested_entries.iter().any(|entry| entry.name == "new.txt"));
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service
+        .resolve_branch(
+            &RepositoryFacade::new()
+                .open(&repo_root)
+                .unwrap()
+                .branch
+                .token_hex,
+        )
+        .unwrap();
+    let error = read_service
+        .open_file(&snapshot, "nested/new.txt")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("file not found") || error.to_string().contains("not found")
+    );
+}
+
+#[test]
+fn writable_live_branch_writeback_commits_overlay_and_refreshes_namespace() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    commit_message(&repo_root, "first", "alpha");
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mut vfs = e2v_vfs::WritableVfs::mount_live_branch(VfsMountConfig::live_branch(
+        repo_root.clone(),
+        branch_token.clone(),
+    ))
+    .unwrap();
+
+    let old_snapshot = vfs.namespace_snapshot_id();
+    vfs.create_directory("nested").unwrap();
+    vfs.write_file("nested/new.txt", b"beta".to_vec()).unwrap();
+
+    let outcome = vfs.writeback("overlay writeback").unwrap();
+    assert!(outcome.namespace_changed);
+    assert!(outcome.requires_invalidation);
+    assert_ne!(vfs.namespace_snapshot_id(), old_snapshot);
+
+    let reopened = vfs.open_file("nested/new.txt").unwrap();
+    let bytes = vfs.read(&reopened, 0, 4).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "beta");
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.resolve_branch(&branch_token).unwrap();
+    let file = read_service.open_file(&snapshot, "nested/new.txt").unwrap();
+    let persisted = read_service.read_range(&file, 0, 4).unwrap();
+    assert_eq!(String::from_utf8(persisted).unwrap(), "beta");
+}
+
+#[test]
+fn writable_live_branch_keeps_overlay_when_writeback_conflicts() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    commit_message(&repo_root, "first", "alpha");
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mut vfs = e2v_vfs::WritableVfs::mount_live_branch(VfsMountConfig::live_branch(
+        repo_root.clone(),
+        branch_token.clone(),
+    ))
+    .unwrap();
+
+    vfs.write_file("tracked.txt", b"local".to_vec()).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "remote").unwrap();
+    commit_message(&repo_root, "second", "remote");
+
+    let error = vfs.writeback("conflicting overlay").unwrap_err();
+    assert!(error.to_string().contains("conflict"));
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let bytes = vfs.read(&handle, 0, 5).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "local");
+
+    let refresh = vfs.refresh_live_branch().unwrap();
+    assert!(refresh.namespace_changed);
+    let reopened = vfs.open_file("tracked.txt").unwrap();
+    let bytes_after_refresh = vfs.read(&reopened, 0, 5).unwrap();
+    assert_eq!(String::from_utf8(bytes_after_refresh).unwrap(), "local");
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.resolve_branch(&branch_token).unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    let persisted = read_service.read_range(&file, 0, 6).unwrap();
+    assert_eq!(String::from_utf8(persisted).unwrap(), "remote");
+}
+
+#[test]
 fn mount_requests_stop_at_the_platform_boundary_with_explicit_status() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -1992,7 +2149,7 @@ fn winfsp_host_config_enables_cache_bypass_for_direct_io_mounts() {
     let config = WinfspHostConfig::from_context(&context);
 
     assert_eq!(config.mount_point, PathBuf::from("X:"));
-    assert!(config.read_only);
+    assert!(!config.read_only);
     assert!(config.enable_kernel_file_info_cache_bypass);
 }
 
@@ -2560,6 +2717,29 @@ fn winfsp_mount_context_rejects_writable_open_requests() {
 }
 
 #[test]
+fn winfsp_live_branch_mount_context_accepts_writable_open_requests() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    commit_message(&repo_root, "first", "alpha");
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let request = MountRequest::live_branch(repo_root.clone(), branch_token, PathBuf::from("M:"));
+    let context = WinfspMountContext::from_test_request(request);
+    let handle = context
+        .open_handle_for_request(&WinfspOpenRequest::writable("tracked.txt"))
+        .unwrap();
+
+    assert_eq!(handle.logical_path(), "tracked.txt");
+    assert_eq!(handle.snapshot_id(), context.namespace_snapshot_id());
+}
+
+#[test]
 fn winfsp_mount_context_can_read_bytes_from_an_open_handle() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -2668,6 +2848,34 @@ fn winfsp_mount_context_exposes_a_read_only_volume_summary() {
     assert!(summary.total_bytes >= summary.free_bytes);
     assert!(summary.read_only);
     assert_eq!(summary.sector_size, 4096);
+}
+
+#[test]
+fn winfsp_live_branch_context_exposes_a_writable_volume_summary() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let request = MountRequest::live_branch(repo_root, branch_token, PathBuf::from("M:"));
+    let context = WinfspMountContext::from_test_request(request);
+    let summary = context.volume_summary();
+
+    assert!(summary.volume_label.contains("e2v"));
+    assert!(summary.filesystem_name.contains("e2v"));
+    assert!(!summary.read_only);
 }
 
 #[test]
@@ -3268,5 +3476,260 @@ fn windows_snapshot_mount_reads_repository_file_through_real_winfsp_mount() {
             }
             Err(error) => panic!("mounted file never became readable: {error:?}"),
         }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_live_branch_mount_writes_repository_file_through_real_winfsp_mount() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mount_point = PathBuf::from("R:");
+
+    let mounted =
+        e2v_vfs::start_live_branch_mount(repo_root.clone(), branch_token.clone(), mount_point)
+            .unwrap();
+    let summary = mounted.summary();
+
+    fs::write(summary.mount_point.join("tracked.txt"), "beta").unwrap();
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = read_service.resolve_branch(&branch_token).unwrap();
+        let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+        let bytes = read_service.read_range(&file, 0, 16).unwrap();
+        let body = String::from_utf8(bytes).unwrap();
+        if body == "beta" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mounted write never committed, observed {body}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_live_branch_mount_creates_new_repository_file_through_real_winfsp_mount() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mounted = e2v_vfs::start_live_branch_mount(
+        repo_root.clone(),
+        branch_token.clone(),
+        PathBuf::from("S:"),
+    )
+    .unwrap();
+    let summary = mounted.summary();
+
+    fs::write(summary.mount_point.join("new.txt"), "delta").unwrap();
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = read_service.resolve_branch(&branch_token).unwrap();
+        match read_service.open_file(&snapshot, "new.txt") {
+            Ok(file) => {
+                let bytes = read_service.read_range(&file, 0, 16).unwrap();
+                if String::from_utf8(bytes).unwrap() == "delta" {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+        assert!(Instant::now() < deadline, "mounted create never committed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_live_branch_mount_creates_directory_through_real_winfsp_mount() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mounted = e2v_vfs::start_live_branch_mount(
+        repo_root.clone(),
+        branch_token.clone(),
+        PathBuf::from("T:"),
+    )
+    .unwrap();
+    let summary = mounted.summary();
+
+    fs::create_dir(summary.mount_point.join("nested")).unwrap();
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = read_service.resolve_branch(&branch_token).unwrap();
+        let entries = read_service.read_dir(&snapshot, "").unwrap();
+        if entries
+            .iter()
+            .any(|entry| entry.name == "nested" && entry.kind == "tree")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mounted mkdir never committed into the branch"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_live_branch_mount_renames_file_through_real_winfsp_mount() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mounted = e2v_vfs::start_live_branch_mount(
+        repo_root.clone(),
+        branch_token.clone(),
+        PathBuf::from("U:"),
+    )
+    .unwrap();
+    let summary = mounted.summary();
+
+    fs::rename(
+        summary.mount_point.join("tracked.txt"),
+        summary.mount_point.join("renamed.txt"),
+    )
+    .unwrap();
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = read_service.resolve_branch(&branch_token).unwrap();
+        let root_entries = read_service.read_dir(&snapshot, "").unwrap();
+        let has_old = root_entries.iter().any(|entry| entry.name == "tracked.txt");
+        let has_new = root_entries.iter().any(|entry| entry.name == "renamed.txt");
+        if !has_old && has_new {
+            let file = read_service.open_file(&snapshot, "renamed.txt").unwrap();
+            let bytes = read_service.read_range(&file, 0, 16).unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mounted rename never committed into the branch"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_live_branch_mount_deletes_file_through_real_winfsp_mount() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_token = RepositoryFacade::new()
+        .open(&repo_root)
+        .unwrap()
+        .branch
+        .token_hex;
+    let mounted = e2v_vfs::start_live_branch_mount(
+        repo_root.clone(),
+        branch_token.clone(),
+        PathBuf::from("V:"),
+    )
+    .unwrap();
+    let summary = mounted.summary();
+
+    fs::remove_file(summary.mount_point.join("tracked.txt")).unwrap();
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = read_service.resolve_branch(&branch_token).unwrap();
+        let root_entries = read_service.read_dir(&snapshot, "").unwrap();
+        if root_entries.iter().all(|entry| entry.name != "tracked.txt") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mounted delete never committed into the branch"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }

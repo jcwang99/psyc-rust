@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -100,6 +100,59 @@ pub struct CheckoutOptions {
     pub repo_root: PathBuf,
     pub snapshot_id: String,
     pub target_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BranchOverlayChange {
+    UpsertFile { path: String, bytes: Vec<u8> },
+    DeleteFile { path: String },
+    CreateDirectory { path: String },
+    DeleteDirectory { path: String },
+    Rename { from: String, to: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchWritebackOptions {
+    pub repo_root: PathBuf,
+    pub ref_token_hex: String,
+    pub expected_head_snapshot_id: Option<String>,
+    pub message: String,
+    pub changes: Vec<BranchOverlayChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchWritebackSuccess {
+    pub snapshot_id: String,
+    pub previous_head_snapshot_id: Option<String>,
+    pub rebased: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchWritebackNoop {
+    pub current_head_snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchWritebackConflictEntry {
+    pub path: String,
+    pub conflict_kind: String,
+    pub base_state: String,
+    pub current_state: String,
+    pub overlay_change: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchWritebackConflict {
+    pub expected_head_snapshot_id: Option<String>,
+    pub current_head_snapshot_id: Option<String>,
+    pub conflicts: Vec<BranchWritebackConflictEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BranchWritebackOutcome {
+    Noop(BranchWritebackNoop),
+    Committed(BranchWritebackSuccess),
+    Conflicted(BranchWritebackConflict),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -853,6 +906,105 @@ impl RepositoryFacade {
             reused_bytes,
             warnings,
         })
+    }
+
+    pub fn write_branch_overlay(
+        &self,
+        options: BranchWritebackOptions,
+    ) -> Result<BranchWritebackOutcome> {
+        ensure!(
+            !options.message.trim().is_empty(),
+            "writeback message must not be empty"
+        );
+        validate_ref_token_value(&options.ref_token_hex)?;
+        if let Some(snapshot_id) = options.expected_head_snapshot_id.as_deref() {
+            validate_object_id_value(snapshot_id).context("invalid expected head snapshot id")?;
+        }
+
+        let repo_root = options.repo_root;
+        let control_dir = repo_root.join(CONTROL_DIR);
+        ensure!(
+            control_dir.is_dir(),
+            "repository is not initialized at {}",
+            repo_root.display()
+        );
+
+        let repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
+        let current_default_ref = read_default_ref(&control_dir, &repo_secrets)?;
+        let (mut branch_ref, branch_is_default) = resolve_branch_ref_for_writeback(
+            &control_dir,
+            &repo_secrets,
+            &current_default_ref,
+            &options.ref_token_hex,
+        )?;
+        let current_head_snapshot_id = branch_ref.head_snapshot_id.clone();
+
+        if options.changes.is_empty() {
+            return Ok(BranchWritebackOutcome::Noop(BranchWritebackNoop {
+                current_head_snapshot_id,
+            }));
+        }
+
+        let (base_snapshot_id, rebased) =
+            if current_head_snapshot_id == options.expected_head_snapshot_id {
+                (current_head_snapshot_id.clone(), false)
+            } else {
+                let conflicts = detect_branch_overlay_conflicts(
+                    &repo_root,
+                    options.expected_head_snapshot_id.as_deref(),
+                    current_head_snapshot_id.as_deref(),
+                    &options.changes,
+                )?;
+                if !conflicts.is_empty() {
+                    return Ok(BranchWritebackOutcome::Conflicted(
+                        BranchWritebackConflict {
+                            expected_head_snapshot_id: options.expected_head_snapshot_id,
+                            current_head_snapshot_id,
+                            conflicts,
+                        },
+                    ));
+                }
+                (current_head_snapshot_id.clone(), true)
+            };
+
+        let manifest_store = LocalManifestStore::new(&repo_root);
+        let mut virtual_root =
+            load_virtual_directory_from_snapshot(&manifest_store, base_snapshot_id.as_deref())?;
+        apply_overlay_changes(&mut virtual_root, &options.changes)?;
+
+        let object_store = open_object_store_with_secrets(&control_dir, repo_secrets.clone());
+        let mut committed_files = 0usize;
+        let mut new_bytes = 0u64;
+        let mut reused_bytes = 0u64;
+        let root_tree_id = write_virtual_directory_object(
+            &object_store,
+            &virtual_root,
+            &mut committed_files,
+            &mut new_bytes,
+            &mut reused_bytes,
+        )?;
+        let snapshot_id = write_object(
+            &object_store,
+            "snapshot",
+            &SnapshotObject {
+                schema_version: REPO_FORMAT_VERSION,
+                message: options.message,
+                root_tree_id,
+                parent_snapshot_id: current_head_snapshot_id.clone(),
+            },
+        )?;
+
+        branch_ref.head_snapshot_id = Some(snapshot_id.clone());
+        write_branch_ref(&control_dir, &repo_secrets, &branch_ref)?;
+        if branch_is_default {
+            write_default_ref(&control_dir, &repo_secrets, &branch_ref)?;
+        }
+
+        Ok(BranchWritebackOutcome::Committed(BranchWritebackSuccess {
+            snapshot_id,
+            previous_head_snapshot_id: current_head_snapshot_id,
+            rebased,
+        }))
     }
 
     pub fn snapshots(&self, repo_root: impl AsRef<Path>) -> Result<Vec<SnapshotSummary>> {
@@ -3150,6 +3302,53 @@ struct ChunkReadContext<'a> {
     chunk_start: &'a mut usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SnapshotPathState {
+    Missing,
+    File { object_id: String },
+    Directory { tree_id: String },
+}
+
+impl SnapshotPathState {
+    fn describe(&self) -> String {
+        match self {
+            Self::Missing => "missing".to_string(),
+            Self::File { object_id } => format!("file:{object_id}"),
+            Self::Directory { tree_id } => format!("directory:{tree_id}"),
+        }
+    }
+
+    fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::File { .. } => "file",
+            Self::Directory { .. } => "directory",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct VirtualDirectory {
+    entries: BTreeMap<String, VirtualEntry>,
+}
+
+#[derive(Debug, Clone)]
+enum VirtualEntry {
+    File(VirtualFileEntry),
+    Directory(VirtualDirectory),
+}
+
+#[derive(Debug, Clone)]
+enum VirtualFileEntry {
+    Existing {
+        object_id: String,
+    },
+    Staged {
+        bytes: Vec<u8>,
+        modified_unix_ms: u64,
+    },
+}
+
 fn append_requested_bytes_from_chunks(
     context: &mut ChunkReadContext<'_>,
     chunk_ids: &[String],
@@ -3211,6 +3410,467 @@ fn append_requested_bytes_from_chunks(
         *context.chunk_start = chunk_end;
     }
     Ok(())
+}
+
+impl VirtualDirectory {
+    fn create_directory(&mut self, path: &str) -> Result<()> {
+        self.create_directory_segments(&path_segments(path))
+    }
+
+    fn create_directory_segments(&mut self, segments: &[String]) -> Result<()> {
+        ensure!(
+            !segments.is_empty(),
+            "overlay directory path must not be empty"
+        );
+        if segments.len() == 1 {
+            match self.entries.get(segments[0].as_str()) {
+                Some(VirtualEntry::File(_)) => {
+                    anyhow::bail!("cannot create directory over file: {}", segments[0]);
+                }
+                Some(VirtualEntry::Directory(_)) => return Ok(()),
+                None => {}
+            }
+            self.entries.insert(
+                segments[0].clone(),
+                VirtualEntry::Directory(Self::default()),
+            );
+            return Ok(());
+        }
+
+        let Some(next) = self.entries.get_mut(segments[0].as_str()) else {
+            anyhow::bail!(
+                "parent directory does not exist: {}",
+                segments[..segments.len() - 1].join("/")
+            );
+        };
+        let VirtualEntry::Directory(directory) = next else {
+            anyhow::bail!("parent path is not a directory: {}", segments[0]);
+        };
+        directory.create_directory_segments(&segments[1..])
+    }
+
+    fn upsert_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        self.upsert_file_segments(&path_segments(path), bytes)
+    }
+
+    fn upsert_file_segments(&mut self, segments: &[String], bytes: Vec<u8>) -> Result<()> {
+        ensure!(!segments.is_empty(), "overlay file path must not be empty");
+        if segments.len() == 1 {
+            if matches!(
+                self.entries.get(segments[0].as_str()),
+                Some(VirtualEntry::Directory(_))
+            ) {
+                anyhow::bail!("cannot replace directory with file: {}", segments[0]);
+            }
+            self.entries.insert(
+                segments[0].clone(),
+                VirtualEntry::File(VirtualFileEntry::Staged {
+                    bytes,
+                    modified_unix_ms: current_unix_time_ms(),
+                }),
+            );
+            return Ok(());
+        }
+
+        let Some(next) = self.entries.get_mut(segments[0].as_str()) else {
+            anyhow::bail!(
+                "parent directory does not exist: {}",
+                segments[..segments.len() - 1].join("/")
+            );
+        };
+        let VirtualEntry::Directory(directory) = next else {
+            anyhow::bail!("parent path is not a directory: {}", segments[0]);
+        };
+        directory.upsert_file_segments(&segments[1..], bytes)
+    }
+
+    fn delete_file(&mut self, path: &str) -> Result<()> {
+        let removed = self.remove_entry_segments(&path_segments(path))?;
+        match removed {
+            VirtualEntry::File(_) => Ok(()),
+            VirtualEntry::Directory(_) => anyhow::bail!("path is a directory: {path}"),
+        }
+    }
+
+    fn delete_directory(&mut self, path: &str) -> Result<()> {
+        let removed = self.remove_entry_segments(&path_segments(path))?;
+        match removed {
+            VirtualEntry::Directory(directory) if directory.entries.is_empty() => Ok(()),
+            VirtualEntry::Directory(_) => anyhow::bail!("directory is not empty: {path}"),
+            VirtualEntry::File(_) => anyhow::bail!("path is not a directory: {path}"),
+        }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let entry = self.remove_entry_segments(&path_segments(from))?;
+        self.insert_entry_segments(&path_segments(to), entry)
+    }
+
+    fn remove_entry_segments(&mut self, segments: &[String]) -> Result<VirtualEntry> {
+        ensure!(!segments.is_empty(), "overlay path must not be empty");
+        if segments.len() == 1 {
+            return self
+                .entries
+                .remove(segments[0].as_str())
+                .with_context(|| format!("overlay path not found: {}", segments[0]));
+        }
+
+        let Some(next) = self.entries.get_mut(segments[0].as_str()) else {
+            anyhow::bail!("overlay path not found: {}", segments.join("/"));
+        };
+        let VirtualEntry::Directory(directory) = next else {
+            anyhow::bail!("parent path is not a directory: {}", segments[0]);
+        };
+        directory.remove_entry_segments(&segments[1..])
+    }
+
+    fn insert_entry_segments(&mut self, segments: &[String], entry: VirtualEntry) -> Result<()> {
+        ensure!(!segments.is_empty(), "overlay path must not be empty");
+        if segments.len() == 1 {
+            ensure!(
+                !self.entries.contains_key(segments[0].as_str()),
+                "overlay target already exists: {}",
+                segments[0]
+            );
+            self.entries.insert(segments[0].clone(), entry);
+            return Ok(());
+        }
+
+        let Some(next) = self.entries.get_mut(segments[0].as_str()) else {
+            anyhow::bail!(
+                "parent directory does not exist: {}",
+                segments[..segments.len() - 1].join("/")
+            );
+        };
+        let VirtualEntry::Directory(directory) = next else {
+            anyhow::bail!("parent path is not a directory: {}", segments[0]);
+        };
+        directory.insert_entry_segments(&segments[1..], entry)
+    }
+}
+
+fn resolve_branch_ref_for_writeback(
+    control_dir: &Path,
+    repo_secrets: &RepoSecrets,
+    current_default_ref: &RefRecord,
+    ref_token_hex: &str,
+) -> Result<(RefRecord, bool)> {
+    if current_default_ref.ref_token_hex == ref_token_hex {
+        return Ok((current_default_ref.clone(), true));
+    }
+    let branch_ref = read_branch_ref_if_exists(control_dir, repo_secrets, ref_token_hex)?
+        .with_context(|| format!("branch ref not found for token {ref_token_hex}"))?;
+    Ok((branch_ref, false))
+}
+
+fn detect_branch_overlay_conflicts(
+    repo_root: &Path,
+    expected_head_snapshot_id: Option<&str>,
+    current_head_snapshot_id: Option<&str>,
+    changes: &[BranchOverlayChange],
+) -> Result<Vec<BranchWritebackConflictEntry>> {
+    let manifest_store = LocalManifestStore::new(repo_root);
+    let mut conflicts = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for change in changes {
+        for path in change.exact_conflict_paths() {
+            let base_state =
+                snapshot_path_state(&manifest_store, expected_head_snapshot_id, &path)?;
+            let current_state =
+                snapshot_path_state(&manifest_store, current_head_snapshot_id, &path)?;
+            if base_state != current_state && seen.insert((path.clone(), "path-changed")) {
+                conflicts.push(BranchWritebackConflictEntry {
+                    path,
+                    conflict_kind: "path-changed".to_string(),
+                    base_state: base_state.describe(),
+                    current_state: current_state.describe(),
+                    overlay_change: change.describe(),
+                });
+            }
+        }
+
+        for path in change.ancestor_conflict_paths() {
+            let base_state =
+                snapshot_path_state(&manifest_store, expected_head_snapshot_id, &path)?;
+            let current_state =
+                snapshot_path_state(&manifest_store, current_head_snapshot_id, &path)?;
+            if ancestor_transition_conflicts(&base_state, &current_state)
+                && seen.insert((path.clone(), "ancestor-changed"))
+            {
+                conflicts.push(BranchWritebackConflictEntry {
+                    path,
+                    conflict_kind: "ancestor-changed".to_string(),
+                    base_state: base_state.describe(),
+                    current_state: current_state.describe(),
+                    overlay_change: change.describe(),
+                });
+            }
+        }
+    }
+
+    Ok(conflicts)
+}
+
+fn ancestor_transition_conflicts(base: &SnapshotPathState, current: &SnapshotPathState) -> bool {
+    match (base.kind_label(), current.kind_label()) {
+        ("directory", "directory") | ("missing", "missing") | ("missing", "directory") => false,
+        (left, right) => left != right,
+    }
+}
+
+fn snapshot_path_state(
+    manifest_store: &LocalManifestStore,
+    snapshot_id: Option<&str>,
+    path: &str,
+) -> Result<SnapshotPathState> {
+    let normalized = normalize_snapshot_path(path);
+    if normalized.is_empty() {
+        return Ok(match snapshot_id {
+            Some(snapshot_id) => SnapshotPathState::Directory {
+                tree_id: manifest_store.get_snapshot(snapshot_id)?.root_tree_id,
+            },
+            None => SnapshotPathState::Directory {
+                tree_id: "__empty_root__".to_string(),
+            },
+        });
+    }
+
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(SnapshotPathState::Missing);
+    };
+    let snapshot = manifest_store.get_snapshot(snapshot_id)?;
+    let mut current_tree_id = snapshot.root_tree_id;
+    let mut segments = normalized.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        let tree = manifest_store.get_tree_node(&current_tree_id)?;
+        let Some(entry) = tree.entries.into_iter().find(|entry| entry.name == segment) else {
+            return Ok(SnapshotPathState::Missing);
+        };
+        if segments.peek().is_none() {
+            return Ok(match entry.kind.as_str() {
+                "file" => SnapshotPathState::File {
+                    object_id: entry.object_id,
+                },
+                "tree" => SnapshotPathState::Directory {
+                    tree_id: entry.object_id,
+                },
+                other => anyhow::bail!("unsupported manifest entry kind: {other}"),
+            });
+        }
+        if entry.kind != "tree" {
+            return Ok(SnapshotPathState::Missing);
+        }
+        current_tree_id = entry.object_id;
+    }
+    Ok(SnapshotPathState::Missing)
+}
+
+fn load_virtual_directory_from_snapshot(
+    manifest_store: &LocalManifestStore,
+    snapshot_id: Option<&str>,
+) -> Result<VirtualDirectory> {
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(VirtualDirectory::default());
+    };
+    let snapshot = manifest_store.get_snapshot(snapshot_id)?;
+    load_virtual_directory(manifest_store, &snapshot.root_tree_id)
+}
+
+fn load_virtual_directory(
+    manifest_store: &LocalManifestStore,
+    tree_id: &str,
+) -> Result<VirtualDirectory> {
+    let tree = manifest_store.get_tree_node(tree_id)?;
+    let mut entries = BTreeMap::new();
+    for entry in tree.entries {
+        let node = match entry.kind.as_str() {
+            "file" => VirtualEntry::File(VirtualFileEntry::Existing {
+                object_id: entry.object_id,
+            }),
+            "tree" => {
+                VirtualEntry::Directory(load_virtual_directory(manifest_store, &entry.object_id)?)
+            }
+            other => anyhow::bail!("unsupported manifest entry kind: {other}"),
+        };
+        entries.insert(entry.name, node);
+    }
+    Ok(VirtualDirectory { entries })
+}
+
+fn apply_overlay_changes(
+    overlay_tree: &mut VirtualDirectory,
+    changes: &[BranchOverlayChange],
+) -> Result<()> {
+    for change in changes {
+        match change {
+            BranchOverlayChange::UpsertFile { path, bytes } => {
+                overlay_tree.upsert_file(&validate_overlay_path(path)?, bytes.clone())?;
+            }
+            BranchOverlayChange::DeleteFile { path } => {
+                overlay_tree.delete_file(&validate_overlay_path(path)?)?;
+            }
+            BranchOverlayChange::CreateDirectory { path } => {
+                overlay_tree.create_directory(&validate_overlay_path(path)?)?;
+            }
+            BranchOverlayChange::DeleteDirectory { path } => {
+                overlay_tree.delete_directory(&validate_overlay_path(path)?)?;
+            }
+            BranchOverlayChange::Rename { from, to } => {
+                overlay_tree.rename(&validate_overlay_path(from)?, &validate_overlay_path(to)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_overlay_path(path: &str) -> Result<String> {
+    let normalized = normalize_snapshot_path(path);
+    ensure!(!normalized.is_empty(), "overlay path must not be empty");
+    WorkingTree::new("D:\\overlay-path-validator").path_jail_validate(&normalized)?;
+    Ok(normalized)
+}
+
+fn path_segments(path: &str) -> Vec<String> {
+    path.split('/').map(ToString::to_string).collect()
+}
+
+fn current_unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn write_virtual_directory_object(
+    object_store: &DirectLayoutObjectStore,
+    directory: &VirtualDirectory,
+    committed_files: &mut usize,
+    new_bytes: &mut u64,
+    reused_bytes: &mut u64,
+) -> Result<String> {
+    let mut tree_entries = Vec::with_capacity(directory.entries.len());
+    for (name, entry) in &directory.entries {
+        let tree_entry = match entry {
+            VirtualEntry::File(VirtualFileEntry::Existing { object_id }) => TreeEntry {
+                name: name.clone(),
+                kind: "file".to_string(),
+                object_id: object_id.clone(),
+            },
+            VirtualEntry::File(VirtualFileEntry::Staged {
+                bytes,
+                modified_unix_ms,
+            }) => TreeEntry {
+                name: name.clone(),
+                kind: "file".to_string(),
+                object_id: write_virtual_file_object(
+                    object_store,
+                    name,
+                    bytes,
+                    *modified_unix_ms,
+                    committed_files,
+                    new_bytes,
+                    reused_bytes,
+                )?,
+            },
+            VirtualEntry::Directory(child) => TreeEntry {
+                name: name.clone(),
+                kind: "tree".to_string(),
+                object_id: write_virtual_directory_object(
+                    object_store,
+                    child,
+                    committed_files,
+                    new_bytes,
+                    reused_bytes,
+                )?,
+            },
+        };
+        tree_entries.push(tree_entry);
+    }
+
+    if tree_entries.len() <= MAX_TREE_ENTRIES_PER_OBJECT {
+        return write_object(
+            object_store,
+            "tree",
+            &TreeObject {
+                schema_version: REPO_FORMAT_VERSION,
+                entries: tree_entries,
+            },
+        );
+    }
+
+    build_directory_root_object(object_store, tree_entries)
+}
+
+fn write_virtual_file_object(
+    object_store: &DirectLayoutObjectStore,
+    entry_name: &str,
+    bytes: &[u8],
+    modified_unix_ms: u64,
+    committed_files: &mut usize,
+    new_bytes: &mut u64,
+    reused_bytes: &mut u64,
+) -> Result<String> {
+    let entry = WorkingTreeEntry {
+        name: entry_name.to_string(),
+        path: PathBuf::from(format!("virtual/{entry_name}")),
+        is_dir: false,
+    };
+    let mut warnings = Vec::new();
+    let tree_entry = build_file_tree_entry_with(
+        object_store,
+        &entry,
+        committed_files,
+        new_bytes,
+        reused_bytes,
+        &mut warnings,
+        |_path| Ok((bytes.to_vec(), modified_unix_ms)),
+    )?
+    .context("virtual overlay file should be writable")?;
+    ensure!(
+        warnings.is_empty(),
+        "virtual overlay file staging produced unexpected warnings"
+    );
+    Ok(tree_entry.object_id)
+}
+
+impl BranchOverlayChange {
+    fn describe(&self) -> String {
+        match self {
+            Self::UpsertFile { path, .. } => format!("upsert-file:{path}"),
+            Self::DeleteFile { path } => format!("delete-file:{path}"),
+            Self::CreateDirectory { path } => format!("create-directory:{path}"),
+            Self::DeleteDirectory { path } => format!("delete-directory:{path}"),
+            Self::Rename { from, to } => format!("rename:{from}->{to}"),
+        }
+    }
+
+    fn exact_conflict_paths(&self) -> Vec<String> {
+        match self {
+            Self::UpsertFile { path, .. }
+            | Self::DeleteFile { path }
+            | Self::CreateDirectory { path }
+            | Self::DeleteDirectory { path } => vec![normalize_snapshot_path(path)],
+            Self::Rename { from, to } => {
+                vec![normalize_snapshot_path(from), normalize_snapshot_path(to)]
+            }
+        }
+    }
+
+    fn ancestor_conflict_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for path in self.exact_conflict_paths() {
+            let mut current = path.as_str();
+            while let Some((parent, _)) = current.rsplit_once('/') {
+                paths.push(parent.to_string());
+                current = parent;
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
 }
 
 #[cfg(test)]

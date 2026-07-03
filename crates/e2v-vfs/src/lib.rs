@@ -8,7 +8,10 @@ use anyhow::Result;
 use blake3::Hasher;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use e2v_core::{DirectoryEntry, FileHandle, ReadService, SnapshotHandle};
+use e2v_core::{
+    BranchOverlayChange, BranchWritebackOptions, BranchWritebackOutcome, DirectoryEntry,
+    FileHandle, ReadService, RepositoryFacade, SnapshotHandle,
+};
 use getrandom::fill as getrandom_fill;
 use unicode_normalization::UnicodeNormalization;
 
@@ -194,7 +197,19 @@ pub struct OpenedFile {
     inode_id: u64,
     logical_path: String,
     plaintext_cache: Arc<Mutex<Option<CachedRange>>>,
-    file: FileHandle,
+    overlay_bytes: Option<Arc<Vec<u8>>>,
+    backing: OpenedFileBacking,
+}
+
+#[derive(Debug, Clone)]
+enum OpenedFileBacking {
+    Snapshot(FileHandle),
+    Overlay {
+        snapshot_id: String,
+        layout_generation: u64,
+        file_object_id: String,
+        file_size: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +237,54 @@ pub struct ReadOnlyVfs {
     encrypted_range_cache: Option<EncryptedRangeCache>,
     read_service: ReadService,
     namespace_snapshot: SnapshotHandle,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WritableOverlay {
+    created_directories: Vec<String>,
+    upserted_files: HashMap<String, Vec<u8>>,
+}
+
+impl WritableOverlay {
+    fn as_changes(&self) -> Vec<BranchOverlayChange> {
+        let mut changes = self
+            .created_directories
+            .iter()
+            .cloned()
+            .map(|path| BranchOverlayChange::CreateDirectory { path })
+            .collect::<Vec<_>>();
+        let mut files = self
+            .upserted_files
+            .iter()
+            .map(|(path, bytes)| BranchOverlayChange::UpsertFile {
+                path: path.clone(),
+                bytes: bytes.clone(),
+            })
+            .collect::<Vec<_>>();
+        changes.append(&mut files);
+        changes
+    }
+
+    fn created_directories_under(&self, parent: &str) -> Vec<String> {
+        self.created_directories
+            .iter()
+            .filter_map(|path| immediate_child_name(parent, path))
+            .collect()
+    }
+
+    fn upserted_files_under(&self, parent: &str) -> Vec<String> {
+        self.upserted_files
+            .keys()
+            .filter_map(|path| immediate_child_name(parent, path))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WritableVfs {
+    config: VfsMountConfig,
+    inner: ReadOnlyVfs,
+    overlay: WritableOverlay,
 }
 
 type PlaintextCacheKey = (String, String, u64);
@@ -350,6 +413,10 @@ impl ReadOnlyVfs {
         self.namespace_snapshot.snapshot_id.clone()
     }
 
+    pub fn namespace_layout_generation(&self) -> u64 {
+        self.namespace_snapshot.layout_generation
+    }
+
     pub fn open_file(&self, path: &str) -> Result<OpenedFile> {
         let normalized = normalize_vfs_path(path);
         let file = self
@@ -359,7 +426,8 @@ impl ReadOnlyVfs {
             inode_id: stable_inode_id(&file.snapshot_id, &normalized, &file.file_object_id),
             logical_path: normalized,
             plaintext_cache: Arc::new(Mutex::new(None)),
-            file,
+            overlay_bytes: None,
+            backing: OpenedFileBacking::Snapshot(file),
         })
     }
 
@@ -387,7 +455,7 @@ impl ReadOnlyVfs {
                 inode_id: file.inode_id(),
                 logical_path: normalized.to_string(),
                 kind: VfsNodeKind::File,
-                size_bytes: file.file.file_size(),
+                size_bytes: file.file_size(),
                 snapshot_id: file.snapshot_id().to_string(),
                 layout_generation: file.layout_generation(),
             });
@@ -409,12 +477,17 @@ impl ReadOnlyVfs {
     }
 
     pub fn read(&self, opened_file: &OpenedFile, offset: usize, length: usize) -> Result<Vec<u8>> {
+        if let Some(overlay_bytes) = &opened_file.overlay_bytes {
+            anyhow::ensure!(offset <= overlay_bytes.len(), "range offset out of bounds");
+            let end = offset.saturating_add(length).min(overlay_bytes.len());
+            return Ok(overlay_bytes[offset..end].to_vec());
+        }
         let cache_key = (
             opened_file.snapshot_id().to_string(),
             opened_file.file_object_id().to_string(),
             opened_file.layout_generation(),
         );
-        let file_size = opened_file.file.file_size() as usize;
+        let file_size = opened_file.file_size() as usize;
         anyhow::ensure!(offset <= file_size, "range offset out of bounds");
 
         if let Some(cached) = opened_file.cached_range_bytes(offset, length) {
@@ -453,9 +526,10 @@ impl ReadOnlyVfs {
             return Ok(cached);
         }
 
-        let bytes = self
-            .read_service
-            .read_range(&opened_file.file, offset, length)?;
+        let OpenedFileBacking::Snapshot(file) = &opened_file.backing else {
+            anyhow::bail!("overlay-backed files must be read from overlay bytes");
+        };
+        let bytes = self.read_service.read_range(file, offset, length)?;
         if let Some(cache) = &self.encrypted_range_cache {
             let _ = cache.write_range(
                 opened_file.snapshot_id(),
@@ -526,6 +600,352 @@ impl ReadOnlyVfs {
 
     fn replace_open_file_cache(&self, opened_file: &OpenedFile, cached_range: Option<CachedRange>) {
         *opened_file.plaintext_cache.lock().unwrap() = cached_range;
+    }
+}
+
+impl WritableVfs {
+    pub fn mount_live_branch(config: VfsMountConfig) -> Result<Self> {
+        let inner = ReadOnlyVfs::mount_live_branch(config.clone())?;
+        Ok(Self {
+            config,
+            inner,
+            overlay: WritableOverlay::default(),
+        })
+    }
+
+    pub fn namespace_snapshot_id(&self) -> String {
+        self.inner.namespace_snapshot_id()
+    }
+
+    pub fn cache_policy(&self) -> CachePolicy {
+        self.inner.cache_policy()
+    }
+
+    pub fn namespace_layout_generation(&self) -> u64 {
+        self.inner.namespace_layout_generation()
+    }
+
+    pub fn require_semantic(&self, semantic: VfsSemantic) -> Result<()> {
+        match semantic {
+            VfsSemantic::WritableHandles => Ok(()),
+            VfsSemantic::ByteRangeLocks => {
+                anyhow::bail!("unsupported VFS semantic: byte-range locks")
+            }
+            VfsSemantic::MemoryMappedWrites => {
+                anyhow::bail!("unsupported VFS semantic: memory-mapped writes")
+            }
+            VfsSemantic::WritebackCaching => {
+                anyhow::bail!("unsupported VFS semantic: writeback caching")
+            }
+        }
+    }
+
+    pub fn open_file(&self, path: &str) -> Result<OpenedFile> {
+        let normalized = normalize_vfs_path(path);
+        if let Some(bytes) = self.overlay.upserted_files.get(&normalized) {
+            return Ok(OpenedFile {
+                inode_id: stable_inode_id(
+                    &self.inner.namespace_snapshot.snapshot_id,
+                    &normalized,
+                    &format!("overlay:{normalized}"),
+                ),
+                logical_path: normalized.clone(),
+                plaintext_cache: Arc::new(Mutex::new(None)),
+                overlay_bytes: Some(Arc::new(bytes.clone())),
+                backing: OpenedFileBacking::Overlay {
+                    snapshot_id: self.inner.namespace_snapshot.snapshot_id.clone(),
+                    layout_generation: self.inner.namespace_snapshot.layout_generation,
+                    file_object_id: format!("overlay:{normalized}"),
+                    file_size: bytes.len() as u64,
+                },
+            });
+        }
+        self.inner.open_file(&normalized)
+    }
+
+    pub fn read(&self, opened_file: &OpenedFile, offset: usize, length: usize) -> Result<Vec<u8>> {
+        self.inner.read(opened_file, offset, length)
+    }
+
+    pub fn stat_path(&self, path: &str) -> Result<VfsNodeMetadata> {
+        let normalized = normalize_vfs_path(path);
+        if normalized.is_empty() {
+            return Ok(VfsNodeMetadata {
+                inode_id: stable_directory_inode_id(&self.inner.namespace_snapshot.snapshot_id, ""),
+                logical_path: String::new(),
+                kind: VfsNodeKind::Directory,
+                size_bytes: 0,
+                snapshot_id: self.inner.namespace_snapshot.snapshot_id.clone(),
+                layout_generation: self.inner.namespace_snapshot.layout_generation,
+            });
+        }
+        if let Some(bytes) = self.overlay.upserted_files.get(&normalized) {
+            return Ok(VfsNodeMetadata {
+                inode_id: stable_inode_id(
+                    &self.inner.namespace_snapshot.snapshot_id,
+                    &normalized,
+                    &format!("overlay:{normalized}"),
+                ),
+                logical_path: normalized,
+                kind: VfsNodeKind::File,
+                size_bytes: bytes.len() as u64,
+                snapshot_id: self.inner.namespace_snapshot.snapshot_id.clone(),
+                layout_generation: self.inner.namespace_snapshot.layout_generation,
+            });
+        }
+        if self.overlay_directory_exists(&normalized) {
+            return Ok(VfsNodeMetadata {
+                inode_id: stable_directory_inode_id(
+                    &self.inner.namespace_snapshot.snapshot_id,
+                    &normalized,
+                ),
+                logical_path: normalized,
+                kind: VfsNodeKind::Directory,
+                size_bytes: 0,
+                snapshot_id: self.inner.namespace_snapshot.snapshot_id.clone(),
+                layout_generation: self.inner.namespace_snapshot.layout_generation,
+            });
+        }
+        self.inner.stat_path(path)
+    }
+
+    pub fn read_dir(&self, path: &str) -> Result<Vec<DirectoryEntry>> {
+        let normalized = normalize_vfs_path(path);
+        let mut entries = match self.inner.read_dir(&normalized) {
+            Ok(entries) => entries,
+            Err(error) if self.overlay_directory_exists(&normalized) => {
+                let _ = error;
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut by_name = entries
+            .drain(..)
+            .map(|entry| (entry.name.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        for directory in self.overlay.created_directories_under(&normalized) {
+            by_name.insert(
+                directory.clone(),
+                DirectoryEntry {
+                    name: directory,
+                    kind: "tree".to_string(),
+                },
+            );
+        }
+        for file in self.overlay.upserted_files_under(&normalized) {
+            by_name.insert(
+                file.clone(),
+                DirectoryEntry {
+                    name: file,
+                    kind: "file".to_string(),
+                },
+            );
+        }
+
+        let mut entries = by_name.into_values().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
+    }
+
+    pub fn create_directory(&mut self, path: &str) -> Result<()> {
+        let normalized = normalize_vfs_path(path);
+        anyhow::ensure!(!normalized.is_empty(), "directory path must not be empty");
+        let parent = parent_vfs_path(&normalized);
+        anyhow::ensure!(
+            self.directory_exists(&parent),
+            "parent directory does not exist: {parent}"
+        );
+        if let Ok(metadata) = self.inner.stat_path(&normalized) {
+            anyhow::ensure!(
+                metadata.kind == VfsNodeKind::Directory,
+                "path already exists as file: {normalized}"
+            );
+            return Ok(());
+        }
+        if self.overlay.upserted_files.contains_key(&normalized) {
+            anyhow::bail!("path already exists as file: {normalized}");
+        }
+        if !self.overlay.created_directories.contains(&normalized) {
+            self.overlay.created_directories.push(normalized);
+        }
+        Ok(())
+    }
+
+    pub fn write_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        let normalized = normalize_vfs_path(path);
+        anyhow::ensure!(!normalized.is_empty(), "file path must not be empty");
+        let parent = parent_vfs_path(&normalized);
+        anyhow::ensure!(
+            self.directory_exists(&parent),
+            "parent directory does not exist: {parent}"
+        );
+        if self.overlay_directory_exists(&normalized) {
+            anyhow::bail!("path already exists as directory: {normalized}");
+        }
+        self.overlay.upserted_files.insert(normalized, bytes);
+        Ok(())
+    }
+
+    pub fn writeback(&mut self, message: &str) -> Result<RefreshOutcome> {
+        self.writeback_with_changes(Vec::new(), message)
+    }
+
+    pub fn create_directory_and_writeback(
+        &mut self,
+        path: &str,
+        message: &str,
+    ) -> Result<RefreshOutcome> {
+        self.create_directory(path)?;
+        self.writeback(message)
+    }
+
+    pub fn delete_file_and_writeback(
+        &mut self,
+        path: &str,
+        message: &str,
+    ) -> Result<RefreshOutcome> {
+        self.writeback_with_changes(
+            vec![BranchOverlayChange::DeleteFile {
+                path: normalize_vfs_path(path),
+            }],
+            message,
+        )
+    }
+
+    pub fn delete_directory_and_writeback(
+        &mut self,
+        path: &str,
+        message: &str,
+    ) -> Result<RefreshOutcome> {
+        self.writeback_with_changes(
+            vec![BranchOverlayChange::DeleteDirectory {
+                path: normalize_vfs_path(path),
+            }],
+            message,
+        )
+    }
+
+    pub fn rename_and_writeback(
+        &mut self,
+        from: &str,
+        to: &str,
+        message: &str,
+    ) -> Result<RefreshOutcome> {
+        self.writeback_with_changes(
+            vec![BranchOverlayChange::Rename {
+                from: normalize_vfs_path(from),
+                to: normalize_vfs_path(to),
+            }],
+            message,
+        )
+    }
+
+    fn writeback_with_changes(
+        &mut self,
+        mut extra_changes: Vec<BranchOverlayChange>,
+        message: &str,
+    ) -> Result<RefreshOutcome> {
+        let MountMode::LiveBranch { branch_token_hex } = &self.config.mode else {
+            anyhow::bail!("writable VFS requires a live branch mount");
+        };
+        let facade = RepositoryFacade::new();
+        let expected_head_snapshot_id = Some(self.inner.namespace_snapshot.snapshot_id.clone());
+        let mut changes = self.overlay.as_changes();
+        changes.append(&mut extra_changes);
+        let outcome = facade.write_branch_overlay(BranchWritebackOptions {
+            repo_root: self.config.repo_root.clone(),
+            ref_token_hex: branch_token_hex.clone(),
+            expected_head_snapshot_id,
+            message: message.to_string(),
+            changes,
+        })?;
+
+        match outcome {
+            BranchWritebackOutcome::Noop(_) => {
+                return Ok(RefreshOutcome {
+                    namespace_changed: false,
+                    requires_invalidation: false,
+                });
+            }
+            BranchWritebackOutcome::Committed(_) => {}
+            BranchWritebackOutcome::Conflicted(conflict) => {
+                anyhow::bail!(
+                    "branch overlay writeback reported a conflict: {}",
+                    conflict
+                        .conflicts
+                        .iter()
+                        .map(|entry| entry.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        let refreshed = self
+            .inner
+            .read_service
+            .resolve_branch(branch_token_hex.as_str())?;
+        let namespace_changed = refreshed.snapshot_id != self.inner.namespace_snapshot.snapshot_id;
+        self.inner.namespace_snapshot = refreshed;
+        self.overlay = WritableOverlay::default();
+        *self.inner.plaintext_cache.lock().unwrap() =
+            PlaintextCache::new(self.inner.plaintext_memory_cache_budget_bytes);
+        Ok(RefreshOutcome {
+            namespace_changed,
+            requires_invalidation: namespace_changed
+                && self.inner.cache_policy == CachePolicy::KernelCacheWithInvalidation,
+        })
+    }
+
+    pub fn refresh_live_branch(&mut self) -> Result<RefreshOutcome> {
+        let MountMode::LiveBranch { branch_token_hex } = &self.config.mode else {
+            return Ok(RefreshOutcome {
+                namespace_changed: false,
+                requires_invalidation: false,
+            });
+        };
+        let refreshed = self
+            .inner
+            .read_service
+            .resolve_branch(branch_token_hex.as_str())?;
+        let namespace_changed = refreshed.snapshot_id != self.inner.namespace_snapshot.snapshot_id;
+        if namespace_changed {
+            self.inner.namespace_snapshot = refreshed;
+        }
+        Ok(RefreshOutcome {
+            namespace_changed,
+            requires_invalidation: namespace_changed
+                && self.inner.cache_policy == CachePolicy::KernelCacheWithInvalidation,
+        })
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        path.is_empty()
+            || self.overlay_directory_exists(path)
+            || matches!(
+                self.inner.stat_path(path),
+                Ok(VfsNodeMetadata {
+                    kind: VfsNodeKind::Directory,
+                    ..
+                })
+            )
+    }
+
+    fn overlay_directory_exists(&self, path: &str) -> bool {
+        self.overlay
+            .created_directories
+            .iter()
+            .any(|value| value == path)
+            || self
+                .overlay
+                .created_directories
+                .iter()
+                .any(|value| value.starts_with(&format!("{path}/")))
+            || self
+                .overlay
+                .upserted_files
+                .keys()
+                .any(|value| parent_vfs_path(value) == path)
     }
 }
 
@@ -1063,7 +1483,10 @@ impl OpenedFile {
     }
 
     pub fn snapshot_id(&self) -> &str {
-        &self.file.snapshot_id
+        match &self.backing {
+            OpenedFileBacking::Snapshot(file) => &file.snapshot_id,
+            OpenedFileBacking::Overlay { snapshot_id, .. } => snapshot_id,
+        }
     }
 
     pub fn logical_path(&self) -> &str {
@@ -1071,11 +1494,19 @@ impl OpenedFile {
     }
 
     pub fn file_object_id(&self) -> &str {
-        &self.file.file_object_id
+        match &self.backing {
+            OpenedFileBacking::Snapshot(file) => &file.file_object_id,
+            OpenedFileBacking::Overlay { file_object_id, .. } => file_object_id,
+        }
     }
 
     pub fn layout_generation(&self) -> u64 {
-        self.file.layout_generation()
+        match &self.backing {
+            OpenedFileBacking::Snapshot(file) => file.layout_generation(),
+            OpenedFileBacking::Overlay {
+                layout_generation, ..
+            } => *layout_generation,
+        }
     }
 
     pub fn inode_id(&self) -> u64 {
@@ -1083,7 +1514,10 @@ impl OpenedFile {
     }
 
     pub fn file_size(&self) -> u64 {
-        self.file.file_size()
+        match &self.backing {
+            OpenedFileBacking::Snapshot(file) => file.file_size(),
+            OpenedFileBacking::Overlay { file_size, .. } => *file_size,
+        }
     }
 }
 
@@ -1111,6 +1545,25 @@ fn normalize_vfs_path(path: &str) -> String {
         .map(|component| component.nfc().collect::<String>())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn parent_vfs_path(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+fn immediate_child_name(parent: &str, path: &str) -> Option<String> {
+    let remainder = if parent.is_empty() {
+        path
+    } else {
+        path.strip_prefix(&format!("{parent}/"))?
+    };
+    if remainder.is_empty() {
+        return None;
+    }
+    let name = remainder.split('/').next()?.to_string();
+    Some(name)
 }
 
 pub fn mount_snapshot(
