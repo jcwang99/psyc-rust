@@ -290,6 +290,81 @@ fn sdk_checkout_snapshot_reports_corrupt_state_for_invalid_checkout_mapping() {
 }
 
 #[test]
+fn sdk_checkout_snapshot_rejects_checkout_mapping_path_conflict_before_partial_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let checkout_dir = temp.path().join("checkout");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&checkout_dir).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let first = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "beta").unwrap();
+    fs::write(repo_root.join("added.txt"), "second file").unwrap();
+    let second = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    sdk.checkout_snapshot(CheckoutSnapshotOptions {
+        repo_root: repo_root.clone(),
+        snapshot_id: second.snapshot_id,
+        target_dir: checkout_dir.clone(),
+    })
+    .unwrap();
+
+    let original_tracked = fs::read_to_string(checkout_dir.join("tracked.txt")).unwrap();
+    assert_eq!(original_tracked, "beta");
+    assert_eq!(
+        fs::read_to_string(checkout_dir.join("added.txt")).unwrap(),
+        "second file"
+    );
+
+    let mapping_path = checkout_dir.join(".e2v-checkout-mapping.json");
+    fs::remove_file(&mapping_path).unwrap();
+    fs::create_dir_all(&mapping_path).unwrap();
+
+    let error = sdk
+        .checkout_snapshot(CheckoutSnapshotOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: first.snapshot_id,
+            target_dir: checkout_dir.clone(),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to read checkout mapping"),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout_dir.join("tracked.txt")).unwrap(),
+        "beta",
+        "checkout should fail before partially publishing files"
+    );
+    assert!(
+        checkout_dir.join("added.txt").is_file(),
+        "checkout should preserve previous materialized files when mapping state is corrupt"
+    );
+}
+
+#[test]
 fn sdk_list_branches_reports_corrupt_state_for_invalid_local_branch_ref_record() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

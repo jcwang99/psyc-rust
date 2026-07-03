@@ -405,8 +405,20 @@ impl WorkingTree {
 
     pub(crate) fn read_platform_name_mappings(&self) -> Result<Vec<(String, PathBuf)>> {
         let mapping_path = self.repo_root.join(LOCAL_CHECKOUT_MAPPING_FILE);
-        if !mapping_path.is_file() {
-            return Ok(Vec::new());
+        match fs::symlink_metadata(&mapping_path) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.is_dir(),
+                    "failed to read checkout mapping {}",
+                    mapping_path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read checkout mapping {}", mapping_path.display())
+                });
+            }
         }
         let bytes = fs::read(&mapping_path).with_context(|| {
             format!("failed to read checkout mapping {}", mapping_path.display())
@@ -1483,6 +1495,24 @@ mod tests {
 
         assert!(
             error.to_string().contains("case-fold"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn read_platform_name_mappings_rejects_directory_path_conflict() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(super::LOCAL_CHECKOUT_MAPPING_FILE)).unwrap();
+        let working_tree = WorkingTree::new(&root);
+
+        let error = working_tree.read_platform_name_mappings().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read checkout mapping"),
             "unexpected error: {error:#}"
         );
     }

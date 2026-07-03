@@ -1397,6 +1397,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     } else if lower.contains("authentication failed")
         || lower.contains("tampered")
         || lower.contains("stale-layout fallback unavailable")
+        || lower.contains("failed to read checkout mapping")
         || lower.contains("failed to decode checkout mapping")
         || lower.contains("failed to decode gc delete journal")
         || lower.contains("failed to decode historical rewrite checkpoint")
@@ -1563,6 +1564,17 @@ mod tests {
     #[test]
     fn map_error_treats_corrupted_checkout_mapping_as_corrupt_state() {
         let error = anyhow::anyhow!("failed to decode checkout mapping");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_unreadable_checkout_mapping_as_corrupt_state() {
+        let error = anyhow::anyhow!(
+            "failed to read checkout mapping C:/tmp/repo/.e2v-checkout-mapping.json"
+        );
 
         let mapped = map_error(error);
 
