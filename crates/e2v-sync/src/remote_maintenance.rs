@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
+use e2v_core::{RepositoryFacade, sync_support};
 use e2v_store::{
     BackendCapability, RefToken, RemoteBackend, is_missing_physical_object_error,
     validate_object_id_value,
@@ -238,6 +238,15 @@ impl GcReachabilityStore {
             .execute("DELETE FROM reachable_physical_refs", [])?;
         Ok(())
     }
+
+    fn object_count(&self) -> Result<usize> {
+        let count = self
+            .sqlite
+            .query_row("SELECT COUNT(*) FROM reachable_objects", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        Ok(count.max(0) as usize)
+    }
 }
 
 impl RemoteReachabilityRecorder for GcReachabilityStore {
@@ -281,18 +290,40 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
     let old_epoch_count = remote_old_epoch_count
         .map(|remote_old_epoch_count| remote_old_epoch_count.max(local_old_epoch_count))
         .unwrap_or(local_old_epoch_count);
-    let reachable_object_count =
-        match sync_support::export_head_snapshot(&facade, &options.repo_root) {
-            Ok((_state, snapshot)) => ManifestStore::new(&options.repo_root)
-                .collect_reachable_object_ids(&snapshot.snapshot_id)?
-                .len(),
-            Err(error) if error.to_string().contains("head snapshot is missing") => 0,
-            Err(error) => return Err(error),
+    let rewrite_checkpoint = load_historical_rewrite_checkpoint(&control_dir)?;
+    let reachable_object_count = if let Some(rewrite_checkpoint) = rewrite_checkpoint {
+        rewrite_checkpoint.rewritten_object_ids.len()
+    } else {
+        let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
+        let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+        let pack_locations =
+            load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+        let validation_root = RemoteValidationRoot {
+            path: next_validation_root(&options.repo_root)?,
+            cache_control_dir: Some(control_dir.clone()),
         };
-    let remote_loose_object_count = load_push_remote_loose_object_ids(remote)?.len();
+        let mut pack_cache = BTreeMap::new();
+        let mut traversal = RemoteReachabilityTraversal {
+            remote,
+            remote_loose_object_ids: &remote_loose_object_ids,
+            pack_locations: &pack_locations,
+            validation_root: &validation_root,
+            validation_secrets: &secrets,
+            pack_cache: &mut pack_cache,
+        };
+        let mut reachable_object_ids = GcReachabilityStore::new(&options.repo_root)?;
+        collect_all_remote_reachable_object_ids(
+            &options.repo_root,
+            &mut traversal,
+            &mut reachable_object_ids,
+        )?;
+        reachable_object_ids.object_count()?
+    };
     let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
-    let remote_pack_object_count =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?.len();
+    let pack_locations =
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    let remote_loose_object_count = load_push_remote_loose_object_ids(remote)?.len();
+    let remote_pack_object_count = pack_locations.len();
     let large_repo_advisory = if reachable_object_count >= 10_000
         || remote_loose_object_count >= 10_000
         || remote_pack_object_count >= 10_000
@@ -1485,6 +1516,9 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
         sync_support::decode_default_ref_record(repo_root, &local_default_ref_bytes)?;
     let mut saw_head_snapshot = false;
     for listed_ref in list_remote_branch_refs(traversal.remote, repo_root)? {
+        let control_plane =
+            read_remote_control_plane(traversal.remote, listed_ref.stored.value.bytes.clone())?;
+        write_remote_control_plane_to_validation_root(traversal.validation_root, &control_plane)?;
         let (decoded_branch_token, head_snapshot_id) =
             sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)
                 .with_context(|| {
