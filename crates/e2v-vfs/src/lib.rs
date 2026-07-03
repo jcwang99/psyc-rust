@@ -280,6 +280,12 @@ impl WritableOverlay {
     }
 }
 
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Debug, Clone)]
 pub struct WritableVfs {
     config: VfsMountConfig,
@@ -497,7 +503,7 @@ impl ReadOnlyVfs {
         if let Some(requested) = self
             .plaintext_cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_range(&cache_key, offset, length)
         {
             self.replace_open_file_cache(
@@ -545,7 +551,7 @@ impl ReadOnlyVfs {
             if let Some(cacheable) = cacheable {
                 self.plaintext_cache
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(cache_key, cacheable.bytes);
             }
         } else {
@@ -599,7 +605,7 @@ impl ReadOnlyVfs {
     }
 
     fn replace_open_file_cache(&self, opened_file: &OpenedFile, cached_range: Option<CachedRange>) {
-        *opened_file.plaintext_cache.lock().unwrap() = cached_range;
+        *lock_or_recover(&opened_file.plaintext_cache) = cached_range;
     }
 }
 
@@ -894,7 +900,7 @@ impl WritableVfs {
         let namespace_changed = refreshed.snapshot_id != self.inner.namespace_snapshot.snapshot_id;
         self.inner.namespace_snapshot = refreshed;
         self.overlay = WritableOverlay::default();
-        *self.inner.plaintext_cache.lock().unwrap() =
+        *lock_or_recover(&self.inner.plaintext_cache) =
             PlaintextCache::new(self.inner.plaintext_memory_cache_budget_bytes);
         Ok(RefreshOutcome {
             namespace_changed,
@@ -1476,7 +1482,7 @@ impl PlaintextCache {
 
 impl OpenedFile {
     fn cached_range_bytes(&self, offset: usize, length: usize) -> Option<Vec<u8>> {
-        let cached = self.plaintext_cache.lock().unwrap();
+        let cached = lock_or_recover(&self.plaintext_cache);
         let cached = cached.as_ref()?;
         let cache_end = cached.offset.saturating_add(cached.bytes.len());
         let request_end = offset.saturating_add(length);
@@ -1753,7 +1759,7 @@ pub mod testing {
         opened_file
             .plaintext_cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|cached| cached.bytes.clone())
     }
@@ -1828,6 +1834,40 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::Arc;
+
+    use e2v_core::{CommitOptions, InitOptions, RepositoryFacade};
+    use tempfile::tempdir;
+
+    fn init_repo(repo_root: &std::path::Path) {
+        RepositoryFacade::new()
+            .init(InitOptions {
+                repo_root: repo_root.to_path_buf(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+    }
+
+    fn commit_message(repo_root: &std::path::Path, message: &str, body: &str) -> String {
+        fs::write(repo_root.join("tracked.txt"), body).unwrap();
+        RepositoryFacade::new()
+            .commit(CommitOptions {
+                repo_root: repo_root.to_path_buf(),
+                message: message.to_string(),
+            })
+            .unwrap()
+            .snapshot_id
+    }
+
+    fn poison_mutex<T>(mutex: &Arc<Mutex<T>>) {
+        let poisoned = Arc::clone(mutex);
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison test mutex");
+        }));
+    }
 
     #[test]
     fn plaintext_cache_returns_only_the_requested_slice() {
@@ -1836,5 +1876,86 @@ mod tests {
         cache.insert(key.clone(), b"alpha".to_vec());
 
         assert_eq!(cache.get_range(&key, 1, 3).unwrap(), b"lph".to_vec());
+    }
+
+    #[test]
+    fn read_recovers_from_poisoned_open_file_cache_and_repopulates_it() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+
+        let snapshot_id = commit_message(&repo_root, "first", "alpha");
+        let vfs =
+            ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root, snapshot_id)).unwrap();
+
+        let handle = vfs.open_file("tracked.txt").unwrap();
+        poison_mutex(&handle.plaintext_cache);
+
+        let bytes = vfs.read(&handle, 0, 5).unwrap();
+        assert_eq!(bytes, b"alpha");
+
+        let cached = handle
+            .plaintext_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            cached.as_ref().map(|range| range.bytes.clone()),
+            Some(b"alpha".to_vec())
+        );
+    }
+
+    #[test]
+    fn read_recovers_from_poisoned_global_plaintext_cache_and_repopulates_it() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+
+        let snapshot_id = commit_message(&repo_root, "first", "alpha");
+        let vfs =
+            ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root, snapshot_id.clone()))
+                .unwrap();
+
+        poison_mutex(&vfs.plaintext_cache);
+
+        let handle = vfs.open_file("tracked.txt").unwrap();
+        let bytes = vfs.read(&handle, 0, 5).unwrap();
+        assert_eq!(bytes, b"alpha");
+
+        let mut cache = vfs
+            .plaintext_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (
+            snapshot_id,
+            handle.file_object_id().to_string(),
+            handle.layout_generation(),
+        );
+        assert_eq!(cache.get_range(&key, 0, 5), Some(b"alpha".to_vec()));
+    }
+
+    #[test]
+    fn writable_writeback_recovers_from_poisoned_plaintext_cache_reset() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+
+        commit_message(&repo_root, "first", "alpha");
+        let branch_token = RepositoryFacade::new()
+            .open(&repo_root)
+            .unwrap()
+            .branch
+            .token_hex;
+        let mut vfs =
+            WritableVfs::mount_live_branch(VfsMountConfig::live_branch(repo_root, branch_token))
+                .unwrap();
+
+        poison_mutex(&vfs.inner.plaintext_cache);
+        vfs.write_file("created.txt", b"beta".to_vec()).unwrap();
+
+        let refresh = vfs.writeback("second").unwrap();
+        assert!(refresh.namespace_changed);
     }
 }
