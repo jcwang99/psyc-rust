@@ -393,8 +393,7 @@ impl WorkingTree {
             return Ok(());
         }
 
-        let bytes =
-            serde_json::to_vec_pretty(&mappings).context("failed to encode checkout mapping")?;
+        let bytes = serde_json::to_vec(&mappings).context("failed to encode checkout mapping")?;
         fs::write(&mapping_path, bytes).with_context(|| {
             format!(
                 "failed to write checkout mapping {}",

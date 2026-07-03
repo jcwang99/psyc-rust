@@ -1686,6 +1686,41 @@ fn repeated_checkout_does_not_duplicate_local_checkout_mapping_entries() {
 }
 
 #[test]
+fn checkout_mapping_is_stored_as_compact_json() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("root.txt"), "root").unwrap();
+    fs::create_dir_all(repo_root.join("nested")).unwrap();
+    fs::write(repo_root.join("nested").join("hello.txt"), "hello nested").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".into(),
+        })
+        .unwrap();
+
+    let checkout_target = temp.path().join("checkout");
+    fs::create_dir_all(&checkout_target).unwrap();
+    facade
+        .checkout(CheckoutOptions {
+            repo_root: repo_root.clone(),
+            snapshot_id: commit.snapshot_id,
+            target_dir: checkout_target.clone(),
+        })
+        .unwrap();
+
+    let mapping = fs::read_to_string(checkout_target.join(".e2v-checkout-mapping.json")).unwrap();
+    assert!(
+        !mapping.contains('\n'),
+        "expected compact checkout mapping json without pretty-printed newlines"
+    );
+}
+
+#[test]
 fn checkout_rewrites_local_checkout_mapping_to_current_snapshot_entries() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
