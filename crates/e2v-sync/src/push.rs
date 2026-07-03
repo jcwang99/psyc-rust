@@ -695,7 +695,7 @@ pub(crate) fn mirror_remote_keyring_pointer<R: RemoteBackend>(
     Ok(())
 }
 
-fn read_remote_current_keyring_bytes<R: RemoteBackend>(
+pub(crate) fn read_remote_current_keyring_bytes<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
 ) -> Result<Option<Vec<u8>>> {

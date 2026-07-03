@@ -510,6 +510,87 @@ fn plan_historical_rewrite_reports_old_epochs_reachable_objects_and_guidance() {
 }
 
 #[test]
+fn plan_historical_rewrite_prefers_remote_current_keyring_epoch_count_over_stale_local_copy() {
+    let temp = tempdir().unwrap();
+    let source_root = temp.path().join("source");
+    let stale_clone_root = temp.path().join("stale-clone");
+    fs::create_dir_all(&source_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_root.join("tracked.txt"), b"hello").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-plan-remote-keyring-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: stale_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&source_root, "correct horse battery staple")
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-plan-remote-keyring-advance".to_string(),
+        },
+    )
+    .unwrap();
+
+    let stale_local_keyring: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            stale_clone_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.1"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stale_local_keyring["epochs"].as_array().unwrap().len(), 1);
+
+    let plan = plan_historical_rewrite(
+        &remote,
+        HistoricalRewritePlanOptions {
+            repo_root: stale_clone_root,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(plan.old_epoch_count, 1);
+}
+
+#[test]
 fn repair_remote_restores_missing_local_object_from_remote_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
