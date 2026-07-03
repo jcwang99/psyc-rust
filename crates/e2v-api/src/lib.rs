@@ -1149,11 +1149,32 @@ fn add_remote_registration(
 }
 
 fn load_default_remote_registration(repo_root: &Path) -> SdkResult<RemoteRegistration> {
-    let bytes = std::fs::read(default_remote_path(repo_root))
+    let path = default_remote_path(repo_root);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(SdkError::new(
+                SdkErrorCode::CorruptState,
+                format!("failed to read default remote: {}", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SdkError::new(
+                SdkErrorCode::NotFound,
+                format!("default remote not found: {}", path.display()),
+            ));
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!("failed to read default remote: {error}"))
+                .map_err(map_error);
+        }
+    }
+    let bytes = std::fs::read(&path)
         .map_err(|error| anyhow::anyhow!("failed to read default remote: {error}"))
         .map_err(map_error)?;
     serde_json::from_slice(&bytes)
         .map_err(anyhow::Error::from)
+        .map_err(|error| anyhow::anyhow!("failed to decode default remote: {error}"))
         .map_err(map_error)
 }
 
@@ -1397,6 +1418,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     } else if lower.contains("authentication failed")
         || lower.contains("tampered")
         || lower.contains("stale-layout fallback unavailable")
+        || lower.contains("failed to decode default remote")
         || lower.contains("failed to read checkout mapping")
         || lower.contains("failed to decode checkout mapping")
         || lower.contains("failed to decode gc delete journal")
@@ -1564,6 +1586,15 @@ mod tests {
     #[test]
     fn map_error_treats_corrupted_checkout_mapping_as_corrupt_state() {
         let error = anyhow::anyhow!("failed to decode checkout mapping");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_default_remote_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decode default remote: expected value at line 1");
 
         let mapped = map_error(error);
 

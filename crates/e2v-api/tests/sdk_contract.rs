@@ -2385,3 +2385,60 @@ fn sdk_can_register_s3_remote_specs_as_default_remotes() {
     assert_eq!(loaded.name, "origin");
     assert_eq!(loaded.spec, remote_spec);
 }
+
+#[test]
+fn sdk_load_default_remote_reports_corrupt_state_for_path_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+    sdk.add_remote(&repo_root, "origin", "file://D:/tmp/remote")
+        .unwrap();
+
+    let default_remote_path = repo_root.join(".e2v").join("remotes").join("default.json");
+    fs::remove_file(&default_remote_path).unwrap();
+    fs::create_dir_all(&default_remote_path).unwrap();
+
+    let error = sdk.load_default_remote(&repo_root).unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to read default remote"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn sdk_load_default_remote_reports_corrupt_state_for_invalid_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+    sdk.add_remote(&repo_root, "origin", "file://D:/tmp/remote")
+        .unwrap();
+
+    let default_remote_path = repo_root.join(".e2v").join("remotes").join("default.json");
+    fs::write(&default_remote_path, br#"{"broken":true"#).unwrap();
+
+    let error = sdk.load_default_remote(&repo_root).unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to decode"),
+        "unexpected error: {error:?}"
+    );
+}
