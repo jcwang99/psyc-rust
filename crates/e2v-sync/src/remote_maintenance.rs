@@ -321,7 +321,8 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         store_historical_rewrite_checkpoint(&control_dir, &state)?;
         rewrite_state = Some(state);
     }
-    let rewrite_state = rewrite_state.expect("rewrite state initialized");
+    let rewrite_state = rewrite_state
+        .ok_or_else(|| anyhow::anyhow!("historical rewrite checkpoint was not initialized"))?;
     let repo_state = facade.open(&options.repo_root)?;
     let keyring_files = sync_support::list_keyring_files(&options.repo_root)?;
     let layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;

@@ -74,6 +74,21 @@ fn sync_exposes_oblivious_layout_api_for_p3_b() {
 }
 
 #[test]
+fn historical_rewrite_remote_does_not_expect_initialized_rewrite_state() {
+    let maintenance_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("remote_maintenance.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !maintenance_source.contains("expect(\"rewrite state initialized\")"),
+        "historical rewrite should surface checkpoint initialization failures as errors instead of panicking"
+    );
+}
+
+#[test]
 fn plan_oblivious_layout_reports_amplification_and_advisories() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
