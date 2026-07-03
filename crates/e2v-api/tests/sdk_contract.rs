@@ -1516,6 +1516,69 @@ fn sdk_verify_default_remote_reports_corrupt_state_for_invalid_pack_index_segmen
 }
 
 #[test]
+fn sdk_verify_default_remote_reports_corrupt_state_for_invalid_trusted_state_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    let trusted_state_root = temp.path().join("trusted-state");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    fs::create_dir_all(&trusted_state_root).unwrap();
+
+    let _guard = e2v_sync::testing::override_trusted_state_dir_for_test(trusted_state_root.clone());
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-invalid-trusted-state".to_string(),
+    })
+    .unwrap();
+
+    sdk.verify_default_remote(e2v_api::VerifyRemoteRequest {
+        repo_root: repo_root.clone(),
+        sample_percent: 100,
+    })
+    .unwrap();
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).unwrap();
+    fs::write(
+        trusted_state_root.join(format!("{repo_id}.json")),
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+
+    let error = sdk
+        .verify_default_remote(e2v_api::VerifyRemoteRequest {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to decode trusted state"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
