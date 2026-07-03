@@ -3441,7 +3441,8 @@ fn windows_mount_context_source_keeps_security_descriptor_parsing_behind_lazy_ca
         security_descriptor_selection.contains("READ_ONLY_SECURITY_DESCRIPTOR_BYTES")
             && security_descriptor_selection.contains("WRITABLE_SECURITY_DESCRIPTOR_BYTES")
             && security_descriptor_selection.contains(".as_ref()")
-            && security_descriptor_selection.contains("map_err(|error| anyhow::anyhow!(\"{error:#}\"))?"),
+            && security_descriptor_selection
+                .contains("map_err(|error| anyhow::anyhow!(\"{error:#}\"))?"),
         "WinFSP mount context should reuse cached security descriptor bytes instead of reparsing SDDL per request"
     );
 }
