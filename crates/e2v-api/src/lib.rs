@@ -1389,7 +1389,11 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
 
-    let code = if lower.contains("authentication failed")
+    let code = if lower.contains("critical_rollback_detected")
+        || lower.contains(" rollback detected")
+    {
+        SdkErrorCode::RollbackDetected
+    } else if lower.contains("authentication failed")
         || lower.contains("tampered")
         || lower.contains("stale-layout fallback unavailable")
         || lower.contains("failed to decode remote layout root")
@@ -1397,6 +1401,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode remote keyring state")
         || lower.contains("failed to decode remote branch ref")
         || lower.contains("failed to decode authenticated pack index root")
+        || lower.contains("remote keyring pointer generation mismatch")
         || lower.contains("missing physical chunk")
         || lower.contains("cached pack index has no entry")
         || lower.contains("corrupt")

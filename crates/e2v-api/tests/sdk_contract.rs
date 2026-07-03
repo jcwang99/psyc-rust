@@ -1161,12 +1161,187 @@ fn sdk_verify_default_remote_reports_corrupt_state_for_invalid_remote_layout_roo
         })
         .unwrap_err();
 
-    println!("verify_default_remote invalid layout root error: {error:?}");
     assert_eq!(error.code(), SdkErrorCode::CorruptState);
     assert!(
         error
             .message()
             .contains("failed to decode remote layout root"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn sdk_verify_default_remote_reports_corrupt_state_for_remote_keyring_pointer_generation_mismatch()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-invalid-remote-keyring-generation".to_string(),
+    })
+    .unwrap();
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).unwrap();
+    let pointer_path = remote_root
+        .join("control")
+        .join("refs")
+        .join("by-token")
+        .join("keyring")
+        .join(format!("{repo_id}.json"));
+    let pointer_bytes = fs::read(&pointer_path).unwrap();
+    let mut pointer_record: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let pointer_json = pointer_record["value"]["bytes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as u8)
+        .collect::<Vec<_>>();
+    let mut pointer_json: serde_json::Value = serde_json::from_slice(&pointer_json).unwrap();
+    pointer_json["generation"] = serde_json::json!(0);
+    pointer_record["value"]["bytes"] = serde_json::Value::Array(
+        serde_json::to_vec(&pointer_json)
+            .unwrap()
+            .into_iter()
+            .map(serde_json::Value::from)
+            .collect(),
+    );
+    fs::write(&pointer_path, serde_json::to_vec(&pointer_record).unwrap()).unwrap();
+
+    let error = sdk
+        .verify_default_remote(e2v_api::VerifyRemoteRequest {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error
+            .message()
+            .contains("remote keyring pointer generation mismatch"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn sdk_verify_default_remote_reports_rollback_detected_for_remote_keyring_generation_below_floor() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-rollback-remote-keyring-generation".to_string(),
+    })
+    .unwrap();
+
+    let pointer_file_path = remote_root
+        .join("control")
+        .join("keyring")
+        .join("keyring.current");
+    let pointer_file_bytes = fs::read(&pointer_file_path).unwrap();
+    let mut pointer_file_json: serde_json::Value =
+        serde_json::from_slice(&pointer_file_bytes).unwrap();
+    let current_keyring = pointer_file_json["current"].as_str().unwrap().to_string();
+    pointer_file_json["generation"] = serde_json::json!(0);
+    fs::write(
+        &pointer_file_path,
+        serde_json::to_vec(&pointer_file_json).unwrap(),
+    )
+    .unwrap();
+
+    let keyring_generation_path = remote_root
+        .join("control")
+        .join("keyring")
+        .join(&current_keyring);
+    let keyring_generation_bytes = fs::read(&keyring_generation_path).unwrap();
+    let mut keyring_generation_json: serde_json::Value =
+        serde_json::from_slice(&keyring_generation_bytes).unwrap();
+    keyring_generation_json["generation"] = serde_json::json!(0);
+    fs::write(
+        &keyring_generation_path,
+        serde_json::to_vec(&keyring_generation_json).unwrap(),
+    )
+    .unwrap();
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).unwrap();
+    let pointer_ref_path = remote_root
+        .join("control")
+        .join("refs")
+        .join("by-token")
+        .join("keyring")
+        .join(format!("{repo_id}.json"));
+    let pointer_ref_bytes = fs::read(&pointer_ref_path).unwrap();
+    let mut pointer_ref_json: serde_json::Value =
+        serde_json::from_slice(&pointer_ref_bytes).unwrap();
+    pointer_ref_json["value"]["bytes"] = serde_json::Value::Array(
+        serde_json::to_vec(&pointer_file_json)
+            .unwrap()
+            .into_iter()
+            .map(serde_json::Value::from)
+            .collect(),
+    );
+    fs::write(
+        &pointer_ref_path,
+        serde_json::to_vec(&pointer_ref_json).unwrap(),
+    )
+    .unwrap();
+
+    let error = sdk
+        .verify_default_remote(e2v_api::VerifyRemoteRequest {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::RollbackDetected);
+    assert!(
+        error.message().contains("CRITICAL_ROLLBACK_DETECTED")
+            || error
+                .message()
+                .contains("remote keyring generation is invalid"),
         "unexpected error: {error:?}"
     );
 }
