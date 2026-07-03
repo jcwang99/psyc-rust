@@ -88,7 +88,8 @@ pub(crate) fn cache_pack_data_bytes(
 ) -> Result<()> {
     validate_cached_pack_relative_name(container_id)?;
     let cache_path = pack_data_cache_path(control_dir, container_id);
-    if cache_path.is_file() {
+    if cache_path.is_file() && cached_pack_data_hash_matches(control_dir, container_id, pack_bytes)?
+    {
         return Ok(());
     }
     write_cached_pack_data_bytes(control_dir, container_id, pack_bytes)
@@ -264,7 +265,7 @@ fn cached_pack_data_hash_matches(
     let expected = match std::fs::read_to_string(hash_path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
+        Err(_) => return Ok(false),
     };
     Ok(expected.trim() == pack_data_hash(bytes))
 }
@@ -410,6 +411,45 @@ mod tests {
 
         assert!(cache_path.is_file());
         assert_eq!(std::fs::read(&cache_path).unwrap(), b"payload");
+        assert!(hash_path.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&hash_path).unwrap().trim(),
+            pack_data_hash(b"payload")
+        );
+    }
+
+    #[test]
+    fn cache_pack_data_restores_missing_hash_sidecar_when_cache_file_exists() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path();
+        let container_id = "packs/data/op-00000000.bin";
+        let cache_path = pack_data_cache_path(control_dir, container_id);
+        let hash_path = pack_data_cache_hash_path(control_dir, container_id);
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, b"payload").unwrap();
+
+        cache_pack_data_bytes(control_dir, container_id, b"payload").unwrap();
+
+        assert!(hash_path.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&hash_path).unwrap().trim(),
+            pack_data_hash(b"payload")
+        );
+    }
+
+    #[test]
+    fn cache_pack_data_replaces_hash_sidecar_path_conflict_when_cache_file_exists() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path();
+        let container_id = "packs/data/op-00000000.bin";
+        let cache_path = pack_data_cache_path(control_dir, container_id);
+        let hash_path = pack_data_cache_hash_path(control_dir, container_id);
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, b"payload").unwrap();
+        std::fs::create_dir(&hash_path).unwrap();
+
+        cache_pack_data_bytes(control_dir, container_id, b"payload").unwrap();
+
         assert!(hash_path.is_file());
         assert_eq!(
             std::fs::read_to_string(&hash_path).unwrap().trim(),
