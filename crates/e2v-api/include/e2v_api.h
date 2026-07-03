@@ -87,6 +87,10 @@ e2v_error_code_t e2v_gc_default_remote_dry_run_json(e2v_sdk_t *sdk, const char *
 e2v_error_code_t e2v_gc_default_remote_execute_json(e2v_sdk_t *sdk, const char *repo_root, uint64_t grace_period_days, bool allow_single_writer_maintenance_window, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_historical_rewrite_default_remote_plan_json(e2v_sdk_t *sdk, const char *repo_root, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_historical_rewrite_default_remote_execute_json(e2v_sdk_t *sdk, const char *repo_root, const char *password, bool confirm_full_reencryption, e2v_string_t *json_out, e2v_error_t **error_out);
+e2v_error_code_t e2v_oblivious_layout_default_remote_plan_json(e2v_sdk_t *sdk, const char *repo_root, e2v_string_t *json_out, e2v_error_t **error_out);
+e2v_error_code_t e2v_oblivious_layout_default_remote_status_json(e2v_sdk_t *sdk, const char *repo_root, e2v_string_t *json_out, e2v_error_t **error_out);
+e2v_error_code_t e2v_enable_oblivious_layout_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, const char *policy_profile, e2v_string_t *json_out, e2v_error_t **error_out);
+e2v_error_code_t e2v_reshuffle_oblivious_layout_default_remote_json(e2v_sdk_t *sdk, const char *repo_root, const char *policy_profile, e2v_string_t *json_out, e2v_error_t **error_out);
 
 e2v_error_code_t e2v_share_list_json(e2v_sdk_t *sdk, const char *repo_root, e2v_string_t *json_out, e2v_error_t **error_out);
 e2v_error_code_t e2v_share_invite_member_json(e2v_sdk_t *sdk, const char *repo_root, const char *display_name, e2v_string_t *json_out, e2v_error_t **error_out);

@@ -2,6 +2,7 @@ mod clone;
 mod fetch;
 mod journal;
 mod object_type;
+mod oram;
 mod pack;
 mod pack_index;
 mod publisher;
@@ -18,6 +19,11 @@ pub use fetch::{FetchOptions, FetchResult, fetch_remote};
 pub use journal::{
     ObjectUploadRecord, ObjectUploadState, OperationId, OperationJournal, OperationMetadata,
     OperationType,
+};
+pub use oram::{
+    EnableObliviousLayoutOptions, ObliviousLayoutPlan, ObliviousLayoutStatus,
+    ReshuffleObliviousLayoutOptions, enable_oblivious_layout, plan_oblivious_layout,
+    reshuffle_oblivious_layout, status_oblivious_layout,
 };
 pub use push::{PushOptions, PushResult, ResumeOptions, ResumeResult, push_head, resume_push};
 pub use remote_maintenance::{

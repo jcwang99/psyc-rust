@@ -9,9 +9,10 @@ use std::ptr;
 use serde::Serialize;
 
 use crate::{
-    CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest,
-    HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest, InitRepositoryOptions,
-    PullRequest, PushRequest, ReadHandle, Sdk, SdkError, SdkErrorCode, ShareAcceptDeviceRequest,
+    CloneRequest, CommitRepositoryOptions, EnableObliviousLayoutRequest, FetchRequest,
+    GcExecuteRequest, HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest,
+    InitRepositoryOptions, ObliviousLayoutPlanRequest, PullRequest, PushRequest, ReadHandle,
+    ReshuffleObliviousLayoutRequest, Sdk, SdkError, SdkErrorCode, ShareAcceptDeviceRequest,
     ShareAcceptMemberRequest, ShareInviteDeviceRequest, ShareInviteMemberRequest,
     ShareRevokeDeviceRequest, ShareRevokeMemberRequest, SnapshotView, VerifyRemoteRequest,
 };
@@ -1106,6 +1107,68 @@ pub unsafe extern "C" fn e2v_historical_rewrite_default_remote_execute_json(
             repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
             password: ffi_read_c_string(password, "password")?,
             confirm_full_reencryption,
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn e2v_oblivious_layout_default_remote_plan_json(
+    sdk: *mut e2v_sdk_t,
+    repo_root: *const c_char,
+    json_out: *mut e2v_string_t,
+    error_out: *mut *mut e2v_error_t,
+) -> e2v_error_code_t {
+    ffi_call_with_json(json_out, error_out, || {
+        let sdk = unsafe { sdk_ref(sdk)? };
+        sdk.oblivious_layout_default_remote_plan(ObliviousLayoutPlanRequest {
+            repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn e2v_oblivious_layout_default_remote_status_json(
+    sdk: *mut e2v_sdk_t,
+    repo_root: *const c_char,
+    json_out: *mut e2v_string_t,
+    error_out: *mut *mut e2v_error_t,
+) -> e2v_error_code_t {
+    ffi_call_with_json(json_out, error_out, || {
+        let sdk = unsafe { sdk_ref(sdk)? };
+        sdk.oblivious_layout_default_remote_status(ffi_read_c_string(repo_root, "repo_root")?)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn e2v_enable_oblivious_layout_default_remote_json(
+    sdk: *mut e2v_sdk_t,
+    repo_root: *const c_char,
+    policy_profile: *const c_char,
+    json_out: *mut e2v_string_t,
+    error_out: *mut *mut e2v_error_t,
+) -> e2v_error_code_t {
+    ffi_call_with_json(json_out, error_out, || {
+        let sdk = unsafe { sdk_ref(sdk)? };
+        sdk.enable_oblivious_layout_default_remote(EnableObliviousLayoutRequest {
+            repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
+            policy_profile: ffi_read_c_string(policy_profile, "policy_profile")?,
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn e2v_reshuffle_oblivious_layout_default_remote_json(
+    sdk: *mut e2v_sdk_t,
+    repo_root: *const c_char,
+    policy_profile: *const c_char,
+    json_out: *mut e2v_string_t,
+    error_out: *mut *mut e2v_error_t,
+) -> e2v_error_code_t {
+    ffi_call_with_json(json_out, error_out, || {
+        let sdk = unsafe { sdk_ref(sdk)? };
+        sdk.reshuffle_oblivious_layout_default_remote(ReshuffleObliviousLayoutRequest {
+            repo_root: ffi_read_c_string(repo_root, "repo_root")?.into(),
+            policy_profile: ffi_read_c_string(policy_profile, "policy_profile")?,
         })
     })
 }

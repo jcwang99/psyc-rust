@@ -1522,6 +1522,160 @@ fn c_abi_header_matches_generated_contract() {
 }
 
 #[test]
+fn c_abi_supports_oblivious_layout_default_remote_workflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = new_sdk_handle();
+    let source_repo_c = path_c_string(&source_repo);
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    let remote_spec_c = c_string(&remote_spec);
+    let mut error = std::ptr::null_mut();
+    let mut init_json = c_abi::e2v_string_t::default();
+
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_init_repository_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("correct horse battery staple").as_ptr(),
+                c_string("main").as_ptr(),
+                &mut init_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let repo: RepositoryInfo = serde_json::from_str(&read_owned_string(&mut init_json)).unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    let mut commit_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_commit_repository_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("seed").as_ptr(),
+                &mut commit_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _seed: CommitInfo = serde_json::from_str(&read_owned_string(&mut commit_json)).unwrap();
+
+    let mut add_remote_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_add_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("origin").as_ptr(),
+                remote_spec_c.as_ptr(),
+                &mut add_remote_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _added_remote: RemoteRegistration =
+        serde_json::from_str(&read_owned_string(&mut add_remote_json)).unwrap();
+
+    let mut push_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_push_default_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string(&repo.branch.token_hex).as_ptr(),
+                c_string("push-oram-1").as_ptr(),
+                &mut push_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let _push: e2v_api::PushResponse =
+        serde_json::from_str(&read_owned_string(&mut push_json)).unwrap();
+
+    let mut plan_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_oblivious_layout_default_remote_plan_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                &mut plan_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let plan: e2v_api::ObliviousLayoutPlanResponse =
+        serde_json::from_str(&read_owned_string(&mut plan_json)).unwrap();
+    assert!(plan.estimated_cover_reads_per_request >= 1);
+
+    let mut enable_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_enable_oblivious_layout_default_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("balanced").as_ptr(),
+                &mut enable_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let enabled: e2v_api::ObliviousLayoutStatusResponse =
+        serde_json::from_str(&read_owned_string(&mut enable_json)).unwrap();
+    assert_eq!(enabled.layout_mode, "oblivious");
+
+    let mut status_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_oblivious_layout_default_remote_status_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                &mut status_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let status: e2v_api::ObliviousLayoutStatusResponse =
+        serde_json::from_str(&read_owned_string(&mut status_json)).unwrap();
+    assert_eq!(status.policy_profile, "balanced");
+
+    let mut reshuffle_json = c_abi::e2v_string_t::default();
+    assert_eq!(
+        unsafe {
+            c_abi::e2v_reshuffle_oblivious_layout_default_remote_json(
+                sdk,
+                source_repo_c.as_ptr(),
+                c_string("balanced").as_ptr(),
+                &mut reshuffle_json,
+                &mut error,
+            )
+        },
+        c_abi::E2V_OK
+    );
+    let reshuffled: e2v_api::ObliviousLayoutStatusResponse =
+        serde_json::from_str(&read_owned_string(&mut reshuffle_json)).unwrap();
+    assert!(reshuffled.layout_generation > enabled.layout_generation);
+
+    unsafe {
+        c_abi::e2v_sdk_free(sdk);
+    }
+}
+
+#[test]
 fn c_abi_smoke_program_honors_forced_repo_root_override() {
     let workspace_root = workspace_root();
     let smoke_exe = compile_ffi_smoke_program(&workspace_root);

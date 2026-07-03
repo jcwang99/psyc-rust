@@ -1534,6 +1534,121 @@ fn historical_rewrite_commands_delegate_through_the_sdk_boundary() {
 }
 
 #[test]
+fn oram_commands_surface_plan_status_enable_and_reshuffle() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    init_repo(&repo_root);
+    fs::write(repo_root.join("tracked.txt"), "hello oram").unwrap();
+    let facade = RepositoryFacade::new();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    let branch_state = facade.open(&repo_root).unwrap().branch;
+    let remote = LocalFolderBackend::new(&remote_root);
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: branch_state.token_hex.clone(),
+            operation_id: "cli-oram-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_cli::testing::run_cli([
+        "e2v",
+        "remote",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "add",
+        "origin",
+        &format!(
+            "file://{}",
+            remote_root.to_string_lossy().replace('\\', "/")
+        ),
+    ])
+    .unwrap();
+
+    let plan_output =
+        e2v_cli::testing::run_cli(["e2v", "oram", "--repo", repo_root.to_str().unwrap(), "plan"])
+            .unwrap();
+    assert!(plan_output.contains("oblivious layout plan"));
+    assert!(plan_output.contains("cover reads"));
+
+    let enable_output = e2v_cli::testing::run_cli([
+        "e2v",
+        "oram",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "enable",
+        "--policy",
+        "balanced",
+    ])
+    .unwrap();
+    assert!(enable_output.contains("oblivious layout enabled"));
+    assert!(enable_output.contains("generation-scoped-randomized"));
+
+    let status_output = e2v_cli::testing::run_cli([
+        "e2v",
+        "oram",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "status",
+    ])
+    .unwrap();
+    assert!(status_output.contains("mode: oblivious"));
+    assert!(status_output.contains("policy: balanced"));
+
+    let reshuffle_output = e2v_cli::testing::run_cli([
+        "e2v",
+        "oram",
+        "--repo",
+        repo_root.to_str().unwrap(),
+        "reshuffle",
+        "--policy",
+        "balanced",
+    ])
+    .unwrap();
+    assert!(reshuffle_output.contains("oblivious layout reshuffled"));
+}
+
+#[test]
+fn oram_commands_delegate_through_the_sdk_boundary() {
+    let source = cli_lib_source_without_whitespace();
+
+    for legacy_call in [
+        "plan_oblivious_layout(",
+        "status_oblivious_layout(",
+        "enable_oblivious_layout(",
+        "reshuffle_oblivious_layout(",
+    ] {
+        assert!(
+            !source.contains(legacy_call),
+            "expected CLI oram commands to delegate through e2v_api::Sdk instead of {legacy_call}"
+        );
+    }
+
+    for sdk_call in [
+        "sdk.oblivious_layout_default_remote_plan(",
+        "sdk.oblivious_layout_default_remote_status(",
+        "sdk.enable_oblivious_layout_default_remote(",
+        "sdk.reshuffle_oblivious_layout_default_remote(",
+    ] {
+        assert!(
+            source.contains(sdk_call),
+            "expected CLI oram commands to use SDK call {sdk_call}"
+        );
+    }
+}
+
+#[test]
 fn branch_and_share_commands_delegate_through_the_sdk_boundary() {
     let source = cli_lib_source_without_whitespace();
 

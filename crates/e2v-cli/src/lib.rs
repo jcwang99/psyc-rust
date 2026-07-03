@@ -7,9 +7,10 @@ use std::{
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use e2v_api::{
-    CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest, GcExecuteRequest,
-    HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest, InitRepositoryOptions,
-    PullRequest, PushRequest, Sdk, ShareAcceptDeviceRequest, ShareAcceptMemberRequest,
+    CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, EnableObliviousLayoutRequest,
+    FetchRequest, GcExecuteRequest, HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest,
+    InitRepositoryOptions, ObliviousLayoutPlanRequest, PullRequest, PushRequest,
+    ReshuffleObliviousLayoutRequest, Sdk, ShareAcceptDeviceRequest, ShareAcceptMemberRequest,
     ShareInviteDeviceRequest, ShareInviteMemberRequest, ShareRevokeDeviceRequest,
     ShareRevokeMemberRequest, VerifyRemoteRequest,
 };
@@ -134,6 +135,12 @@ enum Command {
         #[arg(long)]
         repo: PathBuf,
     },
+    Oram {
+        #[command(subcommand)]
+        command: OramCommand,
+        #[arg(long)]
+        repo: PathBuf,
+    },
     Doctor {
         #[arg(long)]
         repo: PathBuf,
@@ -247,6 +254,20 @@ enum HistoricalRewriteCommand {
         password: String,
         #[arg(long = "confirm-full-reencryption", default_value_t = false)]
         confirm_full_reencryption: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OramCommand {
+    Plan,
+    Status,
+    Enable {
+        #[arg(long = "policy", default_value = "balanced")]
+        policy: String,
+    },
+    Reshuffle {
+        #[arg(long = "policy", default_value = "balanced")]
+        policy: String,
     },
 }
 
@@ -684,6 +705,74 @@ fn execute(cli: Cli) -> Result<String> {
                     result.rewritten_objects,
                     result.retired_epoch_count,
                     result.deleted_stale_remote_refs.len()
+                ))
+            }
+        },
+        Command::Oram { command, repo } => match command {
+            OramCommand::Plan => {
+                let plan =
+                    sdk.oblivious_layout_default_remote_plan(ObliviousLayoutPlanRequest {
+                        repo_root: repo.clone(),
+                    })?;
+                let mut output = String::new();
+                output.push_str("oblivious layout plan\n");
+                output.push_str(&format!(
+                    "real reads: {}\ncover reads: {}\nbytes/request: {}\nwrite amplification: {}\n",
+                    plan.estimated_real_reads_per_request,
+                    plan.estimated_cover_reads_per_request,
+                    plan.estimated_bytes_per_request,
+                    plan.estimated_write_amplification
+                ));
+                for advisory in plan.advisory_messages {
+                    output.push_str(&format!("advisory: {advisory}\n"));
+                }
+                Ok(output)
+            }
+            OramCommand::Status => {
+                let status = sdk.oblivious_layout_default_remote_status(&repo)?;
+                Ok(format!(
+                    "mode: {}\ndedup: {}\nlayout generation: {}\noblivious generation: {}\npolicy: {}\n",
+                    status.layout_mode,
+                    status.dedup_mode,
+                    status.layout_generation,
+                    status
+                        .oblivious_generation
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    status.policy_profile
+                ))
+            }
+            OramCommand::Enable { policy } => {
+                let status =
+                    sdk.enable_oblivious_layout_default_remote(EnableObliviousLayoutRequest {
+                        repo_root: repo,
+                        policy_profile: policy,
+                    })?;
+                Ok(format!(
+                    "oblivious layout enabled: mode={}, dedup={}, layout_generation={}, oblivious_generation={}\n",
+                    status.layout_mode,
+                    status.dedup_mode,
+                    status.layout_generation,
+                    status
+                        .oblivious_generation
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                ))
+            }
+            OramCommand::Reshuffle { policy } => {
+                let status = sdk.reshuffle_oblivious_layout_default_remote(
+                    ReshuffleObliviousLayoutRequest {
+                        repo_root: repo,
+                        policy_profile: policy,
+                    },
+                )?;
+                Ok(format!(
+                    "oblivious layout reshuffled: layout_generation={}, oblivious_generation={}\n",
+                    status.layout_generation,
+                    status
+                        .oblivious_generation
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
                 ))
             }
         },

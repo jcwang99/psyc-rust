@@ -2,9 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use e2v_api::{
-    CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, FetchRequest,
-    HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest, InitRepositoryOptions,
-    PullRequest, PushRequest, Sdk, SdkErrorCode, parse_remote_spec,
+    CheckoutSnapshotOptions, CloneRequest, CommitRepositoryOptions, EnableObliviousLayoutRequest,
+    FetchRequest, HistoricalRewriteExecuteRequest, HistoricalRewritePlanRequest,
+    InitRepositoryOptions, ObliviousLayoutPlanRequest, PullRequest, PushRequest,
+    ReshuffleObliviousLayoutRequest, Sdk, SdkErrorCode, parse_remote_spec,
 };
 
 fn file_remote_spec(path: &Path) -> String {
@@ -1180,6 +1181,82 @@ fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote()
             .message()
             .contains("full re-encryption confirmation"),
         "unexpected error: {explicit_error:?}"
+    );
+}
+
+#[test]
+fn sdk_can_plan_status_enable_and_reshuffle_oblivious_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-oblivious-default".to_string(),
+    })
+    .unwrap();
+
+    let plan = sdk
+        .oblivious_layout_default_remote_plan(ObliviousLayoutPlanRequest {
+            repo_root: repo_root.clone(),
+        })
+        .unwrap();
+    assert!(plan.estimated_real_reads_per_request >= 1);
+    assert!(plan.estimated_cover_reads_per_request >= 1);
+    assert!(plan.estimated_bytes_per_request > 0);
+    assert!(plan.requires_layout_root_rewrite);
+
+    let enabled = sdk
+        .enable_oblivious_layout_default_remote(EnableObliviousLayoutRequest {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        })
+        .unwrap();
+    assert_eq!(enabled.layout_mode, "oblivious");
+    assert_eq!(enabled.dedup_mode, "generation-scoped-randomized");
+    assert!(enabled.oblivious_generation.is_some());
+
+    let status = sdk
+        .oblivious_layout_default_remote_status(repo_root.clone())
+        .unwrap();
+    assert_eq!(status.layout_mode, "oblivious");
+    assert_eq!(status.policy_profile, "balanced");
+
+    let reshuffled = sdk
+        .reshuffle_oblivious_layout_default_remote(ReshuffleObliviousLayoutRequest {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        })
+        .unwrap();
+    assert!(reshuffled.layout_generation > enabled.layout_generation);
+    assert!(reshuffled.oblivious_generation > enabled.oblivious_generation);
+
+    let explicit_status = sdk
+        .oblivious_layout_remote_status(&remote_spec, repo_root.clone())
+        .unwrap();
+    assert_eq!(
+        explicit_status.layout_generation,
+        reshuffled.layout_generation
     );
 }
 

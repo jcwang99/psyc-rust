@@ -77,7 +77,7 @@ impl LocalFolderBackend {
             supports_reliable_remote_time: true,
             supports_object_generation_or_etag: true,
             supports_layout_root_cas: false,
-            supports_oblivious_access_schedule: false,
+            supports_oblivious_access_schedule: true,
         }
     }
 

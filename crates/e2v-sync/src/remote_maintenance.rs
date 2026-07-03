@@ -19,11 +19,11 @@ use crate::fetch::{
 };
 use crate::journal::{OperationId, OperationJournal, RewriteJournalState};
 use crate::object_type::candidate_object_types;
-use crate::pack::PackedObjectLocation;
-use crate::pack_index::{
-    load_remote_pack_index_segment_paths, load_remote_pack_locations_with_local_cache,
-    publish_pack_index_root,
+use crate::oram::{
+    load_remote_active_pack_locations_with_local_cache, load_remote_active_pack_segment_paths,
 };
+use crate::pack::PackedObjectLocation;
+use crate::pack_index::publish_pack_index_root;
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::push::{
     cleanup_completed_operation_markers, list_operation_pack_index_segment_paths,
@@ -570,7 +570,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
-        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
@@ -650,7 +650,7 @@ pub fn verify_remote<R: RemoteBackend>(
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
-        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let facade = RepositoryFacade::new();
@@ -742,7 +742,7 @@ pub fn repair_remote<R: RemoteBackend>(
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
-        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
@@ -804,7 +804,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
-        load_remote_pack_locations_with_local_cache(remote, &control_dir, Some(&secrets))?;
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
@@ -841,7 +841,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
         &mut reachable_object_ids,
     )?;
     persist_cached_pack_data(&control_dir, &pack_cache)?;
-    let pack_index_segment_paths = load_remote_pack_index_segment_paths(remote, Some(&secrets))?;
+    let pack_index_segment_paths = load_remote_active_pack_segment_paths(remote, &secrets)?;
     let active_intent_paths = list_active_intent_paths(remote)?;
     let mut unreachable_physical_refs = collect_unreachable_physical_refs_with_spill(
         remote,

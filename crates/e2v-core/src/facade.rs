@@ -11,7 +11,8 @@ use blake3::Hasher;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use e2v_store::{
-    DirectLayoutObjectStore, EpochSecrets, LayoutRoot, RepoSecrets, validate_object_id_value,
+    DedupMode, DirectLayoutObjectStore, EpochSecrets, LayoutCostPolicy, LayoutMode, LayoutRoot,
+    LayoutSchedulePolicy, LayoutTrafficPolicy, RepoSecrets, validate_object_id_value,
     validate_ref_token_value,
 };
 use postcard::{from_bytes as postcard_from_bytes, to_stdvec as postcard_to_vec};
@@ -595,7 +596,27 @@ impl RepositoryFacade {
             schema_version: REPO_FORMAT_VERSION,
             layout_id: DIRECT_LAYOUT_ID.to_string(),
             generation: 1,
+            mode: LayoutMode::Direct,
             mapping_policy: DIRECT_MAPPING_POLICY.to_string(),
+            dedup_mode: DedupMode::StablePhysical,
+            oblivious_generation: None,
+            schedule_policy: LayoutSchedulePolicy {
+                bucket_bytes: 0,
+                min_total_reads: 1,
+                cover_reads_per_request: 0,
+                reshuffle_after_generations: 0,
+            },
+            traffic_policy: LayoutTrafficPolicy {
+                max_parallel_reads: 0,
+                inter_read_delay_ms: 0,
+                burst_budget_bytes: 0,
+                target_request_window_ms: 0,
+            },
+            cost_policy: LayoutCostPolicy {
+                profile: "direct".to_string(),
+                max_expected_read_amplification: 1,
+                max_expected_write_amplification: 1,
+            },
         };
         let default_ref = RefRecord {
             branch_name: branch.name.clone(),
@@ -2498,14 +2519,12 @@ pub fn validate_layout_root_value(layout_root: &LayoutRoot) -> Result<()> {
         layout_root.schema_version
     );
     ensure!(
-        layout_root.layout_id == DIRECT_LAYOUT_ID,
-        "unsupported layout id {}",
-        layout_root.layout_id
+        !layout_root.layout_id.trim().is_empty(),
+        "layout root id must not be empty"
     );
     ensure!(
-        layout_root.mapping_policy == DIRECT_MAPPING_POLICY,
-        "unsupported layout mapping policy {}",
-        layout_root.mapping_policy
+        !layout_root.mapping_policy.trim().is_empty(),
+        "layout root mapping policy must not be empty"
     );
     Ok(())
 }

@@ -85,21 +85,35 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
     validate_pack_index_root(&root)?;
 
     let mut locations = BTreeMap::new();
-    for segment_path in &root.segments {
-        validate_segment_path(segment_path)?;
-        let cache_path = cached_segment_path(&cache_dir, segment_path);
-        let segment_bytes =
-            load_segment_bytes_with_cache_recovery(remote, segment_path, &cache_path, secrets)?;
-        append_segment_locations(
-            remote,
-            segment_path,
-            &segment_bytes,
-            &mut locations,
-            secrets,
-        )?;
-    }
+    append_remote_pack_locations_from_segment_paths(
+        remote,
+        &cache_dir,
+        secrets,
+        &root.segments,
+        &mut locations,
+    )?;
 
     std::fs::write(cache_dir.join("root.json"), root_bytes)?;
+    Ok(locations)
+}
+
+pub(crate) fn load_remote_pack_locations_from_segment_paths_with_local_cache<B: BlobStore>(
+    remote: &B,
+    control_dir: &Path,
+    secrets: Option<&RepoSecrets>,
+    segment_paths: &[String],
+) -> Result<BTreeMap<String, PackedObjectLocation>> {
+    let cache_dir = pack_index_cache_dir(control_dir);
+    std::fs::create_dir_all(segment_cache_dir(control_dir))?;
+
+    let mut locations = BTreeMap::new();
+    append_remote_pack_locations_from_segment_paths(
+        remote,
+        &cache_dir,
+        secrets,
+        segment_paths,
+        &mut locations,
+    )?;
     Ok(locations)
 }
 
@@ -244,6 +258,23 @@ fn cached_segment_path(cache_dir: &Path, segment_path: &str) -> PathBuf {
     cache_dir
         .join("segments")
         .join(segment_path.replace('/', "__"))
+}
+
+fn append_remote_pack_locations_from_segment_paths<B: BlobStore>(
+    remote: &B,
+    cache_dir: &Path,
+    secrets: Option<&RepoSecrets>,
+    segment_paths: &[String],
+    locations: &mut BTreeMap<String, PackedObjectLocation>,
+) -> Result<()> {
+    for segment_path in segment_paths {
+        validate_segment_path(segment_path)?;
+        let cache_path = cached_segment_path(cache_dir, segment_path);
+        let segment_bytes =
+            load_segment_bytes_with_cache_recovery(remote, segment_path, &cache_path, secrets)?;
+        append_segment_locations(remote, segment_path, &segment_bytes, locations, secrets)?;
+    }
+    Ok(())
 }
 
 fn load_segment_bytes_with_cache_recovery<B: BlobStore>(

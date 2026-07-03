@@ -2610,6 +2610,51 @@ fn open_rejects_unsupported_layout_root_schema_version() {
 }
 
 #[test]
+fn open_accepts_oblivious_layout_root_metadata_when_schema_is_supported() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let layout_root_path = repo_root.join(".e2v").join("layout_root.json");
+    let mut layout_root: serde_json::Value =
+        serde_json::from_slice(&fs::read(&layout_root_path).unwrap()).unwrap();
+    layout_root["layout_id"] = serde_json::Value::String("oram-v1".to_string());
+    layout_root["mode"] = serde_json::Value::String("Oblivious".to_string());
+    layout_root["mapping_policy"] = serde_json::Value::String("bucketed-randomized".to_string());
+    layout_root["dedup_mode"] = serde_json::Value::String("GenerationScopedRandomized".to_string());
+    layout_root["oblivious_generation"] = serde_json::Value::from(3u64);
+    layout_root["schedule_policy"] = serde_json::json!({
+        "bucket_bytes": 4096u64,
+        "min_total_reads": 3u64,
+        "cover_reads_per_request": 2u64,
+        "reshuffle_after_generations": 5u64
+    });
+    layout_root["traffic_policy"] = serde_json::json!({
+        "max_parallel_reads": 2u64,
+        "inter_read_delay_ms": 15u64,
+        "burst_budget_bytes": 16384u64,
+        "target_request_window_ms": 90u64
+    });
+    layout_root["cost_policy"] = serde_json::json!({
+        "profile": "balanced",
+        "max_expected_read_amplification": 3u64,
+        "max_expected_write_amplification": 4u64
+    });
+    fs::write(
+        &layout_root_path,
+        serde_json::to_vec_pretty(&layout_root).unwrap(),
+    )
+    .unwrap();
+
+    let state = facade.open(&repo_root).unwrap();
+
+    assert_eq!(state.layout_generation, 1);
+}
+
+#[test]
 fn verify_snapshot_requires_layout_root_view_to_be_present() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

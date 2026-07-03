@@ -11,9 +11,9 @@ use e2v_core::{
     SnapshotHandle, SnapshotSummary,
 };
 use e2v_sync::{
-    CloneOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions, HistoricalRewriteOptions,
-    HistoricalRewritePlanOptions, PushOptions, RemoteSpec, RepairRemoteOptions,
-    VerifyRemoteOptions,
+    CloneOptions, EnableObliviousLayoutOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions,
+    HistoricalRewriteOptions, HistoricalRewritePlanOptions, PushOptions, RemoteSpec,
+    RepairRemoteOptions, ReshuffleObliviousLayoutOptions, VerifyRemoteOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -145,6 +145,23 @@ pub struct HistoricalRewriteExecuteRequest {
     pub repo_root: PathBuf,
     pub password: String,
     pub confirm_full_reencryption: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObliviousLayoutPlanRequest {
+    pub repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnableObliviousLayoutRequest {
+    pub repo_root: PathBuf,
+    pub policy_profile: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReshuffleObliviousLayoutRequest {
+    pub repo_root: PathBuf,
+    pub policy_profile: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +372,25 @@ pub struct HistoricalRewriteExecuteResponse {
     pub retired_epoch_count: usize,
     pub deleted_stale_remote_refs: Vec<String>,
     pub next_layout_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObliviousLayoutPlanResponse {
+    pub estimated_real_reads_per_request: u8,
+    pub estimated_cover_reads_per_request: u8,
+    pub estimated_bytes_per_request: u64,
+    pub estimated_write_amplification: u8,
+    pub requires_layout_root_rewrite: bool,
+    pub advisory_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObliviousLayoutStatusResponse {
+    pub layout_mode: String,
+    pub dedup_mode: String,
+    pub layout_generation: u64,
+    pub oblivious_generation: Option<u64>,
+    pub policy_profile: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -809,6 +845,104 @@ impl Sdk {
         self.historical_rewrite_remote_execute(&stored.spec, request)
     }
 
+    pub fn oblivious_layout_remote_plan(
+        &self,
+        remote_spec: &str,
+        request: ObliviousLayoutPlanRequest,
+    ) -> SdkResult<ObliviousLayoutPlanResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::plan_oblivious_layout(backend, &request.repo_root)
+        })
+        .map(oblivious_layout_plan_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn oblivious_layout_default_remote_plan(
+        &self,
+        request: ObliviousLayoutPlanRequest,
+    ) -> SdkResult<ObliviousLayoutPlanResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.oblivious_layout_remote_plan(&stored.spec, request)
+    }
+
+    pub fn oblivious_layout_remote_status(
+        &self,
+        remote_spec: &str,
+        repo_root: impl AsRef<Path>,
+    ) -> SdkResult<ObliviousLayoutStatusResponse> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::status_oblivious_layout(backend, &repo_root)
+        })
+        .map(oblivious_layout_status_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn oblivious_layout_default_remote_status(
+        &self,
+        repo_root: impl AsRef<Path>,
+    ) -> SdkResult<ObliviousLayoutStatusResponse> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let stored = self.load_default_remote(&repo_root)?;
+        self.oblivious_layout_remote_status(&stored.spec, repo_root)
+    }
+
+    pub fn enable_oblivious_layout_remote(
+        &self,
+        remote_spec: &str,
+        request: EnableObliviousLayoutRequest,
+    ) -> SdkResult<ObliviousLayoutStatusResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::enable_oblivious_layout(
+                backend,
+                EnableObliviousLayoutOptions {
+                    repo_root: request.repo_root.clone(),
+                    policy_profile: request.policy_profile.clone(),
+                },
+            )
+        })
+        .map(oblivious_layout_status_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn enable_oblivious_layout_default_remote(
+        &self,
+        request: EnableObliviousLayoutRequest,
+    ) -> SdkResult<ObliviousLayoutStatusResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.enable_oblivious_layout_remote(&stored.spec, request)
+    }
+
+    pub fn reshuffle_oblivious_layout_remote(
+        &self,
+        remote_spec: &str,
+        request: ReshuffleObliviousLayoutRequest,
+    ) -> SdkResult<ObliviousLayoutStatusResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::reshuffle_oblivious_layout(
+                backend,
+                ReshuffleObliviousLayoutOptions {
+                    repo_root: request.repo_root.clone(),
+                    policy_profile: request.policy_profile.clone(),
+                },
+            )
+        })
+        .map(oblivious_layout_status_response_from_result)
+        .map_err(map_error)
+    }
+
+    pub fn reshuffle_oblivious_layout_default_remote(
+        &self,
+        request: ReshuffleObliviousLayoutRequest,
+    ) -> SdkResult<ObliviousLayoutStatusResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.reshuffle_oblivious_layout_remote(&stored.spec, request)
+    }
+
     pub fn repair_remote(
         &self,
         remote_spec: &str,
@@ -1202,6 +1336,31 @@ fn historical_rewrite_execute_response_from_result(
         retired_epoch_count: result.retired_epoch_count,
         deleted_stale_remote_refs: result.deleted_stale_remote_refs,
         next_layout_generation: result.next_layout_generation,
+    }
+}
+
+fn oblivious_layout_plan_response_from_result(
+    result: e2v_sync::ObliviousLayoutPlan,
+) -> ObliviousLayoutPlanResponse {
+    ObliviousLayoutPlanResponse {
+        estimated_real_reads_per_request: result.estimated_real_reads_per_request,
+        estimated_cover_reads_per_request: result.estimated_cover_reads_per_request,
+        estimated_bytes_per_request: result.estimated_bytes_per_request,
+        estimated_write_amplification: result.estimated_write_amplification,
+        requires_layout_root_rewrite: result.requires_layout_root_rewrite,
+        advisory_messages: result.advisory_messages,
+    }
+}
+
+fn oblivious_layout_status_response_from_result(
+    result: e2v_sync::ObliviousLayoutStatus,
+) -> ObliviousLayoutStatusResponse {
+    ObliviousLayoutStatusResponse {
+        layout_mode: result.layout_mode,
+        dedup_mode: result.dedup_mode,
+        layout_generation: result.layout_generation,
+        oblivious_generation: result.oblivious_generation,
+        policy_profile: result.policy_profile,
     }
 }
 

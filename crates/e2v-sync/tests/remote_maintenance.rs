@@ -9,10 +9,12 @@ use e2v_store::{BlobStore, MemoryBackend};
 use tempfile::tempdir;
 
 use e2v_sync::{
-    CloneOptions, GcDryRunOptions, GcExecuteOptions, HistoricalRewriteOptions,
-    HistoricalRewritePlanOptions, PushOptions, RepairRemoteOptions, VerifyRemoteOptions,
-    clone_remote, fetch_remote, force_accept_remote_rollback, gc_dry_run, gc_execute,
-    historical_rewrite_remote, plan_historical_rewrite, push_head, repair_remote, verify_remote,
+    CloneOptions, EnableObliviousLayoutOptions, GcDryRunOptions, GcExecuteOptions,
+    HistoricalRewriteOptions, HistoricalRewritePlanOptions, PushOptions, RepairRemoteOptions,
+    ReshuffleObliviousLayoutOptions, VerifyRemoteOptions, clone_remote, enable_oblivious_layout,
+    fetch_remote, force_accept_remote_rollback, gc_dry_run, gc_execute, historical_rewrite_remote,
+    plan_historical_rewrite, plan_oblivious_layout, push_head, repair_remote,
+    reshuffle_oblivious_layout, status_oblivious_layout, verify_remote,
 };
 
 #[test]
@@ -43,6 +45,209 @@ fn sync_exposes_historical_rewrite_plan_and_execute_api_for_p3_a() {
             "expected P3-A historical rewrite surface to include {required_export}"
         );
     }
+}
+
+#[test]
+fn sync_exposes_oblivious_layout_api_for_p3_b() {
+    let lib_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    for required_export in [
+        "ObliviousLayoutPlan",
+        "ObliviousLayoutStatus",
+        "EnableObliviousLayoutOptions",
+        "ReshuffleObliviousLayoutOptions",
+        "plan_oblivious_layout",
+        "status_oblivious_layout",
+        "enable_oblivious_layout",
+        "reshuffle_oblivious_layout",
+    ] {
+        assert!(
+            lib_source.contains(required_export),
+            "expected P3-B oblivious layout surface to include {required_export}"
+        );
+    }
+}
+
+#[test]
+fn plan_oblivious_layout_reports_amplification_and_advisories() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-oram-plan".to_string(),
+        },
+    )
+    .unwrap();
+
+    let plan = plan_oblivious_layout(&remote, &repo_root).unwrap();
+
+    assert!(plan.estimated_real_reads_per_request >= 1);
+    assert!(plan.estimated_cover_reads_per_request >= 1);
+    assert!(plan.estimated_bytes_per_request > 0);
+    assert!(plan.requires_layout_root_rewrite);
+    assert!(
+        plan.advisory_messages
+            .iter()
+            .any(|message: &String| message.contains("ORAM") || message.contains("oblivious")),
+        "expected ORAM advisory copy, saw {:?}",
+        plan.advisory_messages
+    );
+}
+
+#[test]
+fn enable_and_reshuffle_oblivious_layout_publish_new_generations() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-oram-enable".to_string(),
+        },
+    )
+    .unwrap();
+
+    let enabled = enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+    let status_after_enable = status_oblivious_layout(&remote, &repo_root).unwrap();
+    let reshuffled = reshuffle_oblivious_layout(
+        &remote,
+        ReshuffleObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(enabled.layout_mode, "oblivious");
+    assert_eq!(enabled.dedup_mode, "generation-scoped-randomized");
+    assert!(remote.exists_physical("oblivious/root.json"));
+    assert!(status_after_enable.oblivious_generation.is_some());
+    assert!(reshuffled.layout_generation > enabled.layout_generation);
+    assert!(reshuffled.oblivious_generation.unwrap() > enabled.oblivious_generation.unwrap());
+}
+
+#[test]
+fn gc_under_oblivious_layout_does_not_require_pack_index_root() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-oram-gc".to_string(),
+        },
+    )
+    .unwrap();
+    enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    for path in remote.list_physical("objects/").unwrap() {
+        remote.delete_physical(&path).unwrap();
+    }
+    remote.delete_physical("pack-index/root.json").unwrap();
+    let stray_object_path =
+        "objects/abababababababababababababababababababababababababababababababab.json";
+    remote
+        .put_physical(stray_object_path, br#"{"garbage":true}"#)
+        .unwrap();
+
+    let report = gc_dry_run(
+        &remote,
+        GcDryRunOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        report
+            .unreachable_physical_refs
+            .contains(&stray_object_path.to_string()),
+        "gc dry-run should still classify stray physical refs under oblivious layout"
+    );
 }
 
 #[test]

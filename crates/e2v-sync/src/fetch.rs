@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use crate::journal::validate_sync_identifier;
 use crate::object_type::candidate_object_types;
+use crate::oram::load_remote_active_pack_locations_with_local_cache;
 use crate::pack::{PackedObjectLocation, read_packed_object};
-use crate::pack_index::load_remote_pack_locations_with_local_cache;
 use crate::trusted_state::{
     TrustedRemoteState, load_trusted_remote_state, store_trusted_remote_state,
 };
@@ -300,11 +300,12 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
     };
 
     let listed = remote.list_physical("objects/")?;
-    let pack_locations = load_remote_pack_locations_with_local_cache(
-        remote,
-        &control_dir,
-        pack_index_secrets.as_ref(),
-    )?;
+    let pack_locations = match pack_index_secrets.as_ref() {
+        Some(secrets) => {
+            load_remote_active_pack_locations_with_local_cache(remote, &control_dir, secrets)?
+        }
+        None => BTreeMap::new(),
+    };
     let mut validated_remote_objects = Vec::with_capacity(listed.len());
     let mut remote_loose_object_ids = BTreeSet::new();
     for relative_path in listed {
@@ -1608,7 +1609,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::pack_index::load_remote_pack_locations_with_local_cache;
+    use crate::oram::load_remote_active_pack_locations_with_local_cache;
     use crate::push::{PushOptions, push_head};
 
     #[derive(Default)]
@@ -1677,7 +1678,7 @@ mod tests {
         let control_dir = repo_root.join(".e2v");
         let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
         let pack_locations =
-            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+            load_remote_active_pack_locations_with_local_cache(&remote, &control_dir, &secrets)
                 .unwrap();
         let control_plane =
             read_remote_control_plane(&remote, default_ref.value.bytes.clone()).unwrap();

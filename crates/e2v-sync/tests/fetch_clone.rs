@@ -12,8 +12,9 @@ use e2v_store::{
 use tempfile::tempdir;
 
 use e2v_sync::{
-    CloneOptions, FetchOptions, HistoricalRewriteOptions, PushOptions, clone_remote, fetch_remote,
-    historical_rewrite_remote, push_head,
+    CloneOptions, EnableObliviousLayoutOptions, FetchOptions, HistoricalRewriteOptions,
+    PushOptions, clone_remote, enable_oblivious_layout, fetch_remote, historical_rewrite_remote,
+    push_head,
 };
 
 fn seed_remote() -> (
@@ -1403,6 +1404,182 @@ fn fetch_reuses_pack_reads_when_restoring_objects_after_remote_keyring_pointer_c
     RepositoryFacade::new()
         .unlock(&clone_repo_root, "new horse battery staple")
         .unwrap();
+}
+
+#[test]
+fn fetch_restores_objects_after_remote_enables_oblivious_layout() {
+    let temp = tempdir().unwrap();
+    let source_root = temp.path().join("source");
+    let clone_root = temp.path().join("clone");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::create_dir_all(&clone_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_root.join("hello.txt"), b"hello oram").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "fetch-oram-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+    enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: source_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: "correct horse battery staple".to_string(),
+        },
+    )
+    .unwrap();
+
+    let object_count_before = fs::read_dir(clone_root.join(".e2v").join("objects"))
+        .unwrap()
+        .count();
+    let first_object = fs::read_dir(clone_root.join(".e2v").join("objects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(&first_object).unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            repo_root: clone_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        },
+    )
+    .unwrap();
+
+    let read = facade.read_service(&clone_root).unwrap();
+    let snapshot = read.resolve_branch(&state.branch.token_hex).unwrap();
+    let file = read.open_file(&snapshot, "hello.txt").unwrap();
+    let bytes = read.read_range(&file, 0, 32).unwrap();
+
+    assert!(fetched.downloaded_objects >= 1);
+    assert_eq!(String::from_utf8(bytes).unwrap(), "hello oram");
+    assert_eq!(
+        fs::read_dir(clone_root.join(".e2v").join("objects"))
+            .unwrap()
+            .count(),
+        object_count_before
+    );
+}
+
+#[test]
+fn fetch_after_oram_enablement_uses_oblivious_root_when_pack_index_root_is_missing() {
+    let temp = tempdir().unwrap();
+    let source_root = temp.path().join("source");
+    let clone_root = temp.path().join("clone");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::create_dir_all(&clone_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_root.join("hello.txt"), b"hello oram").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: source_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "fetch-oram-routing-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+    enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: source_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: "correct horse battery staple".to_string(),
+        },
+    )
+    .unwrap();
+
+    for path in remote.list_physical("objects/").unwrap() {
+        remote.delete_physical(&path).unwrap();
+    }
+    remote.delete_physical("pack-index/root.json").unwrap();
+
+    let first_object = fs::read_dir(clone_root.join(".e2v").join("objects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(&first_object).unwrap();
+
+    let fetched = fetch_remote(
+        &remote,
+        FetchOptions {
+            repo_root: clone_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        },
+    )
+    .unwrap();
+
+    let read = facade.read_service(&clone_root).unwrap();
+    let snapshot = read.resolve_branch(&state.branch.token_hex).unwrap();
+    let file = read.open_file(&snapshot, "hello.txt").unwrap();
+    let bytes = read.read_range(&file, 0, 32).unwrap();
+
+    assert!(fetched.downloaded_objects >= 1);
+    assert_eq!(String::from_utf8(bytes).unwrap(), "hello oram");
 }
 
 #[test]
@@ -3686,9 +3863,7 @@ fn clone_rejects_remote_layout_root_with_unsupported_schema_version() {
             current_layout.generation,
             e2v_store::LayoutRoot {
                 schema_version: 99,
-                layout_id: current_layout.layout_id,
-                generation: current_layout.generation,
-                mapping_policy: current_layout.mapping_policy,
+                ..current_layout.clone()
             },
         )
         .unwrap();
@@ -4133,9 +4308,7 @@ fn fetch_rejects_remote_layout_root_with_unsupported_schema_version() {
             current_layout.generation,
             e2v_store::LayoutRoot {
                 schema_version: 99,
-                layout_id: current_layout.layout_id,
-                generation: current_layout.generation,
-                mapping_policy: current_layout.mapping_policy,
+                ..current_layout.clone()
             },
         )
         .unwrap();

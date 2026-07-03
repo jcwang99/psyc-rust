@@ -11,7 +11,8 @@ use serde_json::Value;
 use tempfile::tempdir;
 
 use e2v_sync::{
-    CloneOptions, PushOptions, ResumeOptions, clone_remote, fetch_remote, push_head, resume_push,
+    CloneOptions, EnableObliviousLayoutOptions, PushOptions, ResumeOptions, clone_remote,
+    enable_oblivious_layout, fetch_remote, push_head, resume_push,
 };
 
 #[test]
@@ -6895,5 +6896,143 @@ fn push_does_not_upload_local_keyring_lock_file_to_remote_control_plane() {
     assert!(
         !remote.exists_physical("control/keyring/keyring.lock"),
         "push should not upload local keyring lock files"
+    );
+}
+
+#[test]
+fn push_preserves_remote_oblivious_layout_mode_after_enablement() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "oram-seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-oram-preserve-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+    let enabled = enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    fs::write(repo_root.join("hello.txt"), b"hello remote again").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "oram-second".to_string(),
+        })
+        .unwrap();
+
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-oram-preserve-second".to_string(),
+        },
+    )
+    .unwrap();
+
+    let layout_root = remote.read_layout_root().unwrap();
+
+    assert_eq!(enabled.layout_mode, "oblivious");
+    assert!(matches!(layout_root.mode, e2v_store::LayoutMode::Oblivious));
+    assert!(layout_root.oblivious_generation.is_some());
+}
+
+#[test]
+fn push_under_oblivious_layout_does_not_add_new_loose_object_uploads() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "oram-seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-oram-loose-bootstrap".to_string(),
+        },
+    )
+    .unwrap();
+    enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+    let loose_before = remote.list_physical("objects/").unwrap().len();
+
+    fs::write(repo_root.join("hello.txt"), b"hello remote again").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "oram-second".to_string(),
+        })
+        .unwrap();
+
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-oram-loose-second".to_string(),
+        },
+    )
+    .unwrap();
+
+    let loose_after = remote.list_physical("objects/").unwrap().len();
+
+    assert_eq!(
+        loose_after, loose_before,
+        "new pushes under oblivious layout should stay within the active oblivious placement instead of adding fresh loose-object paths"
     );
 }
