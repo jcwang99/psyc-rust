@@ -228,7 +228,9 @@ pub fn decode_pack_index_segment_value_for_test(
 ) -> Result<Value> {
     let secrets = open_or_unlock_repo_secrets_for_sync(control_dir)?;
     let plaintext = decode_pack_index_segment_plaintext(segment_path, bytes, Some(&secrets))?;
-    let index: ObjectPackIndex = serde_json::from_slice(&plaintext)?;
+    let index: ObjectPackIndex = serde_json::from_slice(&plaintext).with_context(|| {
+        format!("failed to decode authenticated pack index segment {segment_path}")
+    })?;
     serde_json::to_value(index).map_err(Into::into)
 }
 
@@ -485,7 +487,10 @@ fn append_segment_locations<B: BlobStore>(
     }
 
     let plaintext = decode_pack_index_segment_plaintext(segment_path, segment_bytes, secrets)?;
-    let aggregate: AggregatePackIndexSegment = serde_json::from_slice(&plaintext)?;
+    let aggregate: AggregatePackIndexSegment =
+        serde_json::from_slice(&plaintext).with_context(|| {
+            format!("failed to decode authenticated pack index segment {segment_path}")
+        })?;
     ensure!(
         aggregate.schema_version == PACK_INDEX_ROOT_SCHEMA_VERSION,
         "unsupported aggregate pack index schema version {}",
@@ -515,7 +520,9 @@ fn read_segment_entries(
 ) -> Result<Vec<AggregatePackIndexEntry>> {
     if segment_path.starts_with(REMOTE_PACK_INDEX_PREFIX) {
         let plaintext = decode_pack_index_segment_plaintext(segment_path, segment_bytes, secrets)?;
-        let index: ObjectPackIndex = serde_json::from_slice(&plaintext)?;
+        let index: ObjectPackIndex = serde_json::from_slice(&plaintext).with_context(|| {
+            format!("failed to decode authenticated pack index segment {segment_path}")
+        })?;
         return Ok(index
             .entries
             .into_iter()
@@ -529,7 +536,10 @@ fn read_segment_entries(
     }
 
     let plaintext = decode_pack_index_segment_plaintext(segment_path, segment_bytes, secrets)?;
-    let aggregate: AggregatePackIndexSegment = serde_json::from_slice(&plaintext)?;
+    let aggregate: AggregatePackIndexSegment =
+        serde_json::from_slice(&plaintext).with_context(|| {
+            format!("failed to decode authenticated pack index segment {segment_path}")
+        })?;
     ensure!(
         aggregate.schema_version == PACK_INDEX_ROOT_SCHEMA_VERSION,
         "unsupported aggregate pack index schema version {}",
@@ -1063,6 +1073,53 @@ mod tests {
                 || error
                     .to_string()
                     .contains("failed to decrypt authenticated pack index segment"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn authenticated_pack_index_segment_reports_decode_failure() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+        remote
+            .put_physical("packs/data/op-00000000.bin", b"payload")
+            .unwrap();
+        remote
+            .put_physical(
+                PACK_INDEX_ROOT_PATH,
+                &encode_pack_index_root_bytes(
+                    &secrets,
+                    &PackIndexRoot {
+                        schema_version: PACK_INDEX_ROOT_SCHEMA_VERSION,
+                        layout_id: "pack".to_string(),
+                        layout_generation: 1,
+                        generation: 1,
+                        segments: vec!["packs/index/op-00000000.json".to_string()],
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        remote
+            .put_physical(
+                "packs/index/op-00000000.json",
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    "packs/index/op-00000000.json",
+                    br#"{"broken":true"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let error =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode authenticated pack index segment"),
             "unexpected error: {error:#}"
         );
     }

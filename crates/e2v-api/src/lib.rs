@@ -1401,6 +1401,8 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode remote keyring state")
         || lower.contains("failed to decode remote branch ref")
         || lower.contains("failed to decode authenticated pack index root")
+        || lower.contains("failed to decode authenticated pack index segment")
+        || lower.contains("failed to decrypt authenticated pack index segment")
         || lower.contains("remote keyring pointer generation mismatch")
         || lower.contains("missing physical chunk")
         || lower.contains("cached pack index has no entry")
@@ -1409,12 +1411,16 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         SdkErrorCode::CorruptState
     } else if lower.contains("unsupported remote spec")
         || lower.contains("unsupported remote url scheme")
+        || lower.contains("invalid remote url")
+        || lower.contains("invalid snapshot id")
+        || lower.contains("invalid snapshot path")
         || lower.contains("path traversal")
         || lower.contains("must not be empty")
+        || lower.contains("sample percent must be between")
+        || lower.contains("grace period must be greater than zero")
         || lower.contains("full re-encryption confirmation")
         || lower.contains("confirm-full-reencryption")
         || lower.contains("maintenance window")
-        || lower.contains("invalid")
         || lower.contains("bad request")
     {
         SdkErrorCode::InvalidArgument
@@ -1451,4 +1457,20 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
     };
 
     SdkError::new(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_error_does_not_treat_corrupt_pack_index_segment_as_invalid_argument() {
+        let error = anyhow::anyhow!(
+            "failed to decode authenticated pack index segment packs/index/push-invalid-pack-index-segment-op/pack-index.000000.json"
+        );
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
 }

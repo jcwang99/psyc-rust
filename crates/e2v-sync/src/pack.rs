@@ -173,7 +173,8 @@ pub(crate) fn append_pack_index_locations_from_bytes<B: BlobStore>(
     index_bytes: &[u8],
     locations: &mut BTreeMap<String, PackedObjectLocation>,
 ) -> Result<()> {
-    let index: ObjectPackIndex = serde_json::from_slice(index_bytes)?;
+    let index: ObjectPackIndex =
+        serde_json::from_slice(index_bytes).context("failed to decode authenticated pack index segment")?;
     append_pack_index_locations(remote, index, locations)
 }
 
