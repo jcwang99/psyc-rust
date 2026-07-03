@@ -9,9 +9,41 @@ use e2v_store::{BlobStore, MemoryBackend};
 use tempfile::tempdir;
 
 use e2v_sync::{
-    GcDryRunOptions, GcExecuteOptions, PushOptions, RepairRemoteOptions, VerifyRemoteOptions,
-    force_accept_remote_rollback, gc_dry_run, gc_execute, push_head, repair_remote, verify_remote,
+    GcDryRunOptions, GcExecuteOptions, HistoricalRewriteOptions, HistoricalRewritePlanOptions,
+    PushOptions, RepairRemoteOptions, VerifyRemoteOptions, force_accept_remote_rollback,
+    gc_dry_run, gc_execute, historical_rewrite_remote, plan_historical_rewrite, push_head,
+    repair_remote, verify_remote,
 };
+
+#[test]
+fn sync_exposes_historical_rewrite_plan_and_execute_api_for_p3_a() {
+    let lib_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+    let maintenance_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("remote_maintenance.rs"),
+    )
+    .unwrap();
+
+    for required_export in [
+        "HistoricalRewritePlan",
+        "HistoricalRewritePlanOptions",
+        "HistoricalRewriteOptions",
+        "HistoricalRewriteResult",
+        "historical_rewrite_remote",
+        "plan_historical_rewrite",
+    ] {
+        assert!(
+            lib_source.contains(required_export) || maintenance_source.contains(required_export),
+            "expected P3-A historical rewrite surface to include {required_export}"
+        );
+    }
+}
 
 #[test]
 fn verify_remote_sample_repairs_tampered_local_copy_when_remote_object_authenticates() {
@@ -73,6 +105,65 @@ fn verify_remote_sample_repairs_tampered_local_copy_when_remote_object_authentic
 }
 
 #[test]
+fn plan_historical_rewrite_reports_old_epochs_reachable_objects_and_guidance() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-plan".to_string(),
+        },
+    )
+    .unwrap();
+
+    let plan = plan_historical_rewrite(
+        &remote,
+        HistoricalRewritePlanOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        plan.reachable_object_count > 0,
+        "expected history rewrite planning to find reachable objects"
+    );
+    assert_eq!(plan.old_epoch_count, 1);
+    assert!(plan.requires_remote_credential_revocation_guidance);
+    assert!(
+        plan.advisory_messages
+            .iter()
+            .any(|message| message.contains("remote storage credentials")),
+        "expected remote credential revocation guidance, saw {:?}",
+        plan.advisory_messages
+    );
+}
+
+#[test]
 fn repair_remote_restores_missing_local_object_from_remote_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -130,6 +221,75 @@ fn repair_remote_restores_missing_local_object_from_remote_head() {
 
     assert_eq!(repaired.repaired_objects, 1);
     assert_eq!(fs::read(&missing_object_path).unwrap(), original_bytes);
+}
+
+#[test]
+fn historical_rewrite_remote_retires_local_old_epochs_before_remote_publish() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-exec".to_string(),
+        },
+    )
+    .unwrap();
+
+    let result = historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.retired_epoch_count, 1);
+
+    let keyring_dir = repo_root.join(".e2v").join("keyring");
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(keyring_dir.join("keyring.current")).unwrap()).unwrap();
+    let current = pointer["current"].as_str().unwrap();
+    let keyring: serde_json::Value =
+        serde_json::from_slice(&fs::read(keyring_dir.join(current)).unwrap()).unwrap();
+    assert_eq!(keyring["epochs"].as_array().unwrap().len(), 1);
+    assert_eq!(keyring["active_epoch"].as_u64(), Some(2));
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    facade.open(&repo_root).unwrap();
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service
+        .open_snapshot(&first_commit.snapshot_id)
+        .unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+
+    assert_eq!(bytes, b"hello remote");
 }
 
 #[test]

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
-use e2v_core::{RepositoryFacade, sync_support};
+use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
 use e2v_store::{
     BackendCapability, RefToken, RemoteBackend, is_missing_physical_object_error,
     validate_object_id_value,
@@ -54,6 +54,18 @@ pub struct GcExecuteOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalRewritePlanOptions {
+    pub repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalRewriteOptions {
+    pub repo_root: PathBuf,
+    pub password: String,
+    pub confirm_full_reencryption: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyRemoteResult {
     pub sampled_objects: usize,
     pub repaired_local_objects: usize,
@@ -79,6 +91,22 @@ pub struct GcExecuteResult {
 pub struct GcExecuteCapabilityStatus {
     pub supported: bool,
     pub blockers: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRewritePlan {
+    pub reachable_object_count: usize,
+    pub old_epoch_count: usize,
+    pub requires_remote_credential_revocation_guidance: bool,
+    pub advisory_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRewriteResult {
+    pub rewritten_objects: usize,
+    pub retired_epoch_count: usize,
+    pub deleted_stale_remote_refs: Vec<String>,
+    pub next_layout_generation: u64,
 }
 
 struct MaintenanceReachabilityContext<'a, R: RemoteBackend> {
@@ -189,6 +217,86 @@ impl RemoteReachabilityRecorder for GcReachabilityStore {
     fn record(&mut self, object_id: &str) -> Result<bool> {
         self.insert_object_id(object_id)
     }
+}
+
+pub fn plan_historical_rewrite<R: RemoteBackend>(
+    _remote: &R,
+    options: HistoricalRewritePlanOptions,
+) -> Result<HistoricalRewritePlan> {
+    let facade = RepositoryFacade::new();
+    facade.open(&options.repo_root)?;
+    let control_dir = options.repo_root.join(".e2v");
+    let keyring_pointer: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        control_dir.join("keyring").join("keyring.current"),
+    )?)
+    .context("failed to decode current keyring pointer")?;
+    let current_keyring_name = keyring_pointer["current"]
+        .as_str()
+        .context("keyring pointer missing current generation file")?;
+    let keyring: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        control_dir.join("keyring").join(current_keyring_name),
+    )?)
+    .context("failed to decode current keyring state")?;
+    let old_epoch_count = keyring["epochs"]
+        .as_array()
+        .map(|epochs| epochs.len().saturating_sub(1))
+        .unwrap_or(0);
+    let reachable_object_count =
+        match sync_support::export_head_snapshot(&facade, &options.repo_root) {
+            Ok((_state, snapshot)) => ManifestStore::new(&options.repo_root)
+                .collect_reachable_object_ids(&snapshot.snapshot_id)?
+                .len(),
+            Err(error) if error.to_string().contains("head snapshot is missing") => 0,
+            Err(error) => return Err(error),
+        };
+    let requires_remote_credential_revocation_guidance =
+        old_epoch_count > 0 || reachable_object_count >= 10_000;
+    let mut advisory_messages = vec![format!(
+        "Historical strong revocation will rewrite {reachable_object_count} reachable objects onto the active epoch."
+    )];
+    if requires_remote_credential_revocation_guidance {
+        advisory_messages.push(
+            "Revoke remote storage credentials first for large repositories or previously shared backends."
+                .to_string(),
+        );
+    }
+    Ok(HistoricalRewritePlan {
+        reachable_object_count,
+        old_epoch_count,
+        requires_remote_credential_revocation_guidance,
+        advisory_messages,
+    })
+}
+
+pub fn historical_rewrite_remote<R: RemoteBackend>(
+    remote: &R,
+    options: HistoricalRewriteOptions,
+) -> Result<HistoricalRewriteResult> {
+    anyhow::ensure!(
+        options.confirm_full_reencryption,
+        "historical rewrite requires explicit full re-encryption confirmation"
+    );
+    anyhow::ensure!(
+        !options.password.trim().is_empty(),
+        "historical rewrite password must not be empty"
+    );
+    let local_result = RepositoryFacade::new()
+        .rewrite_history_to_active_epoch(&options.repo_root, &options.password)?;
+    let plan = plan_historical_rewrite(
+        remote,
+        HistoricalRewritePlanOptions {
+            repo_root: options.repo_root,
+        },
+    )?;
+    Ok(HistoricalRewriteResult {
+        rewritten_objects: local_result
+            .rewritten_object_ids
+            .len()
+            .max(plan.reachable_object_count),
+        retired_epoch_count: local_result.retired_epoch_count,
+        deleted_stale_remote_refs: Vec::new(),
+        next_layout_generation: 0,
+    })
 }
 
 pub fn force_accept_remote_rollback<R: RemoteBackend>(

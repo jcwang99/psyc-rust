@@ -22,8 +22,10 @@ pub use journal::{
 pub use push::{PushOptions, PushResult, ResumeOptions, ResumeResult, push_head, resume_push};
 pub use remote_maintenance::{
     GcDryRunOptions, GcDryRunReport, GcExecuteCapabilityStatus, GcExecuteOptions, GcExecuteResult,
-    RepairRemoteOptions, RepairRemoteResult, VerifyRemoteOptions, VerifyRemoteResult,
-    force_accept_remote_rollback, gc_dry_run, gc_execute, gc_execute_capability_status,
+    HistoricalRewriteOptions, HistoricalRewritePlan, HistoricalRewritePlanOptions,
+    HistoricalRewriteResult, RepairRemoteOptions, RepairRemoteResult, VerifyRemoteOptions,
+    VerifyRemoteResult, force_accept_remote_rollback, gc_dry_run, gc_execute,
+    gc_execute_capability_status, historical_rewrite_remote, plan_historical_rewrite,
     repair_remote, verify_remote,
 };
 pub use remote_spec::{RemoteBackendRef, RemoteSpec};
