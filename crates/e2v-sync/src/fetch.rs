@@ -736,10 +736,44 @@ fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
             .and_then(|ext| ext.to_str())
             .unwrap_or("tmp")
     ));
+    if let Some(parent) = path.parent() {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(&temp_path)?;
     std::fs::write(&temp_path, bytes)
         .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    std::fs::rename(&temp_path, &path)
-        .with_context(|| format!("failed to publish {}", path.display()))?;
+    match std::fs::rename(&temp_path, &path) {
+        Ok(()) => {}
+        Err(_) => {
+            remove_path_if_exists(&path)?;
+            std::fs::rename(&temp_path, &path)
+                .with_context(|| format!("failed to publish {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn ensure_directory_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && parent != path
+    {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)?;
+    std::fs::create_dir_all(path)?;
     Ok(())
 }
 

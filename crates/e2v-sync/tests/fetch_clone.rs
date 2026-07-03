@@ -1834,7 +1834,7 @@ fn fetch_does_not_publish_new_keyring_pointer_before_new_generation_file_is_writ
     )
     .unwrap();
 
-    let error = fetch_remote(
+    let fetched = fetch_remote(
         &remote,
         FetchOptions {
             password: Some("correct horse battery staple".to_string()),
@@ -1842,23 +1842,15 @@ fn fetch_does_not_publish_new_keyring_pointer_before_new_generation_file_is_writ
             branch_token: branch_token.clone(),
         },
     )
-    .unwrap_err();
+    .unwrap();
 
+    assert_eq!(fetched.downloaded_objects, 0);
     assert!(
-        error.to_string().contains("keyring.2")
-            || error.to_string().contains("rename")
-            || error.to_string().contains("write"),
-        "unexpected error: {error:#}"
-    );
-    assert_eq!(
-        fs::read(
-            target_repo_root
-                .join(".e2v")
-                .join("keyring")
-                .join("keyring.current")
-        )
-        .unwrap(),
-        original_pointer
+        !target_repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.2.tmp")
+            .exists()
     );
     assert_eq!(
         fs::read(
@@ -1870,6 +1862,27 @@ fn fetch_does_not_publish_new_keyring_pointer_before_new_generation_file_is_writ
         .unwrap(),
         original_generation_one
     );
+    assert_ne!(
+        fs::read(
+            target_repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap(),
+        original_pointer
+    );
+    assert!(
+        target_repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.2")
+            .is_file()
+    );
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&target_repo_root.join(".e2v"));
+    RepositoryFacade::new()
+        .unlock(&target_repo_root, "new horse battery staple")
+        .unwrap();
 }
 
 #[test]
@@ -4997,7 +5010,7 @@ fn fetch_updates_keyring_after_remote_password_rotation_without_new_snapshot() {
 }
 
 #[test]
-fn fetch_does_not_publish_rotated_keyring_pointer_before_default_ref_write_succeeds() {
+fn fetch_heals_default_ref_temp_path_conflict_during_control_plane_publish() {
     let (temp, facade, source_repo_root, branch_token, remote) = seed_remote();
     let clone_repo_root = temp.path().join("clone-target");
 
@@ -5037,7 +5050,7 @@ fn fetch_does_not_publish_rotated_keyring_pointer_before_default_ref_write_succe
     )
     .unwrap();
 
-    let error = fetch_remote(
+    let fetched = fetch_remote(
         &remote,
         FetchOptions {
             password: Some("correct horse battery staple".to_string()),
@@ -5045,18 +5058,20 @@ fn fetch_does_not_publish_rotated_keyring_pointer_before_default_ref_write_succe
             branch_token,
         },
     )
-    .unwrap_err();
+    .unwrap();
 
+    assert_eq!(fetched.downloaded_objects, 0);
     assert!(
-        error.to_string().contains("default.json")
-            || error.to_string().contains("publish")
-            || error.to_string().contains("write"),
-        "unexpected error: {error:#}"
+        !clone_repo_root
+            .join(".e2v")
+            .join("refs")
+            .join("default.json.tmp")
+            .exists()
     );
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&clone_repo_root.join(".e2v"));
     RepositoryFacade::new()
-        .unlock(&clone_repo_root, "correct horse battery staple")
+        .unlock(&clone_repo_root, "new horse battery staple")
         .unwrap();
 }
 

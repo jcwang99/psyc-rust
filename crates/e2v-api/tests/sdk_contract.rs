@@ -504,6 +504,33 @@ fn sdk_open_repository_reports_corrupt_state_for_invalid_local_layout_root_file(
 }
 
 #[test]
+fn sdk_open_repository_reports_corrupt_state_for_local_layout_root_path_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    let layout_root_path = repo_root.join(".e2v").join("layout_root.json");
+    fs::remove_file(&layout_root_path).unwrap();
+    fs::create_dir_all(&layout_root_path).unwrap();
+
+    let error = sdk.open_repository(&repo_root).unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("layout_root.json"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_read_directory_entries_through_public_read_api() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
