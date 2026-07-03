@@ -269,15 +269,16 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         .map(|epochs| epochs.len().saturating_sub(1))
         .unwrap_or(0);
     let remote_old_epoch_count =
-        crate::push::read_remote_current_keyring_bytes(remote, &options.repo_root)
-            .ok()
-            .flatten()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|value| {
-                value["epochs"]
+        match crate::push::read_remote_current_keyring_bytes(remote, &options.repo_root)? {
+            Some(bytes) => Some(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .context("failed to decode remote current keyring state")?["epochs"]
                     .as_array()
                     .map(|epochs| epochs.len().saturating_sub(1))
-            });
+                    .unwrap_or(0),
+            ),
+            None => None,
+        };
     let old_epoch_count = remote_old_epoch_count
         .map(|remote_old_epoch_count| remote_old_epoch_count.max(local_old_epoch_count))
         .unwrap_or(local_old_epoch_count);

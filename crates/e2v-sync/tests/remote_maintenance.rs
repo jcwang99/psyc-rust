@@ -591,6 +591,60 @@ fn plan_historical_rewrite_prefers_remote_current_keyring_epoch_count_over_stale
 }
 
 #[test]
+fn plan_historical_rewrite_rejects_corrupted_remote_current_keyring_pointer() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-plan-corrupt-remote-keyring".to_string(),
+        },
+    )
+    .unwrap();
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).unwrap();
+    remote
+        .compare_and_swap_ref(
+            &RefToken::new(format!("keyring/{repo_id}")),
+            Some(e2v_store::RefVersion { value: 1 }),
+            EncryptedRef::new(br#"{"broken":true"#.to_vec()),
+        )
+        .unwrap();
+
+    let error =
+        plan_historical_rewrite(&remote, HistoricalRewritePlanOptions { repo_root }).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to decode remote keyring pointer"),
+        "unexpected planning error: {error:#}"
+    );
+}
+
+#[test]
 fn repair_remote_restores_missing_local_object_from_remote_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
