@@ -478,6 +478,13 @@ impl RepositoryFacade {
                     .replace('\\', "/"),
             );
         }
+        let current_layout_root = validate_layout_root(&control_dir)?;
+        let next_layout_root = LayoutRoot {
+            generation: current_layout_root.generation + 1,
+            ..current_layout_root
+        };
+        atomic_write_json(control_dir.join(LAYOUT_ROOT_FILE), &next_layout_root)?;
+        rewritten_control_records.push(LAYOUT_ROOT_FILE.to_string());
 
         let retired_epoch_count = repo_secrets.epoch_keys.len().saturating_sub(1);
         let active_epoch_keys = repo_secrets.active_epoch_keys()?.clone();

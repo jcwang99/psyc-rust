@@ -4785,6 +4785,47 @@ fn rewrite_history_to_active_epoch_retires_old_epochs_after_rewriting_local_hist
 }
 
 #[test]
+fn rewrite_history_to_active_epoch_bumps_layout_generation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(repo_root.join(".e2v").join("layout_root.json")).unwrap())
+            .unwrap();
+    let result = facade
+        .rewrite_history_to_active_epoch(&repo_root, "correct horse battery staple")
+        .unwrap();
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(repo_root.join(".e2v").join("layout_root.json")).unwrap())
+            .unwrap();
+    let reopened = facade.open(&repo_root).unwrap();
+
+    assert_eq!(before["generation"].as_u64(), Some(1));
+    assert_eq!(after["generation"].as_u64(), Some(2));
+    assert_eq!(reopened.layout_generation, 2);
+    assert!(
+        result
+            .rewritten_control_records
+            .iter()
+            .any(|path| path == "layout_root.json"),
+        "expected layout_root.json to be reported as a rewritten control record"
+    );
+}
+
+#[test]
 fn sync_support_decode_object_bytes_accepts_objects_from_previous_epoch() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
