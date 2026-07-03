@@ -833,7 +833,9 @@ pub fn push_head<R: RemoteBackend + Clone>(
                     }
                     if remote_ref_matches_local {
                         upload_remote_keyring_generations(remote, &keyring_files)?;
-                        remote.put_physical("layout_root.json", &layout_root_bytes)?;
+                        if !remote_control_plane_matches(remote, &layout_root_bytes) {
+                            remote.put_physical("layout_root.json", &layout_root_bytes)?;
+                        }
                         let pointer_bytes =
                             publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
                         mirror_remote_keyring_pointer(remote, &pointer_bytes)?;

@@ -1440,6 +1440,129 @@ impl RemoteBackend for KeyringGenerationCountingBackend {
 }
 
 #[derive(Debug, Clone)]
+struct LayoutRootWriteCountingBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    layout_root_puts: Arc<Mutex<usize>>,
+}
+
+impl LayoutRootWriteCountingBackend {
+    fn new() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            capability: BackendCapability {
+                supports_conditional_put: true,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::StrongWhitelisted,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            layout_root_puts: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn layout_root_put_count(&self) -> usize {
+        *self.layout_root_puts.lock().unwrap()
+    }
+
+    fn reset_counts(&self) {
+        *self.layout_root_puts.lock().unwrap() = 0;
+    }
+}
+
+impl BlobStore for LayoutRootWriteCountingBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        if relative_path == "layout_root.json" {
+            *self.layout_root_puts.lock().unwrap() += 1;
+        }
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for LayoutRootWriteCountingBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for LayoutRootWriteCountingBackend {
+    fn read_layout_root(&self) -> anyhow::Result<LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: u64,
+        next: LayoutRoot,
+    ) -> anyhow::Result<CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for LayoutRootWriteCountingBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Debug, Clone)]
 struct InventoryListingForbiddenBackend {
     inner: MemoryBackend,
     capability: BackendCapability,
@@ -6660,6 +6783,69 @@ fn push_control_plane_repair_does_not_rewrite_unchanged_keyring_generations() {
         remote.keyring_generation_put_count(),
         0,
         "control-plane repair should not rewrite unchanged keyring generation files when only layout_root.json is stale"
+    );
+}
+
+#[test]
+fn push_control_plane_repair_does_not_rewrite_unchanged_layout_root_when_only_keyring_changes() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "control-plane-repair-layout-root".to_string(),
+        })
+        .unwrap();
+
+    let remote = LayoutRootWriteCountingBackend::new();
+    let first = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "control-plane-repair-layout-root-1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first.published_snapshot_id, commit.snapshot_id);
+
+    facade
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    remote.reset_counts();
+
+    let second = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "control-plane-repair-layout-root-2".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.layout_root_put_count(),
+        0,
+        "control-plane repair should not rewrite an unchanged layout_root.json when only keyring metadata changed"
     );
 }
 
