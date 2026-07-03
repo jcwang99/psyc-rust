@@ -154,11 +154,11 @@ pub(crate) fn prune_stale_cached_pack_data(
             if live_container_ids.contains(&container_id) {
                 continue;
             }
-            delete_cached_pack_data_bytes(control_dir, &container_id)?;
+            let _ = delete_cached_pack_data_bytes(control_dir, &container_id);
         }
     }
 
-    remove_empty_cache_dirs(&cache_root, &cache_root)?;
+    let _ = remove_empty_cache_dirs(&cache_root, &cache_root);
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use e2v_core::{CommitOptions, InitOptions, ManifestStore, ManifestStoreApi, RepositoryFacade};
 use e2v_store::{
@@ -8,6 +9,11 @@ use e2v_store::{
 use e2v_store::{BlobStore, MemoryBackend};
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
 use e2v_sync::{
     CloneOptions, EnableObliviousLayoutOptions, GcDryRunOptions, GcExecuteOptions,
     HistoricalRewriteOptions, HistoricalRewritePlanOptions, PushOptions, RepairRemoteOptions,
@@ -16,6 +22,65 @@ use e2v_sync::{
     plan_historical_rewrite, plan_oblivious_layout, push_head, repair_remote,
     reshuffle_oblivious_layout, status_oblivious_layout, verify_remote,
 };
+
+enum UndeletableCacheEntryGuard {
+    #[cfg(unix)]
+    Permissions { path: PathBuf, original_mode: u32 },
+    #[cfg(windows)]
+    Locked { _file: std::fs::File },
+    #[cfg(not(any(unix, windows)))]
+    Noop,
+}
+
+impl Drop for UndeletableCacheEntryGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Self::Permissions {
+            path,
+            original_mode,
+        } = self
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(*original_mode);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+    }
+}
+
+fn make_undeletable_cache_entry(path: &Path) -> UndeletableCacheEntryGuard {
+    #[cfg(unix)]
+    {
+        fs::write(path, b"foreign").unwrap();
+        let metadata = fs::metadata(path).unwrap();
+        let original_mode = metadata.permissions().mode();
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0);
+        fs::set_permissions(path, permissions).unwrap();
+        UndeletableCacheEntryGuard::Permissions {
+            path: path.to_path_buf(),
+            original_mode,
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap();
+        UndeletableCacheEntryGuard::Locked { _file: file }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::write(path, b"foreign").unwrap();
+        UndeletableCacheEntryGuard::Noop
+    }
+}
 
 #[test]
 fn sync_exposes_historical_rewrite_plan_and_execute_api_for_p3_a() {
@@ -5292,4 +5357,108 @@ fn verify_remote_prunes_stale_local_pack_data_cache_after_historical_rewrite() {
             stale_hash_path.display()
         );
     }
+}
+
+#[test]
+fn verify_remote_ignores_undeletable_stale_local_pack_data_cache_entries() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            repo_root.join(format!("undeletable-packed-{index:02}.txt")),
+            format!("undeletable-packed-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "epoch-one".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-pack-cache-undeletable-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    let tracked_remote = RangeReadTrackingBackend::new(remote.clone());
+    let first = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+    assert!(first.sampled_objects > 0);
+
+    let cache_root = repo_root
+        .join(".e2v")
+        .join("cache")
+        .join("pack-data")
+        .join("packs")
+        .join("data");
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(repo_root.join("epoch-two.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-pack-cache-undeletable-rotate".to_string(),
+        },
+    )
+    .unwrap();
+    historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    let stale_path = cache_root.join("foreign-stale-pack.bin");
+    let _stale_guard = make_undeletable_cache_entry(&stale_path);
+    fs::write(stale_path.with_extension("bin.blake3"), b"deadbeef").unwrap();
+
+    let second = verify_remote(
+        &tracked_remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap();
+
+    assert!(second.sampled_objects > 0);
 }
