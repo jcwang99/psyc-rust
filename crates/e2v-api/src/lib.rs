@@ -728,6 +728,12 @@ impl Sdk {
     }
 
     pub fn pull_default_remote(&self, request: PullRequest) -> SdkResult<PullResponse> {
+        let default_ref_path = request
+            .repo_root
+            .join(".e2v")
+            .join("refs")
+            .join("default.json");
+        let original_default_ref = std::fs::read(&default_ref_path).ok();
         let previous = self
             .facade
             .read_service(&request.repo_root)
@@ -754,6 +760,9 @@ impl Sdk {
             &request.branch_token,
             Some(&fetched_snapshot_id),
         ) {
+            if let Some(original_default_ref) = original_default_ref.as_deref() {
+                let _ = std::fs::write(&default_ref_path, original_default_ref);
+            }
             let _ = self
                 .facade
                 .restore_default_ref_from_branch(&request.repo_root, &request.branch_token);

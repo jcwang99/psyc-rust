@@ -881,6 +881,97 @@ fn sdk_pull_rejects_diverged_local_history_without_moving_the_current_branch() {
 }
 
 #[test]
+fn sdk_pull_reports_corrupted_local_branch_ref_instead_of_silently_dropping_previous_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = Sdk::new();
+    let source_state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "first".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-first-corrupt-pull".to_string(),
+    })
+    .unwrap();
+
+    sdk.clone_remote(CloneRequest {
+        remote_spec: remote_spec.clone(),
+        target_repo_root: clone_repo.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_token: source_state.branch.token_hex.clone(),
+    })
+    .unwrap();
+    sdk.add_remote(&clone_repo, "origin", &remote_spec).unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "beta").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "second".to_string(),
+    })
+    .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-second-corrupt-pull".to_string(),
+    })
+    .unwrap();
+
+    let local_branch_ref_path = clone_repo
+        .join(".e2v")
+        .join("refs")
+        .join("branches")
+        .join(format!("{}.json", source_state.branch.token_hex));
+    fs::create_dir_all(local_branch_ref_path.parent().unwrap()).unwrap();
+    fs::write(&local_branch_ref_path, br#"{"broken":true"#).unwrap();
+    let default_ref_before =
+        fs::read(clone_repo.join(".e2v").join("refs").join("default.json")).unwrap();
+
+    let error = sdk
+        .pull_default_remote(PullRequest {
+            repo_root: clone_repo.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to decode encrypted ref")
+            || error
+                .message()
+                .contains("failed to decode branch ref record"),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        fs::read(clone_repo.join(".e2v").join("refs").join("default.json")).unwrap(),
+        default_ref_before
+    );
+}
+
+#[test]
 fn sdk_can_push_and_fetch_with_explicit_remote_spec_without_default_remote_registration() {
     let temp = tempfile::tempdir().unwrap();
     let source_repo = temp.path().join("source");
