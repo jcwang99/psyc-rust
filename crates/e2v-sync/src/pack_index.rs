@@ -435,7 +435,13 @@ fn compact_segment_paths_if_needed<B: BlobStore>(
 
     let compacted_bytes =
         build_compacted_segment_bytes(remote, &older_segments, &compacted_path, secrets)?;
-    remote.put_physical(&compacted_path, &compacted_bytes)?;
+    if !remote
+        .get_physical(&compacted_path)
+        .map(|existing| existing == compacted_bytes)
+        .unwrap_or(false)
+    {
+        remote.put_physical(&compacted_path, &compacted_bytes)?;
+    }
 
     let mut compacted_segments = vec![compacted_path];
     compacted_segments.extend(newer_segments);
@@ -613,6 +619,25 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct CompactedSegmentWriteCountingBackend {
+        inner: MemoryBackend,
+        compacted_segment_put_calls: Arc<Mutex<usize>>,
+    }
+
+    impl CompactedSegmentWriteCountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                compacted_segment_put_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn compacted_segment_put_call_count(&self) -> usize {
+            *self.compacted_segment_put_calls.lock().unwrap()
+        }
+    }
+
     impl BlobStore for RootProbeBackend {
         fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
             self.inner.put_physical(relative_path, bytes)
@@ -662,6 +687,48 @@ mod tests {
         fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
             if relative_path == PACK_INDEX_ROOT_PATH {
                 *self.root_put_calls.lock().unwrap() += 1;
+            }
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl BlobStore for CompactedSegmentWriteCountingBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            if relative_path.starts_with(PACK_INDEX_COMPACTED_SEGMENT_PREFIX) {
+                *self.compacted_segment_put_calls.lock().unwrap() += 1;
             }
             self.inner.put_physical(relative_path, bytes)
         }
@@ -1326,6 +1393,125 @@ mod tests {
             remote.root_put_call_count(),
             2,
             "publishing a changed pack-index root should still rewrite pack-index/root.json"
+        );
+    }
+
+    #[test]
+    fn unchanged_compacted_pack_index_segment_is_not_rewritten_remotely() {
+        let (_temp, _control_dir, secrets) = seeded_control_dir();
+        let remote = CompactedSegmentWriteCountingBackend::new();
+        for index in 0..6usize {
+            let (pack_index, payload) = build_pack(
+                &format!("op-{index}"),
+                0,
+                &[(
+                    format!("{index:064x}"),
+                    format!("payload-{index}").into_bytes(),
+                )],
+            )
+            .unwrap();
+            remote
+                .put_physical(&pack_index.data_path, &payload)
+                .unwrap();
+            let segment_path = format!("packs/index/op-{index}-00000000.json");
+            remote
+                .put_physical(
+                    &segment_path,
+                    &encode_pack_index_segment_bytes(
+                        &secrets,
+                        &segment_path,
+                        &serde_json::to_vec(&pack_index).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let segment_paths = list_remote_pack_index_segments(&remote).unwrap();
+        publish_pack_index_root(&remote, &secrets, "direct", 6, segment_paths.clone()).unwrap();
+        assert_eq!(remote.compacted_segment_put_call_count(), 1);
+
+        publish_pack_index_root(&remote, &secrets, "direct", 6, segment_paths).unwrap();
+
+        assert_eq!(
+            remote.compacted_segment_put_call_count(),
+            1,
+            "publishing an unchanged compacted pack-index view should not overwrite the compacted segment again"
+        );
+    }
+
+    #[test]
+    fn changed_compacted_pack_index_segment_is_still_rewritten_remotely() {
+        let (_temp, _control_dir, secrets) = seeded_control_dir();
+        let remote = CompactedSegmentWriteCountingBackend::new();
+        for index in 0..6usize {
+            let (pack_index, payload) = build_pack(
+                &format!("op-{index}"),
+                0,
+                &[(
+                    format!("{index:064x}"),
+                    format!("payload-{index}").into_bytes(),
+                )],
+            )
+            .unwrap();
+            remote
+                .put_physical(&pack_index.data_path, &payload)
+                .unwrap();
+            let segment_path = format!("packs/index/op-{index}-00000000.json");
+            remote
+                .put_physical(
+                    &segment_path,
+                    &encode_pack_index_segment_bytes(
+                        &secrets,
+                        &segment_path,
+                        &serde_json::to_vec(&pack_index).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            6,
+            list_remote_pack_index_segments(&remote).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(remote.compacted_segment_put_call_count(), 1);
+
+        let extra_segment_path = "packs/index/op-6-00000000.json";
+        let (extra_index, extra_payload) =
+            build_pack("op-6", 0, &[("f".repeat(64), b"payload-6".to_vec())]).unwrap();
+        remote
+            .put_physical(&extra_index.data_path, &extra_payload)
+            .unwrap();
+        remote
+            .put_physical(
+                extra_segment_path,
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    extra_segment_path,
+                    &serde_json::to_vec(&extra_index).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            7,
+            list_remote_pack_index_segments(&remote).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote.compacted_segment_put_call_count(),
+            2,
+            "publishing a changed compacted pack-index view should still rewrite the compacted segment"
         );
     }
 
