@@ -1649,6 +1649,62 @@ fn sdk_fetch_default_remote_reports_corrupt_state_for_invalid_local_keyring_poin
 }
 
 #[test]
+fn sdk_historical_rewrite_plan_reports_corrupt_state_for_invalid_current_keyring_pointer() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-invalid-current-keyring-pointer".to_string(),
+    })
+    .unwrap();
+
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+
+    let error = sdk
+        .historical_rewrite_default_remote_plan(HistoricalRewritePlanRequest {
+            repo_root: repo_root.clone(),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error
+            .message()
+            .contains("failed to decode current keyring pointer"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");
