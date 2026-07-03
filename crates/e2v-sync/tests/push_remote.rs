@@ -143,6 +143,21 @@ fn push_cleanup_does_not_probe_marker_existence_before_removing_or_validating_it
     }
 }
 
+#[test]
+fn push_remote_inventory_loader_does_not_expect_initialized_cache() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("push.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("expect(\"inventory initialized\")"),
+        "push remote inventory loading should surface cache initialization failures as errors instead of panicking"
+    );
+}
+
 fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     RefToken::new(format!(
         "keyring/{}",

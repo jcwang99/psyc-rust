@@ -266,10 +266,10 @@ fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
     remote: &'a R,
     inventory: &'a mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
 ) -> Result<&'a (BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
-    if inventory.is_none() {
-        *inventory = Some(load_remote_object_inventory(control_dir, remote)?);
+    match inventory {
+        Some(inventory) => Ok(inventory),
+        None => Ok(inventory.insert(load_remote_object_inventory(control_dir, remote)?)),
     }
-    Ok(inventory.as_ref().expect("inventory initialized"))
 }
 
 struct ResumeRemoteAuthContext<'a, R: RemoteBackend> {
