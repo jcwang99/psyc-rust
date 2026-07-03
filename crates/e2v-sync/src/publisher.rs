@@ -83,6 +83,54 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             .put_physical(path, serde_json::to_vec(&renewed)?.as_slice())?;
         Ok(renewed)
     }
+
+    fn recover_or_renew_lease_if_needed(
+        &self,
+        path: &str,
+        session: &PublishSession,
+    ) -> Result<RemoteWriterLeaseMarker> {
+        let lease_bytes = self.remote_backend.get_physical(path)?;
+        anyhow::ensure!(
+            !lease_bytes.is_empty(),
+            "pre-commit verify failed: writer lease missing or empty"
+        );
+        match serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes) {
+            Ok(lease_marker) => {
+                anyhow::ensure!(
+                    lease_marker.operation_id == session.operation_id.value,
+                    "pre-commit verify failed: writer lease belongs to another operation"
+                );
+                self.renew_lease_if_needed(path, &lease_marker)
+            }
+            Err(error) => {
+                let observed_now = observe_remote_now_with_probe(
+                    &self.remote_backend,
+                    ".e2v/publish-remote-time.probe",
+                )?;
+                if marker_is_fresh_at(
+                    &self.remote_backend,
+                    path,
+                    observed_now,
+                    INTENT_EXPIRY_HOURS,
+                )? {
+                    return Err(error)
+                        .context("pre-commit verify failed: invalid writer lease marker");
+                }
+                let observed_at = system_time_to_unix_ms(observed_now)?;
+                let plan = PublishPlan {
+                    operation_id: session.operation_id.clone(),
+                    target_branch_token: session.target_branch_token.clone(),
+                    expected_ref_version: session.expected_ref_version,
+                    planned_snapshot_id: None,
+                    writer_mode: session.writer_mode.clone(),
+                };
+                let recovered = build_writer_lease_marker(&plan, observed_at, 1, 1);
+                self.remote_backend
+                    .put_physical(path, serde_json::to_vec(&recovered)?.as_slice())?;
+                Ok(recovered)
+            }
+        }
+    }
 }
 
 impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
@@ -272,18 +320,7 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             );
         }
         if let Some(lease_path) = &session.lease_path {
-            let lease = self.remote_backend.get_physical(lease_path)?;
-            anyhow::ensure!(
-                !lease.is_empty(),
-                "pre-commit verify failed: writer lease missing or empty"
-            );
-            let lease_marker: RemoteWriterLeaseMarker = serde_json::from_slice(&lease)
-                .context("pre-commit verify failed: invalid writer lease marker")?;
-            anyhow::ensure!(
-                lease_marker.operation_id == session.operation_id.value,
-                "pre-commit verify failed: writer lease belongs to another operation"
-            );
-            let _lease = self.renew_lease_if_needed(lease_path, &lease_marker)?;
+            let _lease = self.recover_or_renew_lease_if_needed(lease_path, session)?;
         }
         Ok(())
     }
@@ -1554,6 +1591,119 @@ mod tests {
         assert_eq!(lease["heartbeat"]["remote_observed_at_unix_ms"], renewed_ms);
         assert_eq!(lease["heartbeat"]["sequence"], 2);
         assert_eq!(lease["lease_generation"], 2);
+    }
+
+    #[test]
+    fn pre_commit_verify_recovers_from_corrupted_stale_lease_marker() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let renewed_time = initial_time + Duration::from_secs(73 * 60 * 60);
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-corrupt-stale-precommit".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-precommit".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "transactions/active/op-corrupt-stale-precommit.intent",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "leases/branch-token.lock",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        remote
+            .put_physical("leases/branch-token.lock", br#"{"broken":true"#)
+            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "leases/branch-token.lock",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        remote.set_fixed_time_for_test(renewed_time);
+
+        publisher.pre_commit_verify(&session).unwrap();
+
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(lease["operation_id"], "op-corrupt-stale-precommit");
+        assert_eq!(lease["writer_id"], "writer:op-corrupt-stale-precommit");
+    }
+
+    #[test]
+    fn pre_commit_verify_still_rejects_corrupted_fresh_lease_marker() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-corrupt-fresh-precommit".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-precommit".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .put_physical("leases/branch-token.lock", br#"{"broken":true"#)
+            .unwrap();
+
+        let error = publisher.pre_commit_verify(&session).unwrap_err();
+
+        assert!(error.to_string().contains("invalid writer lease marker"));
     }
 
     #[test]
