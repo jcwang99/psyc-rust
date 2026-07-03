@@ -189,6 +189,7 @@ struct RemoteFetchValidationInputs<'a> {
 #[derive(Debug)]
 pub(crate) struct RemoteValidationRoot {
     pub(crate) path: PathBuf,
+    pub(crate) cache_control_dir: Option<PathBuf>,
 }
 
 impl RemoteValidationRoot {
@@ -558,6 +559,7 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
 ) -> Result<RemoteFetchPlan> {
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(inputs.repo_root)?,
+        cache_control_dir: Some(inputs.repo_root.join(".e2v")),
     };
     write_remote_control_plane_to_validation_root(&validation_root, inputs.control_plane)?;
     let validation_secrets = load_remote_validation_secrets(
@@ -794,15 +796,30 @@ pub(crate) fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
     };
     let physical_ref = location.physical_ref();
     if !pack_cache.contains_key(&physical_ref.container_id) {
-        let pack_len: usize = remote
-            .stat_physical(&physical_ref.container_id)?
-            .length
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
-        let pack_bytes = remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
-        if let Some(control_dir) = control_dir {
-            cache_pack_data_bytes(control_dir, &physical_ref.container_id, &pack_bytes)?;
-        }
+        let pack_bytes = if let Some(control_dir) = control_dir {
+            if let Some(cached) =
+                read_cached_pack_data_bytes(control_dir, &physical_ref.container_id)?
+            {
+                cached
+            } else {
+                let pack_len: usize = remote
+                    .stat_physical(&physical_ref.container_id)?
+                    .length
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
+                let pack_bytes =
+                    remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?;
+                cache_pack_data_bytes(control_dir, &physical_ref.container_id, &pack_bytes)?;
+                pack_bytes
+            }
+        } else {
+            let pack_len: usize = remote
+                .stat_physical(&physical_ref.container_id)?
+                .length
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("pack is too large to read on this platform"))?;
+            remote.get_physical_range(&physical_ref.container_id, 0, pack_len)?
+        };
         pack_cache.insert(physical_ref.container_id.clone(), pack_bytes);
     }
     let pack_bytes = pack_cache.get(&physical_ref.container_id).unwrap();
@@ -816,6 +833,19 @@ pub(crate) fn remote_object_bytes_with_pack_cache<R: RemoteBackend>(
         "packed object range out of bounds for {object_id}"
     );
     Ok(Some(pack_bytes[offset..end].to_vec()))
+}
+
+fn read_cached_pack_data_bytes(control_dir: &Path, container_id: &str) -> Result<Option<Vec<u8>>> {
+    validate_remote_relative_name(container_id)?;
+    let cache_path = control_dir
+        .join("cache")
+        .join("pack-data")
+        .join(container_id);
+    match std::fs::read(cache_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn cache_pack_data_bytes(control_dir: &Path, container_id: &str, pack_bytes: &[u8]) -> Result<()> {
@@ -845,6 +875,7 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
     let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
     };
     let validation_control = validation_root.control_dir();
     (|| -> Result<()> {
@@ -897,6 +928,7 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
     let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
     };
     let validation_control = validation_root.control_dir();
     let mut pack_cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -1567,7 +1599,7 @@ fn fetch_remote_object_into_validation_root<R: RemoteBackend>(
         remote_loose_object_ids,
         pack_locations,
         pack_cache,
-        None,
+        validation_root.cache_control_dir.as_deref(),
         object_id,
     )?
     .with_context(|| format!("missing remote object {object_id}"))?;
@@ -1684,6 +1716,7 @@ mod tests {
             read_remote_control_plane(&remote, default_ref.value.bytes.clone()).unwrap();
         let validation_root = RemoteValidationRoot {
             path: next_validation_root(&repo_root).unwrap(),
+            cache_control_dir: None,
         };
         write_remote_control_plane_to_validation_root(&validation_root, &control_plane).unwrap();
         let remote_loose_object_ids = remote_loose_object_ids(&remote);

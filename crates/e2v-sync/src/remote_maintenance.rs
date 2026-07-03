@@ -576,6 +576,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
     let reachable_object_ids = match head_snapshot_id.as_deref() {
@@ -660,6 +661,7 @@ pub fn verify_remote<R: RemoteBackend>(
     assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
     let reachable_object_ids = collect_remote_reachable_object_ids(
@@ -749,6 +751,7 @@ pub fn repair_remote<R: RemoteBackend>(
     assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
     let reachable_object_ids = collect_remote_reachable_object_ids(
@@ -809,6 +812,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
     assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
     let mut pack_cache = BTreeMap::new();

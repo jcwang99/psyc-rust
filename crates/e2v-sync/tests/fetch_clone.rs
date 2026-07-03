@@ -489,6 +489,102 @@ impl RemoteBackend for PackIndexListingForbiddenRemote {
 }
 
 #[derive(Clone, Debug)]
+struct PackDataRangeReadForbiddenRemote {
+    inner: MemoryBackend,
+}
+
+impl PackDataRangeReadForbiddenRemote {
+    fn new(inner: MemoryBackend) -> Self {
+        Self { inner }
+    }
+}
+
+impl BlobStore for PackDataRangeReadForbiddenRemote {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        if relative_path.starts_with("packs/data/") {
+            anyhow::bail!("pack data range reads disabled for test");
+        }
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for PackDataRangeReadForbiddenRemote {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: e2v_store::EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for PackDataRangeReadForbiddenRemote {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl RemoteBackend for PackDataRangeReadForbiddenRemote {
+    fn capability(&self) -> &e2v_store::BackendCapability {
+        self.inner.capability()
+    }
+}
+
+#[derive(Clone, Debug)]
 struct GetTrackingBackend {
     inner: MemoryBackend,
     fetched_paths: Arc<Mutex<Vec<String>>>,
@@ -1085,6 +1181,107 @@ fn fetch_allows_read_service_to_fallback_to_cached_pack_data_when_local_chunk_go
             .next()
             .is_some()
     );
+}
+
+#[test]
+fn fetch_reuses_local_pack_data_cache_when_remote_pack_ranges_are_unavailable() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let source_repo_root = temp.path().join("source");
+    fs::create_dir_all(&source_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: source_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..24usize {
+        fs::write(
+            source_repo_root.join(format!("cache-reuse-{index:02}.txt")),
+            format!("cache-reuse-payload-{index:02}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: source_repo_root.clone(),
+            message: "packed-fetch-cache-reuse".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: source_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "packed-fetch-cache-reuse-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(pushed.uploaded_objects > 0);
+    assert!(remote.list_physical("objects/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/data/").unwrap().is_empty());
+
+    let target_repo_root = temp.path().join("fetch-target");
+    fs::create_dir_all(&target_repo_root).unwrap();
+    RepositoryFacade::new()
+        .init(InitOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let cache_pack_data_root = target_repo_root
+        .join(".e2v")
+        .join("cache")
+        .join("pack-data")
+        .join("packs")
+        .join("data");
+    assert!(cache_pack_data_root.is_dir());
+    assert!(
+        fs::read_dir(&cache_pack_data_root)
+            .unwrap()
+            .next()
+            .is_some()
+    );
+
+    let deleted_object_path = fs::read_dir(target_repo_root.join(".e2v").join("objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .next()
+        .unwrap();
+    fs::remove_file(&deleted_object_path).unwrap();
+    assert!(!deleted_object_path.exists());
+
+    let guarded_remote = PackDataRangeReadForbiddenRemote::new(remote);
+    let fetched = fetch_remote(
+        &guarded_remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(fetched.downloaded_objects > 0);
+    assert!(deleted_object_path.is_file());
 }
 
 #[test]
