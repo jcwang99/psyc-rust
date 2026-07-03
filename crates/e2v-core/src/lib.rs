@@ -225,6 +225,29 @@ pub mod sync_support {
         repo_root: impl AsRef<Path>,
         object_id: &str,
     ) -> Result<Vec<u8>> {
+        fn cached_pack_data_hash_matches(pack_path: &Path) -> Result<bool> {
+            use std::io::Read;
+
+            let expected = match std::fs::read_to_string(cached_pack_data_hash_path(pack_path)) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+
+            let mut file = std::fs::File::open(pack_path)?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+
+            Ok(expected.trim() == hasher.finalize().to_hex().to_string())
+        }
+
         fn cached_pack_data_path(repo_root: &Path, container_id: &str) -> Result<PathBuf> {
             let relative = Path::new(container_id);
             ensure!(
@@ -257,6 +280,13 @@ pub mod sync_support {
         let length = usize::try_from(physical_ref.length)
             .map_err(|_| anyhow::anyhow!("cached pack length is too large to read"))?;
         let pack_path = cached_pack_data_path(repo_root.as_ref(), &physical_ref.container_id)?;
+        if !cached_pack_data_hash_matches(&pack_path)? {
+            delete_cached_pack_data_entry(&pack_path)?;
+            anyhow::bail!(
+                "cached pack data integrity metadata is missing or invalid for {}",
+                physical_ref.container_id
+            );
+        }
         let mut pack_file = std::fs::File::open(&pack_path).with_context(|| {
             format!(
                 "cached pack data is missing for {}",
@@ -264,6 +294,66 @@ pub mod sync_support {
             )
         })?;
         read_cached_pack_object_range(&mut pack_file, offset, length, object_id)
+    }
+
+    fn cached_pack_data_hash_path(pack_path: &Path) -> PathBuf {
+        pack_path.with_extension(format!(
+            "{}.blake3",
+            pack_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("cache")
+        ))
+    }
+
+    fn delete_cached_pack_data_entry(pack_path: &Path) -> Result<()> {
+        let hash_path = cached_pack_data_hash_path(pack_path);
+        if let Err(error) = std::fs::remove_file(pack_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
+        if let Err(error) = std::fs::remove_file(hash_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn cached_pack_data_path(repo_root: &Path, container_id: &str) -> Result<PathBuf> {
+        let relative = Path::new(container_id);
+        ensure!(
+            !container_id.is_empty(),
+            "cached pack container id must not be empty"
+        );
+        ensure!(
+            !relative.is_absolute(),
+            "cached pack container id must be relative"
+        );
+        ensure!(
+            relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+            "cached pack container path traversal is not allowed"
+        );
+        let mut path = repo_root.join(".e2v").join("cache").join("pack-data");
+        for segment in relative.components() {
+            let Component::Normal(segment) = segment else {
+                unreachable!("validated above")
+            };
+            path.push(segment);
+        }
+        Ok(path)
+    }
+
+    pub fn delete_cached_pack_data_for_object_id(
+        repo_root: impl AsRef<Path>,
+        object_id: &str,
+    ) -> Result<()> {
+        let physical_ref = load_cached_pack_physical_ref_for_object_id(&repo_root, object_id)?;
+        let pack_path = cached_pack_data_path(repo_root.as_ref(), &physical_ref.container_id)?;
+        delete_cached_pack_data_entry(&pack_path)
     }
 
     fn read_cached_pack_object_range<R: std::io::Read + std::io::Seek>(

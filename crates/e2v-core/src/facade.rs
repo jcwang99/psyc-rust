@@ -3391,6 +3391,8 @@ fn append_requested_bytes_from_chunks(
                 &fallback_bytes,
             )
             .map_err(|_| {
+                let _ =
+                    crate::sync_support::delete_cached_pack_data_for_object_id(context.repo_root, chunk_id);
                 anyhow::anyhow!(
                     "stale-layout fallback unavailable for missing chunk {chunk_id} at layout generation {}",
                     context.file.layout_generation

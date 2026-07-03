@@ -3514,8 +3514,14 @@ fn read_range_falls_back_to_cached_pack_data_when_loose_chunk_is_missing() {
         .join("packs")
         .join("data")
         .join("op-00000000.bin");
+    let cached_pack_hash_path = cached_pack_path.with_extension("bin.blake3");
     fs::create_dir_all(cached_pack_path.parent().unwrap()).unwrap();
-    fs::write(&cached_pack_path, chunk_bytes).unwrap();
+    fs::write(&cached_pack_path, &chunk_bytes).unwrap();
+    fs::write(
+        &cached_pack_hash_path,
+        blake3::hash(&chunk_bytes).to_hex().to_string(),
+    )
+    .unwrap();
     fs::remove_file(&chunk_path).unwrap();
 
     let bytes = read_service.read_range(&file, 0, 5).unwrap();
@@ -3603,6 +3609,210 @@ fn read_range_reports_unavailable_fallback_when_cached_pack_data_is_missing() {
             .to_string()
             .contains("stale-layout fallback unavailable"),
         "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_range_treats_corrupted_cached_pack_data_as_unavailable_fallback() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "cached-pack-fallback-corrupted-pack".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let control_dir = repo_root.join(".e2v");
+    let chunk_path = control_dir.join("objects").join(format!("{chunk_id}.json"));
+    let chunk_bytes = fs::read(&chunk_path).unwrap();
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["packs/index/op-00000000.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "pack_id": "op-00000000",
+        "data_path": "packs/data/op-00000000.bin",
+        "entries": [
+            {
+                "object_id": chunk_id,
+                "offset": 0u64,
+                "length": chunk_bytes.len() as u64,
+            }
+        ],
+    });
+    let segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:packs/index/op-00000000.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000000.json"),
+        segment_bytes,
+    )
+    .unwrap();
+
+    let cached_pack_path = control_dir
+        .join("cache")
+        .join("pack-data")
+        .join("packs")
+        .join("data")
+        .join("op-00000000.bin");
+    let cached_pack_hash_path = cached_pack_path.with_extension("bin.blake3");
+    fs::create_dir_all(cached_pack_path.parent().unwrap()).unwrap();
+    fs::write(&cached_pack_path, &chunk_bytes).unwrap();
+    fs::write(
+        &cached_pack_hash_path,
+        blake3::hash(&chunk_bytes).to_hex().to_string(),
+    )
+    .unwrap();
+    let mut corrupted_pack_bytes = fs::read(&cached_pack_path).unwrap();
+    corrupted_pack_bytes[0] ^= 0x01;
+    fs::write(&cached_pack_path, corrupted_pack_bytes).unwrap();
+    fs::remove_file(&chunk_path).unwrap();
+
+    let error = read_service.read_range(&file, 0, 5).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("stale-layout fallback unavailable"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn read_range_prunes_corrupted_cached_pack_data_after_failed_fallback() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("hello.txt"), "hello world").unwrap();
+
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "cached-pack-fallback-prune-corrupted-pack".to_string(),
+        })
+        .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(&commit.snapshot_id).unwrap();
+    let file = read_service.open_file(&snapshot, "hello.txt").unwrap();
+    let chunk_id = file.debug_chunk_ids()[0].clone();
+    let control_dir = repo_root.join(".e2v");
+    let chunk_path = control_dir.join("objects").join(format!("{chunk_id}.json"));
+    let chunk_bytes = fs::read(&chunk_path).unwrap();
+    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).unwrap();
+    let cache_dir = control_dir.join("cache").join("pack-index");
+    fs::create_dir_all(cache_dir.join("segments")).unwrap();
+
+    let root_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "layout_id": "pack",
+        "layout_generation": 7u64,
+        "generation": 7u64,
+        "segments": ["packs/index/op-00000000.json"],
+    });
+    let root_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-root",
+        "pack-index-root",
+        &serde_json::to_vec(&root_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(cache_dir.join("root.json"), root_bytes).unwrap();
+
+    let segment_plaintext = serde_json::json!({
+        "schema_version": 1u32,
+        "pack_id": "op-00000000",
+        "data_path": "packs/data/op-00000000.bin",
+        "entries": [
+            {
+                "object_id": chunk_id,
+                "offset": 0u64,
+                "length": chunk_bytes.len() as u64,
+            }
+        ],
+    });
+    let segment_bytes = e2v_core::sync_support::encrypt_control_record_for_sync(
+        &secrets,
+        "pack-index-segment:packs/index/op-00000000.json",
+        "pack-index-segment",
+        &serde_json::to_vec(&segment_plaintext).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        cache_dir
+            .join("segments")
+            .join("packs__index__op-00000000.json"),
+        segment_bytes,
+    )
+    .unwrap();
+
+    let cached_pack_path = control_dir
+        .join("cache")
+        .join("pack-data")
+        .join("packs")
+        .join("data")
+        .join("op-00000000.bin");
+    let cached_pack_hash_path = cached_pack_path.with_extension("bin.blake3");
+    fs::create_dir_all(cached_pack_path.parent().unwrap()).unwrap();
+    fs::write(&cached_pack_path, &chunk_bytes).unwrap();
+    let mut corrupted_pack_bytes = fs::read(&cached_pack_path).unwrap();
+    corrupted_pack_bytes[0] ^= 0x01;
+    fs::write(&cached_pack_path, corrupted_pack_bytes).unwrap();
+    fs::write(
+        &cached_pack_hash_path,
+        blake3::hash(&fs::read(&cached_pack_path).unwrap())
+            .to_hex()
+            .to_string(),
+    )
+    .unwrap();
+    fs::remove_file(&chunk_path).unwrap();
+
+    let _ = read_service.read_range(&file, 0, 5).unwrap_err();
+
+    assert!(
+        !cached_pack_path.exists(),
+        "corrupted cached pack-data entry should be pruned after failed fallback: {cached_pack_path:?}"
+    );
+    assert!(
+        !cached_pack_hash_path.exists(),
+        "corrupted cached pack-data hash sidecar should be pruned with the data entry: {cached_pack_hash_path:?}"
     );
 }
 
