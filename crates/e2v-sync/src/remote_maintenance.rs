@@ -45,6 +45,7 @@ use tempfile::TempDir;
 
 const UNPUBLISHED_SNAPSHOT_GRACE_PERIOD_DAYS: u64 = 30;
 const HISTORY_REWRITE_CHECKPOINT_FILE: &str = "history-rewrite.checkpoint";
+const HISTORY_REWRITE_CHECKPOINT_BACKUP_FILE: &str = "history-rewrite.checkpoint.bak";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyRemoteOptions {
@@ -471,12 +472,56 @@ fn historical_rewrite_checkpoint_path(control_dir: &Path) -> PathBuf {
         .join(HISTORY_REWRITE_CHECKPOINT_FILE)
 }
 
+fn historical_rewrite_checkpoint_backup_path(control_dir: &Path) -> PathBuf {
+    control_dir
+        .join("journal")
+        .join("sync")
+        .join(HISTORY_REWRITE_CHECKPOINT_BACKUP_FILE)
+}
+
 fn load_historical_rewrite_checkpoint(control_dir: &Path) -> Result<Option<RewriteJournalState>> {
     let path = historical_rewrite_checkpoint_path(control_dir);
+    let backup_path = historical_rewrite_checkpoint_backup_path(control_dir);
+    match load_historical_rewrite_checkpoint_from_path(control_dir, &path) {
+        Ok(Some(state)) => Ok(Some(state)),
+        Ok(None) => match load_historical_rewrite_checkpoint_from_path(control_dir, &backup_path) {
+            Ok(Some(state)) => {
+                store_historical_rewrite_checkpoint(control_dir, &state)?;
+                Ok(Some(state))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        },
+        Err(primary_error) => {
+            match load_historical_rewrite_checkpoint_from_path(control_dir, &backup_path) {
+                Ok(Some(state)) => {
+                    remove_path_if_exists(&path).with_context(|| {
+                        format!(
+                            "failed to remove corrupted historical rewrite checkpoint {}",
+                            path.display()
+                        )
+                    })?;
+                    store_historical_rewrite_checkpoint(control_dir, &state)?;
+                    Ok(Some(state))
+                }
+                Ok(None) => Err(primary_error),
+                Err(backup_error) => Err(primary_error.context(format!(
+                    "; backup checkpoint at {} also failed: {backup_error:#}",
+                    backup_path.display()
+                ))),
+            }
+        }
+    }
+}
+
+fn load_historical_rewrite_checkpoint_from_path(
+    control_dir: &Path,
+    path: &Path,
+) -> Result<Option<RewriteJournalState>> {
     if !path.is_file() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path).with_context(|| {
+    let bytes = std::fs::read(path).with_context(|| {
         format!(
             "failed to read historical rewrite checkpoint {}",
             path.display()
@@ -522,7 +567,11 @@ fn store_historical_rewrite_checkpoint(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    atomic_write_bytes(path, &bytes)
+    atomic_write_bytes(path, &bytes)?;
+    atomic_write_bytes(
+        historical_rewrite_checkpoint_backup_path(control_dir),
+        &bytes,
+    )
 }
 
 fn clear_historical_rewrite_checkpoint(control_dir: &Path) -> Result<()> {
@@ -531,6 +580,13 @@ fn clear_historical_rewrite_checkpoint(control_dir: &Path) -> Result<()> {
         format!(
             "failed to remove historical rewrite checkpoint {}",
             path.display()
+        )
+    })?;
+    let backup_path = historical_rewrite_checkpoint_backup_path(control_dir);
+    remove_path_if_exists(&backup_path).with_context(|| {
+        format!(
+            "failed to remove historical rewrite checkpoint {}",
+            backup_path.display()
         )
     })
 }
@@ -1196,9 +1252,18 @@ fn load_gc_delete_journal(path: &std::path::Path) -> Result<Option<GcDeleteJourn
     }
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read gc delete journal {}", path.display()))?;
-    let journal = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to decode gc delete journal {}", path.display()))?;
-    Ok(Some(journal))
+    match serde_json::from_slice(&bytes) {
+        Ok(journal) => Ok(Some(journal)),
+        Err(_) => {
+            remove_path_if_exists(path).with_context(|| {
+                format!(
+                    "failed to remove corrupted gc delete journal {}",
+                    path.display()
+                )
+            })?;
+            Ok(None)
+        }
+    }
 }
 
 fn store_gc_delete_journal(path: &std::path::Path, journal: &GcDeleteJournal) -> Result<()> {

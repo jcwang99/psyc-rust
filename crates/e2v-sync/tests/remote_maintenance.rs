@@ -1411,6 +1411,96 @@ fn historical_rewrite_remote_recovers_from_checkpoint_path_conflict() {
 }
 
 #[test]
+fn historical_rewrite_remote_recovers_from_corrupted_checkpoint() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello corrupted checkpoint").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let reachable_object_ids = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(&first_commit.snapshot_id)
+        .unwrap();
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-corrupt-checkpoint".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+    let stale_path = format!("objects/{}.json", reachable_object_ids[0]);
+    let interrupted_remote = FailOnceOnDeleteBackend::new(remote.clone(), stale_path.clone());
+
+    let first_error = historical_rewrite_remote(
+        &interrupted_remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        first_error.to_string().contains("injected delete failure"),
+        "unexpected interruption error: {first_error:#}"
+    );
+
+    let checkpoint_path = repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("sync")
+        .join("history-rewrite.checkpoint");
+    fs::write(&checkpoint_path, br#"{"broken":true"#).unwrap();
+
+    let resumed = historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+    let reopened = facade.open(&repo_root).unwrap();
+
+    assert!(resumed.rewritten_objects >= reachable_object_ids.len());
+    assert_eq!(resumed.next_layout_generation, reopened.layout_generation);
+    assert_eq!(
+        remote.read_layout_root().unwrap().generation,
+        reopened.layout_generation
+    );
+    assert!(
+        !remote.exists_physical(&stale_path),
+        "resumed historical rewrite should eventually purge stale loose ref {stale_path}"
+    );
+    assert!(
+        !checkpoint_path.exists(),
+        "historical rewrite should clear corrupted checkpoints after a successful recovery"
+    );
+}
+
+#[test]
 fn historical_rewrite_remote_resumes_after_pack_segment_upload_interruption() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -4104,6 +4194,75 @@ fn gc_execute_recovers_from_gc_delete_journal_path_conflict() {
     .unwrap_err();
     assert!(first_error.to_string().contains("delete failure"));
     assert!(journal_path.is_file());
+}
+
+#[test]
+fn gc_execute_recovers_from_corrupted_gc_delete_journal() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-gc-delete-journal-corruption".to_string(),
+        },
+    )
+    .unwrap();
+
+    let stray_path =
+        "objects/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json";
+    remote
+        .put_physical(stray_path, br#"{"garbage":1}"#)
+        .unwrap();
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+    e2v_store::testing::override_memory_backend_modified_time(&remote, stray_path, old_time)
+        .unwrap();
+
+    let journal_path = repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("gc")
+        .join("gc-execute.json");
+    fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+    fs::write(&journal_path, br#"{"broken":true"#).unwrap();
+
+    let result = gc_execute(
+        &remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.deleted_physical_refs, vec![stray_path.to_string()]);
+    assert!(!remote.exists_physical(stray_path));
+    assert!(
+        !journal_path.exists(),
+        "gc execute should discard corrupted local delete journals after recomputing candidates"
+    );
 }
 
 #[test]

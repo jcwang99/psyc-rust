@@ -62,6 +62,55 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
         Ok(renewed)
     }
 
+    fn load_or_recover_intent_marker(
+        &self,
+        path: &str,
+        session: &PublishSession,
+        phase: &str,
+    ) -> Result<RemoteWriteIntentMarker> {
+        let intent_bytes = self.remote_backend.get_physical(path)?;
+        anyhow::ensure!(
+            !intent_bytes.is_empty(),
+            "{phase}: active intent missing or empty"
+        );
+        match serde_json::from_slice::<RemoteWriteIntentMarker>(&intent_bytes) {
+            Ok(intent_marker) => {
+                anyhow::ensure!(
+                    intent_marker.operation_id == session.operation_id.value,
+                    "{phase}: active intent belongs to another operation"
+                );
+                Ok(intent_marker)
+            }
+            Err(error) => {
+                let observed_now = observe_remote_now_with_probe(
+                    &self.remote_backend,
+                    ".e2v/publish-remote-time.probe",
+                )?;
+                if marker_is_fresh_at(
+                    &self.remote_backend,
+                    path,
+                    observed_now,
+                    INTENT_EXPIRY_HOURS,
+                )? {
+                    return Err(error).context(format!("{phase}: invalid active intent marker"));
+                }
+                let observed_at = system_time_to_unix_ms(observed_now)?;
+                let plan = PublishPlan {
+                    operation_id: session.operation_id.clone(),
+                    target_branch_token: session.target_branch_token.clone(),
+                    expected_ref_version: session.expected_ref_version,
+                    planned_snapshot_id: session.planned_snapshot_id.clone(),
+                    writer_mode: session.writer_mode.clone(),
+                };
+                let mut recovered = build_write_intent_marker(&plan, observed_at, 1);
+                recovered.started_at_remote_unix_ms = session.started_at_remote_unix_ms;
+                self.remote_backend
+                    .put_physical(path, serde_json::to_vec(&recovered)?.as_slice())?;
+                Ok(recovered)
+            }
+        }
+    }
+
     fn renew_lease_if_needed(
         &self,
         path: &str,
@@ -84,23 +133,24 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
         Ok(renewed)
     }
 
-    fn recover_or_renew_lease_if_needed(
+    fn load_or_recover_lease_marker(
         &self,
         path: &str,
         session: &PublishSession,
+        phase: &str,
     ) -> Result<RemoteWriterLeaseMarker> {
         let lease_bytes = self.remote_backend.get_physical(path)?;
         anyhow::ensure!(
             !lease_bytes.is_empty(),
-            "pre-commit verify failed: writer lease missing or empty"
+            "{phase}: writer lease missing or empty"
         );
         match serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes) {
             Ok(lease_marker) => {
                 anyhow::ensure!(
                     lease_marker.operation_id == session.operation_id.value,
-                    "pre-commit verify failed: writer lease belongs to another operation"
+                    "{phase}: writer lease belongs to another operation"
                 );
-                self.renew_lease_if_needed(path, &lease_marker)
+                Ok(lease_marker)
             }
             Err(error) => {
                 let observed_now = observe_remote_now_with_probe(
@@ -113,8 +163,7 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
                     observed_now,
                     INTENT_EXPIRY_HOURS,
                 )? {
-                    return Err(error)
-                        .context("pre-commit verify failed: invalid writer lease marker");
+                    return Err(error).context(format!("{phase}: invalid writer lease marker"));
                 }
                 let observed_at = system_time_to_unix_ms(observed_now)?;
                 let plan = PublishPlan {
@@ -215,7 +264,9 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             operation_id: plan.operation_id,
             target_branch_token: plan.target_branch_token,
             expected_ref_version: plan.expected_ref_version,
+            planned_snapshot_id: plan.planned_snapshot_id,
             writer_mode,
+            started_at_remote_unix_ms: observed_at,
             next_layout_root: None,
             next_layout_root_bytes: None,
             active_intent_path,
@@ -232,19 +283,11 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     }
 
     fn heartbeat(&self, session: &PublishSession) -> Result<()> {
-        let intent_bytes = self
-            .remote_backend
-            .get_physical(&session.active_intent_path)?;
-        anyhow::ensure!(
-            !intent_bytes.is_empty(),
-            "heartbeat failed: active intent missing or empty"
-        );
-        let intent: RemoteWriteIntentMarker = serde_json::from_slice(&intent_bytes)
-            .context("heartbeat failed: invalid active intent marker")?;
-        anyhow::ensure!(
-            intent.operation_id == session.operation_id.value,
-            "heartbeat failed: active intent belongs to another operation"
-        );
+        let intent = self.load_or_recover_intent_marker(
+            &session.active_intent_path,
+            session,
+            "heartbeat failed",
+        )?;
         let observed_now =
             observe_remote_now_with_probe(&self.remote_backend, ".e2v/publish-remote-time.probe")?;
         let observed_at = system_time_to_unix_ms(observed_now)?;
@@ -255,17 +298,8 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
         )?;
 
         if let Some(lease_path) = &session.lease_path {
-            let lease_bytes = self.remote_backend.get_physical(lease_path)?;
-            anyhow::ensure!(
-                !lease_bytes.is_empty(),
-                "heartbeat failed: writer lease missing or empty"
-            );
-            let lease: RemoteWriterLeaseMarker = serde_json::from_slice(&lease_bytes)
-                .context("heartbeat failed: invalid writer lease marker")?;
-            anyhow::ensure!(
-                lease.operation_id == session.operation_id.value,
-                "heartbeat failed: writer lease belongs to another operation"
-            );
+            let lease =
+                self.load_or_recover_lease_marker(lease_path, session, "heartbeat failed")?;
             let renewed_lease = renew_writer_lease_marker(&lease, observed_at);
             self.remote_backend
                 .put_physical(lease_path, serde_json::to_vec(&renewed_lease)?.as_slice())?;
@@ -291,19 +325,11 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     }
 
     fn pre_commit_verify(&self, session: &PublishSession) -> Result<()> {
-        let bytes = self
-            .remote_backend
-            .get_physical(&session.active_intent_path)?;
-        anyhow::ensure!(
-            !bytes.is_empty(),
-            "pre-commit verify failed: active intent missing or empty"
-        );
-        let intent: RemoteWriteIntentMarker = serde_json::from_slice(&bytes)
-            .context("pre-commit verify failed: invalid active intent marker")?;
-        anyhow::ensure!(
-            intent.operation_id == session.operation_id.value,
-            "pre-commit verify failed: active intent belongs to another operation"
-        );
+        let intent = self.load_or_recover_intent_marker(
+            &session.active_intent_path,
+            session,
+            "pre-commit verify failed",
+        )?;
         let _intent = self.renew_intent_if_needed(&session.active_intent_path, &intent)?;
         if let Some(expected_ref_version) = session.expected_ref_version {
             validate_sync_identifier("branch token", &session.target_branch_token)?;
@@ -320,7 +346,9 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             );
         }
         if let Some(lease_path) = &session.lease_path {
-            let _lease = self.recover_or_renew_lease_if_needed(lease_path, session)?;
+            let lease =
+                self.load_or_recover_lease_marker(lease_path, session, "pre-commit verify failed")?;
+            let _lease = self.renew_lease_if_needed(lease_path, &lease)?;
         }
         Ok(())
     }
@@ -1363,6 +1391,124 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_recovers_from_corrupted_stale_active_intent_marker() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let renewed_time = initial_time + Duration::from_secs(73 * 60 * 60);
+        let initial_ms = initial_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let renewed_ms = renewed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-heartbeat-corrupt-intent".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-heartbeat".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .put_physical(
+                "transactions/active/op-heartbeat-corrupt-intent.intent",
+                br#"{"broken":true"#,
+            )
+            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "transactions/active/op-heartbeat-corrupt-intent.intent",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        remote.set_fixed_time_for_test(renewed_time);
+
+        publisher.heartbeat(&session).unwrap();
+
+        let intent: serde_json::Value = serde_json::from_slice(
+            &remote
+                .get_physical("transactions/active/op-heartbeat-corrupt-intent.intent")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(intent["operation_id"], "op-heartbeat-corrupt-intent");
+        assert_eq!(intent["planned_snapshot_id"], "snapshot-heartbeat");
+        assert_eq!(intent["started_at_remote_unix_ms"], initial_ms);
+        assert_eq!(
+            intent["heartbeat"]["remote_observed_at_unix_ms"],
+            renewed_ms
+        );
+        assert_eq!(intent["heartbeat"]["sequence"], 2);
+    }
+
+    #[test]
+    fn heartbeat_still_rejects_corrupted_fresh_active_intent_marker() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-heartbeat-fresh-intent".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-heartbeat".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .put_physical(
+                "transactions/active/op-heartbeat-fresh-intent.intent",
+                br#"{"broken":true"#,
+            )
+            .unwrap();
+
+        let error = publisher.heartbeat(&session).unwrap_err();
+
+        assert!(error.to_string().contains("invalid active intent marker"));
+    }
+
+    #[test]
     fn begin_rejects_read_only_backend_capabilities() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
@@ -1663,6 +1809,126 @@ mod tests {
     }
 
     #[test]
+    fn pre_commit_verify_recovers_from_corrupted_stale_active_intent_marker() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let renewed_time = initial_time + Duration::from_secs(73 * 60 * 60);
+        let initial_ms = initial_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let renewed_ms = renewed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-corrupt-stale-intent".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-precommit".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .put_physical(
+                "transactions/active/op-corrupt-stale-intent.intent",
+                br#"{"broken":true"#,
+            )
+            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "transactions/active/op-corrupt-stale-intent.intent",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        remote.set_fixed_time_for_test(renewed_time);
+
+        publisher.pre_commit_verify(&session).unwrap();
+
+        let intent: serde_json::Value = serde_json::from_slice(
+            &remote
+                .get_physical("transactions/active/op-corrupt-stale-intent.intent")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(intent["operation_id"], "op-corrupt-stale-intent");
+        assert_eq!(intent["writer_id"], "writer:op-corrupt-stale-intent");
+        assert_eq!(intent["target_branch_token"], "branch-token");
+        assert_eq!(intent["planned_snapshot_id"], "snapshot-precommit");
+        assert_eq!(intent["started_at_remote_unix_ms"], initial_ms);
+        assert_eq!(
+            intent["heartbeat"]["remote_observed_at_unix_ms"],
+            renewed_ms
+        );
+        assert_eq!(intent["heartbeat"]["sequence"], 1);
+    }
+
+    #[test]
+    fn pre_commit_verify_still_rejects_corrupted_fresh_active_intent_marker() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-corrupt-fresh-intent".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-precommit".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .put_physical(
+                "transactions/active/op-corrupt-fresh-intent.intent",
+                br#"{"broken":true"#,
+            )
+            .unwrap();
+
+        let error = publisher.pre_commit_verify(&session).unwrap_err();
+
+        assert!(error.to_string().contains("invalid active intent marker"));
+    }
+
+    #[test]
     fn pre_commit_verify_still_rejects_corrupted_fresh_lease_marker() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
@@ -1846,7 +2112,9 @@ mod tests {
             operation_id: OperationId::new("op-invalid-session".to_string()).unwrap(),
             target_branch_token: "../evil".to_string(),
             expected_ref_version: None,
+            planned_snapshot_id: None,
             writer_mode: WriterMode::ReadOnly,
+            started_at_remote_unix_ms: 0,
             next_layout_root: None,
             next_layout_root_bytes: None,
             active_intent_path: "transactions/active/op-invalid-session.intent".to_string(),
