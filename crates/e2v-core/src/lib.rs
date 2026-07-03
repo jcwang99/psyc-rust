@@ -254,19 +254,32 @@ pub mod sync_support {
         let length = usize::try_from(physical_ref.length)
             .map_err(|_| anyhow::anyhow!("cached pack length is too large to read"))?;
         let pack_path = cached_pack_data_path(repo_root.as_ref(), &physical_ref.container_id)?;
-        if !cached_pack_data_hash_matches(&pack_path)? {
+        let cached_pack_is_usable = match cached_pack_data_hash_matches(&pack_path) {
+            Ok(matches) => matches,
+            Err(_) => {
+                let _ = delete_cached_pack_data_entry(&pack_path);
+                false
+            }
+        };
+        if !cached_pack_is_usable {
             delete_cached_pack_data_entry(&pack_path)?;
             anyhow::bail!(
                 "cached pack data integrity metadata is missing or invalid for {}",
                 physical_ref.container_id
             );
         }
-        let mut pack_file = std::fs::File::open(&pack_path).with_context(|| {
-            format!(
-                "cached pack data is missing for {}",
-                physical_ref.container_id
-            )
-        })?;
+        let mut pack_file = match std::fs::File::open(&pack_path) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = delete_cached_pack_data_entry(&pack_path);
+                return Err(error).with_context(|| {
+                    format!(
+                        "cached pack data is missing for {}",
+                        physical_ref.container_id
+                    )
+                });
+            }
+        };
         read_cached_pack_object_range(&mut pack_file, offset, length, object_id)
     }
 
@@ -280,18 +293,20 @@ pub mod sync_support {
         ))
     }
 
+    fn remove_cached_pack_path_if_exists(path: &Path) -> Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+            Ok(_) => std::fs::remove_file(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     fn delete_cached_pack_data_entry(pack_path: &Path) -> Result<()> {
         let hash_path = cached_pack_data_hash_path(pack_path);
-        if let Err(error) = std::fs::remove_file(pack_path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(error.into());
-        }
-        if let Err(error) = std::fs::remove_file(hash_path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(error.into());
-        }
+        remove_cached_pack_path_if_exists(pack_path)?;
+        remove_cached_pack_path_if_exists(&hash_path)?;
         Ok(())
     }
 
