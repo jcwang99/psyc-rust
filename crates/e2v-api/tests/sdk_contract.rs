@@ -972,6 +972,77 @@ fn sdk_pull_reports_corrupted_local_branch_ref_instead_of_silently_dropping_prev
 }
 
 #[test]
+fn sdk_pull_reports_corrupt_state_when_default_ref_backup_cannot_be_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = Sdk::new();
+    let source_state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "first".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = format!(
+        "file://{}",
+        remote_repo.to_string_lossy().replace('\\', "/")
+    );
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-first-unreadable-default-ref".to_string(),
+    })
+    .unwrap();
+
+    sdk.clone_remote(CloneRequest {
+        remote_spec: remote_spec.clone(),
+        target_repo_root: clone_repo.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_token: source_state.branch.token_hex.clone(),
+    })
+    .unwrap();
+    sdk.add_remote(&clone_repo, "origin", &remote_spec).unwrap();
+
+    let default_ref_path = clone_repo.join(".e2v").join("refs").join("default.json");
+    let default_ref_bytes = fs::read(&default_ref_path).unwrap();
+    fs::remove_file(&default_ref_path).unwrap();
+    fs::create_dir_all(&default_ref_path).unwrap();
+
+    let error = sdk
+        .pull_default_remote(PullRequest {
+            repo_root: clone_repo.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::Internal);
+    assert!(
+        error.message().contains("failed to read")
+            || error.message().contains("default.json")
+            || error.message().contains("os error"),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir(&default_ref_path).unwrap();
+    fs::write(&default_ref_path, default_ref_bytes).unwrap();
+}
+
+#[test]
 fn sdk_can_push_and_fetch_with_explicit_remote_spec_without_default_remote_registration() {
     let temp = tempfile::tempdir().unwrap();
     let source_repo = temp.path().join("source");

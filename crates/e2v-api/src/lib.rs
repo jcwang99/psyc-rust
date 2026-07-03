@@ -733,7 +733,11 @@ impl Sdk {
             .join(".e2v")
             .join("refs")
             .join("default.json");
-        let original_default_ref = std::fs::read(&default_ref_path).ok();
+        let original_default_ref = match std::fs::read(&default_ref_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(map_error(error.into())),
+        };
         let previous = self
             .facade
             .read_service(&request.repo_root)
