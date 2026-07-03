@@ -96,11 +96,16 @@ impl LocalFolderBackend {
     pub fn put_object(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
         let full_path = self.resolve_relative_path(relative_path)?;
         if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create object parent {}", parent.display()))?;
+            ensure_directory_path(parent)?;
         }
-        fs::write(&full_path, bytes)
-            .with_context(|| format!("failed to write object {}", full_path.display()))?;
+        match fs::write(&full_path, bytes) {
+            Ok(()) => {}
+            Err(_) => {
+                remove_path_if_exists(&full_path)?;
+                fs::write(&full_path, bytes)
+                    .with_context(|| format!("failed to write object {}", full_path.display()))?;
+            }
+        }
         Ok(())
     }
 
@@ -142,6 +147,31 @@ impl LocalFolderBackend {
         file.set_times(std::fs::FileTimes::new().set_modified(modified_at))?;
         Ok(())
     }
+}
+
+fn ensure_directory_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && parent != path
+    {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)?;
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create object parent {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 impl BlobStore for LocalFolderBackend {
@@ -551,6 +581,38 @@ mod tests {
             error.to_string().contains("path traversal") || error.to_string().contains("separator"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn put_object_replaces_target_path_conflict_with_file_contents() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let conflicted_path = temp.path().join("objects").join("sample.bin");
+        fs::create_dir_all(&conflicted_path).unwrap();
+
+        backend
+            .put_object("objects/sample.bin", b"hello world")
+            .unwrap();
+
+        assert!(conflicted_path.is_file());
+        assert_eq!(fs::read(&conflicted_path).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn put_object_replaces_parent_path_conflict_with_directory_tree() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let conflicted_parent = temp.path().join("objects");
+        fs::write(&conflicted_parent, b"not-a-directory").unwrap();
+
+        backend
+            .put_object("objects/sample.bin", b"hello world")
+            .unwrap();
+
+        let target_path = conflicted_parent.join("sample.bin");
+        assert!(conflicted_parent.is_dir());
+        assert!(target_path.is_file());
+        assert_eq!(fs::read(&target_path).unwrap(), b"hello world");
     }
 
     #[test]
