@@ -1420,6 +1420,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decrypt authenticated pack index root")
         || lower.contains("failed to decode authenticated pack index segment")
         || lower.contains("failed to decrypt authenticated pack index segment")
+        || lower.contains("failed to read trusted state")
         || lower.contains("failed to decode trusted state")
         || lower.contains("remote keyring pointer generation mismatch")
         || lower.contains("missing physical chunk")
@@ -1505,6 +1506,16 @@ mod tests {
     fn map_error_treats_corrupted_trusted_state_as_corrupt_state() {
         let error =
             anyhow::anyhow!("failed to decode trusted state C:/tmp/e2v/trusted-state/repo.json");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_unreadable_trusted_state_as_corrupt_state() {
+        let error =
+            anyhow::anyhow!("failed to read trusted state C:/tmp/e2v/trusted-state/repo.json");
 
         let mapped = map_error(error);
 

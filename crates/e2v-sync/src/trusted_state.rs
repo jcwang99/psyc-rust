@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 static TRUSTED_STATE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static TRUSTED_STATE_OVERRIDE_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TrustedRemoteState {
@@ -16,15 +17,23 @@ pub struct TrustedRemoteState {
 
 #[doc(hidden)]
 pub(crate) fn override_trusted_state_dir_for_test(path: PathBuf) -> TrustedStateDirGuard {
+    let usage_lock = TRUSTED_STATE_OVERRIDE_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
     let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = slot.replace(path);
-    TrustedStateDirGuard { previous }
+    TrustedStateDirGuard {
+        previous,
+        _usage_lock: Some(usage_lock),
+    }
 }
 
 #[doc(hidden)]
 pub struct TrustedStateDirGuard {
     previous: Option<PathBuf>,
+    _usage_lock: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl Drop for TrustedStateDirGuard {
@@ -36,8 +45,13 @@ impl Drop for TrustedStateDirGuard {
 
 pub(crate) fn load_trusted_remote_state(repo_id: &str) -> Result<Option<TrustedRemoteState>> {
     let path = trusted_state_file_path(repo_id)?;
-    if !path.is_file() {
-        return Ok(None);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {
+            anyhow::bail!("failed to read trusted state {}", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     }
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read trusted state {}", path.display()))?;
@@ -108,11 +122,6 @@ mod tests {
 
     use super::*;
 
-    fn set_override_path(path: Option<PathBuf>) {
-        let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
-        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
-    }
-
     fn poison_override_lock() {
         let lock = TRUSTED_STATE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
         let _ = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -143,10 +152,25 @@ mod tests {
     }
 
     #[test]
+    fn trusted_state_load_rejects_path_conflicts_instead_of_treating_them_as_missing() {
+        let temp = tempdir().unwrap();
+        let _guard = override_trusted_state_dir_for_test(temp.path().to_path_buf());
+        let path = temp.path().join("repo-123.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = load_trusted_remote_state("repo-123").unwrap_err();
+
+        assert!(
+            error.to_string().contains("failed to read trusted state"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn trusted_state_root_recovers_from_poisoned_override_lock() {
         let temp = tempdir().unwrap();
         let expected = temp.path().to_path_buf();
-        set_override_path(Some(expected.clone()));
+        let _guard = override_trusted_state_dir_for_test(expected.clone());
 
         poison_override_lock();
 
@@ -159,9 +183,10 @@ mod tests {
     fn trusted_state_guard_drop_recovers_from_poisoned_override_lock() {
         let temp_one = tempdir().unwrap();
         let temp_two = tempdir().unwrap();
-        set_override_path(Some(temp_two.path().to_path_buf()));
+        let _guard = override_trusted_state_dir_for_test(temp_two.path().to_path_buf());
         let guard = TrustedStateDirGuard {
             previous: Some(temp_one.path().to_path_buf()),
+            _usage_lock: None,
         };
 
         poison_override_lock();
