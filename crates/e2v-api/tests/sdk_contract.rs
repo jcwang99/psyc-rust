@@ -290,6 +290,48 @@ fn sdk_checkout_snapshot_reports_corrupt_state_for_invalid_checkout_mapping() {
 }
 
 #[test]
+fn sdk_list_branches_reports_corrupt_state_for_invalid_local_branch_ref_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+    sdk.create_branch(&repo_root, "feature").unwrap();
+
+    let branch_ref_path = repo_root
+        .join(".e2v")
+        .join("refs")
+        .join("branches")
+        .join(format!("{}.json", state.branch.token_hex));
+    fs::write(&branch_ref_path, b"corrupt-local-branch-ref").unwrap();
+
+    let error = sdk.list_branches(&repo_root).unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::CorruptState);
+    assert!(
+        error.message().contains("failed to decode encrypted ref")
+            || error
+                .message()
+                .contains("failed to decode branch ref record"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn sdk_can_read_directory_entries_through_public_read_api() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

@@ -1399,6 +1399,9 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode checkout mapping")
         || lower.contains("failed to decode gc delete journal")
         || lower.contains("failed to decode historical rewrite checkpoint")
+        || lower.contains("failed to decode ref record")
+        || lower.contains("failed to decode branch ref record")
+        || lower.contains("failed to decode encrypted ref")
         || lower.contains("failed to decode remote layout root")
         || lower.contains("failed to decode remote keyring pointer")
         || lower.contains("failed to decode remote keyring state")
@@ -1534,6 +1537,24 @@ mod tests {
     #[test]
     fn map_error_treats_corrupted_checkout_mapping_as_corrupt_state() {
         let error = anyhow::anyhow!("failed to decode checkout mapping");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_local_branch_ref_record_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decode branch ref record");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_corrupted_encrypted_ref_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to decode encrypted ref");
 
         let mapped = map_error(error);
 
