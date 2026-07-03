@@ -264,6 +264,10 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         control_dir.join("keyring").join(current_keyring_name),
     )?)
     .context("failed to decode current keyring state")?;
+    let local_old_epoch_count = keyring["epochs"]
+        .as_array()
+        .map(|epochs| epochs.len().saturating_sub(1))
+        .unwrap_or(0);
     let remote_old_epoch_count =
         crate::push::read_remote_current_keyring_bytes(remote, &options.repo_root)
             .ok()
@@ -274,12 +278,9 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
                     .as_array()
                     .map(|epochs| epochs.len().saturating_sub(1))
             });
-    let old_epoch_count = remote_old_epoch_count.unwrap_or_else(|| {
-        keyring["epochs"]
-            .as_array()
-            .map(|epochs| epochs.len().saturating_sub(1))
-            .unwrap_or(0)
-    });
+    let old_epoch_count = remote_old_epoch_count
+        .map(|remote_old_epoch_count| remote_old_epoch_count.max(local_old_epoch_count))
+        .unwrap_or(local_old_epoch_count);
     let reachable_object_count =
         match sync_support::export_head_snapshot(&facade, &options.repo_root) {
             Ok((_state, snapshot)) => ManifestStore::new(&options.repo_root)
