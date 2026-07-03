@@ -1157,8 +1157,12 @@ fn winfsp_security_callbacks_reuse_a_single_cached_descriptor_parse() {
         .matches("SecurityDescriptorBytes::from_sddl(")
         .count();
     assert_eq!(
-        parse_count, 1,
-        "WinFSP host should parse the read-only security descriptor once and reuse cached bytes, found {parse_count} parses"
+        parse_count, 2,
+        "WinFSP host should parse each static security descriptor once and reuse cached bytes, found {parse_count} parses"
+    );
+    assert!(
+        source.contains("LazyLock<Arc<SecurityDescriptorBytes>>"),
+        "WinFSP host should cache parsed security descriptors behind LazyLock statics"
     );
 }
 
@@ -3411,6 +3415,27 @@ fn windows_mount_context_reports_invalid_snapshot_request_without_panicking() {
             || error.to_string().contains("not found")
             || error.to_string().contains("missing"),
         "unexpected error: {error:#}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_mount_context_source_keeps_security_descriptor_parsing_behind_lazy_cache() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        source.contains("LazyLock<Arc<SecurityDescriptorBytes>>"),
+        "WinFSP mount context should keep parsed security descriptors behind a LazyLock cache"
+    );
+    assert!(
+        source.contains("Arc::clone(&READ_ONLY_SECURITY_DESCRIPTOR_BYTES)")
+            || source.contains("Arc::clone(&WRITABLE_SECURITY_DESCRIPTOR_BYTES)"),
+        "WinFSP mount context should reuse cached security descriptor bytes instead of reparsing SDDL per request"
     );
 }
 

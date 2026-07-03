@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::{CString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -37,6 +38,22 @@ const VOLUME_PARAMS_ALWAYS_USE_DOUBLE_BUFFERING_BIT: u32 = 1 << 12;
 const VOLUME_PARAMS_VOLUME_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 0;
 const VOLUME_PARAMS_DIR_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 1;
 const FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE: i32 = 0;
+
+static READ_ONLY_SECURITY_DESCRIPTOR_BYTES: LazyLock<Arc<SecurityDescriptorBytes>> =
+    LazyLock::new(|| {
+        Arc::new(
+            SecurityDescriptorBytes::from_sddl(READ_ONLY_SECURITY_DESCRIPTOR_SDDL)
+                .expect("WinFSP read-only security descriptor should be valid"),
+        )
+    });
+
+static WRITABLE_SECURITY_DESCRIPTOR_BYTES: LazyLock<Arc<SecurityDescriptorBytes>> =
+    LazyLock::new(|| {
+        Arc::new(
+            SecurityDescriptorBytes::from_sddl(WRITABLE_SECURITY_DESCRIPTOR_SDDL)
+                .expect("WinFSP writable security descriptor should be valid"),
+        )
+    });
 
 #[derive(Debug)]
 pub struct WindowsMountedFilesystemHost {
@@ -2009,10 +2026,10 @@ impl WinfspMountContext {
             WinfspVfs::ReadOnly(vfs) => vfs.cache_policy(),
             WinfspVfs::Writable(vfs) => vfs.lock().unwrap().cache_policy(),
         };
-        let security_descriptor_sddl = if matches!(vfs, WinfspVfs::Writable(_)) {
-            WRITABLE_SECURITY_DESCRIPTOR_SDDL
+        let security_descriptor = if matches!(vfs, WinfspVfs::Writable(_)) {
+            Arc::clone(&WRITABLE_SECURITY_DESCRIPTOR_BYTES)
         } else {
-            READ_ONLY_SECURITY_DESCRIPTOR_SDDL
+            Arc::clone(&READ_ONLY_SECURITY_DESCRIPTOR_BYTES)
         };
         Ok(Self {
             request,
@@ -2020,10 +2037,7 @@ impl WinfspMountContext {
             observed_inode_ids: Arc::new(Mutex::new(BTreeSet::new())),
             observed_directory_paths: Arc::new(Mutex::new(BTreeSet::new())),
             add_dir_info: None,
-            security_descriptor: Arc::new(
-                SecurityDescriptorBytes::from_sddl(security_descriptor_sddl)
-                    .expect("WinFSP security descriptor should be valid"),
-            ),
+            security_descriptor,
             vfs,
         })
     }
