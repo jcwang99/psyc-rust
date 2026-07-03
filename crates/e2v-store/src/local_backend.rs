@@ -350,7 +350,9 @@ impl RefStore for LocalFolderBackend {
 impl LayoutRootStore for LocalFolderBackend {
     fn read_layout_root(&self) -> Result<LayoutRoot> {
         match self.get_physical("layout_root.json") {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).context("failed to decode remote layout root")
+            }
             Err(error) if is_missing_physical_object_error(&error) => {
                 Ok(Self::default_layout_root())
             }
