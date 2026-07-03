@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::fs;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -226,6 +227,14 @@ pub struct ShareListResult {
     pub devices: Vec<ShareDeviceSummary>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRewriteLocalResult {
+    pub rewritten_object_ids: Vec<String>,
+    pub rewritten_control_records: Vec<String>,
+    pub retired_epoch_count: usize,
+    pub active_epoch: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareInviteMemberOptions {
     pub display_name: String,
@@ -415,6 +424,101 @@ impl RepositoryFacade {
             snapshot_reader: Some(snapshot_reader),
             stable_read_policy: Some(stable_read_policy),
         }
+    }
+
+    pub fn rewrite_history_to_active_epoch(
+        &self,
+        repo_root: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<HistoryRewriteLocalResult> {
+        ensure!(
+            !password.trim().is_empty(),
+            "history rewrite password must not be empty"
+        );
+        let repo_root = repo_root.as_ref();
+        self.open(repo_root)?;
+        let control_dir = repo_root.join(CONTROL_DIR);
+        let mut repo_secrets = unlock_repo_secrets(&control_dir, password)?;
+        let keyring = read_current_keyring_state(&control_dir)?;
+        let default_ref = read_default_ref(&control_dir, &repo_secrets)?;
+        let branch_refs = read_all_branch_refs(&control_dir, &repo_secrets)?;
+        let manifest_store = LocalManifestStore::new(repo_root);
+        let object_store = open_object_store_with_secrets(&control_dir, repo_secrets.clone());
+        let mut reachable_object_ids = BTreeSet::new();
+        collect_reachable_object_ids_into(
+            &manifest_store,
+            default_ref.head_snapshot_id.as_deref(),
+            &mut reachable_object_ids,
+        )?;
+        for branch_ref in &branch_refs {
+            collect_reachable_object_ids_into(
+                &manifest_store,
+                branch_ref.head_snapshot_id.as_deref(),
+                &mut reachable_object_ids,
+            )?;
+        }
+
+        let mut rewritten_object_ids = Vec::new();
+        for object_id in reachable_object_ids {
+            let loaded = object_store.get_typed_object(&object_id)?;
+            let rewritten_object_id =
+                object_store.put_object(&loaded.object_type, &loaded.plaintext)?;
+            rewritten_object_ids.push(rewritten_object_id);
+        }
+
+        write_default_ref(&control_dir, &repo_secrets, &default_ref)?;
+        let mut rewritten_control_records = vec![DEFAULT_REF_FILE.to_string()];
+        for branch_ref in &branch_refs {
+            write_branch_ref(&control_dir, &repo_secrets, branch_ref)?;
+            rewritten_control_records.push(
+                branch_ref_path(&control_dir, &branch_ref.ref_token_hex)?
+                    .strip_prefix(&control_dir)
+                    .unwrap_or_else(|_| Path::new(DEFAULT_REF_FILE))
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+
+        let retired_epoch_count = repo_secrets.epoch_keys.len().saturating_sub(1);
+        let active_epoch_keys = repo_secrets.active_epoch_keys()?.clone();
+        repo_secrets.epoch_keys.clear();
+        repo_secrets
+            .epoch_keys
+            .insert(repo_secrets.active_epoch, active_epoch_keys.clone());
+        repo_secrets.repo_manifest_enc_key = active_epoch_keys.manifest_enc_key;
+        repo_secrets.repo_nonce_key = active_epoch_keys.nonce_key;
+
+        let next_generation = keyring.generation + 1;
+        let next_file_name = format!("keyring.{next_generation}");
+        let next_state = KeyringState {
+            generation: next_generation,
+            active_epoch: repo_secrets.active_epoch,
+            epochs: build_epoch_descriptors(&repo_secrets),
+            envelopes: rebuild_local_device_and_password_envelopes(
+                &keyring,
+                &repo_secrets,
+                password,
+            )?,
+            ..keyring
+        };
+        let next_pointer = KeyringPointer {
+            generation: next_generation,
+            current: next_file_name.clone(),
+        };
+        write_keyring_generation_and_pointer(
+            &control_dir,
+            &next_file_name,
+            &next_state,
+            &next_pointer,
+        )?;
+        cache_unlocked_secrets(&control_dir, &repo_secrets);
+        cache_unlocked_password(&control_dir, password);
+        Ok(HistoryRewriteLocalResult {
+            rewritten_object_ids,
+            rewritten_control_records,
+            retired_epoch_count,
+            active_epoch: keyring.active_epoch,
+        })
     }
 
     pub fn init(&self, options: InitOptions) -> Result<RepositoryState> {
@@ -2537,6 +2641,20 @@ fn read_all_branch_refs(control_dir: &Path, secrets: &RepoSecrets) -> Result<Vec
         }
     }
     Ok(refs)
+}
+
+fn collect_reachable_object_ids_into(
+    manifest_store: &LocalManifestStore,
+    head_snapshot_id: Option<&str>,
+    reachable_object_ids: &mut BTreeSet<String>,
+) -> Result<()> {
+    let Some(head_snapshot_id) = head_snapshot_id else {
+        return Ok(());
+    };
+    for object_id in manifest_store.collect_reachable_object_ids(head_snapshot_id)? {
+        reachable_object_ids.insert(object_id);
+    }
+    Ok(())
 }
 
 fn branch_ref_path(control_dir: &Path, ref_token_hex: &str) -> Result<PathBuf> {

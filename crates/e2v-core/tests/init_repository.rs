@@ -91,6 +91,25 @@ fn facade_module_is_not_exposed_as_a_public_crate_module() {
 }
 
 #[test]
+fn facade_exposes_history_rewrite_api_for_p3_a() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("facade.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        source.contains("pub struct HistoryRewriteLocalResult"),
+        "expected facade to expose a local history rewrite result type for P3-A"
+    );
+    assert!(
+        source.contains("pub fn rewrite_history_to_active_epoch("),
+        "expected facade to expose a history rewrite entrypoint for P3-A"
+    );
+}
+
+#[test]
 fn testing_module_does_not_reexport_core_facade_types_or_sync_reconcile_directly() {
     let source = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4702,6 +4721,58 @@ fn rotated_active_epoch_keeps_old_snapshot_readable() {
             message: "second".to_string(),
         })
         .unwrap();
+
+    let read_service = facade.read_service(&repo_root).unwrap();
+    let snapshot = read_service
+        .open_snapshot(&first_commit.snapshot_id)
+        .unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+
+    assert_eq!(String::from_utf8(bytes).unwrap(), "alpha");
+}
+
+#[test]
+fn rewrite_history_to_active_epoch_retires_old_epochs_after_rewriting_local_history() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let before = read_current_keyring_json(&repo_root);
+    assert_eq!(before["active_epoch"].as_u64(), Some(2));
+    assert_eq!(before["epochs"].as_array().unwrap().len(), 2);
+
+    let result = facade
+        .rewrite_history_to_active_epoch(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let after = read_current_keyring_json(&repo_root);
+    assert_eq!(result.active_epoch, 2);
+    assert_eq!(result.retired_epoch_count, 1);
+    assert!(
+        !result.rewritten_object_ids.is_empty(),
+        "expected history rewrite to rewrite at least one local object"
+    );
+    assert_eq!(after["active_epoch"].as_u64(), Some(2));
+    assert_eq!(after["epochs"].as_array().unwrap().len(), 1);
+    assert_eq!(after["epochs"][0]["epoch"].as_u64(), Some(2));
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    facade.open(&repo_root).unwrap();
 
     let read_service = facade.read_service(&repo_root).unwrap();
     let snapshot = read_service

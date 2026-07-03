@@ -95,10 +95,11 @@ pub mod testing {
 
 pub use facade::{
     BranchState, BranchSummary, CheckoutOptions, CommitOptions, CommitResult, DirectoryEntry,
-    FileHandle, InitOptions, ReadService, RepositoryFacade, RepositoryState,
-    ShareAcceptDeviceOptions, ShareAcceptMemberOptions, ShareAcceptResult, ShareInviteBundle,
-    ShareInviteDeviceOptions, ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions,
-    ShareRevokeMemberOptions, SnapshotHandle, SnapshotSummary, validate_layout_root_value,
+    FileHandle, HistoryRewriteLocalResult, InitOptions, ReadService, RepositoryFacade,
+    RepositoryState, ShareAcceptDeviceOptions, ShareAcceptMemberOptions, ShareAcceptResult,
+    ShareInviteBundle, ShareInviteDeviceOptions, ShareInviteMemberOptions, ShareListResult,
+    ShareRevokeDeviceOptions, ShareRevokeMemberOptions, SnapshotHandle, SnapshotSummary,
+    validate_layout_root_value,
 };
 pub use keyring::clear_unlocked_keyring_cache;
 pub use local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
