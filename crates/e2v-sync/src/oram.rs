@@ -26,6 +26,7 @@ use crate::push::{
     reconcile_local_keyring_with_remote_if_needed, upload_objects_as_pack_segments,
     upload_remote_keyring_generations,
 };
+use crate::remote_maintenance::list_remote_branch_refs;
 use crate::transaction::{PublishPlan, PublishSession};
 
 pub(crate) const OBLIVIOUS_ROOT_PATH: &str = "oblivious/root.json";
@@ -229,7 +230,7 @@ fn execute_oblivious_layout_publish<R: RemoteBackend + Clone>(
     );
     let next_layout_root_bytes = serde_json::to_vec(&next_layout_root)
         .context("failed to encode next oblivious layout root")?;
-    let reachable_object_ids = reachable_object_ids_for_head(repo_root)?;
+    let reachable_object_ids = collect_oram_publish_object_ids(remote, repo_root, &secrets)?;
 
     let operation_id =
         OperationId::new(format!("{operation_prefix}-{next_layout_generation:020}"))?;
@@ -406,16 +407,134 @@ fn build_next_oblivious_layout_root(
     }
 }
 
-fn reachable_object_ids_for_head(repo_root: &Path) -> Result<Vec<String>> {
+fn collect_oram_publish_object_ids<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+    secrets: &RepoSecrets,
+) -> Result<Vec<String>> {
+    let mut object_ids = collect_local_branch_reachable_object_ids(repo_root)?;
+    hydrate_remote_only_branch_objects_for_oram_publish(
+        remote,
+        repo_root,
+        secrets,
+        &mut object_ids,
+    )?;
+    Ok(object_ids)
+}
+
+fn collect_local_branch_reachable_object_ids(repo_root: &Path) -> Result<Vec<String>> {
     let facade = RepositoryFacade::new();
-    let (_state, snapshot) = sync_support::export_head_snapshot(&facade, repo_root)?;
-    let object_ids =
-        ManifestStore::new(repo_root).collect_reachable_object_ids(&snapshot.snapshot_id)?;
-    for object_id in &object_ids {
-        validate_object_id_value(object_id)?;
+    let manifest_store = ManifestStore::new(repo_root);
+    let mut object_ids = BTreeSet::new();
+    for branch in facade.list_branches(repo_root)? {
+        let snapshot = facade
+            .read_service(repo_root)?
+            .resolve_branch(&branch.token_hex)
+            .with_context(|| {
+                format!(
+                    "failed to resolve local branch snapshot for ORAM publish {}",
+                    branch.token_hex
+                )
+            })?;
+        for object_id in manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)? {
+            validate_object_id_value(&object_id)?;
+            object_ids.insert(object_id);
+        }
     }
-    let unique = object_ids.into_iter().collect::<BTreeSet<_>>();
-    Ok(unique.into_iter().collect())
+    Ok(object_ids.into_iter().collect())
+}
+
+fn hydrate_remote_only_branch_objects_for_oram_publish<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+    secrets: &RepoSecrets,
+    object_ids: &mut Vec<String>,
+) -> Result<()> {
+    let remote_branch_refs = list_remote_branch_refs(remote, repo_root)?;
+    if remote_branch_refs.is_empty() {
+        return Ok(());
+    }
+
+    let mut unique = object_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let control_dir = repo_root.join(".e2v");
+    let remote_loose_object_ids = remote
+        .list_physical("objects/")?
+        .into_iter()
+        .filter_map(|relative_path| {
+            relative_path
+                .strip_prefix("objects/")
+                .and_then(|value| value.strip_suffix(".json"))
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+    let pack_locations =
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, secrets)?;
+    let validation_root = crate::fetch::RemoteValidationRoot {
+        path: crate::fetch::next_validation_root(repo_root)?,
+        cache_control_dir: Some(control_dir.clone()),
+    };
+    let mut pack_cache = BTreeMap::new();
+
+    for listed_ref in remote_branch_refs {
+        let control_plane =
+            crate::fetch::read_remote_control_plane(remote, listed_ref.stored.value.bytes.clone())?;
+        crate::fetch::write_remote_control_plane_to_validation_root(
+            &validation_root,
+            &control_plane,
+        )?;
+        let (branch_token, head_snapshot_id) =
+            sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)?;
+        if branch_token != listed_ref.token.value {
+            anyhow::bail!(
+                "remote ref token mismatch during ORAM publish: listed {}, decoded {}",
+                listed_ref.token.value,
+                branch_token
+            );
+        }
+        let Some(head_snapshot_id) = head_snapshot_id else {
+            continue;
+        };
+        let reachable = crate::fetch::collect_remote_reachable_object_ids(
+            remote,
+            &remote_loose_object_ids,
+            &pack_locations,
+            &validation_root,
+            secrets,
+            &mut pack_cache,
+            &head_snapshot_id,
+        )?;
+        for object_id in reachable {
+            validate_object_id_value(&object_id)?;
+            crate::fetch::fetch_remote_object_into_validation_root(
+                remote,
+                &remote_loose_object_ids,
+                &pack_locations,
+                &validation_root,
+                &mut pack_cache,
+                &object_id,
+            )?;
+            let target = repo_root
+                .join(".e2v")
+                .join("objects")
+                .join(format!("{object_id}.json"));
+            if !target.exists() {
+                let source = validation_root.object_path(&object_id);
+                let bytes = std::fs::read(&source).with_context(|| {
+                    format!(
+                        "failed to read hydrated remote object {} from {}",
+                        object_id,
+                        source.display()
+                    )
+                })?;
+                std::fs::write(&target, bytes)?;
+            }
+            if unique.insert(object_id.clone()) {
+                object_ids.push(object_id);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn policy_for_profile(profile: &str) -> LayoutSchedulePolicy {

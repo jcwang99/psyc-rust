@@ -1716,7 +1716,7 @@ fn capture_gc_fence_state<R: RemoteBackend>(remote: &R) -> Result<GcFenceState> 
     })
 }
 
-fn list_remote_branch_refs<R: RemoteBackend>(
+pub(crate) fn list_remote_branch_refs<R: RemoteBackend>(
     remote: &R,
     _repo_root: &std::path::Path,
 ) -> Result<Vec<e2v_store::ListedRef>> {

@@ -7229,6 +7229,192 @@ fn clone_remote_only_branch_succeeds_after_historical_rewrite_remote() {
 }
 
 #[test]
+fn clone_nondefault_branch_succeeds_after_remote_enables_oblivious_layout() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let feature_clone_root = temp.path().join("feature-clone");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "clone-oram-nondefault-main-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade.create_branch(&owner_root, "feature").unwrap();
+    let feature_state = facade.checkout_branch(&owner_root, "feature").unwrap();
+    fs::write(owner_root.join("feature.txt"), b"feature-only").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: feature_state.branch.token_hex.clone(),
+            operation_id: "clone-oram-nondefault-feature-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade.checkout_branch(&owner_root, "main").unwrap();
+    enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: owner_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+    for path in remote.list_physical("objects/").unwrap() {
+        remote.delete_physical(&path).unwrap();
+    }
+    remote.delete_physical("pack-index/root.json").unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: feature_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: feature_state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let opened = facade.open(&feature_clone_root).unwrap();
+    assert_eq!(opened.branch.token_hex, feature_state.branch.token_hex);
+    let branches = facade.list_branches(&feature_clone_root).unwrap();
+    let current = branches
+        .into_iter()
+        .find(|branch| branch.is_current)
+        .expect("current branch");
+    assert_eq!(current.name, "feature");
+}
+
+#[test]
+fn clone_remote_only_branch_succeeds_after_remote_enables_oblivious_layout() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let contributor_root = temp.path().join("contributor");
+    let feature_clone_root = temp.path().join("feature-clone");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "clone-oram-remote-only-main-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: contributor_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    facade.create_branch(&contributor_root, "feature").unwrap();
+    let contributor_feature = facade
+        .checkout_branch(&contributor_root, "feature")
+        .unwrap();
+    fs::write(contributor_root.join("feature.txt"), b"remote-only-feature").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: contributor_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: contributor_root.clone(),
+            branch_token: contributor_feature.branch.token_hex.clone(),
+            operation_id: "clone-oram-remote-only-feature-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: owner_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+    for path in remote.list_physical("objects/").unwrap() {
+        remote.delete_physical(&path).unwrap();
+    }
+    remote.delete_physical("pack-index/root.json").unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: feature_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: contributor_feature.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let opened = facade.open(&feature_clone_root).unwrap();
+    assert_eq!(
+        opened.branch.token_hex,
+        contributor_feature.branch.token_hex
+    );
+}
+
+#[test]
 fn fetch_prefers_remote_current_device_secrets_when_keyring_pointer_changes() {
     let temp = tempdir().unwrap();
     let owner_root = temp.path().join("owner");
