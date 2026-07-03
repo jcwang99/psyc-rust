@@ -757,6 +757,7 @@ pub(crate) fn cleanup_completed_operation_markers<R: RemoteBackend>(
     branch_token: &str,
 ) -> Result<()> {
     let intent_path = format!("transactions/active/{}.intent", operation_id.value);
+    let had_current_intent = remote.exists_physical(&intent_path);
     match remote.delete_physical(&intent_path) {
         Ok(()) => {}
         Err(error) if is_missing_physical_object_error(&error) => {}
@@ -766,12 +767,16 @@ pub(crate) fn cleanup_completed_operation_markers<R: RemoteBackend>(
     let lease_path = format!("leases/{branch_token}.lock");
     match remote.get_physical(&lease_path) {
         Ok(lease_bytes) => {
-            let lease_marker: serde_json::Value = serde_json::from_slice(&lease_bytes)?;
-            if lease_marker
-                .get("operation_id")
-                .and_then(|value| value.as_str())
-                == Some(operation_id.value.as_str())
-            {
+            let should_remove = match serde_json::from_slice::<serde_json::Value>(&lease_bytes) {
+                Ok(lease_marker) => {
+                    lease_marker
+                        .get("operation_id")
+                        .and_then(|value| value.as_str())
+                        == Some(operation_id.value.as_str())
+                }
+                Err(_) => had_current_intent,
+            };
+            if should_remove {
                 match remote.delete_physical(&lease_path) {
                     Ok(()) => {}
                     Err(error) if is_missing_physical_object_error(&error) => {}
@@ -1310,10 +1315,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PackedObjectLocation, PushOptions, publish_remote_keyring_pointer, push_head,
-        read_remote_current_keyring_bytes, remote_object_authenticates_for_repo,
-        remote_snapshot_graph_authenticates_for_repo, should_pack_small_objects,
-        upload_object_batch,
+        PackedObjectLocation, PushOptions, cleanup_completed_operation_markers,
+        publish_remote_keyring_pointer, push_head, read_remote_current_keyring_bytes,
+        remote_object_authenticates_for_repo, remote_snapshot_graph_authenticates_for_repo,
+        should_pack_small_objects, upload_object_batch,
     };
     use crate::journal::OperationId;
 
@@ -1444,6 +1449,43 @@ mod tests {
     fn default_small_object_pack_threshold_starts_at_100k() {
         assert!(!should_pack_small_objects(99_999));
         assert!(should_pack_small_objects(100_000));
+    }
+
+    #[test]
+    fn cleanup_completed_operation_markers_removes_corrupted_current_lease_marker() {
+        let remote = MemoryBackend::new();
+        let operation_id = OperationId::new("cleanup-corrupted-lease".to_string()).unwrap();
+        remote
+            .put_physical(
+                &format!("transactions/active/{}.intent", operation_id.value),
+                br#"{"stale":true}"#,
+            )
+            .unwrap();
+        remote
+            .put_physical("leases/branch-token.lock", br#"{"broken":true"#)
+            .unwrap();
+
+        cleanup_completed_operation_markers(&remote, &operation_id, "branch-token").unwrap();
+
+        assert!(!remote.exists_physical("leases/branch-token.lock"));
+        assert!(!remote.exists_physical(&format!(
+            "transactions/active/{}.intent",
+            operation_id.value
+        )));
+    }
+
+    #[test]
+    fn cleanup_completed_operation_markers_keeps_corrupted_lease_without_current_intent() {
+        let remote = MemoryBackend::new();
+        let operation_id =
+            OperationId::new("cleanup-corrupted-lease-no-intent".to_string()).unwrap();
+        remote
+            .put_physical("leases/branch-token.lock", br#"{"broken":true"#)
+            .unwrap();
+
+        cleanup_completed_operation_markers(&remote, &operation_id, "branch-token").unwrap();
+
+        assert!(remote.exists_physical("leases/branch-token.lock"));
     }
 
     #[test]
