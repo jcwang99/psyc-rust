@@ -174,7 +174,7 @@ fn overwrite_cached_pack_data_bytes(
 fn read_cached_pack_data_bytes(control_dir: &Path, container_id: &str) -> Result<Option<Vec<u8>>> {
     validate_cached_pack_relative_name(container_id)?;
     let cache_path = pack_data_cache_path(control_dir, container_id);
-    match std::fs::read(cache_path) {
+    match std::fs::read(&cache_path) {
         Ok(bytes) => {
             if cached_pack_data_hash_matches(control_dir, container_id, &bytes)? {
                 Ok(Some(bytes))
@@ -184,7 +184,10 @@ fn read_cached_pack_data_bytes(control_dir: &Path, container_id: &str) -> Result
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(_) => {
+            delete_cached_pack_data_bytes(control_dir, container_id)?;
+            Ok(None)
+        }
     }
 }
 
@@ -192,16 +195,8 @@ fn delete_cached_pack_data_bytes(control_dir: &Path, container_id: &str) -> Resu
     validate_cached_pack_relative_name(container_id)?;
     let cache_path = pack_data_cache_path(control_dir, container_id);
     let hash_path = pack_data_cache_hash_path(control_dir, container_id);
-    if let Err(error) = std::fs::remove_file(cache_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(error.into());
-    }
-    if let Err(error) = std::fs::remove_file(hash_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(error.into());
-    }
+    remove_path_if_exists(&cache_path)?;
+    remove_path_if_exists(&hash_path)?;
     Ok(())
 }
 
@@ -281,9 +276,8 @@ fn write_cached_pack_data_bytes(
 ) -> Result<()> {
     let cache_path = pack_data_cache_path(control_dir, container_id);
     let hash_path = pack_data_cache_hash_path(control_dir, container_id);
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    prepare_cache_file_path(&cache_path)?;
+    prepare_cache_file_path(&hash_path)?;
     atomic_write_bytes(cache_path, pack_bytes)?;
     atomic_write_bytes(hash_path, pack_data_hash(pack_bytes).as_bytes())
 }
@@ -299,14 +293,54 @@ fn atomic_write_bytes(path: std::path::PathBuf, bytes: &[u8]) -> Result<()> {
             .and_then(|ext| ext.to_str())
             .unwrap_or("tmp")
     ));
+    if let Some(parent) = path.parent() {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(&temp_path)?;
     std::fs::write(&temp_path, bytes)
         .map_err(anyhow::Error::from)
-        .and_then(|_| {
-            std::fs::rename(&temp_path, &path)
-                .map_err(anyhow::Error::from)
-                .map(|_| ())
+        .and_then(|_| match std::fs::rename(&temp_path, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::AlreadyExists => {
+                remove_path_if_exists(&path)?;
+                std::fs::rename(&temp_path, &path)
+                    .map_err(anyhow::Error::from)
+                    .map(|_| ())
+            }
+            Err(error) => Err(anyhow::Error::from(error)),
         })
         .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn ensure_directory_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && parent != path
+    {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)?;
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn prepare_cache_file_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_directory_path(parent)?;
+    }
+    remove_path_if_exists(path)
 }
 
 fn remove_empty_cache_dirs(root: &Path, current: &Path) -> Result<bool> {
@@ -329,4 +363,57 @@ fn remove_empty_cache_dirs(root: &Path, current: &Path) -> Result<bool> {
         return Ok(true);
     }
     Ok(is_empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn read_cached_pack_data_prunes_cache_path_conflicts() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path();
+        let container_id = "packs/data/op-00000000.bin";
+        let cache_path = pack_data_cache_path(control_dir, container_id);
+        let hash_path = pack_data_cache_hash_path(control_dir, container_id);
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&cache_path).unwrap();
+        std::fs::write(&hash_path, b"deadbeef").unwrap();
+
+        let cached = read_cached_pack_data_bytes(control_dir, container_id).unwrap();
+
+        assert!(cached.is_none());
+        assert!(
+            !cache_path.exists(),
+            "cache path conflict should be pruned after failed read: {cache_path:?}"
+        );
+        assert!(
+            !hash_path.exists(),
+            "cache hash should be pruned together with conflicting cache path: {hash_path:?}"
+        );
+    }
+
+    #[test]
+    fn write_cached_pack_data_heals_data_and_hash_path_conflicts() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path();
+        let container_id = "packs/data/op-00000000.bin";
+        let cache_path = pack_data_cache_path(control_dir, container_id);
+        let hash_path = pack_data_cache_hash_path(control_dir, container_id);
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&cache_path).unwrap();
+        std::fs::create_dir(&hash_path).unwrap();
+
+        write_cached_pack_data_bytes(control_dir, container_id, b"payload").unwrap();
+
+        assert!(cache_path.is_file());
+        assert_eq!(std::fs::read(&cache_path).unwrap(), b"payload");
+        assert!(hash_path.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&hash_path).unwrap().trim(),
+            pack_data_hash(b"payload")
+        );
+    }
 }
