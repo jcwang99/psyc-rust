@@ -2483,6 +2483,119 @@ fn force_accept_remote_rollback_rewrites_current_branch_mirror_to_remote_head() 
 }
 
 #[test]
+fn force_accept_remote_rollback_restores_other_remote_branch_mirrors() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let contributor_root = temp.path().join("contributor");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-rollback-all-refs-main".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: contributor_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    facade.create_branch(&contributor_root, "feature").unwrap();
+    let contributor_feature = facade
+        .checkout_branch(&contributor_root, "feature")
+        .unwrap();
+    fs::write(contributor_root.join("feature.txt"), b"remote-only-feature").unwrap();
+    let feature_snapshot = facade
+        .commit(CommitOptions {
+            repo_root: contributor_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: contributor_root.clone(),
+            branch_token: contributor_feature.branch.token_hex.clone(),
+            operation_id: "push-op-rollback-all-refs-feature".to_string(),
+        },
+    )
+    .unwrap();
+
+    fs::write(owner_root.join("base.txt"), b"local ahead").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "local-ahead".to_string(),
+        })
+        .unwrap();
+
+    let feature_branch_ref_path = owner_root
+        .join(".e2v")
+        .join("refs")
+        .join("branches")
+        .join(format!("{}.json", contributor_feature.branch.token_hex));
+    let original_feature_ref_bytes = fs::read(&feature_branch_ref_path).ok();
+    let _ = fs::remove_file(&feature_branch_ref_path);
+
+    force_accept_remote_rollback(
+        &remote,
+        RepairRemoteOptions {
+            repo_root: owner_root.clone(),
+        },
+        "correct horse battery staple",
+    )
+    .unwrap();
+
+    let branches = facade.list_branches(&owner_root).unwrap();
+    let restored_feature = branches
+        .into_iter()
+        .find(|branch| branch.token_hex == contributor_feature.branch.token_hex)
+        .expect("restored feature branch");
+    assert_eq!(
+        restored_feature.head_snapshot_id.as_deref(),
+        Some(feature_snapshot.snapshot_id.as_str())
+    );
+    assert!(
+        feature_branch_ref_path.is_file(),
+        "force-accept rollback should restore local mirrors for other remote branch refs"
+    );
+    if let Some(original_bytes) = original_feature_ref_bytes {
+        assert_ne!(
+            fs::read(&feature_branch_ref_path).unwrap(),
+            original_bytes,
+            "restored branch mirror should be rewritten from remote control-plane state"
+        );
+    }
+}
+
+#[test]
 fn force_accept_remote_rollback_can_reset_local_high_water_after_explicit_acceptance() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

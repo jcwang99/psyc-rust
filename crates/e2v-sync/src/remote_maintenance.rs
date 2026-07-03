@@ -938,6 +938,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     }
 
     rewrite_local_control_plane_from_remote(&control_dir, &control_plane)?;
+    restore_local_branch_mirrors_from_remote(remote, &options.repo_root)?;
     update_trusted_remote_state_from_control_plane(&default_ref, &control_plane)?;
     RepositoryFacade::new().unlock(&options.repo_root, password)?;
     RepositoryFacade::new().verify_ref(&options.repo_root)?;
@@ -1450,6 +1451,36 @@ fn rewrite_local_control_plane_from_remote(
         &control_plane.keyring_pointer_bytes,
     )?;
     e2v_core::clear_unlocked_keyring_cache(control_dir);
+    Ok(())
+}
+
+fn restore_local_branch_mirrors_from_remote<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<()> {
+    let control_dir = repo_root.join(".e2v");
+    let branch_dir = control_dir.join("refs").join("branches");
+    std::fs::create_dir_all(&branch_dir)?;
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+
+    for listed_ref in list_remote_branch_refs(remote, repo_root)? {
+        let plaintext = sync_support::decrypt_control_record_for_sync(
+            &secrets,
+            "default",
+            "ref",
+            &listed_ref.stored.value.bytes,
+        )?;
+        let local_branch_ref_bytes = sync_support::encrypt_control_record_for_sync(
+            &secrets,
+            &format!("branch-ref:{}", listed_ref.token.value),
+            "ref",
+            &plaintext,
+        )?;
+        overwrite_local_object_bytes(
+            &branch_dir.join(format!("{}.json", listed_ref.token.value)),
+            &local_branch_ref_bytes,
+        )?;
+    }
     Ok(())
 }
 
