@@ -83,6 +83,7 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
     };
     let root = decode_pack_index_root_bytes(&root_bytes, secrets)?;
     validate_pack_index_root(&root)?;
+    prune_stale_cached_segments(&cache_dir, &root.segments)?;
 
     let mut locations = BTreeMap::new();
     append_remote_pack_locations_from_segment_paths(
@@ -105,6 +106,7 @@ pub(crate) fn load_remote_pack_locations_from_segment_paths_with_local_cache<B: 
 ) -> Result<BTreeMap<String, PackedObjectLocation>> {
     let cache_dir = pack_index_cache_dir(control_dir);
     std::fs::create_dir_all(segment_cache_dir(control_dir))?;
+    prune_stale_cached_segments(&cache_dir, segment_paths)?;
 
     let mut locations = BTreeMap::new();
     append_remote_pack_locations_from_segment_paths(
@@ -258,6 +260,26 @@ fn cached_segment_path(cache_dir: &Path, segment_path: &str) -> PathBuf {
     cache_dir
         .join("segments")
         .join(segment_path.replace('/', "__"))
+}
+
+fn prune_stale_cached_segments(cache_dir: &Path, live_segment_paths: &[String]) -> Result<()> {
+    let segment_dir = cache_dir.join("segments");
+    if !segment_dir.is_dir() {
+        return Ok(());
+    }
+
+    let live_paths = live_segment_paths
+        .iter()
+        .map(|segment_path| cached_segment_path(cache_dir, segment_path))
+        .collect::<std::collections::BTreeSet<_>>();
+    for entry in std::fs::read_dir(&segment_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file() && !live_paths.contains(&path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 fn append_remote_pack_locations_from_segment_paths<B: BlobStore>(
@@ -934,6 +956,74 @@ mod tests {
                 .unwrap();
         assert!(refreshed.contains_key("abc"));
         assert_eq!(std::fs::read(cache_path).unwrap(), segment_bytes);
+    }
+
+    #[test]
+    fn stale_cached_pack_index_segments_are_pruned_when_root_changes() {
+        let (_temp, control_dir, secrets) = seeded_control_dir();
+        let remote = MemoryBackend::new();
+
+        let (index_one, payload_one) =
+            build_pack("op-1", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
+        remote.put_physical(&index_one.data_path, &payload_one).unwrap();
+        let segment_one = "packs/index/op-1-00000000.json";
+        remote
+            .put_physical(
+                segment_one,
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    segment_one,
+                    &serde_json::to_vec(&index_one).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec![segment_one.to_string()],
+        )
+        .unwrap();
+        load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets)).unwrap();
+        let stale_cache_path = cached_segment_path(&pack_index_cache_dir(&control_dir), segment_one);
+        assert!(stale_cache_path.is_file());
+
+        let (index_two, payload_two) =
+            build_pack("op-2", 0, &[("def".to_string(), b"world".to_vec())]).unwrap();
+        remote.put_physical(&index_two.data_path, &payload_two).unwrap();
+        let segment_two = "packs/index/op-2-00000000.json";
+        remote
+            .put_physical(
+                segment_two,
+                &encode_pack_index_segment_bytes(
+                    &secrets,
+                    segment_two,
+                    &serde_json::to_vec(&index_two).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            2,
+            vec![segment_two.to_string()],
+        )
+        .unwrap();
+
+        let refreshed =
+            load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
+                .unwrap();
+
+        assert!(refreshed.contains_key("def"));
+        assert!(!refreshed.contains_key("abc"));
+        assert!(
+            !stale_cache_path.exists(),
+            "pack-index cache should prune segment files that are no longer referenced by the current root"
+        );
     }
 
     #[test]
