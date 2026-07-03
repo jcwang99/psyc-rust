@@ -115,6 +115,21 @@ fn sync_exposes_a_single_doc_hidden_probe_surface() {
 }
 
 #[test]
+fn sync_testing_surface_does_not_keep_redundant_cached_pack_ref_probe() {
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub fn load_cached_pack_physical_ref_for_object_id("),
+        "e2v-sync::testing should not keep a redundant cached pack physical-ref probe once e2v-core::sync_support already owns that helper"
+    );
+}
+
+#[test]
 fn sync_root_does_not_reexport_internal_transaction_publisher_types() {
     let source = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

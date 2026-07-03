@@ -6,7 +6,7 @@ use e2v_core::sync_support::{
     decrypt_control_record_for_sync, encrypt_control_record_for_sync,
     open_or_unlock_repo_secrets_for_sync,
 };
-use e2v_store::{BlobStore, PhysicalObjectRef, RepoSecrets, is_missing_physical_object_error};
+use e2v_store::{BlobStore, RepoSecrets, is_missing_physical_object_error};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -195,16 +195,6 @@ pub fn load_remote_operation_pack_locations_with_secrets<B: BlobStore>(
         batch_index += 1;
     }
     Ok(locations)
-}
-
-pub fn load_cached_pack_physical_ref_for_object_id(
-    control_dir: &Path,
-    object_id: &str,
-) -> Result<PhysicalObjectRef> {
-    let repo_root = control_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("control_dir has no parent repository root"))?;
-    e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(repo_root, object_id)
 }
 
 #[doc(hidden)]
@@ -935,8 +925,10 @@ mod tests {
         load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets)).unwrap();
         remote.delete_physical(segment_path).unwrap();
 
+        let repo_root = control_dir.parent().unwrap();
         let physical_ref =
-            load_cached_pack_physical_ref_for_object_id(&control_dir, "abc").unwrap();
+            e2v_core::sync_support::load_cached_pack_physical_ref_for_object_id(repo_root, "abc")
+                .unwrap();
 
         assert_eq!(physical_ref.layout_id, "pack");
         assert_eq!(physical_ref.container_id, "packs/data/op-00000000.bin");

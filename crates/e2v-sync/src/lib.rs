@@ -95,13 +95,6 @@ pub mod testing {
         )
     }
 
-    pub fn load_cached_pack_physical_ref_for_object_id(
-        control_dir: &Path,
-        object_id: &str,
-    ) -> Result<e2v_store::PhysicalObjectRef> {
-        crate::pack_index::load_cached_pack_physical_ref_for_object_id(control_dir, object_id)
-    }
-
     pub fn override_trusted_state_dir_for_test(
         path: PathBuf,
     ) -> crate::trusted_state::TrustedStateDirGuard {
