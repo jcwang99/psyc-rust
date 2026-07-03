@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -38,16 +38,6 @@ pub fn search_metadata(
     head_snapshot_id: Option<&str>,
     query: &MetadataSearchQuery,
 ) -> Result<Vec<MetadataSearchResult>> {
-    let db_path = repo_root.join(INDEX_DB_FILE);
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create index directory {}", parent.display()))?;
-    }
-    let connection = Connection::open(&db_path)
-        .with_context(|| format!("failed to open index database {}", db_path.display()))?;
-    bootstrap(&connection)?;
-    rebuild_if_needed(&connection, repo_root, branch_token_hex, head_snapshot_id)?;
-
     let extension = query
         .extension
         .as_ref()
@@ -59,27 +49,37 @@ pub fn search_metadata(
     let min_size = query.min_size.map(i64::try_from).transpose()?;
     let max_size = query.max_size.map(i64::try_from).transpose()?;
 
-    let mut statement = connection.prepare(
-        "SELECT path, extension, size_bytes, modified_unix_ms, file_object_id
-         FROM current_files
-         WHERE (?1 IS NULL OR extension = ?1)
-           AND (?2 IS NULL OR path = ?2 OR path LIKE (?2 || '/%'))
-           AND (?3 IS NULL OR size_bytes >= ?3)
-           AND (?4 IS NULL OR size_bytes <= ?4)
-         ORDER BY path ASC",
-    )?;
-    let rows = statement.query_map(params![extension, path_prefix, min_size, max_size], |row| {
-        Ok(MetadataSearchResult {
-            path: row.get(0)?,
-            extension: row.get(1)?,
-            size_bytes: row.get::<_, u64>(2)?,
-            modified_unix_ms: row.get::<_, u64>(3)?,
-            file_object_id: row.get(4)?,
-        })
-    })?;
+    with_local_index_connection(
+        repo_root,
+        branch_token_hex,
+        head_snapshot_id,
+        |connection| {
+            let mut statement = connection.prepare(
+                "SELECT path, extension, size_bytes, modified_unix_ms, file_object_id
+             FROM current_files
+             WHERE (?1 IS NULL OR extension = ?1)
+               AND (?2 IS NULL OR path = ?2 OR path LIKE (?2 || '/%'))
+               AND (?3 IS NULL OR size_bytes >= ?3)
+               AND (?4 IS NULL OR size_bytes <= ?4)
+             ORDER BY path ASC",
+            )?;
+            let rows = statement.query_map(
+                params![extension, path_prefix, min_size, max_size],
+                |row| {
+                    Ok(MetadataSearchResult {
+                        path: row.get(0)?,
+                        extension: row.get(1)?,
+                        size_bytes: row.get::<_, u64>(2)?,
+                        modified_unix_ms: row.get::<_, u64>(3)?,
+                        file_object_id: row.get(4)?,
+                    })
+                },
+            )?;
 
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(anyhow::Error::from)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(anyhow::Error::from)
+        },
+    )
 }
 
 pub fn search_filenames(
@@ -88,37 +88,106 @@ pub fn search_filenames(
     head_snapshot_id: Option<&str>,
     query_text: &str,
 ) -> Result<Vec<FilenameSearchResult>> {
-    let db_path = repo_root.join(INDEX_DB_FILE);
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create index directory {}", parent.display()))?;
-    }
-    let connection = Connection::open(&db_path)
-        .with_context(|| format!("failed to open index database {}", db_path.display()))?;
-    bootstrap(&connection)?;
-    rebuild_if_needed(&connection, repo_root, branch_token_hex, head_snapshot_id)?;
-
     let query_text = query_text.trim();
     if query_text.is_empty() {
         return Ok(Vec::new());
     }
     let needle = query_text.to_lowercase();
-    let mut statement = connection.prepare(
-        "SELECT path, file_name, file_object_id
-         FROM filename_fts
-         WHERE filename_fts MATCH ?1
-         ORDER BY path ASC",
-    )?;
-    let rows = statement.query_map([format!("{needle}*")], |row| {
-        Ok(FilenameSearchResult {
-            path: row.get(0)?,
-            file_name: row.get(1)?,
-            file_object_id: row.get(2)?,
-        })
-    })?;
+    with_local_index_connection(
+        repo_root,
+        branch_token_hex,
+        head_snapshot_id,
+        |connection| {
+            let mut statement = connection.prepare(
+                "SELECT path, file_name, file_object_id
+             FROM filename_fts
+             WHERE filename_fts MATCH ?1
+             ORDER BY path ASC",
+            )?;
+            let rows = statement.query_map([format!("{needle}*")], |row| {
+                Ok(FilenameSearchResult {
+                    path: row.get(0)?,
+                    file_name: row.get(1)?,
+                    file_object_id: row.get(2)?,
+                })
+            })?;
 
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(anyhow::Error::from)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(anyhow::Error::from)
+        },
+    )
+}
+
+fn with_local_index_connection<T>(
+    repo_root: &Path,
+    branch_token_hex: &str,
+    head_snapshot_id: Option<&str>,
+    operation: impl Fn(&Connection) -> Result<T>,
+) -> Result<T> {
+    let db_path = repo_root.join(INDEX_DB_FILE);
+    let mut reset_attempted = false;
+    loop {
+        let outcome = open_index_connection(&db_path).and_then(|connection| {
+            bootstrap(&connection)?;
+            rebuild_if_needed(&connection, repo_root, branch_token_hex, head_snapshot_id)?;
+            operation(&connection)
+        });
+        match outcome {
+            Ok(value) => return Ok(value),
+            Err(error) if !reset_attempted && is_recoverable_local_index_error(&error) => {
+                reset_attempted = true;
+                reset_index_database(&db_path)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn open_index_connection(db_path: &Path) -> Result<Connection> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create index directory {}", parent.display()))?;
+    }
+    Connection::open(db_path)
+        .with_context(|| format!("failed to open index database {}", db_path.display()))
+}
+
+fn is_recoverable_local_index_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(sql_error, _))
+                if matches!(
+                    sql_error.code,
+                    rusqlite::ffi::ErrorCode::CannotOpen
+                        | rusqlite::ffi::ErrorCode::DatabaseCorrupt
+                        | rusqlite::ffi::ErrorCode::NotADatabase
+                )
+        )
+    })
+}
+
+fn reset_index_database(db_path: &Path) -> Result<()> {
+    remove_path_if_exists(db_path)?;
+    remove_path_if_exists(&sqlite_sidecar_path(db_path, "-wal"))?;
+    remove_path_if_exists(&sqlite_sidecar_path(db_path, "-shm"))?;
+    Ok(())
+}
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os_string = db_path.as_os_str().to_os_string();
+    os_string.push(suffix);
+    PathBuf::from(os_string)
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn bootstrap(connection: &Connection) -> Result<()> {

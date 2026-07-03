@@ -5108,6 +5108,85 @@ fn metadata_search_refresh_preserves_unchanged_index_rows_across_head_updates() 
 }
 
 #[test]
+fn metadata_search_rebuilds_corrupted_local_index_database() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("stable.txt"), "stable").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let first = facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: None,
+                path_prefix: None,
+                min_size: None,
+                max_size: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(first.len(), 1);
+
+    let index_db = repo_root.join(".e2v").join("index.sqlite3");
+    fs::write(&index_db, b"not-a-sqlite-database").unwrap();
+
+    let rebuilt = facade
+        .search_metadata(
+            &repo_root,
+            e2v_core::MetadataSearchQuery {
+                extension: None,
+                path_prefix: None,
+                min_size: None,
+                max_size: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].path, "stable.txt");
+    assert_ne!(fs::read(&index_db).unwrap(), b"not-a-sqlite-database");
+}
+
+#[test]
+fn filename_search_rebuilds_local_index_when_index_path_is_a_directory() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+    fs::write(repo_root.join("alpha-notes.txt"), "alpha").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let first = facade.search_filenames(&repo_root, "notes").unwrap();
+    assert_eq!(first.len(), 1);
+
+    let index_db = repo_root.join(".e2v").join("index.sqlite3");
+    fs::remove_file(&index_db).unwrap();
+    fs::create_dir(&index_db).unwrap();
+
+    let rebuilt = facade.search_filenames(&repo_root, "notes").unwrap();
+
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].path, "alpha-notes.txt");
+    assert!(index_db.is_file());
+}
+
+#[test]
 fn metadata_and_filename_search_return_empty_results_for_uncommitted_repository() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
