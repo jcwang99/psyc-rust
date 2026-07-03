@@ -1051,9 +1051,12 @@ mod tests {
             build_pack("op", 0, &[("abc".to_string(), b"hello".to_vec())]).unwrap();
         remote.put_physical(&index.data_path, &payload).unwrap();
         let segment_path = "packs/index/op-00000000.json";
-        let segment_bytes =
-            encode_pack_index_segment_bytes(&secrets, segment_path, &serde_json::to_vec(&index).unwrap())
-                .unwrap();
+        let segment_bytes = encode_pack_index_segment_bytes(
+            &secrets,
+            segment_path,
+            &serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
         remote.put_physical(segment_path, &segment_bytes).unwrap();
         publish_pack_index_root(
             &remote,
@@ -1084,12 +1087,18 @@ mod tests {
         );
 
         std::fs::write(&root_cache_path, &original_root_bytes).unwrap();
-        let unchanged_before = std::fs::metadata(&root_cache_path).unwrap().modified().unwrap();
+        let unchanged_before = std::fs::metadata(&root_cache_path)
+            .unwrap()
+            .modified()
+            .unwrap();
         let third =
             load_remote_pack_locations_with_local_cache(&remote, &control_dir, Some(&secrets))
                 .unwrap();
         assert!(third.contains_key("abc"));
-        let unchanged_after = std::fs::metadata(&root_cache_path).unwrap().modified().unwrap();
+        let unchanged_after = std::fs::metadata(&root_cache_path)
+            .unwrap()
+            .modified()
+            .unwrap();
         assert_eq!(
             unchanged_after, unchanged_before,
             "pack-index loader should avoid rewriting an unchanged cached root file"
