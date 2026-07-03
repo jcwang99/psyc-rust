@@ -525,6 +525,7 @@ fn local_keyring_is_newer_than_remote(
     control_dir: &Path,
     control_plane: &RemoteControlPlane,
 ) -> Result<bool> {
+    let has_local_objects = local_objects_dir_has_entries(control_dir)?;
     let local_pointer_path = control_dir.join("keyring").join("keyring.current");
     if !local_pointer_path.is_file() {
         return Ok(false);
@@ -538,11 +539,21 @@ fn local_keyring_is_newer_than_remote(
     let local_keyring_path = control_dir.join("keyring").join(&local_pointer.current);
     let local_keyring_bytes = match std::fs::read(&local_keyring_path) {
         Ok(bytes) => bytes,
-        Err(_) => return Ok(false),
+        Err(error) if !has_local_objects && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", local_keyring_path.display()));
+        }
     };
     let _local_keyring: KeyringStateSummary = match serde_json::from_slice(&local_keyring_bytes) {
         Ok(keyring) => keyring,
-        Err(_) => return Ok(false),
+        Err(error) if !has_local_objects => {
+            let _ = error;
+            return Ok(false);
+        }
+        Err(error) => return Err(error).context("failed to decode local keyring state"),
     };
     if e2v_core::sync_support::open_repo_secrets_for_sync(control_dir).is_err()
         && e2v_core::sync_support::unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
@@ -1709,5 +1720,120 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(recorder.seen, expected);
+    }
+
+    #[test]
+    fn newer_local_keyring_path_conflict_is_not_treated_as_safe_remote_overwrite() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-newer-local-keyring-conflict".to_string(),
+            },
+        )
+        .unwrap();
+
+        let default_ref = remote
+            .read_ref(&e2v_store::RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .unwrap();
+        let control_plane =
+            read_remote_control_plane(&remote, default_ref.value.bytes.clone()).unwrap();
+        let control_dir = repo_root.join(".e2v");
+        let keyring_dir = control_dir.join("keyring");
+
+        fs::write(
+            keyring_dir.join("keyring.current"),
+            br#"{"generation":2,"current":"keyring.2"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(keyring_dir.join("keyring.2")).unwrap();
+
+        let error = local_keyring_is_newer_than_remote(&control_dir, &control_plane).unwrap_err();
+
+        assert!(
+            error.to_string().contains("failed to read") || error.to_string().contains("keyring.2"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn newer_local_keyring_missing_generation_can_still_be_repaired_for_empty_repository() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-newer-local-keyring-missing".to_string(),
+            },
+        )
+        .unwrap();
+
+        let default_ref = remote
+            .read_ref(&e2v_store::RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .unwrap();
+        let control_plane =
+            read_remote_control_plane(&remote, default_ref.value.bytes.clone()).unwrap();
+        let control_dir = repo_root.join(".e2v");
+        let keyring_dir = control_dir.join("keyring");
+        for entry in fs::read_dir(control_dir.join("objects")).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+
+        fs::write(
+            keyring_dir.join("keyring.current"),
+            br#"{"generation":2,"current":"missing.json"}"#,
+        )
+        .unwrap();
+
+        let preserve = local_keyring_is_newer_than_remote(&control_dir, &control_plane).unwrap();
+
+        assert!(!preserve);
     }
 }

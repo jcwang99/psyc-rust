@@ -1436,6 +1436,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("failed to decode local keyring state for pointer ref")
         || lower.contains("failed to decode current keyring pointer")
         || lower.contains("failed to decode current keyring state")
+        || lower.contains("failed to read ") && normalized.contains("/.e2v/keyring/keyring.")
         || lower.contains("failed to read ")
             && normalized.contains("/.e2v/layout_root.json")
             && !lower.contains("not found")
@@ -1687,6 +1688,15 @@ mod tests {
     #[test]
     fn map_error_treats_unreadable_local_layout_root_file_as_corrupt_state() {
         let error = anyhow::anyhow!("failed to read C:\\repo\\.e2v\\layout_root.json");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_treats_unreadable_local_keyring_generation_file_as_corrupt_state() {
+        let error = anyhow::anyhow!("failed to read C:\\repo\\.e2v\\keyring\\keyring.2");
 
         let mapped = map_error(error);
 
