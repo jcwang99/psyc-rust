@@ -12,12 +12,18 @@ pub trait RemoteBackend: BlobStore + RefStore + LayoutRootStore + Send + Sync {
     fn capability(&self) -> &BackendCapability;
 }
 
-static OPENDAL_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+static OPENDAL_RUNTIME: LazyLock<Result<tokio::runtime::Runtime>> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("failed to build opendal runtime")
+        .map_err(|error| anyhow::anyhow!(error).context("failed to build opendal runtime"))
 });
+
+fn opendal_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    OPENDAL_RUNTIME
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
 
 #[derive(Clone)]
 pub struct OpendalMemoryBackend {
@@ -27,7 +33,7 @@ pub struct OpendalMemoryBackend {
 
 impl OpendalMemoryBackend {
     pub fn new() -> Result<Self> {
-        let _guard = OPENDAL_RUNTIME.enter();
+        let _guard = opendal_runtime()?.enter();
         Ok(Self::from_operator(opendal::blocking::Operator::new(
             opendal::Operator::new(opendal::services::Memory::default())?.finish(),
         )?))
@@ -121,7 +127,7 @@ impl OpendalS3Backend {
         );
         anyhow::ensure!(!config.root.trim().is_empty(), "s3 root must not be empty");
 
-        let _guard = OPENDAL_RUNTIME.enter();
+        let _guard = opendal_runtime()?.enter();
         let mut builder = opendal::services::S3::default()
             .endpoint(&config.endpoint)
             .bucket(&config.bucket)
@@ -176,7 +182,7 @@ impl OpendalWebdavBackend {
             "webdav root must not be empty"
         );
 
-        let _guard = OPENDAL_RUNTIME.enter();
+        let _guard = opendal_runtime()?.enter();
         let mut builder = opendal::services::Webdav::default()
             .endpoint(&config.endpoint)
             .root(&config.root)
@@ -1211,19 +1217,19 @@ mod tests {
         assert!(!backend.exists_physical("objects/a.bin"));
     }
 
-    fn shared_memory_operator() -> opendal::blocking::Operator {
-        let _guard = OPENDAL_RUNTIME.enter();
+    fn shared_memory_operator() -> Result<opendal::blocking::Operator> {
+        let _guard = opendal_runtime()?.enter();
         opendal::blocking::Operator::new(
             opendal::Operator::new(opendal::services::Memory::default())
                 .unwrap()
                 .finish(),
         )
-        .unwrap()
+        .map_err(Into::into)
     }
 
     #[test]
     fn independent_opendal_backends_share_ref_and_layout_state() {
-        let operator = shared_memory_operator();
+        let operator = shared_memory_operator().unwrap();
         let writer = OpendalMemoryBackend::from_operator(operator.clone());
         let reader = OpendalMemoryBackend::from_operator(operator);
         let token = RefToken::new("branch-token".to_string());
@@ -1409,7 +1415,7 @@ mod tests {
     #[test]
     fn opendal_memory_backend_range_reads_use_backend_ranges_instead_of_full_object_reads() {
         let service = RangeRecordingService::new((0u8..=15).collect());
-        let _guard = OPENDAL_RUNTIME.enter();
+        let _guard = opendal_runtime().unwrap().enter();
         let operator =
             opendal::blocking::Operator::new(Operator::from_inner(Arc::new(service.clone())))
                 .unwrap();

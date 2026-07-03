@@ -159,6 +159,23 @@ fn store_ref_and_layout_root_records_do_not_spend_bytes_on_pretty_json_whitespac
 }
 
 #[test]
+fn opendal_store_runtime_initialization_does_not_expect_success() {
+    let opendal_source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("e2v-store")
+            .join("src")
+            .join("opendal_backend.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !opendal_source.contains(".expect(\"failed to build opendal runtime\")"),
+        "opendal backend should surface runtime initialization failures as errors instead of panicking"
+    );
+}
+
+#[test]
 fn parse_remote_spec_decodes_webdav_url_into_remote_config() {
     let spec = e2v_sync::RemoteSpec::parse("webdav+https://alice:secret@example.com/repo").unwrap();
 
