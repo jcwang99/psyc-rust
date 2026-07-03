@@ -54,12 +54,7 @@ impl OpendalMemoryBackend {
     }
 
     fn default_layout_root() -> LayoutRoot {
-        LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
-            generation: 1,
-            mapping_policy: "loose".to_string(),
-        }
+        LayoutRoot::direct_default()
     }
 
     fn ref_path(token: &RefToken) -> String {
@@ -1241,10 +1236,8 @@ mod tests {
         assert_eq!(reader.read_ref(&token).unwrap().unwrap().value, next_ref);
 
         let next_layout = LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
             generation: 2,
-            mapping_policy: "loose".to_string(),
+            ..LayoutRoot::direct_default()
         };
         let layout_result = writer
             .compare_and_swap_layout_root(1, next_layout.clone())

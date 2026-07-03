@@ -30,12 +30,7 @@ impl Default for MemoryBackend {
 
 impl MemoryBackend {
     fn default_layout_root() -> LayoutRoot {
-        LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
-            generation: 1,
-            mapping_policy: "loose".to_string(),
-        }
+        LayoutRoot::direct_default()
     }
 
     fn layout_history_path(generation: u64) -> String {
@@ -325,10 +320,8 @@ mod tests {
             .compare_and_swap_layout_root(
                 99,
                 LayoutRoot {
-                    schema_version: 1,
-                    layout_id: "direct".to_string(),
                     generation: 2,
-                    mapping_policy: "loose".to_string(),
+                    ..LayoutRoot::direct_default()
                 },
             )
             .unwrap();
@@ -420,10 +413,8 @@ mod tests {
     fn compare_and_swap_layout_root_materializes_physical_layout_root_file() {
         let backend = MemoryBackend::new();
         let next = LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
             generation: 2,
-            mapping_policy: "loose".to_string(),
+            ..LayoutRoot::direct_default()
         };
 
         let result = backend
@@ -441,10 +432,8 @@ mod tests {
     fn compare_and_swap_layout_root_materializes_physical_layout_root_history_file() {
         let backend = MemoryBackend::new();
         let next = LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
             generation: 2,
-            mapping_policy: "loose".to_string(),
+            ..LayoutRoot::direct_default()
         };
 
         let result = backend
@@ -464,10 +453,8 @@ mod tests {
     fn read_layout_root_uses_physical_layout_root_bytes_when_present() {
         let backend = MemoryBackend::new();
         let physical = LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
             generation: 7,
-            mapping_policy: "loose".to_string(),
+            ..LayoutRoot::direct_default()
         };
         backend
             .put_physical("layout_root.json", &serde_json::to_vec(&physical).unwrap())
@@ -480,16 +467,12 @@ mod tests {
     fn list_retained_layout_roots_uses_physical_history_when_present() {
         let backend = MemoryBackend::new();
         let generation_two = LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
             generation: 2,
-            mapping_policy: "loose".to_string(),
+            ..LayoutRoot::direct_default()
         };
         let generation_three = LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
             generation: 3,
-            mapping_policy: "loose".to_string(),
+            ..LayoutRoot::direct_default()
         };
         backend
             .put_physical(
@@ -515,10 +498,8 @@ mod tests {
      {
         let backend = MemoryBackend::new();
         let physical = LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
             generation: 7,
-            mapping_policy: "loose".to_string(),
+            ..LayoutRoot::direct_default()
         };
         backend
             .put_physical("layout_root.json", &serde_json::to_vec(&physical).unwrap())

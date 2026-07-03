@@ -9,7 +9,9 @@ mod ref_store;
 mod storage_layout;
 
 pub use capability::{BackendCapability, ConsistencyClass, WriterMode};
-pub use layout::LayoutRoot;
+pub use layout::{
+    DedupMode, LayoutCostPolicy, LayoutMode, LayoutRoot, LayoutSchedulePolicy, LayoutTrafficPolicy,
+};
 pub use layout_root_store::{LayoutRootStore, LayoutRootVersion};
 #[doc(hidden)]
 pub use local_backend::is_missing_physical_object_error;
@@ -29,7 +31,9 @@ pub use ref_store::{
     validate_ref_token_value,
 };
 pub use storage_layout::{
-    DirectStorageLayout, LayoutObjectLocation, PackStorageLayout, StorageLayout,
+    DirectStorageLayout, LayoutObjectLocation, LogicalReadRequest, LogicalResponseWindow,
+    PackStorageLayout, PhysicalReadKind, PhysicalReadOp, ReadPlan, StorageLayout,
+    TrafficExecutionHint,
 };
 
 #[doc(hidden)]

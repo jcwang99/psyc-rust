@@ -121,12 +121,7 @@ impl LocalFolderBackend {
     }
 
     fn default_layout_root() -> LayoutRoot {
-        LayoutRoot {
-            schema_version: 1,
-            layout_id: "direct".to_string(),
-            generation: 1,
-            mapping_policy: "loose".to_string(),
-        }
+        LayoutRoot::direct_default()
     }
 
     fn layout_history_path(generation: u64) -> String {
