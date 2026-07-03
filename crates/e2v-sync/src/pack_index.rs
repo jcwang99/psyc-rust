@@ -64,10 +64,15 @@ pub fn publish_pack_index_root<B: BlobStore>(
         generation: layout_generation,
         segments: compacted_segment_paths,
     };
-    remote.put_physical(
-        PACK_INDEX_ROOT_PATH,
-        &encode_pack_index_root_bytes(secrets, &root)?,
-    )
+    let root_bytes = encode_pack_index_root_bytes(secrets, &root)?;
+    if remote
+        .get_physical(PACK_INDEX_ROOT_PATH)
+        .map(|existing| existing == root_bytes)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    remote.put_physical(PACK_INDEX_ROOT_PATH, &root_bytes)
 }
 
 pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
@@ -589,6 +594,25 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct PackIndexRootWriteCountingBackend {
+        inner: MemoryBackend,
+        root_put_calls: Arc<Mutex<usize>>,
+    }
+
+    impl PackIndexRootWriteCountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                root_put_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn root_put_call_count(&self) -> usize {
+            *self.root_put_calls.lock().unwrap()
+        }
+    }
+
     impl BlobStore for RootProbeBackend {
         fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
             self.inner.put_physical(relative_path, bytes)
@@ -622,6 +646,48 @@ mod tests {
             if relative_path == PACK_INDEX_ROOT_PATH {
                 *self.root_exists_calls.lock().unwrap() += 1;
             }
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl BlobStore for PackIndexRootWriteCountingBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            if relative_path == PACK_INDEX_ROOT_PATH {
+                *self.root_put_calls.lock().unwrap() += 1;
+            }
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
             self.inner.exists_physical(relative_path)
         }
 
@@ -1211,6 +1277,55 @@ mod tests {
             root.segments
                 .iter()
                 .any(|path| path.starts_with(PACK_INDEX_COMPACTED_SEGMENT_PREFIX))
+        );
+    }
+
+    #[test]
+    fn unchanged_pack_index_root_is_not_rewritten_remotely() {
+        let (_temp, _control_dir, secrets) = seeded_control_dir();
+        let remote = PackIndexRootWriteCountingBackend::new();
+        let segment_paths = vec!["packs/index/op-00000000.json".to_string()];
+
+        publish_pack_index_root(&remote, &secrets, "direct", 1, segment_paths.clone()).unwrap();
+        assert_eq!(remote.root_put_call_count(), 1);
+
+        publish_pack_index_root(&remote, &secrets, "direct", 1, segment_paths).unwrap();
+
+        assert_eq!(
+            remote.root_put_call_count(),
+            1,
+            "publishing an unchanged pack-index root should not overwrite pack-index/root.json again"
+        );
+    }
+
+    #[test]
+    fn changed_pack_index_root_is_still_rewritten_remotely() {
+        let (_temp, _control_dir, secrets) = seeded_control_dir();
+        let remote = PackIndexRootWriteCountingBackend::new();
+
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            1,
+            vec!["packs/index/op-00000000.json".to_string()],
+        )
+        .unwrap();
+        assert_eq!(remote.root_put_call_count(), 1);
+
+        publish_pack_index_root(
+            &remote,
+            &secrets,
+            "direct",
+            2,
+            vec!["packs/index/op-00000001.json".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote.root_put_call_count(),
+            2,
+            "publishing a changed pack-index root should still rewrite pack-index/root.json"
         );
     }
 

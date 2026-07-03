@@ -623,7 +623,11 @@ pub(crate) fn upload_remote_keyring_generations<R: RemoteBackend>(
             continue;
         }
         let bytes = std::fs::read(keyring_file)?;
-        remote.put_physical(&format!("control/keyring/{file_name}"), &bytes)?;
+        let relative_path = format!("control/keyring/{file_name}");
+        if remote_physical_matches(remote, &relative_path, &bytes) {
+            continue;
+        }
+        remote.put_physical(&relative_path, &bytes)?;
     }
     Ok(())
 }

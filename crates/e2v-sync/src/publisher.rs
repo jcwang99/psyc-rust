@@ -235,10 +235,6 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
                 result.applied,
                 "layout root publish failed: generation changed before publish"
             );
-            if let Some(bytes) = &session.next_layout_root_bytes {
-                self.remote_backend
-                    .put_physical("layout_root.json", bytes)?;
-            }
             Ok(next_layout_root.generation)
         } else {
             Ok(self.remote_backend.read_layout_root()?.generation)
@@ -327,6 +323,126 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct LayoutRootWriteCountingBackend {
+        inner: e2v_store::MemoryBackend,
+        layout_root_puts: Arc<Mutex<usize>>,
+    }
+
+    impl LayoutRootWriteCountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: e2v_store::MemoryBackend::new(),
+                layout_root_puts: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn layout_root_put_count(&self) -> usize {
+            *self.layout_root_puts.lock().unwrap()
+        }
+    }
+
+    impl BlobStore for LayoutRootWriteCountingBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            if relative_path == "layout_root.json" {
+                *self.layout_root_puts.lock().unwrap() += 1;
+            }
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<e2v_store::ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl RefStore for LayoutRootWriteCountingBackend {
+        fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+            self.inner.read_ref(token)
+        }
+
+        fn list_refs(&self) -> Result<Vec<ListedRef>> {
+            self.inner.list_refs()
+        }
+
+        fn compare_and_swap_ref(
+            &self,
+            token: &RefToken,
+            expected: Option<RefVersion>,
+            next: EncryptedRef,
+        ) -> Result<CasResult> {
+            self.inner.compare_and_swap_ref(token, expected, next)
+        }
+    }
+
+    impl LayoutRootStore for LayoutRootWriteCountingBackend {
+        fn read_layout_root(&self) -> Result<LayoutRoot> {
+            self.inner.read_layout_root()
+        }
+
+        fn compare_and_swap_layout_root(
+            &self,
+            expected: u64,
+            next: LayoutRoot,
+        ) -> Result<CasResult> {
+            let current = self.read_layout_root()?;
+            if current.generation != expected {
+                return Ok(CasResult {
+                    applied: false,
+                    current: None,
+                });
+            }
+            let bytes = serde_json::to_vec(&next)?;
+            self.put_physical("layout_root.json", &bytes)?;
+            self.put_physical(
+                &format!("control/layout-roots/{:020}.json", next.generation),
+                &bytes,
+            )?;
+            Ok(CasResult {
+                applied: true,
+                current: None,
+            })
+        }
+
+        fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
+            self.inner.list_retained_layout_roots()
+        }
+    }
+
+    impl e2v_store::RemoteBackend for LayoutRootWriteCountingBackend {
+        fn capability(&self) -> &BackendCapability {
+            self.inner.capability()
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct FixedRemoteTimeBackend {
@@ -862,6 +978,42 @@ mod tests {
         assert_eq!(intent["planned_snapshot_id"], "snapshot-123");
         assert_eq!(lease["remote_observed_at_unix_ms"], fixed_ms);
         assert_eq!(lease["heartbeat"]["remote_observed_at_unix_ms"], fixed_ms);
+    }
+
+    #[test]
+    fn publish_layout_if_needed_does_not_rewrite_layout_root_json_after_successful_cas() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = LayoutRootWriteCountingBackend::new();
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-layout-root".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+        let next_layout_root = LayoutRoot {
+            generation: 2,
+            ..LayoutRoot::direct_default()
+        };
+        let session = PublishSession {
+            next_layout_root: Some(next_layout_root.clone()),
+            next_layout_root_bytes: Some(serde_json::to_vec(&next_layout_root).unwrap()),
+            ..session
+        };
+
+        publisher.publish_layout_if_needed(&session).unwrap();
+
+        assert_eq!(
+            remote.layout_root_put_count(),
+            1,
+            "layout root publish should not rewrite layout_root.json after the layout CAS already stored it"
+        );
     }
 
     #[test]
