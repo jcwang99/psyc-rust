@@ -2715,6 +2715,40 @@ fn open_rejects_unsupported_layout_root_schema_version() {
 }
 
 #[test]
+fn open_rejects_pointer_generation_mismatch_even_with_cached_secrets() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let current_pointer_path = control_dir.join("keyring").join("keyring.current");
+    let opened = facade.open(&repo_root).unwrap();
+    assert_eq!(opened.branch.name, "main");
+
+    fs::write(
+        &current_pointer_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 99u64,
+            "current": "keyring.1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = facade.open(&repo_root).unwrap_err();
+
+    assert!(
+        error.to_string().contains("generation mismatch")
+            || error.to_string().contains("keyring pointer generation mismatch")
+            || error.to_string().contains("keyring"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn open_accepts_oblivious_layout_root_metadata_when_schema_is_supported() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

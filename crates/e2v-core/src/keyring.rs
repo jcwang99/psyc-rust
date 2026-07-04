@@ -21,13 +21,21 @@ const KEYRING_DEVICE_MAGIC: &[u8; 4] = b"E2KD";
 const KEYRING_DEVICE_FORMAT_VERSION: u32 = 1;
 const KEYRING_DEVICE_OBJECT_TYPE: &str = "keyring-device-envelope";
 
-static UNLOCKED_KEYRINGS: OnceLock<Mutex<HashMap<PathBuf, RepoSecrets>>> = OnceLock::new();
+static UNLOCKED_KEYRINGS: OnceLock<Mutex<HashMap<PathBuf, CachedUnlockedKeyring>>> =
+    OnceLock::new();
 static UNLOCKED_PASSWORDS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Debug, Clone)]
+struct CachedUnlockedKeyring {
+    secrets: RepoSecrets,
+    pointer_bytes: Vec<u8>,
+    keyring_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,10 +148,48 @@ struct DeviceEnvelopeRecord {
     auth_tag: Vec<u8>,
 }
 
+fn current_keyring_cache_material(control_dir: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
+    let pointer_path = control_dir.join(KEYRING_CURRENT_FILE);
+    let pointer_bytes = std::fs::read(&pointer_path)
+        .with_context(|| format!("failed to read {}", pointer_path.display()))?;
+    let keyring_pointer: KeyringPointer = serde_json::from_slice(&pointer_bytes)
+        .with_context(|| format!("failed to decode {}", pointer_path.display()))?;
+    validate_keyring_file_name(&keyring_pointer.current).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid current keyring path {}: {error}",
+            keyring_pointer.current
+        )
+    })?;
+    let keyring_path = control_dir.join(KEYRING_DIR).join(&keyring_pointer.current);
+    let keyring_bytes = std::fs::read(&keyring_path)
+        .with_context(|| format!("failed to read {}", keyring_path.display()))?;
+    let keyring: KeyringState = serde_json::from_slice(&keyring_bytes)
+        .with_context(|| format!("failed to decode {}", keyring_path.display()))?;
+    ensure!(
+        keyring_pointer.generation == keyring.generation,
+        "keyring pointer generation mismatch"
+    );
+    Ok((pointer_bytes, keyring_bytes))
+}
+
 pub fn cache_unlocked_secrets(control_dir: &Path, secrets: &RepoSecrets) {
     let cache = UNLOCKED_KEYRINGS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = lock_or_recover(cache);
-    cache.insert(control_dir.to_path_buf(), secrets.clone());
+    match current_keyring_cache_material(control_dir) {
+        Ok((pointer_bytes, keyring_bytes)) => {
+            cache.insert(
+                control_dir.to_path_buf(),
+                CachedUnlockedKeyring {
+                    secrets: secrets.clone(),
+                    pointer_bytes,
+                    keyring_bytes,
+                },
+            );
+        }
+        Err(_) => {
+            cache.remove(control_dir);
+        }
+    }
 }
 
 pub fn cache_unlocked_password(control_dir: &Path, password: &str) {
@@ -212,9 +258,7 @@ pub fn unlock_repo_secrets_from_keyring_bytes_with_local_device(
     let keyring: KeyringState =
         serde_json::from_slice(keyring_bytes).context("failed to decode keyring state")?;
     let credential = read_local_device_credential(control_dir)?;
-    let secrets = unlock_repo_secrets_from_state_with_local_device(&keyring, &credential)?;
-    cache_unlocked_secrets(control_dir, &secrets);
-    Ok(secrets)
+    unlock_repo_secrets_from_state_with_local_device(&keyring, &credential)
 }
 
 fn unlock_repo_secrets_from_state(keyring: &KeyringState, password: &str) -> Result<RepoSecrets> {
@@ -265,11 +309,28 @@ fn unlock_repo_secrets_from_state_with_local_device(
 
 pub fn open_repo_secrets(control_dir: &Path) -> Result<RepoSecrets> {
     let cache = UNLOCKED_KEYRINGS.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache = lock_or_recover(cache);
-    cache
-        .get(control_dir)
-        .cloned()
-        .context("repository keyring is locked; unlock with a password first")
+    let cached = {
+        let cache = lock_or_recover(cache);
+        cache.get(control_dir).cloned()
+    };
+    let Some(cached) = cached else {
+        anyhow::bail!("repository keyring is locked; unlock with a password first");
+    };
+    match current_keyring_cache_material(control_dir) {
+        Ok((pointer_bytes, keyring_bytes))
+            if pointer_bytes == cached.pointer_bytes && keyring_bytes == cached.keyring_bytes =>
+        {
+            Ok(cached.secrets)
+        }
+        Ok(_) => {
+            clear_unlocked_keyring_cache(control_dir);
+            anyhow::bail!("repository keyring is locked; unlock with a password first");
+        }
+        Err(error) => {
+            clear_unlocked_keyring_cache(control_dir);
+            Err(error)
+        }
+    }
 }
 
 pub fn seal_repo_secrets(
@@ -855,6 +916,21 @@ mod tests {
     fn open_repo_secrets_recovers_from_poisoned_unlocked_keyring_cache() {
         let temp = tempdir().unwrap();
         let control_dir = temp.path().join("control");
+        std::fs::create_dir_all(control_dir.join(KEYRING_DIR)).unwrap();
+        std::fs::write(
+            control_dir.join(KEYRING_CURRENT_FILE),
+            serde_json::to_vec(&KeyringPointer {
+                generation: 1,
+                current: "keyring.1".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            control_dir.join(KEYRING_DIR).join("keyring.1"),
+            serde_json::to_vec(&sample_keyring_state()).unwrap(),
+        )
+        .unwrap();
         let expected = RepoSecrets {
             repo_id: "repo".to_string(),
             active_epoch: 1,
