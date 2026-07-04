@@ -19,6 +19,7 @@ use crate::pack_index::{
     next_pack_index_segment_paths, publish_pack_index_root,
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
+use crate::fetch::validate_remote_relative_name;
 use crate::remote_maintenance::load_remote_loose_object_ids;
 use crate::transaction::{PublishPlan, PublishedObject};
 
@@ -693,6 +694,8 @@ pub(crate) fn read_remote_current_keyring_bytes<R: RemoteBackend>(
     let current = pointer["current"]
         .as_str()
         .context("invalid remote keyring pointer current file")?;
+    validate_remote_relative_name(current)
+        .map_err(|error| anyhow::anyhow!("invalid remote keyring path {current}: {error}"))?;
     match remote.get_physical(&format!("control/keyring/{current}")) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if is_missing_physical_object_error(&error) => Ok(None),
@@ -1679,6 +1682,77 @@ mod tests {
         assert!(
             remote_keyring_bytes.is_none(),
             "missing remote keyring generation should be treated as absent state"
+        );
+    }
+
+    #[test]
+    fn read_remote_current_keyring_bytes_rejects_pointer_path_traversal() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "unit-malicious-remote-keyring-pointer".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "unit-malicious-remote-keyring-pointer-op".to_string(),
+            },
+        )
+        .unwrap();
+
+        let malicious_pointer = serde_json::to_vec(&serde_json::json!({
+            "generation": 1u64,
+            "current": "../../evil.json"
+        }))
+        .unwrap();
+        let pointer_token = RefToken::new(format!(
+            "keyring/{}",
+            e2v_core::sync_support::read_repo_id(&repo_root).unwrap()
+        ));
+        let expected_version = remote.read_ref(&pointer_token).unwrap().map(|stored| stored.version);
+        remote
+            .compare_and_swap_ref(
+                &pointer_token,
+                expected_version,
+                EncryptedRef::new(malicious_pointer.clone()),
+            )
+            .unwrap();
+        remote
+            .put_physical("control/keyring/keyring.current", &malicious_pointer)
+            .unwrap();
+        remote
+            .put_physical(
+                "control/keyring/../../evil.json",
+                &remote.get_physical("control/keyring/keyring.1").unwrap(),
+            )
+            .unwrap();
+
+        let error = read_remote_current_keyring_bytes(&remote, &repo_root).unwrap_err();
+
+        assert!(
+            error.to_string().contains("invalid remote keyring path")
+                || error.to_string().contains("path traversal")
+                || error.to_string().contains("path escapes"),
+            "unexpected error: {error:#}"
         );
     }
 

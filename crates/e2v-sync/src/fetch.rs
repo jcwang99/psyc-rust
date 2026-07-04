@@ -1189,7 +1189,7 @@ fn merge_min_ref_generations(
     merged
 }
 
-fn validate_remote_relative_name(value: &str) -> Result<()> {
+pub(crate) fn validate_remote_relative_name(value: &str) -> Result<()> {
     let path = Path::new(value);
     ensure!(!value.is_empty(), "empty relative path");
     ensure!(!path.is_absolute(), "path escapes target directory");
