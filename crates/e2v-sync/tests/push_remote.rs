@@ -160,6 +160,11 @@ fn sync_internal_modules_do_not_duplicate_remote_inventory_or_pack_cache_persist
             && remote_maintenance_source.contains("fn persist_cached_pack_data")),
         "pack-data cache persistence helper should live in one internal implementation to avoid fetch/maintenance drift"
     );
+    assert!(
+        !(fetch_source.contains("fn overwrite_local_object_bytes")
+            && remote_maintenance_source.contains("fn overwrite_local_object_bytes")),
+        "local object overwrite helper should live in one internal implementation to avoid fetch/maintenance drift"
+    );
 }
 
 #[test]

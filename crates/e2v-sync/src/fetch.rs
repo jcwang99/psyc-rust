@@ -12,7 +12,9 @@ use crate::pack::{PackedObjectLocation, read_packed_object};
 use crate::pack_cache::{
     prune_stale_cached_pack_data, remote_object_bytes_with_pack_cache,
 };
-use crate::remote_maintenance::persist_cached_pack_data;
+use crate::remote_maintenance::{
+    overwrite_local_object_bytes, persist_cached_pack_data,
+};
 use crate::trusted_state::{
     TrustedRemoteState, load_trusted_remote_state, store_trusted_remote_state,
 };
@@ -801,21 +803,6 @@ fn atomic_write_bytes(path: PathBuf, bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn overwrite_local_object_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_directory_path(parent)?;
-    }
-    match std::fs::write(path, bytes) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            remove_path_if_exists(path)?;
-            std::fs::write(path, bytes)
-                .with_context(|| format!("failed to write {}", path.display()))?;
-            Ok(())
-        }
-    }
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {

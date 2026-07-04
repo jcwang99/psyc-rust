@@ -1875,15 +1875,16 @@ fn current_remote_physical_path_for_object(
         .or_else(|| Some(format!("objects/{object_id}.json")))
 }
 
-fn overwrite_local_object_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn overwrite_local_object_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_directory_path(parent)?;
     }
     match std::fs::write(path, bytes) {
         Ok(()) => Ok(()),
         Err(_) => {
             remove_path_if_exists(path)?;
-            std::fs::write(path, bytes)?;
+            std::fs::write(path, bytes)
+                .with_context(|| format!("failed to write {}", path.display()))?;
             Ok(())
         }
     }
