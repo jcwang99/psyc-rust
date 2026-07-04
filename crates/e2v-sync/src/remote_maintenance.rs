@@ -372,6 +372,37 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     let facade = RepositoryFacade::new();
     reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let mut rewrite_state = load_historical_rewrite_checkpoint(&control_dir)?;
+    let current_repo_state = facade.open(&options.repo_root)?;
+    if rewrite_state.is_none() {
+        let current_layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;
+        let current_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
+        let current_plan = plan_historical_rewrite(
+            remote,
+            HistoricalRewritePlanOptions {
+                repo_root: options.repo_root.clone(),
+            },
+        )?;
+        let remote_layout_matches_local = remote
+            .get_physical("layout_root.json")
+            .map(|bytes| bytes == current_layout_root_bytes)
+            .unwrap_or(false);
+        let remote_ref_matches_local_before_rewrite = remote
+            .read_ref(&RefToken::new(current_repo_state.branch.token_hex.clone()))?
+            .map(|stored_ref| stored_ref.value.bytes == current_default_ref_bytes)
+            .unwrap_or(false);
+        if remote_layout_matches_local
+            && remote_ref_matches_local_before_rewrite
+            && current_plan.old_epoch_count == 0
+        {
+            remove_local_index_if_present(&options.repo_root)?;
+            return Ok(HistoricalRewriteResult {
+                rewritten_objects: current_plan.reachable_object_count,
+                retired_epoch_count: 0,
+                deleted_stale_remote_refs: Vec::new(),
+                next_layout_generation: current_repo_state.layout_generation,
+            });
+        }
+    }
     if rewrite_state.is_none() {
         hydrate_remote_branch_history_for_rewrite(remote, &options.repo_root)?;
         let local_result =
@@ -402,12 +433,13 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     let remote_branch_refs = list_remote_branch_refs(remote, &options.repo_root)?;
 
     let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
-    let mut stale_loose_paths = rewrite_state
+    let stale_loose_paths = rewrite_state
         .rewritten_object_ids
         .iter()
         .filter(|object_id| remote_loose_object_ids.contains(*object_id))
         .map(|object_id| format!("objects/{object_id}.json"))
         .collect::<Vec<_>>();
+    let mut stale_loose_paths = stale_loose_paths;
     stale_loose_paths.sort();
     let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
     let publisher = SimpleTransactionPublisher::new(
@@ -469,13 +501,6 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         &repo_state.branch.token_hex,
     )?;
     mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
-    for stale_path in &stale_loose_paths {
-        match remote.delete_physical(stale_path) {
-            Ok(()) => {}
-            Err(error) if is_missing_physical_object_error(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
     publisher.complete(session)?;
     cleanup_completed_operation_markers(remote, &operation_id, &repo_state.branch.token_hex)?;
     clear_historical_rewrite_checkpoint(&control_dir)?;
@@ -492,7 +517,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
             .len()
             .max(plan.reachable_object_count),
         retired_epoch_count: rewrite_state.retired_epoch_count,
-        deleted_stale_remote_refs: stale_loose_paths,
+        deleted_stale_remote_refs: Vec::new(),
         next_layout_generation: repo_state.layout_generation,
     })
 }
@@ -1687,7 +1712,10 @@ fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
 ) -> Result<Vec<String>> {
     reachable.clear_physical_refs()?;
     for object_id in remote_loose_object_ids {
-        if reachable.contains_object_id(object_id)? {
+        if reachable.contains_object_id(object_id)?
+            && current_remote_physical_path_for_object(pack_locations, object_id).as_deref()
+                == Some(format!("objects/{object_id}.json").as_str())
+        {
             reachable.insert_physical_ref(&format!("objects/{object_id}.json"))?;
         }
     }
@@ -1722,6 +1750,23 @@ fn collect_unreachable_physical_refs_with_spill<R: RemoteBackend>(
         }
     }
     Ok(unreachable)
+}
+
+fn current_remote_physical_path_for_object(
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    object_id: &str,
+) -> Option<String> {
+    pack_locations
+        .get(object_id)
+        .map(|location| {
+            location
+                .physical_ref()
+                .map(|physical_ref| physical_ref.container_id)
+        })
+        .transpose()
+        .ok()
+        .flatten()
+        .or_else(|| Some(format!("objects/{object_id}.json")))
 }
 
 fn overwrite_local_object_bytes(path: &Path, bytes: &[u8]) -> Result<()> {

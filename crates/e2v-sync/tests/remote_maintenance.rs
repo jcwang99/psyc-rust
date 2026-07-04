@@ -1598,7 +1598,7 @@ fn historical_rewrite_remote_preserves_remote_active_device_envelopes() {
 }
 
 #[test]
-fn historical_rewrite_remote_publishes_new_pack_view_and_purges_stale_loose_refs() {
+fn historical_rewrite_remote_leaves_stale_loose_refs_for_gc_grace_period_cleanup() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -1618,10 +1618,10 @@ fn historical_rewrite_remote_publishes_new_pack_view_and_purges_stale_loose_refs
             message: "seed".to_string(),
         })
         .unwrap();
-
     let reachable_object_ids = ManifestStore::new(&repo_root)
         .collect_reachable_object_ids(&first_commit.snapshot_id)
         .unwrap();
+
     let remote = MemoryBackend::new();
     push_head(
         &facade,
@@ -1661,7 +1661,10 @@ fn historical_rewrite_remote_publishes_new_pack_view_and_purges_stale_loose_refs
     .unwrap();
 
     assert_eq!(result.next_layout_generation, 2);
-    assert_eq!(result.deleted_stale_remote_refs, old_loose_paths);
+    assert!(
+        result.deleted_stale_remote_refs.is_empty(),
+        "historical rewrite should leave stale carriers for later GC cleanup"
+    );
     assert!(
         !repo_root.join(".e2v").join("index.sqlite3").exists(),
         "historical rewrite should invalidate the local sqlite index after publication"
@@ -1696,10 +1699,22 @@ fn historical_rewrite_remote_publishes_new_pack_view_and_purges_stale_loose_refs
 
     for path in &old_loose_paths {
         assert!(
-            !remote.exists_physical(path),
-            "historical rewrite should purge stale loose object carrier {path}"
+            remote.exists_physical(path),
+            "historical rewrite should leave stale loose object carrier {path} for GC grace-period cleanup"
         );
     }
+
+    let gc_report = gc_dry_run(
+        &remote,
+        GcDryRunOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        gc_report.unreachable_physical_refs, old_loose_paths,
+        "historical rewrite should hand stale loose carriers off to GC after publishing the new layout generation"
+    );
 
     let fetched_root = temp.path().join("fetched");
     clone_remote(
@@ -1718,6 +1733,31 @@ fn historical_rewrite_remote_publishes_new_pack_view_and_purges_stale_loose_refs
     let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
     let bytes = read_service.read_range(&file, 0, 64).unwrap();
     assert_eq!(bytes, b"hello rewrite");
+
+    for path in &old_loose_paths {
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote,
+            path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
+        )
+        .unwrap();
+    }
+    let gc_execute = gc_execute(
+        &remote,
+        GcExecuteOptions {
+            repo_root: repo_root.clone(),
+            grace_period_days: 30,
+            allow_single_writer_maintenance_window: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(gc_execute.deleted_physical_refs, old_loose_paths);
+    for path in &old_loose_paths {
+        assert!(
+            !remote.exists_physical(path),
+            "gc should eventually purge stale loose object carrier {path} after the grace period"
+        );
+    }
 }
 
 #[test]
@@ -1741,10 +1781,10 @@ fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
             message: "seed".to_string(),
         })
         .unwrap();
-
     let reachable_object_ids = ManifestStore::new(&repo_root)
         .collect_reachable_object_ids(&first_commit.snapshot_id)
         .unwrap();
+
     let remote = MemoryBackend::new();
     push_head(
         &facade,
@@ -1766,29 +1806,27 @@ fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
         .map(|object_id| format!("objects/{object_id}.json"))
         .collect::<Vec<_>>();
     stale_loose_paths.sort();
-    let interrupted_remote =
-        FailOnceOnDeleteBackend::new(remote.clone(), stale_loose_paths[0].clone());
-
-    let first_error = historical_rewrite_remote(
-        &interrupted_remote,
+    let first = historical_rewrite_remote(
+        &remote,
         HistoricalRewriteOptions {
             repo_root: repo_root.clone(),
             password: "correct horse battery staple".to_string(),
             confirm_full_reencryption: true,
         },
     )
-    .unwrap_err();
+    .unwrap();
+    assert_eq!(first.next_layout_generation, 2);
     assert!(
-        first_error.to_string().contains("injected delete failure"),
-        "unexpected interruption error: {first_error:#}"
+        first.deleted_stale_remote_refs.is_empty(),
+        "historical rewrite should leave stale carriers for GC instead of deleting them eagerly"
     );
 
-    let layout_after_interruption = remote.read_layout_root().unwrap();
-    assert_eq!(layout_after_interruption.generation, 2);
-    let ref_version_after_interruption = remote
+    let layout_after_first = remote.read_layout_root().unwrap();
+    assert_eq!(layout_after_first.generation, 2);
+    let ref_version_after_first = remote
         .read_ref(&RefToken::new(state.branch.token_hex.clone()))
         .unwrap()
-        .expect("remote branch ref after interruption")
+        .expect("remote branch ref after first rewrite")
         .version
         .value;
 
@@ -1803,7 +1841,10 @@ fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
     .unwrap();
 
     assert_eq!(resumed.next_layout_generation, 2);
-    assert_eq!(resumed.deleted_stale_remote_refs, stale_loose_paths);
+    assert!(
+        resumed.deleted_stale_remote_refs.is_empty(),
+        "resumed historical rewrite should keep handing stale carriers off to GC"
+    );
     assert_eq!(remote.read_layout_root().unwrap().generation, 2);
     assert_eq!(
         remote
@@ -1812,13 +1853,13 @@ fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
             .expect("remote branch ref after resume")
             .version
             .value,
-        ref_version_after_interruption,
+        ref_version_after_first,
         "resume should not republish the current branch ref once the rewrite view is already published"
     );
     for path in &stale_loose_paths {
         assert!(
-            !remote.exists_physical(path),
-            "resumed historical rewrite should eventually purge stale loose ref {path}"
+            remote.exists_physical(path),
+            "resumed historical rewrite should continue leaving stale loose ref {path} for GC cleanup"
         );
     }
 }
@@ -1844,10 +1885,10 @@ fn historical_rewrite_remote_stores_rewrite_checkpoint_without_plaintext_object_
             message: "seed".to_string(),
         })
         .unwrap();
-
     let reachable_object_ids = ManifestStore::new(&repo_root)
         .collect_reachable_object_ids(&first_commit.snapshot_id)
         .unwrap();
+
     let remote = MemoryBackend::new();
     push_head(
         &facade,
@@ -1863,8 +1904,8 @@ fn historical_rewrite_remote_stores_rewrite_checkpoint_without_plaintext_object_
     e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
         .unwrap();
     let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
-    let stale_path = format!("objects/{}.json", reachable_object_ids[0]);
-    let interrupted_remote = FailOnceOnDeleteBackend::new(remote.clone(), stale_path);
+    let interrupted_remote =
+        FailOnceOnPutBackend::for_history_rewrite_index_batch(remote.clone(), 0);
 
     let first_error = historical_rewrite_remote(
         &interrupted_remote,
@@ -1876,7 +1917,9 @@ fn historical_rewrite_remote_stores_rewrite_checkpoint_without_plaintext_object_
     )
     .unwrap_err();
     assert!(
-        first_error.to_string().contains("injected delete failure"),
+        first_error
+            .to_string()
+            .contains("injected put failure for history rewrite batch"),
         "unexpected interruption error: {first_error:#}"
     );
 
@@ -1959,16 +2002,13 @@ fn historical_rewrite_remote_recovers_from_checkpoint_path_conflict() {
         })
         .unwrap();
     fs::write(repo_root.join("tracked.txt"), b"hello encrypted checkpoint").unwrap();
-    let first_commit = facade
+    facade
         .commit(CommitOptions {
             repo_root: repo_root.clone(),
             message: "seed".to_string(),
         })
         .unwrap();
 
-    let reachable_object_ids = ManifestStore::new(&repo_root)
-        .collect_reachable_object_ids(&first_commit.snapshot_id)
-        .unwrap();
     let remote = MemoryBackend::new();
     push_head(
         &facade,
@@ -1984,8 +2024,8 @@ fn historical_rewrite_remote_recovers_from_checkpoint_path_conflict() {
     e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
         .unwrap();
     let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
-    let stale_path = format!("objects/{}.json", reachable_object_ids[0]);
-    let interrupted_remote = FailOnceOnDeleteBackend::new(remote.clone(), stale_path);
+    let interrupted_remote =
+        FailOnceOnPutBackend::for_history_rewrite_index_batch(remote.clone(), 0);
     let checkpoint_path = repo_root
         .join(".e2v")
         .join("journal")
@@ -2004,7 +2044,9 @@ fn historical_rewrite_remote_recovers_from_checkpoint_path_conflict() {
     )
     .unwrap_err();
     assert!(
-        first_error.to_string().contains("injected delete failure"),
+        first_error
+            .to_string()
+            .contains("injected put failure for history rewrite batch"),
         "unexpected interruption error: {first_error:#}"
     );
     assert!(
@@ -2052,8 +2094,8 @@ fn historical_rewrite_remote_recovers_from_corrupted_checkpoint() {
 
     e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
         .unwrap();
-    let stale_path = format!("objects/{}.json", reachable_object_ids[0]);
-    let interrupted_remote = FailOnceOnDeleteBackend::new(remote.clone(), stale_path.clone());
+    let interrupted_remote =
+        FailOnceOnPutBackend::for_history_rewrite_index_batch(remote.clone(), 0);
 
     let first_error = historical_rewrite_remote(
         &interrupted_remote,
@@ -2065,7 +2107,9 @@ fn historical_rewrite_remote_recovers_from_corrupted_checkpoint() {
     )
     .unwrap_err();
     assert!(
-        first_error.to_string().contains("injected delete failure"),
+        first_error
+            .to_string()
+            .contains("injected put failure for history rewrite batch"),
         "unexpected interruption error: {first_error:#}"
     );
 
@@ -2093,10 +2137,16 @@ fn historical_rewrite_remote_recovers_from_corrupted_checkpoint() {
         remote.read_layout_root().unwrap().generation,
         reopened.layout_generation
     );
-    assert!(
-        !remote.exists_physical(&stale_path),
-        "resumed historical rewrite should eventually purge stale loose ref {stale_path}"
-    );
+    let stale_loose_paths = reachable_object_ids
+        .iter()
+        .map(|object_id| format!("objects/{object_id}.json"))
+        .collect::<Vec<_>>();
+    for stale_path in &stale_loose_paths {
+        assert!(
+            remote.exists_physical(stale_path),
+            "resumed historical rewrite should leave stale loose ref {stale_path} for later GC cleanup"
+        );
+    }
     assert!(
         !checkpoint_path.exists(),
         "historical rewrite should clear corrupted checkpoints after a successful recovery"

@@ -885,12 +885,15 @@ fn remote_object_bytes<R: RemoteBackend>(
     pack_locations: &BTreeMap<String, PackedObjectLocation>,
     object_id: &str,
 ) -> Result<Option<Vec<u8>>> {
+    if pack_locations.contains_key(object_id) {
+        return read_packed_object(remote, pack_locations, object_id);
+    }
     if loose_object_ids.contains(object_id) {
         return Ok(Some(
             remote.get_physical(&format!("objects/{object_id}.json"))?,
         ));
     }
-    read_packed_object(remote, pack_locations, object_id)
+    Ok(None)
 }
 
 fn remote_object_authenticates_for_repo<R: RemoteBackend>(

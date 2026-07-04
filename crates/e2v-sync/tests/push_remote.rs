@@ -6289,6 +6289,122 @@ fn push_fast_forward_accepts_ancestor_snapshots_stored_only_in_packs() {
 }
 
 #[test]
+fn push_rejects_target_branch_token_when_current_checkout_differs() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+    facade.create_branch(&repo_root, "feature").unwrap();
+    let feature_state = facade.checkout_branch(&repo_root, "feature").unwrap();
+    fs::write(repo_root.join("feature.txt"), b"feature only").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-branch-token-mismatch".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("current checked out branch does not match requested branch token"),
+        "unexpected error when pushing a non-current branch token: {error:#}"
+    );
+    assert!(
+        remote
+            .read_ref(&RefToken::new(feature_state.branch.token_hex))
+            .unwrap()
+            .is_none(),
+        "mismatched branch-token push should not publish the current feature branch by accident"
+    );
+}
+
+#[test]
+fn resume_push_rejects_target_branch_token_when_current_checkout_differs() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+    facade.create_branch(&repo_root, "feature").unwrap();
+    let feature_state = facade.checkout_branch(&repo_root, "feature").unwrap();
+    fs::write(repo_root.join("feature.txt"), b"feature only").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    let error = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "resume-branch-token-mismatch".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("current checked out branch does not match requested branch token"),
+        "unexpected error when resuming a non-current branch token: {error:#}"
+    );
+    assert!(
+        remote
+            .read_ref(&RefToken::new(feature_state.branch.token_hex))
+            .unwrap()
+            .is_none(),
+        "mismatched branch-token resume should not publish the current feature branch by accident"
+    );
+}
+
+#[test]
 fn push_fast_forward_pack_ancestor_validation_avoids_repeating_pack_range_reads() {
     let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();

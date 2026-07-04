@@ -156,16 +156,6 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
     object_id: &str,
     expected_type: &str,
 ) -> bool {
-    if let Ok(bytes) = remote.get_physical(&format!("objects/{object_id}.json")) {
-        return e2v_core::sync_support::decode_object_bytes_for_sync(
-            repo_root,
-            object_id,
-            expected_type,
-            &bytes,
-        )
-        .is_ok();
-    }
-
     if let Some(location) = pack_locations.get(object_id) {
         let physical_ref = match location.physical_ref() {
             Ok(physical_ref) => physical_ref,
@@ -202,6 +192,16 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
             return false;
         }
         let bytes = pack_bytes[offset..end].to_vec();
+        return e2v_core::sync_support::decode_object_bytes_for_sync(
+            repo_root,
+            object_id,
+            expected_type,
+            &bytes,
+        )
+        .is_ok();
+    }
+
+    if let Ok(bytes) = remote.get_physical(&format!("objects/{object_id}.json")) {
         return e2v_core::sync_support::decode_object_bytes_for_sync(
             repo_root,
             object_id,
@@ -813,6 +813,11 @@ pub fn push_head<R: RemoteBackend + Clone>(
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
     reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let current_state = facade.open(&options.repo_root)?;
+    ensure!(
+        current_state.branch.token_hex == options.branch_token,
+        "current checked out branch does not match requested branch token"
+    );
     let (_state, snapshot) = sync_support::export_head_snapshot(facade, &options.repo_root)?;
     let layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;
     let keyring_files = sync_support::list_keyring_files(&options.repo_root)?;
@@ -1034,6 +1039,11 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
     reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let current_state = facade.open(&options.repo_root)?;
+    ensure!(
+        current_state.branch.token_hex == options.branch_token,
+        "current checked out branch does not match requested branch token"
+    );
     let (_state, snapshot) = sync_support::export_head_snapshot(facade, &options.repo_root)?;
     let journal =
         OperationJournal::new(options.repo_root.join(".e2v").join("journal").join("sync"))?;
