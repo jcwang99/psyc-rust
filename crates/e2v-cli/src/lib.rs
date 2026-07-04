@@ -552,7 +552,7 @@ fn execute(cli: Cli) -> Result<String> {
         },
         Command::Verify { command, repo } => match command {
             VerifyCommand::Snapshot { snapshot_id } => {
-                facade.verify_snapshot(&repo, &snapshot_id)?;
+                sdk.verify_snapshot(&repo, &snapshot_id)?;
                 Ok(format!(
                     "verified snapshot {}\n",
                     &snapshot_id[..snapshot_id.len().min(8)]

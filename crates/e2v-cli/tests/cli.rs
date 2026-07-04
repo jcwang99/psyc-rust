@@ -1723,6 +1723,20 @@ fn branch_and_share_commands_delegate_through_the_sdk_boundary() {
 }
 
 #[test]
+fn verify_snapshot_command_delegates_through_the_sdk_boundary() {
+    let source = cli_lib_source_without_whitespace();
+
+    assert!(
+        !source.contains("facade.verify_snapshot("),
+        "expected CLI snapshot verification to delegate through e2v_api::Sdk instead of facade.verify_snapshot"
+    );
+    assert!(
+        source.contains("sdk.verify_snapshot("),
+        "expected CLI snapshot verification to use sdk.verify_snapshot"
+    );
+}
+
+#[test]
 fn repair_command_uses_default_file_remote() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
