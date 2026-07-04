@@ -7,7 +7,7 @@ use crate::remote_markers::{
     INTENT_EXPIRY_HOURS, RemoteWriteIntentMarker, RemoteWriterLeaseMarker,
     build_write_intent_marker, build_writer_lease_marker, marker_is_fresh_at,
     observe_remote_now_with_probe, remote_observed_at_unix_ms, renew_write_intent_marker,
-    renew_writer_lease_marker, system_time_to_unix_ms,
+    renew_writer_lease_marker, system_time_to_unix_ms, writer_id_for_operation,
 };
 use crate::transaction::{PublishPlan, PublishSession, PublishedObject};
 
@@ -75,10 +75,7 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
         );
         match serde_json::from_slice::<RemoteWriteIntentMarker>(&intent_bytes) {
             Ok(intent_marker) => {
-                anyhow::ensure!(
-                    intent_marker.operation_id == session.operation_id.value,
-                    "{phase}: active intent belongs to another operation"
-                );
+                validate_intent_marker_for_session(&intent_marker, session, phase)?;
                 Ok(intent_marker)
             }
             Err(error) => {
@@ -146,10 +143,7 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
         );
         match serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes) {
             Ok(lease_marker) => {
-                anyhow::ensure!(
-                    lease_marker.operation_id == session.operation_id.value,
-                    "{phase}: writer lease belongs to another operation"
-                );
+                validate_lease_marker_for_session(&lease_marker, session, phase)?;
                 Ok(lease_marker)
             }
             Err(error) => {
@@ -180,6 +174,54 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             }
         }
     }
+}
+
+fn validate_intent_marker_for_session(
+    intent_marker: &RemoteWriteIntentMarker,
+    session: &PublishSession,
+    phase: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        intent_marker.operation_id == session.operation_id.value,
+        "{phase}: active intent belongs to another operation"
+    );
+    anyhow::ensure!(
+        intent_marker.writer_id == writer_id_for_operation(&session.operation_id),
+        "{phase}: active intent belongs to another writer"
+    );
+    anyhow::ensure!(
+        intent_marker.target_branch_token == session.target_branch_token,
+        "{phase}: active intent belongs to another branch"
+    );
+    anyhow::ensure!(
+        intent_marker.expected_ref_version == session.expected_ref_version,
+        "{phase}: active intent expected ref version does not match session"
+    );
+    anyhow::ensure!(
+        intent_marker.planned_snapshot_id == session.planned_snapshot_id,
+        "{phase}: active intent planned snapshot does not match session"
+    );
+    Ok(())
+}
+
+fn validate_lease_marker_for_session(
+    lease_marker: &RemoteWriterLeaseMarker,
+    session: &PublishSession,
+    phase: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        lease_marker.operation_id == session.operation_id.value,
+        "{phase}: writer lease belongs to another operation"
+    );
+    anyhow::ensure!(
+        lease_marker.writer_id == writer_id_for_operation(&session.operation_id),
+        "{phase}: writer lease belongs to another writer"
+    );
+    anyhow::ensure!(
+        lease_marker.target_branch_token == session.target_branch_token,
+        "{phase}: writer lease belongs to another branch"
+    );
+    Ok(())
 }
 
 impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
@@ -1506,6 +1548,154 @@ mod tests {
         let error = publisher.heartbeat(&session).unwrap_err();
 
         assert!(error.to_string().contains("invalid active intent marker"));
+    }
+
+    #[test]
+    fn heartbeat_rejects_stale_active_intent_marker_when_branch_token_mismatches_session() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let renewed_time = initial_time + Duration::from_secs(73 * 60 * 60);
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-heartbeat-intent-mismatch".to_string())
+                    .unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-heartbeat".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .put_physical(
+                "transactions/active/op-heartbeat-intent-mismatch.intent",
+                serde_json::to_vec(&serde_json::json!({
+                    "operation_id": "op-heartbeat-intent-mismatch",
+                    "writer_id": "writer:op-heartbeat-intent-mismatch",
+                    "started_at_remote_unix_ms": 1731000000000u64,
+                    "heartbeat": {
+                        "remote_observed_at_unix_ms": 1731000000000u64,
+                        "sequence": 1u64
+                    },
+                    "expected_ref_version": null,
+                    "target_branch_token": "other-branch",
+                    "planned_snapshot_id": "snapshot-heartbeat",
+                    "client_version": env!("CARGO_PKG_VERSION"),
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "transactions/active/op-heartbeat-intent-mismatch.intent",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        remote.set_fixed_time_for_test(renewed_time);
+
+        let error = publisher.heartbeat(&session).unwrap_err();
+
+        assert!(
+            error.to_string().contains("active intent")
+                && error.to_string().contains("branch")
+                || error.to_string().contains("invalid active intent marker"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_rejects_stale_writer_lease_marker_when_branch_token_mismatches_session() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let renewed_time = initial_time + Duration::from_secs(73 * 60 * 60);
+        let remote = FixedRemoteTimeBackend::new(initial_time);
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-heartbeat-lease-mismatch".to_string())
+                    .unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-heartbeat".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        remote
+            .put_physical(
+                "leases/branch-token.lock",
+                serde_json::to_vec(&serde_json::json!({
+                    "operation_id": "op-heartbeat-lease-mismatch",
+                    "writer_id": "writer:op-heartbeat-lease-mismatch",
+                    "target_branch_token": "other-branch",
+                    "remote_observed_at_unix_ms": 1731000000000u64,
+                    "lease_generation": 1u64,
+                    "heartbeat": {
+                        "remote_observed_at_unix_ms": 1731000000000u64,
+                        "sequence": 1u64
+                    },
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        e2v_store::testing::override_memory_backend_modified_time(
+            &remote.inner,
+            "leases/branch-token.lock",
+            renewed_time - Duration::from_secs(73 * 60 * 60),
+        )
+        .unwrap();
+        remote.set_fixed_time_for_test(renewed_time);
+
+        let error = publisher.heartbeat(&session).unwrap_err();
+
+        assert!(
+            error.to_string().contains("writer lease")
+                && error.to_string().contains("branch")
+                || error.to_string().contains("invalid writer lease marker"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
