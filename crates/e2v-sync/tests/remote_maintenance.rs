@@ -105,12 +105,18 @@ fn sync_exposes_historical_rewrite_plan_and_execute_api_for_p3_a() {
         "HistoricalRewriteResult",
         "historical_rewrite_remote",
         "plan_historical_rewrite",
+        "pending_gc_stale_remote_refs",
     ] {
         assert!(
             lib_source.contains(required_export) || maintenance_source.contains(required_export),
             "expected P3-A historical rewrite surface to include {required_export}"
         );
     }
+
+    assert!(
+        !maintenance_source.contains("deleted_stale_remote_refs"),
+        "historical rewrite result should not expose deleted_stale_remote_refs after cleanup became GC-deferred"
+    );
 }
 
 #[test]
@@ -2056,8 +2062,8 @@ fn historical_rewrite_remote_leaves_stale_loose_refs_for_gc_grace_period_cleanup
 
     assert_eq!(result.next_layout_generation, 2);
     assert!(
-        result.deleted_stale_remote_refs.is_empty(),
-        "historical rewrite should leave stale carriers for later GC cleanup"
+        result.pending_gc_stale_remote_refs == old_loose_paths,
+        "historical rewrite should report stale carriers for later GC cleanup"
     );
     assert!(
         !repo_root.join(".e2v").join("index.sqlite3").exists(),
@@ -2219,8 +2225,8 @@ fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
     .unwrap();
     assert_eq!(first.next_layout_generation, 2);
     assert!(
-        first.deleted_stale_remote_refs.is_empty(),
-        "historical rewrite should leave stale carriers for GC instead of deleting them eagerly"
+        first.pending_gc_stale_remote_refs == stale_loose_paths,
+        "historical rewrite should report stale carriers for GC instead of deleting them eagerly"
     );
 
     let layout_after_first = remote.read_layout_root().unwrap();
@@ -2244,7 +2250,7 @@ fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
 
     assert_eq!(resumed.next_layout_generation, 2);
     assert!(
-        resumed.deleted_stale_remote_refs.is_empty(),
+        resumed.pending_gc_stale_remote_refs == stale_loose_paths,
         "resumed historical rewrite should keep handing stale carriers off to GC"
     );
     assert_eq!(remote.read_layout_root().unwrap().generation, 2);

@@ -6144,6 +6144,31 @@ fn share_revoke_member_blocks_local_device_unlock_after_revocation() {
 }
 
 #[test]
+fn init_writes_local_device_credential_as_compact_json() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    RepositoryFacade::new()
+        .init(init_options(&repo_root))
+        .unwrap();
+
+    let bytes = fs::read(
+        repo_root
+            .join(".e2v")
+            .join("device")
+            .join("local-device.json"),
+    )
+    .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+
+    assert!(
+        !text.contains('\n'),
+        "expected compact local device credential json without pretty-printed newlines"
+    );
+}
+
+#[test]
 fn share_invite_device_and_accept_device_adds_second_active_device_for_actor() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

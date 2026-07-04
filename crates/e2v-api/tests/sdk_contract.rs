@@ -641,6 +641,73 @@ fn sdk_can_verify_snapshot_through_public_api() {
 }
 
 #[test]
+fn sdk_add_remote_rolls_back_named_registration_when_default_publish_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    let default_remote_path = repo_root.join(".e2v").join("remotes").join("default.json");
+    fs::create_dir_all(&default_remote_path).unwrap();
+
+    let error = sdk
+        .add_remote(&repo_root, "origin", "file://D:/tmp/remote")
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::Io);
+    assert!(
+        !repo_root
+            .join(".e2v")
+            .join("remotes")
+            .join("origin.json")
+            .exists(),
+        "named remote registration should roll back when publishing default remote fails"
+    );
+}
+
+#[test]
+fn sdk_add_remote_preserves_previous_named_registration_when_default_publish_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let sdk = Sdk::new();
+    sdk.init_repository(InitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_name: "main".to_string(),
+    })
+    .unwrap();
+
+    sdk.add_remote(&repo_root, "origin", "file://D:/tmp/original")
+        .unwrap();
+    let named_remote_path = repo_root.join(".e2v").join("remotes").join("origin.json");
+    let original_bytes = fs::read(&named_remote_path).unwrap();
+
+    let default_remote_path = repo_root.join(".e2v").join("remotes").join("default.json");
+    fs::remove_file(&default_remote_path).unwrap();
+    fs::create_dir_all(&default_remote_path).unwrap();
+
+    let error = sdk
+        .add_remote(&repo_root, "origin", "file://D:/tmp/updated")
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::Io);
+    assert_eq!(
+        fs::read(&named_remote_path).unwrap(),
+        original_bytes,
+        "previous named remote registration should be restored when publishing default remote fails"
+    );
+}
+
+#[test]
 fn sdk_can_fetch_updates_from_registered_default_remote() {
     let temp = tempfile::tempdir().unwrap();
     let source_repo = temp.path().join("source");
@@ -2806,6 +2873,25 @@ fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote()
     assert!(default_execute.rewritten_objects > 0);
     assert_eq!(default_execute.retired_epoch_count, 1);
     assert!(default_execute.next_layout_generation >= 2);
+    assert!(
+        default_execute.pending_gc_stale_remote_refs.len()
+            >= default_plan.remote_loose_object_count,
+        "historical rewrite should surface stale loose carriers as pending later GC"
+    );
+    let api_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("lib.rs"),
+    )
+    .unwrap();
+    assert!(
+        api_source.contains("pending_gc_stale_remote_refs"),
+        "historical rewrite API should expose pending_gc_stale_remote_refs for deferred cleanup"
+    );
+    assert!(
+        !api_source.contains("pub deleted_stale_remote_refs: Vec<String>"),
+        "historical rewrite API should not keep the deleted_stale_remote_refs field after switching to deferred GC"
+    );
 
     let cloned = sdk
         .clone_remote(CloneRequest {

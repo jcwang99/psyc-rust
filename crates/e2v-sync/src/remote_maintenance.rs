@@ -124,7 +124,7 @@ pub struct HistoricalRewritePlan {
 pub struct HistoricalRewriteResult {
     pub rewritten_objects: usize,
     pub retired_epoch_count: usize,
-    pub deleted_stale_remote_refs: Vec<String>,
+    pub pending_gc_stale_remote_refs: Vec<String>,
     pub next_layout_generation: u64,
 }
 
@@ -400,11 +400,25 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
             && remote_ref_matches_local_before_rewrite
             && current_plan.old_epoch_count == 0
         {
+            let pending_gc_stale_remote_refs = gc_dry_run(
+                remote,
+                GcDryRunOptions {
+                    repo_root: options.repo_root.clone(),
+                },
+            )
+            .map(|report| {
+                report
+                    .unreachable_physical_refs
+                    .into_iter()
+                    .filter(|path| path.starts_with("objects/"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
             remove_local_index_if_present(&options.repo_root)?;
             return Ok(HistoricalRewriteResult {
                 rewritten_objects: current_plan.reachable_object_count,
                 retired_epoch_count: 0,
-                deleted_stale_remote_refs: Vec::new(),
+                pending_gc_stale_remote_refs,
                 next_layout_generation: current_repo_state.layout_generation,
             });
         }
@@ -548,7 +562,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
             .map(|plan| rewritten_objects.max(plan.reachable_object_count))
             .unwrap_or(rewritten_objects),
         retired_epoch_count: rewrite_state.retired_epoch_count,
-        deleted_stale_remote_refs: Vec::new(),
+        pending_gc_stale_remote_refs: stale_loose_paths,
         next_layout_generation: repo_state.layout_generation,
     })
 }

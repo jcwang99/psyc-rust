@@ -684,10 +684,10 @@ fn execute(cli: Cli) -> Result<String> {
                     },
                 )?;
                 Ok(format!(
-                    "historical strong revocation complete: rewritten {} objects, retired {} old epochs, deleted {} stale remote refs\n",
+                    "historical strong revocation complete: rewritten {} objects, retired {} old epochs, pending {} stale remote refs for later gc\n",
                     result.rewritten_objects,
                     result.retired_epoch_count,
-                    result.deleted_stale_remote_refs.len()
+                    result.pending_gc_stale_remote_refs.len()
                 ))
             }
         },

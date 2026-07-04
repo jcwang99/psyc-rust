@@ -402,7 +402,7 @@ pub struct HistoricalRewritePlanResponse {
 pub struct HistoricalRewriteExecuteResponse {
     pub rewritten_objects: usize,
     pub retired_epoch_count: usize,
-    pub deleted_stale_remote_refs: Vec<String>,
+    pub pending_gc_stale_remote_refs: Vec<String>,
     pub next_layout_generation: u64,
 }
 
@@ -1285,8 +1285,8 @@ fn add_remote_registration(
         name: name.to_string(),
         spec: spec.to_string(),
     };
-    let path = remote_path(repo_root, name);
-    if let Some(parent) = path.parent() {
+    let named_remote_path = remote_path(repo_root, name);
+    if let Some(parent) = named_remote_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(anyhow::Error::from)
             .map_err(map_error)?;
@@ -1294,12 +1294,22 @@ fn add_remote_registration(
     let bytes = serde_json::to_vec(&stored)
         .map_err(anyhow::Error::from)
         .map_err(map_error)?;
-    std::fs::write(&path, &bytes)
-        .map_err(anyhow::Error::from)
+    let previous_named_remote_bytes = std::fs::read(&named_remote_path).ok();
+    std::fs::write(&named_remote_path, &bytes)
+        .map_err(|error| anyhow::anyhow!("failed to write remote registration: {error}"))
         .map_err(map_error)?;
-    std::fs::write(default_remote_path(repo_root), bytes)
-        .map_err(anyhow::Error::from)
-        .map_err(map_error)?;
+    let default_remote_path = default_remote_path(repo_root);
+    if let Err(error) = std::fs::write(&default_remote_path, bytes) {
+        match previous_named_remote_bytes {
+            Some(previous_bytes) => {
+                let _ = std::fs::write(&named_remote_path, previous_bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&named_remote_path);
+            }
+        }
+        return Err(anyhow::anyhow!("failed to write default remote: {error}")).map_err(map_error);
+    }
     Ok(stored)
 }
 
@@ -1529,7 +1539,7 @@ fn historical_rewrite_execute_response_from_result(
     HistoricalRewriteExecuteResponse {
         rewritten_objects: result.rewritten_objects,
         retired_epoch_count: result.retired_epoch_count,
-        deleted_stale_remote_refs: result.deleted_stale_remote_refs,
+        pending_gc_stale_remote_refs: result.pending_gc_stale_remote_refs,
         next_layout_generation: result.next_layout_generation,
     }
 }

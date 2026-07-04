@@ -144,7 +144,7 @@ git commit -m "Add historical rewrite planning and journal recovery"
 **Interfaces:**
 - Consumes: `plan_historical_rewrite`, `RepositoryFacade::rewrite_history_to_active_epoch`, pack writer/index, publisher begin/heartbeat/pre_commit/publish_ref/complete, and remote control-plane readers.
 - Produces:
-  - `pub struct HistoricalRewriteResult { pub rewritten_objects: usize, pub retired_epoch_count: usize, pub deleted_stale_remote_refs: Vec<String>, pub next_layout_generation: u64 }`
+  - `pub struct HistoricalRewriteResult { pub rewritten_objects: usize, pub retired_epoch_count: usize, pub pending_gc_stale_remote_refs: Vec<String>, pub next_layout_generation: u64 }`
   - `pub fn historical_rewrite_remote<R: RemoteBackend>(remote: &R, options: HistoricalRewriteOptions) -> Result<HistoricalRewriteResult>`
 
 - [ ] **Step 1: Write failing end-to-end rewrite tests**
@@ -153,7 +153,7 @@ Add tests that prove:
 - after member/device revocation plus historical rewrite, fetch/clone with the retained credentials still works;
 - old epoch keys can no longer decrypt current local or remote objects;
 - the remote current view uses newly written physical refs and a new layout generation;
-- stale loose-object refs from the old epoch are purged so fetch does not accidentally prefer them over rewritten packed refs;
+- stale loose-object refs from the old epoch are surfaced as pending later GC cleanup so fetch does not accidentally prefer them over rewritten packed refs;
 - interrupted rewrite can resume from the journal and finish publication exactly once.
 
 - [ ] **Step 2: Run the focused rewrite tests to verify they fail**

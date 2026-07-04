@@ -1511,6 +1511,11 @@ fn historical_rewrite_commands_require_confirmation_and_surface_plan_guidance() 
     .unwrap();
     assert!(execute_output.contains("historical strong revocation complete"));
     assert!(execute_output.contains("rewritten"));
+    assert!(
+        execute_output.contains("pending ")
+            && execute_output.contains(" stale remote refs for later gc"),
+        "historical rewrite CLI output should reflect deferred stale-carrier cleanup, got: {execute_output:?}"
+    );
 }
 
 #[test]

@@ -589,9 +589,9 @@ pub fn write_local_device_credential(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec_pretty(credential)
-        .context("failed to encode local device credential")?;
-    std::fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))
+    let bytes =
+        serde_json::to_vec(credential).context("failed to encode local device credential")?;
+    atomic_write_bytes(&path, &bytes)
 }
 
 pub fn read_local_device_credential(control_dir: &Path) -> Result<LocalDeviceCredential> {
@@ -690,6 +690,20 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
     let bytes =
         std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {}", path.display()))
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("tmp")
+    ));
+    std::fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
