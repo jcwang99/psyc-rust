@@ -2292,9 +2292,8 @@ pub fn reconcile_remote_keyring_for_sync(
     };
 
     let local_comparable = comparable_keyring_state(&local_state);
-    let remote_comparable = comparable_keyring_state(&remote_state);
     let merged_comparable = merged_state_without_envelopes.clone();
-    if merged_comparable == local_comparable || merged_comparable == remote_comparable {
+    if merged_comparable == local_comparable {
         return Ok(false);
     }
 
@@ -2326,7 +2325,10 @@ pub fn reconcile_remote_keyring_for_sync(
 
     let local_content = comparable_keyring_state(&local_state);
     let merged_content = comparable_keyring_state(&merged_state);
-    if local_content == merged_content {
+    let local_pointer_matches_remote_generation =
+        local_state.active_epoch == merged_state.active_epoch
+            && local_state.generation == merged_state.generation;
+    if local_content == merged_content && local_pointer_matches_remote_generation {
         return Ok(false);
     }
     let next_file_name = format!("keyring.{}", merged_state.generation);

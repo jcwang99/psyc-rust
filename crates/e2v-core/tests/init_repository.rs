@@ -6021,6 +6021,82 @@ fn share_accept_member_bootstraps_empty_recipient_repo() {
 }
 
 #[test]
+fn reconcile_remote_keyring_for_sync_advances_stale_local_device_clone_to_remote_epoch() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&owner_root)).unwrap();
+
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: invite.bundle_bytes.clone(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap();
+
+    let before = read_current_keyring_json(&recipient_root);
+    assert_eq!(before["generation"].as_u64(), Some(2));
+    assert_eq!(before["active_epoch"].as_u64(), Some(1));
+    let recipient_keyring_dir = recipient_root.join(".e2v").join("keyring");
+    let recipient_pointer: serde_json::Value = serde_json::from_slice(
+        &fs::read(recipient_keyring_dir.join("keyring.current")).unwrap(),
+    )
+    .unwrap();
+    let recipient_current = recipient_pointer["current"].as_str().unwrap();
+    let recipient_keyring_bytes = fs::read(recipient_keyring_dir.join(recipient_current)).unwrap();
+    assert!(
+        e2v_core::testing::reconcile_remote_keyring_for_test(&owner_root, &recipient_keyring_bytes)
+            .unwrap(),
+        "expected owner to import the recipient device envelope before rotating epochs"
+    );
+
+    e2v_core::testing::rotate_active_epoch_for_test(
+        &owner_root,
+        "correct horse battery staple",
+    )
+    .unwrap();
+    let owner_rotated = read_current_keyring_json(&owner_root);
+    assert_eq!(owner_rotated["active_epoch"].as_u64(), Some(2));
+
+    let owner_keyring_dir = owner_root.join(".e2v").join("keyring");
+    let owner_pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(owner_keyring_dir.join("keyring.current")).unwrap())
+            .unwrap();
+    let owner_current = owner_pointer["current"].as_str().unwrap();
+    let remote_keyring_bytes = fs::read(owner_keyring_dir.join(owner_current)).unwrap();
+
+    let reconciled =
+        e2v_core::testing::reconcile_remote_keyring_for_test(&recipient_root, &remote_keyring_bytes)
+            .unwrap();
+
+    assert!(
+        reconciled,
+        "expected reconcile to publish a new local keyring generation for the stale recipient clone"
+    );
+    let after = read_current_keyring_json(&recipient_root);
+    assert_eq!(after["active_epoch"].as_u64(), Some(2));
+    assert!(
+        after["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap(),
+        "expected reconcile to publish a newer local keyring generation"
+    );
+}
+
+#[test]
 fn share_accept_member_rejects_bootstrap_pointer_path_traversal_before_writing_outside_repo() {
     let temp = tempdir().unwrap();
     let owner_root = temp.path().join("owner");

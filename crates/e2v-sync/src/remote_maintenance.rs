@@ -108,6 +108,14 @@ pub struct GcExecuteCapabilityStatus {
     pub blockers: Vec<&'static str>,
 }
 
+struct MaintenanceRemoteState {
+    default_ref: e2v_store::StoredRef,
+    control_plane: crate::fetch::RemoteControlPlane,
+    validation_secrets: RepoSecrets,
+    remote_loose_object_ids: BTreeSet<String>,
+    pack_locations: BTreeMap<String, PackedObjectLocation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoricalRewritePlan {
     pub reachable_object_count: usize,
@@ -1085,21 +1093,21 @@ pub fn verify_remote<R: RemoteBackend>(
     );
 
     let control_dir = options.repo_root.join(".e2v");
+    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
     let (branch_token, _) =
         sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
-    let default_ref = remote
-        .read_ref(&RefToken::new(branch_token.clone()))?
-        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
-    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
-    let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    let MaintenanceRemoteState {
+        default_ref,
+        control_plane,
+        validation_secrets,
+        remote_loose_object_ids,
+        pack_locations,
+    } = load_maintenance_remote_state(remote, &options.repo_root, &branch_token)?;
     let mut pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations)?;
     let facade = RepositoryFacade::new();
     let mut repaired_local_objects = 0usize;
 
-    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
@@ -1111,7 +1119,7 @@ pub fn verify_remote<R: RemoteBackend>(
         remote_loose_object_ids: &remote_loose_object_ids,
         pack_locations: &pack_locations,
         validation_root: &validation_root,
-        validation_secrets: &secrets,
+        validation_secrets: &validation_secrets,
         pack_cache: &mut pack_cache,
     };
     let reachable_store = GcReachabilityStore::new(&options.repo_root)?;
@@ -1131,7 +1139,7 @@ pub fn verify_remote<R: RemoteBackend>(
     drop(statement);
     let sampled_object_ids = sample_object_ids(&reachable_object_ids, options.sample_percent);
     let validation_object_store =
-        DirectLayoutObjectStore::new(validation_root.control_dir(), secrets.clone());
+        DirectLayoutObjectStore::new(validation_root.control_dir(), validation_secrets.clone());
 
     for object_id in &sampled_object_ids {
         let bytes = remote_object_bytes_with_pack_cache(
@@ -1182,18 +1190,18 @@ pub fn repair_remote<R: RemoteBackend>(
     options: RepairRemoteOptions,
 ) -> Result<RepairRemoteResult> {
     let control_dir = options.repo_root.join(".e2v");
+    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
     let (branch_token, _) =
         sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
-    let default_ref = remote
-        .read_ref(&RefToken::new(branch_token.clone()))?
-        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
-    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
-    let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    let MaintenanceRemoteState {
+        default_ref,
+        control_plane,
+        validation_secrets,
+        remote_loose_object_ids,
+        pack_locations,
+    } = load_maintenance_remote_state(remote, &options.repo_root, &branch_token)?;
     let mut pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations)?;
-    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
@@ -1205,7 +1213,7 @@ pub fn repair_remote<R: RemoteBackend>(
         remote_loose_object_ids: &remote_loose_object_ids,
         pack_locations: &pack_locations,
         validation_root: &validation_root,
-        validation_secrets: &secrets,
+        validation_secrets: &validation_secrets,
         pack_cache: &mut pack_cache,
     };
     let reachable_store = GcReachabilityStore::new(&options.repo_root)?;
@@ -1256,18 +1264,17 @@ pub fn gc_dry_run<R: RemoteBackend>(
     options: GcDryRunOptions,
 ) -> Result<GcDryRunReport> {
     let control_dir = options.repo_root.join(".e2v");
+    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
     let (branch_token, _) =
         sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
-    let default_ref = remote
-        .read_ref(&RefToken::new(branch_token.clone()))?
-        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-
-    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
-    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
-    let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
-    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    let MaintenanceRemoteState {
+        default_ref,
+        control_plane,
+        validation_secrets,
+        remote_loose_object_ids,
+        pack_locations,
+    } = load_maintenance_remote_state(remote, &options.repo_root, &branch_token)?;
     assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
@@ -1280,7 +1287,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
         remote_loose_object_ids: &remote_loose_object_ids,
         pack_locations: &pack_locations,
         validation_root: &validation_root,
-        validation_secrets: &secrets,
+        validation_secrets: &validation_secrets,
         pack_cache: &mut pack_cache,
     };
     let mut reachable_object_ids = GcReachabilityStore::new(&options.repo_root)?;
@@ -1295,7 +1302,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
         remote_loose_object_ids: &remote_loose_object_ids,
         pack_locations: &pack_locations,
         validation_root: &validation_root,
-        validation_secrets: &secrets,
+        validation_secrets: &validation_secrets,
         pack_cache: &mut pack_cache,
     };
     collect_recent_unpublished_local_reachable_object_ids(
@@ -1303,7 +1310,8 @@ pub fn gc_dry_run<R: RemoteBackend>(
         &mut reachable_object_ids,
     )?;
     persist_cached_pack_data(&control_dir, &pack_cache)?;
-    let pack_index_segment_paths = load_remote_active_pack_segment_paths(remote, &secrets)?;
+    let pack_index_segment_paths =
+        load_remote_active_pack_segment_paths(remote, &validation_secrets)?;
     let active_intent_paths = list_active_intent_paths(remote)?;
     let mut unreachable_physical_refs = collect_unreachable_physical_refs_with_spill(
         remote,
@@ -1709,14 +1717,16 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
         let control_plane =
             read_remote_control_plane(traversal.remote, listed_ref.stored.value.bytes.clone())?;
         write_remote_control_plane_to_validation_root(traversal.validation_root, &control_plane)?;
-        let (decoded_branch_token, head_snapshot_id) =
-            sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)
-                .with_context(|| {
-                    format!(
-                        "failed to decode remote branch ref {}",
-                        listed_ref.token.value
-                    )
-                })?;
+        let (decoded_branch_token, head_snapshot_id) = decode_default_ref_record_with_secrets(
+            traversal.validation_secrets,
+            &listed_ref.stored.value.bytes,
+        )
+        .with_context(|| {
+            format!(
+                "failed to decode remote branch ref {}",
+                listed_ref.token.value
+            )
+        })?;
         anyhow::ensure!(
             decoded_branch_token == listed_ref.token.value,
             "remote ref token mismatch: listed {}, decoded {}",
@@ -1737,8 +1747,10 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
             .ok_or_else(|| {
                 anyhow::anyhow!("remote branch ref not found for {default_branch_token}")
             })?;
-        let (_, head_snapshot_id) =
-            sync_support::decode_default_ref_record(repo_root, &default_ref.value.bytes)?;
+        let (_, head_snapshot_id) = decode_default_ref_record_with_secrets(
+            traversal.validation_secrets,
+            &default_ref.value.bytes,
+        )?;
         if let Some(head_snapshot_id) = head_snapshot_id {
             collect_remote_reachable_object_ids_with_recorder(
                 traversal,
@@ -1749,6 +1761,44 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
     }
 
     Ok(())
+}
+
+fn load_maintenance_remote_state<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+    branch_token: &str,
+) -> Result<MaintenanceRemoteState> {
+    let control_dir = repo_root.join(".e2v");
+    let default_ref = remote
+        .read_ref(&RefToken::new(branch_token.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
+    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    let validation_secrets =
+        load_maintenance_validation_secrets(&control_dir, &control_plane.current_keyring_bytes)?;
+    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
+    let pack_locations = load_remote_active_pack_locations_with_local_cache(
+        remote,
+        &control_dir,
+        &validation_secrets,
+    )?;
+    Ok(MaintenanceRemoteState {
+        default_ref,
+        control_plane,
+        validation_secrets,
+        remote_loose_object_ids,
+        pack_locations,
+    })
+}
+
+fn load_maintenance_validation_secrets(
+    control_dir: &Path,
+    remote_current_keyring_bytes: &[u8],
+) -> Result<RepoSecrets> {
+    sync_support::unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
+        control_dir,
+        remote_current_keyring_bytes,
+    )
+    .or_else(|_| sync_support::open_repo_secrets_for_sync(control_dir))
 }
 
 fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
