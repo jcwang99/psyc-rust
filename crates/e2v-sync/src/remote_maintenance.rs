@@ -505,17 +505,18 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     cleanup_completed_operation_markers(remote, &operation_id, &repo_state.branch.token_hex)?;
     clear_historical_rewrite_checkpoint(&control_dir)?;
     remove_local_index_if_present(&options.repo_root)?;
-    let plan = plan_historical_rewrite(
+    let rewritten_objects = rewrite_state.rewritten_object_ids.len();
+    let post_rewrite_plan = plan_historical_rewrite(
         remote,
         HistoricalRewritePlanOptions {
             repo_root: options.repo_root.clone(),
         },
-    )?;
+    )
+    .ok();
     Ok(HistoricalRewriteResult {
-        rewritten_objects: rewrite_state
-            .rewritten_object_ids
-            .len()
-            .max(plan.reachable_object_count),
+        rewritten_objects: post_rewrite_plan
+            .map(|plan| rewritten_objects.max(plan.reachable_object_count))
+            .unwrap_or(rewritten_objects),
         retired_epoch_count: rewrite_state.retired_epoch_count,
         deleted_stale_remote_refs: Vec::new(),
         next_layout_generation: repo_state.layout_generation,

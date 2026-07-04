@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use anyhow::Context;
 use e2v_core::{CommitOptions, InitOptions, ManifestStore, ManifestStoreApi, RepositoryFacade};
 use e2v_store::{
     BackendCapability, ConsistencyClass, EncryptedRef, LayoutRootStore, RefStore, RefToken,
@@ -1356,6 +1357,73 @@ fn historical_rewrite_remote_clears_checkpoint_after_successful_publish() {
     assert!(journal.read_rewrite_state(&operation_id).unwrap().is_none());
     assert!(journal.operation_metadata(&operation_id).unwrap().is_none());
     assert!(journal.pending_objects(&operation_id).unwrap().is_empty());
+}
+
+#[test]
+fn historical_rewrite_remote_does_not_fail_after_successful_publish_when_tail_plan_refresh_breaks()
+{
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-tail-plan".to_string(),
+        },
+    )
+    .unwrap();
+
+    let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).unwrap();
+    let flaky_remote = FailCurrentKeyringReadAfterPointerAdvanceBackend::new(remote, repo_id);
+
+    let result = historical_rewrite_remote(
+        &flaky_remote,
+        HistoricalRewriteOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    );
+
+    assert!(
+        result.is_ok(),
+        "tail plan refresh should not turn a published rewrite into an error: {result:?}"
+    );
+    let result = result.unwrap();
+    assert!(result.rewritten_objects > 0);
+    assert!(result.next_layout_generation >= 2);
+    assert_eq!(flaky_remote.read_layout_root().unwrap().generation, 2);
+    assert!(
+        !repo_root
+            .join(".e2v")
+            .join("journal")
+            .join("gc")
+            .join("history-rewrite.checkpoint")
+            .exists()
+    );
 }
 
 #[test]
@@ -3851,6 +3919,128 @@ impl LayoutRootStore for FailOnceOnPutBackend {
 }
 
 impl e2v_store::RemoteBackend for FailOnceOnPutBackend {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailCurrentKeyringReadAfterPointerAdvanceBackend {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+    repo_id: String,
+    initial_current_file: String,
+}
+
+impl FailCurrentKeyringReadAfterPointerAdvanceBackend {
+    fn new(inner: MemoryBackend, repo_id: String) -> Self {
+        let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
+        let pointer_bytes = inner
+            .read_ref(&pointer_token)
+            .unwrap()
+            .expect("remote keyring pointer")
+            .value
+            .bytes;
+        let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+        let initial_current_file = pointer["current"].as_str().unwrap().to_string();
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+            repo_id,
+            initial_current_file,
+        }
+    }
+}
+
+impl BlobStore for FailCurrentKeyringReadAfterPointerAdvanceBackend {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        if let Some(file_name) = relative_path.strip_prefix("control/keyring/") {
+            let pointer_token = RefToken::new(format!("keyring/{}", self.repo_id));
+            if let Some(stored) = self.inner.read_ref(&pointer_token)? {
+                let pointer: serde_json::Value = serde_json::from_slice(&stored.value.bytes)
+                    .context("failed to decode remote keyring pointer")?;
+                if pointer["current"].as_str() == Some(file_name)
+                    && file_name != self.initial_current_file
+                {
+                    anyhow::bail!("injected missing current remote keyring file {relative_path}");
+                }
+            }
+        }
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for FailCurrentKeyringReadAfterPointerAdvanceBackend {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        self.inner.list_refs()
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for FailCurrentKeyringReadAfterPointerAdvanceBackend {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for FailCurrentKeyringReadAfterPointerAdvanceBackend {
     fn capability(&self) -> &BackendCapability {
         &self.capability
     }
