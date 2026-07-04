@@ -9,14 +9,13 @@ use anyhow::Result;
 use e2v_core::DirectoryEntry;
 
 use crate::{
-    CachePolicy, MountLaunchSummary, MountMode, MountRequest, MountedFilesystem, OpenedFile,
-    ReadOnlyVfs, RefreshOutcome, VfsMountConfig, VfsNodeMetadata, WritableVfs,
+    CachePolicy, MountLaunchState, MountLaunchSummary, MountMode, MountRequest, MountedFilesystem,
+    OpenedFile, ReadOnlyVfs, RefreshOutcome, VfsMountConfig, VfsNodeMetadata, WritableVfs,
 };
 
 const DEFAULT_SECTOR_SIZE: u32 = 4096;
 const DEFAULT_TOTAL_BYTES: u64 = 1 << 40;
-const WINDOWS_ADAPTER_STATUS: &str =
-    "winfsp adapter boundary ready; windows adapter not implemented yet";
+const WINDOWS_ADAPTER_STATUS: &str = "winfsp adapter boundary ready; host not started";
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
@@ -283,7 +282,7 @@ impl WindowsMountLauncher {
             cache_policy,
             read_only,
             stream_only: true,
-            launch_state: "summary-only".to_string(),
+            launch_state: MountLaunchState::SummaryOnly,
             status_message: WINDOWS_ADAPTER_STATUS.to_string(),
         })
     }
@@ -424,7 +423,7 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
         cache_policy,
         read_only: host_config.read_only,
         stream_only: true,
-        launch_state: "host-active".to_string(),
+        launch_state: MountLaunchState::HostActive,
         status_message: "winfsp host mount active".to_string(),
     };
     Ok(MountedFilesystem::with_windows_host(

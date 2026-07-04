@@ -316,13 +316,19 @@ struct CachedRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountLaunchState {
+    SummaryOnly,
+    HostActive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountLaunchSummary {
     pub mount_mode: String,
     pub mount_point: PathBuf,
     pub cache_policy: CachePolicy,
     pub read_only: bool,
     pub stream_only: bool,
-    pub launch_state: String,
+    pub launch_state: MountLaunchState,
     pub status_message: String,
 }
 

@@ -12,7 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 use e2v_vfs::{
-    CachePolicy, PlatformCapabilities, ReadOnlyVfs, VfsMountConfig, VfsNodeKind, VfsSemantic,
+    CachePolicy, MountLaunchState, PlatformCapabilities, ReadOnlyVfs, VfsMountConfig, VfsNodeKind,
+    VfsSemantic,
     testing::{
         LinuxMountAdapter, MacosMountAdapter, MountRequest, PlatformFamily, VfsHostLauncher,
         WindowsMountLauncher, WinfspHostConfig, WinfspHostDriver, WinfspHostLauncher,
@@ -2038,7 +2039,7 @@ fn mount_requests_stop_at_the_platform_boundary_with_explicit_status() {
     )
     .unwrap();
 
-    assert_eq!(summary.launch_state, "summary-only");
+    assert_eq!(summary.launch_state, MountLaunchState::SummaryOnly);
 }
 
 #[cfg(windows)]
@@ -2056,7 +2057,12 @@ fn current_platform_mount_uses_the_windows_adapter_boundary() {
     )
     .unwrap();
 
-    assert_eq!(summary.launch_state, "summary-only");
+    assert_eq!(summary.launch_state, MountLaunchState::SummaryOnly);
+    assert!(
+        summary.status_message.contains("host not started"),
+        "unexpected status: {}",
+        summary.status_message
+    );
 }
 
 #[test]
@@ -2212,7 +2218,8 @@ fn windows_mount_launcher_can_launch_through_host_and_return_a_summary() {
         summary.cache_policy,
         CachePolicy::KernelCacheWithInvalidation
     );
-    assert_eq!(summary.launch_state, "summary-only");
+    assert_eq!(summary.launch_state, MountLaunchState::SummaryOnly);
+    assert!(summary.status_message.contains("host not started"));
 }
 
 #[test]
@@ -3635,7 +3642,7 @@ fn linux_mount_adapter_exposes_a_future_fuse_boundary() {
     );
     assert_eq!(summary.mount_mode, "live-branch");
     assert_eq!(summary.cache_policy, CachePolicy::DirectIoFallback);
-    assert_eq!(summary.launch_state, "summary-only");
+    assert_eq!(summary.launch_state, MountLaunchState::SummaryOnly);
 }
 
 #[test]
@@ -3662,7 +3669,7 @@ fn macos_mount_adapter_exposes_a_future_fuse_boundary() {
         summary.cache_policy,
         CachePolicy::KernelCacheWithInvalidation
     );
-    assert_eq!(summary.launch_state, "summary-only");
+    assert_eq!(summary.launch_state, MountLaunchState::SummaryOnly);
 }
 
 #[cfg(windows)]
@@ -3685,7 +3692,7 @@ fn windows_snapshot_mount_reads_repository_file_through_real_winfsp_mount() {
 
     assert_eq!(summary.mount_mode, "snapshot-pinned");
     assert_eq!(summary.mount_point, rooted_mount_point);
-    assert_eq!(summary.launch_state, "host-active");
+    assert_eq!(summary.launch_state, MountLaunchState::HostActive);
     assert!(summary.status_message.contains("winfsp host mount active"));
     let dir_output = std::process::Command::new("cmd")
         .args(["/c", "dir", r"Q:\"])

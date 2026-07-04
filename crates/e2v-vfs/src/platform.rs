@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::{MountLaunchSummary, MountRequest, VfsMountConfig};
+use crate::{MountLaunchState, MountLaunchSummary, MountRequest, VfsMountConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformFamily {
@@ -39,7 +39,7 @@ impl PlatformMountAdapter for LinuxMountAdapter {
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
-            launch_state: "summary-only".to_string(),
+            launch_state: MountLaunchState::SummaryOnly,
             status_message: "linux adapter not implemented yet".to_string(),
         })
     }
@@ -62,7 +62,7 @@ impl PlatformMountAdapter for MacosMountAdapter {
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
-            launch_state: "summary-only".to_string(),
+            launch_state: MountLaunchState::SummaryOnly,
             status_message: "macos adapter not implemented yet".to_string(),
         })
     }
@@ -85,7 +85,7 @@ pub fn try_mount_snapshot_on_current_platform(
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
-            launch_state: "summary-only".to_string(),
+            launch_state: MountLaunchState::SummaryOnly,
             status_message: "not supported on this platform yet".to_string(),
         })
     }
@@ -108,7 +108,7 @@ pub fn try_mount_live_branch_on_current_platform(
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
-            launch_state: "summary-only".to_string(),
+            launch_state: MountLaunchState::SummaryOnly,
             status_message: "not supported on this platform yet".to_string(),
         })
     }
