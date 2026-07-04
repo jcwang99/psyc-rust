@@ -1,4 +1,5 @@
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 
@@ -6,6 +7,7 @@ use crate::{
     BackendCapability, BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot,
     LayoutRootStore, LayoutRootVersion, ListedRef, ObjectStat, RefStore, RefToken, RefVersion,
     StoredRef, is_missing_physical_object_error,
+    remote_telemetry::{RemoteOperationKind, RemoteTelemetryHandle},
 };
 
 pub trait RemoteBackend: BlobStore + RefStore + LayoutRootStore + Send + Sync {
@@ -26,22 +28,167 @@ fn opendal_runtime() -> Result<&'static tokio::runtime::Runtime> {
 }
 
 #[derive(Clone)]
+struct TelemetryOperator {
+    inner: opendal::blocking::Operator,
+    telemetry: Option<RemoteTelemetryHandle>,
+}
+
+impl TelemetryOperator {
+    fn new(
+        inner: opendal::blocking::Operator,
+        telemetry: Option<RemoteTelemetryHandle>,
+    ) -> Self {
+        Self { inner, telemetry }
+    }
+
+    fn record_result<T>(
+        &self,
+        kind: RemoteOperationKind,
+        path: &str,
+        bytes_sent: u64,
+        action: impl FnOnce(&opendal::blocking::Operator) -> opendal::Result<T>,
+        summarize: impl FnOnce(&T) -> (u64, u64),
+    ) -> opendal::Result<T> {
+        let start = Instant::now();
+        let result = action(&self.inner);
+        if let Some(telemetry) = &self.telemetry {
+            let (bytes_received, listed_entries) = match result.as_ref() {
+                Ok(value) => summarize(value),
+                Err(_) => (0, 0),
+            };
+            telemetry.record(
+                kind,
+                path,
+                start.elapsed(),
+                bytes_sent,
+                bytes_received,
+                listed_entries,
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    fn write(&self, path: &str, bytes: Vec<u8>) -> opendal::Result<opendal::Metadata> {
+        let bytes_sent = bytes.len() as u64;
+        self.record_result(RemoteOperationKind::Write, path, bytes_sent, move |operator| {
+            operator.write(path, bytes)
+        }, |_| (0, 0))
+    }
+
+    fn write_options(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        opts: opendal::options::WriteOptions,
+    ) -> opendal::Result<opendal::Metadata> {
+        let bytes_sent = bytes.len() as u64;
+        self.record_result(
+            RemoteOperationKind::WriteIfAbsent,
+            path,
+            bytes_sent,
+            move |operator| operator.write_options(path, bytes, opts),
+            |_| (0, 0),
+        )
+    }
+
+    fn read(&self, path: &str) -> opendal::Result<opendal::Buffer> {
+        self.record_result(RemoteOperationKind::Read, path, 0, |operator| operator.read(path), |buffer| {
+            (buffer.len() as u64, 0)
+        })
+    }
+
+    fn read_options(
+        &self,
+        path: &str,
+        opts: opendal::options::ReadOptions,
+    ) -> opendal::Result<opendal::Buffer> {
+        self.record_result(
+            RemoteOperationKind::ReadRange,
+            path,
+            0,
+            move |operator| operator.read_options(path, opts),
+            |buffer| (buffer.len() as u64, 0),
+        )
+    }
+
+    fn delete(&self, path: &str) -> opendal::Result<()> {
+        self.record_result(RemoteOperationKind::Delete, path, 0, |operator| operator.delete(path), |_| {
+            (0, 0)
+        })
+    }
+
+    fn exists(&self, path: &str) -> opendal::Result<bool> {
+        self.record_result(RemoteOperationKind::Exists, path, 0, |operator| operator.exists(path), |_| {
+            (0, 0)
+        })
+    }
+
+    fn stat(&self, path: &str) -> opendal::Result<opendal::Metadata> {
+        self.record_result(RemoteOperationKind::Stat, path, 0, |operator| operator.stat(path), |_| {
+            (0, 0)
+        })
+    }
+
+    fn list(&self, path: &str) -> opendal::Result<Vec<opendal::Entry>> {
+        self.record_result(RemoteOperationKind::List, path, 0, |operator| operator.list(path), |entries| {
+            (0, entries.len() as u64)
+        })
+    }
+
+    fn list_options(
+        &self,
+        path: &str,
+        opts: opendal::options::ListOptions,
+    ) -> opendal::Result<Vec<opendal::Entry>> {
+        self.record_result(
+            RemoteOperationKind::List,
+            path,
+            0,
+            move |operator| operator.list_options(path, opts),
+            |entries| (0, entries.len() as u64),
+        )
+    }
+}
+
+#[derive(Clone)]
 pub struct OpendalMemoryBackend {
-    operator: opendal::blocking::Operator,
+    operator: TelemetryOperator,
     capability: BackendCapability,
 }
 
 impl OpendalMemoryBackend {
     pub fn new() -> Result<Self> {
-        let _guard = opendal_runtime()?.enter();
-        Ok(Self::from_operator(opendal::blocking::Operator::new(
-            opendal::Operator::new(opendal::services::Memory::default())?.finish(),
-        )?))
+        Self::new_with_optional_telemetry(None)
     }
 
-    fn from_operator(operator: opendal::blocking::Operator) -> Self {
+    pub fn new_with_telemetry(telemetry: RemoteTelemetryHandle) -> Result<Self> {
+        Self::new_with_optional_telemetry(Some(telemetry))
+    }
+
+    fn new_with_optional_telemetry(telemetry: Option<RemoteTelemetryHandle>) -> Result<Self> {
+        let _guard = opendal_runtime()?.enter();
+        Ok(Self::from_operator_with_telemetry(
+            opendal::blocking::Operator::new(
+                opendal::Operator::new(opendal::services::Memory::default())?.finish(),
+            )?,
+            telemetry,
+        ))
+    }
+
+    #[cfg(test)]
+    fn from_operator(
+        operator: opendal::blocking::Operator,
+    ) -> Self {
+        Self::from_operator_with_telemetry(operator, None)
+    }
+
+    fn from_operator_with_telemetry(
+        operator: opendal::blocking::Operator,
+        telemetry: Option<RemoteTelemetryHandle>,
+    ) -> Self {
         Self {
-            operator,
+            operator: TelemetryOperator::new(operator, telemetry),
             capability: BackendCapability {
                 supports_conditional_put: false,
                 supports_range_read: true,
@@ -104,19 +251,33 @@ pub struct WebdavRemoteConfig {
 
 #[derive(Clone)]
 pub struct OpendalWebdavBackend {
-    operator: opendal::blocking::Operator,
+    operator: TelemetryOperator,
     capability: BackendCapability,
     flavor: WebdavFlavor,
 }
 
 #[derive(Clone)]
 pub struct OpendalS3Backend {
-    operator: opendal::blocking::Operator,
+    operator: TelemetryOperator,
     capability: BackendCapability,
 }
 
 impl OpendalS3Backend {
     pub fn new(config: S3RemoteConfig) -> Result<Self> {
+        Self::new_with_optional_telemetry(config, None)
+    }
+
+    pub fn new_with_telemetry(
+        config: S3RemoteConfig,
+        telemetry: RemoteTelemetryHandle,
+    ) -> Result<Self> {
+        Self::new_with_optional_telemetry(config, Some(telemetry))
+    }
+
+    fn new_with_optional_telemetry(
+        config: S3RemoteConfig,
+        telemetry: Option<RemoteTelemetryHandle>,
+    ) -> Result<Self> {
         anyhow::ensure!(
             !config.endpoint.trim().is_empty(),
             "s3 endpoint must not be empty"
@@ -152,7 +313,7 @@ impl OpendalS3Backend {
         let operator = opendal::blocking::Operator::new(opendal::Operator::new(builder)?.finish())?;
 
         Ok(Self {
-            operator,
+            operator: TelemetryOperator::new(operator, telemetry),
             capability: BackendCapability {
                 supports_conditional_put: false,
                 supports_range_read: true,
@@ -173,6 +334,20 @@ impl OpendalS3Backend {
 
 impl OpendalWebdavBackend {
     pub fn new(config: WebdavRemoteConfig) -> Result<Self> {
+        Self::new_with_optional_telemetry(config, None)
+    }
+
+    pub fn new_with_telemetry(
+        config: WebdavRemoteConfig,
+        telemetry: RemoteTelemetryHandle,
+    ) -> Result<Self> {
+        Self::new_with_optional_telemetry(config, Some(telemetry))
+    }
+
+    fn new_with_optional_telemetry(
+        config: WebdavRemoteConfig,
+        telemetry: Option<RemoteTelemetryHandle>,
+    ) -> Result<Self> {
         anyhow::ensure!(
             !config.endpoint.trim().is_empty(),
             "webdav endpoint must not be empty"
@@ -200,7 +375,7 @@ impl OpendalWebdavBackend {
         let operator = opendal::blocking::Operator::new(opendal::Operator::new(builder)?.finish())?;
 
         Ok(Self {
-            operator,
+            operator: TelemetryOperator::new(operator, telemetry),
             capability: webdav_capability(&config.verified_capabilities),
             flavor: config.flavor,
         })

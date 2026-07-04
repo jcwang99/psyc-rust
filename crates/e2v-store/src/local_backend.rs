@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 
@@ -7,6 +8,7 @@ use crate::capability::{BackendCapability, ConsistencyClass};
 use crate::layout::LayoutRoot;
 use crate::layout_root_store::{LayoutRootStore, LayoutRootVersion};
 use crate::opendal_backend::RemoteBackend;
+use crate::remote_telemetry::{RemoteOperationKind, RemoteTelemetryHandle};
 use crate::ref_store::{CasResult, ListedRef, RefStore, RefToken, RefVersion, StoredRef};
 
 pub trait BlobStore {
@@ -48,15 +50,31 @@ pub struct ObjectStat {
     pub modified_at: Option<std::time::SystemTime>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LocalFolderBackend {
     repo_root: PathBuf,
+    telemetry: Option<RemoteTelemetryHandle>,
 }
 
 impl LocalFolderBackend {
     pub fn new(repo_root: impl AsRef<Path>) -> Self {
+        Self::new_with_optional_telemetry(repo_root, None)
+    }
+
+    pub fn new_with_telemetry(
+        repo_root: impl AsRef<Path>,
+        telemetry: RemoteTelemetryHandle,
+    ) -> Self {
+        Self::new_with_optional_telemetry(repo_root, Some(telemetry))
+    }
+
+    fn new_with_optional_telemetry(
+        repo_root: impl AsRef<Path>,
+        telemetry: Option<RemoteTelemetryHandle>,
+    ) -> Self {
         Self {
             repo_root: repo_root.as_ref().to_path_buf(),
+            telemetry,
         }
     }
 
@@ -147,7 +165,57 @@ impl LocalFolderBackend {
         file.set_times(std::fs::FileTimes::new().set_modified(modified_at))?;
         Ok(())
     }
+
+    fn record_result<T>(
+        &self,
+        kind: RemoteOperationKind,
+        relative_path: &str,
+        bytes_sent: u64,
+        action: impl FnOnce() -> Result<T>,
+        summarize: impl FnOnce(&T) -> (u64, u64),
+    ) -> Result<T> {
+        let start = Instant::now();
+        let result = action();
+        if let Some(telemetry) = &self.telemetry {
+            let (bytes_received, listed_entries) = match result.as_ref() {
+                Ok(value) => summarize(value),
+                Err(_) => (0, 0),
+            };
+            telemetry.record(
+                kind,
+                relative_path,
+                start.elapsed(),
+                bytes_sent,
+                bytes_received,
+                listed_entries,
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    fn record_bool(
+        &self,
+        kind: RemoteOperationKind,
+        relative_path: &str,
+        action: impl FnOnce() -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        let result = action();
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record(kind, relative_path, start.elapsed(), 0, 0, 0, true);
+        }
+        result
+    }
 }
+
+impl PartialEq for LocalFolderBackend {
+    fn eq(&self, other: &Self) -> bool {
+        self.repo_root == other.repo_root
+    }
+}
+
+impl Eq for LocalFolderBackend {}
 
 fn ensure_directory_path(path: &Path) -> Result<()> {
     if path.is_dir() {
@@ -180,41 +248,62 @@ fn path_conflict_exists(path: &Path) -> bool {
 
 impl BlobStore for LocalFolderBackend {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
-        self.put_object(relative_path, bytes)
+        self.record_result(
+            RemoteOperationKind::Write,
+            relative_path,
+            bytes.len() as u64,
+            || self.put_object(relative_path, bytes),
+            |_| (0, 0),
+        )
     }
 
     fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> Result<bool> {
-        let full_path = self.resolve_relative_path(relative_path)?;
-        if let Some(parent) = full_path.parent() {
-            match ensure_directory_path(parent) {
-                Ok(()) => {}
-                Err(error) if path_conflict_exists(parent) => return Ok(false),
-                Err(error) => return Err(error),
-            }
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&full_path)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(bytes)
-                    .with_context(|| format!("failed to write object {}", full_path.display()))?;
-                Ok(true)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) if path_conflict_exists(&full_path) => {
-                let _ = error;
-                Ok(false)
-            }
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to create object {}", full_path.display())),
-        }
+        self.record_result(
+            RemoteOperationKind::WriteIfAbsent,
+            relative_path,
+            bytes.len() as u64,
+            || {
+                let full_path = self.resolve_relative_path(relative_path)?;
+                if let Some(parent) = full_path.parent() {
+                    match ensure_directory_path(parent) {
+                        Ok(()) => {}
+                        Err(error) if path_conflict_exists(parent) => return Ok(false),
+                        Err(error) => return Err(error),
+                    }
+                }
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&full_path)
+                {
+                    Ok(mut file) => {
+                        use std::io::Write;
+                        file.write_all(bytes).with_context(|| {
+                            format!("failed to write object {}", full_path.display())
+                        })?;
+                        Ok(true)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                    Err(error) if path_conflict_exists(&full_path) => {
+                        let _ = error;
+                        Ok(false)
+                    }
+                    Err(error) => Err(error)
+                        .with_context(|| format!("failed to create object {}", full_path.display())),
+                }
+            },
+            |_| (0, 0),
+        )
     }
 
     fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
-        self.get_object(relative_path)
+        self.record_result(
+            RemoteOperationKind::Read,
+            relative_path,
+            0,
+            || self.get_object(relative_path),
+            |bytes| (bytes.len() as u64, 0),
+        )
     }
 
     fn get_physical_range(
@@ -223,94 +312,129 @@ impl BlobStore for LocalFolderBackend {
         offset: usize,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let full_path = self.resolve_relative_path(relative_path)?;
-        let mut file = fs::File::open(&full_path)
-            .with_context(|| format!("failed to read object {}", full_path.display()))?;
-        let total_length: usize = file
-            .metadata()
-            .with_context(|| format!("failed to stat object {}", full_path.display()))?
-            .len()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("object length does not fit in usize"))?;
-        anyhow::ensure!(offset <= total_length, "range offset out of bounds");
-        let end = offset.saturating_add(length).min(total_length);
-        if offset == end {
-            return Ok(Vec::new());
-        }
-        use std::io::{Read, Seek, SeekFrom};
-        file.seek(SeekFrom::Start(offset as u64))
-            .with_context(|| format!("failed to seek object {}", full_path.display()))?;
-        let mut bytes = vec![0u8; end - offset];
-        file.read_exact(&mut bytes)
-            .with_context(|| format!("failed to read object range {}", full_path.display()))?;
-        Ok(bytes)
+        self.record_result(
+            RemoteOperationKind::ReadRange,
+            relative_path,
+            0,
+            || {
+                let full_path = self.resolve_relative_path(relative_path)?;
+                let mut file = fs::File::open(&full_path)
+                    .with_context(|| format!("failed to read object {}", full_path.display()))?;
+                let total_length: usize = file
+                    .metadata()
+                    .with_context(|| format!("failed to stat object {}", full_path.display()))?
+                    .len()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("object length does not fit in usize"))?;
+                anyhow::ensure!(offset <= total_length, "range offset out of bounds");
+                let end = offset.saturating_add(length).min(total_length);
+                if offset == end {
+                    return Ok(Vec::new());
+                }
+                use std::io::{Read, Seek, SeekFrom};
+                file.seek(SeekFrom::Start(offset as u64))
+                    .with_context(|| format!("failed to seek object {}", full_path.display()))?;
+                let mut bytes = vec![0u8; end - offset];
+                file.read_exact(&mut bytes).with_context(|| {
+                    format!("failed to read object range {}", full_path.display())
+                })?;
+                Ok(bytes)
+            },
+            |bytes| (bytes.len() as u64, 0),
+        )
     }
 
     fn delete_physical(&self, relative_path: &str) -> Result<()> {
-        let full_path = self.resolve_relative_path(relative_path)?;
-        remove_path_if_exists(&full_path)
-            .with_context(|| format!("failed to delete object {}", full_path.display()))
+        self.record_result(
+            RemoteOperationKind::Delete,
+            relative_path,
+            0,
+            || {
+                let full_path = self.resolve_relative_path(relative_path)?;
+                remove_path_if_exists(&full_path)
+                    .with_context(|| format!("failed to delete object {}", full_path.display()))
+            },
+            |_| (0, 0),
+        )
     }
 
     fn exists_physical(&self, relative_path: &str) -> bool {
-        self.exists_object(relative_path)
-    }
-
-    fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
-        let full_path = self.resolve_relative_path(relative_path)?;
-        let metadata = fs::metadata(&full_path)
-            .with_context(|| format!("failed to stat object {}", full_path.display()))?;
-        Ok(ObjectStat {
-            length: metadata.len(),
-            modified_at: metadata.modified().ok(),
+        self.record_bool(RemoteOperationKind::Exists, relative_path, || {
+            self.exists_object(relative_path)
         })
     }
 
+    fn stat_physical(&self, relative_path: &str) -> Result<ObjectStat> {
+        self.record_result(
+            RemoteOperationKind::Stat,
+            relative_path,
+            0,
+            || {
+                let full_path = self.resolve_relative_path(relative_path)?;
+                let metadata = fs::metadata(&full_path)
+                    .with_context(|| format!("failed to stat object {}", full_path.display()))?;
+                Ok(ObjectStat {
+                    length: metadata.len(),
+                    modified_at: metadata.modified().ok(),
+                })
+            },
+            |_| (0, 0),
+        )
+    }
+
     fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
-        let base = self.resolve_relative_path(prefix)?;
-        let mut listed = Vec::new();
-        if !base.exists() {
-            return Ok(listed);
-        }
-
-        fn visit(
-            base: &Path,
-            current: &Path,
-            prefix: &str,
-            listed: &mut Vec<String>,
-        ) -> Result<()> {
-            for entry in fs::read_dir(current)
-                .with_context(|| format!("failed to list objects under {}", current.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                let file_type = entry.file_type()?;
-                if file_type.is_dir() {
-                    visit(base, &path, prefix, listed)?;
-                    continue;
+        self.record_result(
+            RemoteOperationKind::List,
+            prefix,
+            0,
+            || {
+                let base = self.resolve_relative_path(prefix)?;
+                let mut listed = Vec::new();
+                if !base.exists() {
+                    return Ok(listed);
                 }
-                if !file_type.is_file() {
-                    continue;
-                }
-                let relative = path
-                    .strip_prefix(base)
-                    .with_context(|| {
-                        format!(
-                            "failed to strip base {} from listed object {}",
-                            base.display(),
-                            path.display()
-                        )
-                    })?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                listed.push(format!("{prefix}{relative}"));
-            }
-            Ok(())
-        }
 
-        visit(&base, &base, prefix, &mut listed)?;
-        listed.sort();
-        Ok(listed)
+                fn visit(
+                    base: &Path,
+                    current: &Path,
+                    prefix: &str,
+                    listed: &mut Vec<String>,
+                ) -> Result<()> {
+                    for entry in fs::read_dir(current).with_context(|| {
+                        format!("failed to list objects under {}", current.display())
+                    })? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        let file_type = entry.file_type()?;
+                        if file_type.is_dir() {
+                            visit(base, &path, prefix, listed)?;
+                            continue;
+                        }
+                        if !file_type.is_file() {
+                            continue;
+                        }
+                        let relative = path
+                            .strip_prefix(base)
+                            .with_context(|| {
+                                format!(
+                                    "failed to strip base {} from listed object {}",
+                                    base.display(),
+                                    path.display()
+                                )
+                            })?
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        listed.push(format!("{prefix}{relative}"));
+                    }
+                    Ok(())
+                }
+
+                visit(&base, &base, prefix, &mut listed)?;
+                listed.sort();
+                Ok(listed)
+            },
+            |listed| (0, listed.len() as u64),
+        )
     }
 }
 

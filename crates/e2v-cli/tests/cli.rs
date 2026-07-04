@@ -2356,3 +2356,65 @@ fn doctor_bundle_redacts_s3_remote_credentials() {
         "bundle summary leaked s3 bucket name: {summary}"
     );
 }
+
+#[test]
+fn diagnose_command_reports_phase_timings_request_counts_and_bytes() {
+    let temp = tempdir().unwrap();
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let output = e2v_cli::testing::run_cli([
+        "e2v",
+        "diagnose",
+        &file_remote_spec(&remote_root),
+        "--file-count",
+        "1",
+        "--payload-bytes",
+        "32",
+    ])
+    .unwrap();
+
+    for expected in [
+        "remote diagnostics",
+        "push_v1",
+        "clone",
+        "push_v2",
+        "fetch",
+        "requests",
+        "bytes_sent",
+        "bytes_received",
+    ] {
+        assert!(
+            output.contains(expected),
+            "expected diagnose summary to contain {expected}, got: {output}"
+        );
+    }
+}
+
+#[test]
+fn diagnose_command_can_emit_machine_readable_json() {
+    let temp = tempdir().unwrap();
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let output = e2v_cli::testing::run_cli([
+        "e2v",
+        "diagnose",
+        &file_remote_spec(&remote_root),
+        "--scenario",
+        "fetch",
+        "--file-count",
+        "1",
+        "--payload-bytes",
+        "16",
+        "--json",
+    ])
+    .unwrap();
+
+    let report: e2v_sync::RemoteDiagnosticsReport = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(report.scenario, e2v_sync::RemoteDiagnosticsScenario::Fetch);
+    assert_eq!(report.phases.len(), 1);
+    assert_eq!(report.phases[0].name, "fetch");
+    assert!(report.phases[0].metrics.total_requests > 0);
+}

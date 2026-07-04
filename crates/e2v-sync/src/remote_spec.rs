@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use e2v_store::{
-    LocalFolderBackend, OpendalS3Backend, OpendalWebdavBackend, S3RemoteConfig, WebdavFlavor,
-    WebdavRemoteConfig, WebdavVerifiedCapabilities,
+    LocalFolderBackend, OpendalS3Backend, OpendalWebdavBackend, RemoteTelemetryHandle,
+    S3RemoteConfig, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,17 +83,38 @@ impl RemoteSpec {
         &self,
         handler: impl FnOnce(RemoteBackendRef<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.with_backend_telemetry(None, handler)
+    }
+
+    pub fn with_backend_telemetry<T>(
+        &self,
+        telemetry: Option<RemoteTelemetryHandle>,
+        handler: impl FnOnce(RemoteBackendRef<'_>) -> Result<T>,
+    ) -> Result<T> {
         match self {
             Self::LocalFolder(path) => {
-                let backend = LocalFolderBackend::new(path);
+                let backend = match telemetry.clone() {
+                    Some(telemetry) => LocalFolderBackend::new_with_telemetry(path, telemetry),
+                    None => LocalFolderBackend::new(path),
+                };
                 handler(RemoteBackendRef::LocalFolder(&backend))
             }
             Self::S3(config) => {
-                let backend = OpendalS3Backend::new(config.clone())?;
+                let backend = match telemetry.clone() {
+                    Some(telemetry) => {
+                        OpendalS3Backend::new_with_telemetry(config.clone(), telemetry)?
+                    }
+                    None => OpendalS3Backend::new(config.clone())?,
+                };
                 handler(RemoteBackendRef::S3(&backend))
             }
             Self::Webdav(config) => {
-                let backend = OpendalWebdavBackend::new(config.clone())?;
+                let backend = match telemetry {
+                    Some(telemetry) => {
+                        OpendalWebdavBackend::new_with_telemetry(config.clone(), telemetry)?
+                    }
+                    None => OpendalWebdavBackend::new(config.clone())?,
+                };
                 handler(RemoteBackendRef::Webdav(&backend))
             }
         }

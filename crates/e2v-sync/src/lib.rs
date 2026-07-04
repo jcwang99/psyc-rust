@@ -10,6 +10,7 @@ mod publisher;
 mod push;
 mod remote_maintenance;
 mod remote_markers;
+mod remote_diagnostics;
 mod remote_spec;
 mod transaction;
 mod trusted_state;
@@ -37,6 +38,10 @@ pub use remote_maintenance::{
     VerifyRemoteResult, force_accept_remote_rollback, gc_dry_run, gc_execute,
     gc_execute_capability_status, historical_rewrite_remote, plan_historical_rewrite,
     repair_remote, verify_remote,
+};
+pub use remote_diagnostics::{
+    RemoteDiagnosticsOptions, RemoteDiagnosticsPhaseReport, RemoteDiagnosticsReport,
+    RemoteDiagnosticsScenario, run_remote_diagnostics,
 };
 pub use remote_spec::{RemoteBackendRef, RemoteSpec};
 pub use trusted_state::TrustedRemoteState;

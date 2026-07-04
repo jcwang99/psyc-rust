@@ -145,6 +145,21 @@ enum Command {
         #[arg(long)]
         bundle: Option<PathBuf>,
     },
+    Diagnose {
+        remote_spec: String,
+        #[arg(long, default_value = "full")]
+        scenario: String,
+        #[arg(long, default_value = "correct horse battery staple")]
+        password: String,
+        #[arg(long = "file-count", default_value_t = 1)]
+        file_count: usize,
+        #[arg(long = "payload-bytes", default_value_t = 32)]
+        payload_bytes: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long = "force-single-writer-risk", default_value_t = false)]
+        force_single_writer_risk: bool,
+    },
     Serve {
         #[arg(long)]
         repo: PathBuf,
@@ -782,6 +797,29 @@ fn execute(cli: Cli) -> Result<String> {
                 Ok(format!("{}\n", serde_json::to_string_pretty(&summary)?))
             }
         }
+        Command::Diagnose {
+            remote_spec,
+            scenario,
+            password,
+            file_count,
+            payload_bytes,
+            json,
+            force_single_writer_risk,
+        } => {
+            let report = e2v_sync::run_remote_diagnostics(e2v_sync::RemoteDiagnosticsOptions {
+                remote_spec,
+                scenario: parse_diagnostics_scenario(&scenario)?,
+                password,
+                file_count,
+                payload_bytes,
+                force_single_writer_risk,
+            })?;
+            if json {
+                Ok(format!("{}\n", serde_json::to_string_pretty(&report)?))
+            } else {
+                Ok(report.render_summary())
+            }
+        }
         Command::Serve { .. } => anyhow::bail!("serve command requires the CLI process entrypoint"),
         Command::Mount { .. } => anyhow::bail!("mount command requires the CLI process entrypoint"),
     }
@@ -880,6 +918,18 @@ fn parse_grace_period_days(value: &str) -> Result<u64> {
     let parsed: u64 = number.parse()?;
     anyhow::ensure!(parsed > 0, "grace period must be greater than zero");
     Ok(parsed)
+}
+
+fn parse_diagnostics_scenario(value: &str) -> Result<e2v_sync::RemoteDiagnosticsScenario> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "full" => Ok(e2v_sync::RemoteDiagnosticsScenario::Full),
+        "push" => Ok(e2v_sync::RemoteDiagnosticsScenario::Push),
+        "clone" => Ok(e2v_sync::RemoteDiagnosticsScenario::Clone),
+        "fetch" => Ok(e2v_sync::RemoteDiagnosticsScenario::Fetch),
+        other => anyhow::bail!(
+            "unsupported diagnostics scenario {other}; expected one of full, push, clone, fetch"
+        ),
+    }
 }
 
 fn cli_operation_id(prefix: &str) -> Result<String> {
