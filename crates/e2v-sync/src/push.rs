@@ -26,6 +26,17 @@ use crate::transaction::{PublishPlan, PublishedObject};
 
 const KEYRING_LOCK_FILE: &str = "keyring.lock";
 
+#[derive(Debug, serde::Deserialize)]
+struct RemoteKeyringPointerSummary {
+    generation: u64,
+    current: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoteKeyringStateSummary {
+    generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushOptions {
     pub repo_root: PathBuf,
@@ -690,15 +701,21 @@ pub(crate) fn read_remote_current_keyring_bytes<R: RemoteBackend>(
         Some(stored) => stored.value.bytes,
         None => return Ok(None),
     };
-    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes)
+    let pointer: RemoteKeyringPointerSummary = serde_json::from_slice(&pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
-    let current = pointer["current"]
-        .as_str()
-        .context("invalid remote keyring pointer current file")?;
+    let current = pointer.current.as_str();
     validate_remote_relative_name(current)
         .map_err(|error| anyhow::anyhow!("invalid remote keyring path {current}: {error}"))?;
     match remote.get_physical(&format!("control/keyring/{current}")) {
-        Ok(bytes) => Ok(Some(bytes)),
+        Ok(bytes) => {
+            let keyring_state: RemoteKeyringStateSummary = serde_json::from_slice(&bytes)
+                .context("failed to decode remote current keyring state")?;
+            anyhow::ensure!(
+                keyring_state.generation == pointer.generation,
+                "remote keyring pointer generation mismatch"
+            );
+            Ok(Some(bytes))
+        }
         Err(error) if is_missing_physical_object_error(&error) => Ok(None),
         Err(error) => Err(error),
     }
@@ -1823,6 +1840,72 @@ mod tests {
             error.to_string().contains("invalid remote keyring path")
                 || error.to_string().contains("path traversal")
                 || error.to_string().contains("path escapes"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn read_remote_current_keyring_bytes_rejects_pointer_generation_mismatch() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "unit-malicious-remote-keyring-generation".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "unit-malicious-remote-keyring-generation-op".to_string(),
+            },
+        )
+        .unwrap();
+
+        let pointer_token = RefToken::new(format!(
+            "keyring/{}",
+            e2v_core::sync_support::read_repo_id(&repo_root).unwrap()
+        ));
+        let expected_version = remote.read_ref(&pointer_token).unwrap().map(|stored| stored.version);
+        let mismatched_pointer = serde_json::to_vec(&serde_json::json!({
+            "generation": 99u64,
+            "current": "keyring.1"
+        }))
+        .unwrap();
+        remote
+            .compare_and_swap_ref(
+                &pointer_token,
+                expected_version,
+                EncryptedRef::new(mismatched_pointer.clone()),
+            )
+            .unwrap();
+        remote
+            .put_physical("control/keyring/keyring.current", &mismatched_pointer)
+            .unwrap();
+
+        let error = read_remote_current_keyring_bytes(&remote, &repo_root).unwrap_err();
+
+        assert!(
+            error.to_string().contains("generation mismatch")
+                || error
+                    .to_string()
+                    .contains("remote keyring pointer generation mismatch"),
             "unexpected error: {error:#}"
         );
     }
