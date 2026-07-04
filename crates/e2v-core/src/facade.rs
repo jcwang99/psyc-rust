@@ -757,7 +757,7 @@ impl RepositoryFacade {
                     let current = journal["current"]
                         .as_str()
                         .context("invalid keyring recovery journal current")?;
-                    let generation = journal["generation"]
+                    let _journal_generation = journal["generation"]
                         .as_u64()
                         .context("invalid keyring recovery journal generation")?;
                     let generation_path = control_dir.join(KEYRING_DIR).join(current);
@@ -767,10 +767,11 @@ impl RepositoryFacade {
                             current,
                             password,
                         )?;
+                        let recovered_keyring: KeyringState = read_json(generation_path)?;
                         atomic_write_json(
                             control_dir.join(KEYRING_CURRENT_FILE),
                             &KeyringPointer {
-                                generation,
+                                generation: recovered_keyring.generation,
                                 current: current.to_string(),
                             },
                         )?;

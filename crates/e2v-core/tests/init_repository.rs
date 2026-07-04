@@ -658,6 +658,76 @@ fn unlock_recovers_when_generation_exists_but_journal_is_still_writing_generatio
 }
 
 #[test]
+fn unlock_recovery_uses_keyring_file_generation_instead_of_tampered_journal_generation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let keyring_current = repo_root
+        .join(".e2v")
+        .join("keyring")
+        .join("keyring.current");
+    let journal_path = repo_root
+        .join(".e2v")
+        .join("journal")
+        .join("keyring-update.json");
+
+    RepositoryFacade::new()
+        .change_password(
+            &repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+
+    fs::write(
+        &keyring_current,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 1u64,
+            "current": "keyring.1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &journal_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 999u64,
+            "current": "keyring.2",
+            "stage": "writing_pointer"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+
+    let reopened = facade
+        .unlock(&repo_root, "new horse battery staple")
+        .unwrap();
+
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(&keyring_current).unwrap()).unwrap();
+    assert_eq!(pointer["current"].as_str(), Some("keyring.2"));
+    assert_eq!(
+        pointer["generation"].as_u64(),
+        Some(2),
+        "recovery should rewrite the pointer with the actual recovered keyring generation"
+    );
+    assert!(!journal_path.exists());
+    assert_eq!(reopened.branch.name, "main");
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&repo_root.join(".e2v"));
+    let reopened_again = facade
+        .unlock(&repo_root, "new horse battery staple")
+        .unwrap();
+    assert_eq!(reopened_again.branch.name, "main");
+}
+
+#[test]
 fn open_restores_access_after_fresh_process_lock_state_via_local_device() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
