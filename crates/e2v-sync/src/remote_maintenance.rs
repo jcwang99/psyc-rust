@@ -1434,10 +1434,18 @@ fn sample_object_ids(object_ids: &[String], sample_percent: u8) -> Vec<String> {
         return Vec::new();
     }
     let target = ((object_ids.len() * usize::from(sample_percent)).saturating_add(99)) / 100;
-    object_ids
+    let mut scored = object_ids
         .iter()
+        .map(|object_id| {
+            let digest = blake3::hash(object_id.as_bytes());
+            (digest.as_bytes().to_vec(), object_id)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+    scored
+        .into_iter()
         .take(target.max(1))
-        .cloned()
+        .map(|(_, object_id)| object_id.clone())
         .collect::<Vec<_>>()
 }
 
@@ -2189,6 +2197,22 @@ mod tests {
                 .join("pack-00000001.bin")
                 .is_file(),
             "initializing the maintenance pack cache should preserve the on-disk cache for later lazy reuse"
+        );
+    }
+
+    #[test]
+    fn sample_object_ids_spreads_selection_instead_of_taking_prefix_only() {
+        let object_ids = (1..=8u8)
+            .map(|value| format!("{value:064x}"))
+            .collect::<Vec<_>>();
+
+        let sampled = sample_object_ids(&object_ids, 25);
+
+        assert_eq!(sampled.len(), 2);
+        assert_eq!(
+            sampled,
+            vec![format!("{:064x}", 5), format!("{:064x}", 3)],
+            "verify_remote sampling should use a stable pseudo-random spread rather than the first N sorted object ids"
         );
     }
 }
