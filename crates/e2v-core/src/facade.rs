@@ -28,7 +28,7 @@ use crate::keyring::{
     unlock_repo_secrets, unlock_repo_secrets_from_generation_file,
     unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
     unlock_repo_secrets_with_local_device, validate_keyring_file_name,
-    write_local_device_credential,
+    write_local_bootstrap_credential, write_local_device_credential,
 };
 use crate::local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
 use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreApi};
@@ -2262,61 +2262,53 @@ pub(crate) fn bootstrap_password_clone_local_device(
         .first()
         .map(|actor| actor.actor_id.clone())
         .unwrap_or_else(|| "owner-admin".to_string());
-    let local_device = generate_local_device_credential(
+    let bootstrap_device = generate_local_device_credential(
         actor_id.clone(),
         format!("device-{}", random_hex_identifier()?),
         "cloned-device".to_string(),
     )?;
-
-    let mut devices = current_state.devices.clone();
-    devices.push(crate::keyring::DeviceRecord {
-        device_id: local_device.device_id.clone(),
-        actor_id: actor_id.clone(),
-        label: local_device.label.clone(),
-        device_pubkey_hex: local_device.public_key_hex.clone(),
-        status: "active".to_string(),
-    });
-    devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
-
-    let mut next_state = current_state.clone();
-    next_state.generation += 1;
-    next_state.devices = devices;
-    next_state.envelopes = {
-        let mut envelopes = Vec::new();
-        if let Some(password_envelope) = select_password_envelope_for_active_epoch(
-            &current_state,
-            &current_state,
-            repo_secrets.active_epoch,
-        )? {
-            envelopes.push(password_envelope);
-        }
-        envelopes.extend(build_device_envelopes_for_active_devices(
+    let bootstrap_generation = current_state.generation + 1;
+    let bootstrap_generation_file = format!(
+        "keyring.{}.bootstrap-{}",
+        bootstrap_generation, bootstrap_device.device_id
+    );
+    let bootstrap_keyring_state = KeyringState {
+        format_version: current_state.format_version,
+        generation: bootstrap_generation,
+        repo_id: current_state.repo_id.clone(),
+        active_epoch: current_state.active_epoch,
+        crypto_suite: current_state.crypto_suite.clone(),
+        kdf: current_state.kdf.clone(),
+        actors: current_state.actors.clone(),
+        devices: vec![crate::keyring::DeviceRecord {
+            device_id: bootstrap_device.device_id.clone(),
+            actor_id: actor_id.clone(),
+            label: bootstrap_device.label.clone(),
+            device_pubkey_hex: bootstrap_device.public_key_hex.clone(),
+            status: "active".to_string(),
+        }],
+        epochs: current_state.epochs.clone(),
+        envelopes: vec![seal_repo_secrets_for_device(
             &current_state.repo_id,
-            &next_state.devices,
-            repo_secrets.active_epoch,
+            current_state.active_epoch,
+            &bootstrap_device.public_key_hex,
             &repo_secrets,
-        )?);
-        envelopes.sort_by(|left, right| {
-            left.kind
-                .cmp(&right.kind)
-                .then(left.actor_id.cmp(&right.actor_id))
-                .then(left.device_id.cmp(&right.device_id))
-                .then(left.envelope_id.cmp(&right.envelope_id))
-        });
-        envelopes
+            &actor_id,
+            &bootstrap_device.device_id,
+        )?],
     };
-    let next_file_name = format!("keyring.{}", next_state.generation);
-    let next_pointer = KeyringPointer {
-        generation: next_state.generation,
-        current: next_file_name.clone(),
+    let bootstrap_keyring_pointer = KeyringPointer {
+        generation: bootstrap_generation,
+        current: bootstrap_generation_file,
     };
-    write_keyring_generation_and_pointer(
+    write_local_bootstrap_credential(
         &control_dir,
-        &next_file_name,
-        &next_state,
-        &next_pointer,
+        &crate::keyring::LocalBootstrapCredential {
+            credential: bootstrap_device,
+            keyring_pointer: bootstrap_keyring_pointer,
+            keyring_state: bootstrap_keyring_state,
+        },
     )?;
-    write_local_device_credential(&control_dir, &local_device)?;
     cache_unlocked_secrets(&control_dir, &repo_secrets);
     cache_unlocked_password(&control_dir, password);
     Ok(())

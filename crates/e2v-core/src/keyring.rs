@@ -14,6 +14,7 @@ use e2v_store::{EpochSecrets, RepoSecrets};
 pub const KEYRING_DIR: &str = "keyring";
 pub const KEYRING_CURRENT_FILE: &str = "keyring/keyring.current";
 pub const LOCAL_DEVICE_FILE: &str = "device/local-device.json";
+pub const LOCAL_BOOTSTRAP_FILE: &str = "device/local-bootstrap.json";
 const KEYRING_PASSWORD_MAGIC: &[u8; 4] = b"E2KP";
 const KEYRING_PASSWORD_FORMAT_VERSION: u32 = 1;
 const KEYRING_PASSWORD_OBJECT_TYPE: &str = "keyring-password-envelope";
@@ -137,6 +138,13 @@ pub struct LocalDeviceCredential {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalBootstrapCredential {
+    pub credential: LocalDeviceCredential,
+    pub keyring_pointer: KeyringPointer,
+    pub keyring_state: KeyringState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DeviceEnvelopeRecord {
     magic: [u8; 4],
     format_version: u32,
@@ -228,9 +236,19 @@ pub fn unlock_repo_secrets(control_dir: &Path, password: &str) -> Result<RepoSec
 }
 
 pub fn unlock_repo_secrets_with_local_device(control_dir: &Path) -> Result<RepoSecrets> {
-    let keyring = read_current_keyring_state(control_dir)?;
-    let credential = read_local_device_credential(control_dir)?;
-    let secrets = unlock_repo_secrets_from_state_with_local_device(&keyring, &credential)?;
+    let secrets = match unlock_repo_secrets_with_current_local_device(control_dir) {
+        Ok(secrets) => secrets,
+        Err(primary_error) => {
+            let bootstrap = match read_local_bootstrap_credential(control_dir) {
+                Ok(bootstrap) => bootstrap,
+                Err(_) => return Err(primary_error),
+            };
+            unlock_repo_secrets_from_state_with_local_device(
+                &bootstrap.keyring_state,
+                &bootstrap.credential,
+            )?
+        }
+    };
     cache_unlocked_secrets(control_dir, &secrets);
     Ok(secrets)
 }
@@ -314,6 +332,12 @@ fn unlock_repo_secrets_from_state_with_local_device(
         repo_path_index_key: decode_hex_key(&sealed.repo_path_index_key_hex)?,
         epoch_keys: decode_epoch_keys(&sealed, keyring.active_epoch)?,
     })
+}
+
+fn unlock_repo_secrets_with_current_local_device(control_dir: &Path) -> Result<RepoSecrets> {
+    let keyring = read_current_keyring_state(control_dir)?;
+    let credential = read_local_device_credential(control_dir)?;
+    unlock_repo_secrets_from_state_with_local_device(&keyring, &credential)
 }
 
 pub fn open_repo_secrets(control_dir: &Path) -> Result<RepoSecrets> {
@@ -718,6 +742,24 @@ pub fn write_local_device_credential(
 
 pub fn read_local_device_credential(control_dir: &Path) -> Result<LocalDeviceCredential> {
     read_json(control_dir.join(LOCAL_DEVICE_FILE))
+}
+
+pub fn write_local_bootstrap_credential(
+    control_dir: &Path,
+    bootstrap: &LocalBootstrapCredential,
+) -> Result<()> {
+    let path = control_dir.join(LOCAL_BOOTSTRAP_FILE);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let bytes =
+        serde_json::to_vec(bootstrap).context("failed to encode local bootstrap credential")?;
+    atomic_write_bytes(&path, &bytes)
+}
+
+pub fn read_local_bootstrap_credential(control_dir: &Path) -> Result<LocalBootstrapCredential> {
+    read_json(control_dir.join(LOCAL_BOOTSTRAP_FILE))
 }
 
 pub fn decode_hex_key(value: &str) -> Result<[u8; 32]> {

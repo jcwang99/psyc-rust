@@ -2649,10 +2649,10 @@ fn sdk_fetch_default_remote_reports_corrupt_state_for_unreadable_newer_local_key
     let keyring_dir = clone_repo.join(".e2v").join("keyring");
     fs::write(
         keyring_dir.join("keyring.current"),
-        br#"{"generation":2,"current":"keyring.2"}"#,
+        br#"{"generation":3,"current":"keyring.3"}"#,
     )
     .unwrap();
-    fs::create_dir_all(keyring_dir.join("keyring.2")).unwrap();
+    fs::create_dir_all(keyring_dir.join("keyring.3")).unwrap();
 
     let error = sdk
         .fetch_default_remote(FetchRequest {

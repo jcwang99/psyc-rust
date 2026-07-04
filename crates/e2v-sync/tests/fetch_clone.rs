@@ -7645,6 +7645,10 @@ fn password_clone_remains_openable_after_unlock_cache_is_cleared() {
     )
     .unwrap();
 
+    let remote_pointer = remote
+        .get_physical("control/keyring/keyring.current")
+        .unwrap();
+
     clone_remote(
         &remote,
         CloneOptions {
@@ -7654,6 +7658,17 @@ fn password_clone_remains_openable_after_unlock_cache_is_cleared() {
         },
     )
     .unwrap();
+
+    assert_eq!(
+        fs::read(
+            clone_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap(),
+        remote_pointer
+    );
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&clone_root.join(".e2v"));
     let reopened = facade.open(&clone_root).unwrap();
