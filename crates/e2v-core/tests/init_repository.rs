@@ -5917,6 +5917,53 @@ fn share_accept_member_bootstraps_empty_recipient_repo() {
 }
 
 #[test]
+fn share_accept_member_rejects_bootstrap_pointer_path_traversal_before_writing_outside_repo() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let recipient_root = temp.path().join("recipient");
+    fs::create_dir_all(&owner_root).unwrap();
+    fs::create_dir_all(&recipient_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&owner_root)).unwrap();
+
+    let invite = facade
+        .share_invite_member(
+            &owner_root,
+            e2v_core::ShareInviteMemberOptions {
+                display_name: "Alice".to_string(),
+            },
+        )
+        .unwrap();
+    let mut tampered_invite: serde_json::Value =
+        serde_json::from_slice(&invite.bundle_bytes).unwrap();
+    tampered_invite["bootstrap_keyring_pointer"]["current"] =
+        serde_json::Value::String("../../../outside.json".to_string());
+
+    let error = facade
+        .share_accept_member(
+            &recipient_root,
+            e2v_core::ShareAcceptMemberOptions {
+                invite_bytes: serde_json::to_vec(&tampered_invite).unwrap(),
+                local_device_label: "alice-laptop".to_string(),
+            },
+        )
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("invalid current keyring path")
+            || error.to_string().contains("invalid keyring")
+            || error.to_string().contains("path traversal")
+            || error.to_string().contains("single path segment"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !temp.path().join("outside.json").exists(),
+        "tampered invite should not write keyring data outside the recipient repository"
+    );
+}
+
+#[test]
 fn share_revoke_member_advances_active_epoch_and_removes_member_envelope() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

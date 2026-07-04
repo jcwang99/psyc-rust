@@ -460,7 +460,7 @@ pub(crate) fn read_current_keyring_state_with_pointer(
     Ok((keyring_pointer, keyring))
 }
 
-fn validate_keyring_file_name(value: &str) -> Result<()> {
+pub(crate) fn validate_keyring_file_name(value: &str) -> Result<()> {
     let path = Path::new(value);
     ensure!(!value.trim().is_empty(), "keyring file name must not be empty");
     ensure!(!path.is_absolute(), "keyring file name must be relative");

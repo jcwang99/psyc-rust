@@ -27,7 +27,8 @@ use crate::keyring::{
     read_local_device_credential, seal_repo_secrets,
     seal_repo_secrets_for_device, unlock_repo_secrets, unlock_repo_secrets_from_generation_file,
     unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
-    unlock_repo_secrets_with_local_device, write_local_device_credential,
+    unlock_repo_secrets_with_local_device, validate_keyring_file_name,
+    write_local_device_credential,
 };
 use crate::local_index::{FilenameSearchResult, MetadataSearchQuery, MetadataSearchResult};
 use crate::manifest_store::{ManifestStore as LocalManifestStore, ManifestStoreApi};
@@ -4080,6 +4081,14 @@ fn write_keyring_generation_and_pointer(
     keyring_state: &KeyringState,
     keyring_pointer: &KeyringPointer,
 ) -> Result<()> {
+    validate_keyring_file_name(generation_file_name)
+        .with_context(|| format!("invalid keyring generation file name {generation_file_name}"))?;
+    validate_keyring_file_name(&keyring_pointer.current).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid keyring pointer current {}: {error}",
+            keyring_pointer.current
+        )
+    })?;
     let journal_path = control_dir.join(JOURNAL_DIR).join("keyring-update.json");
     atomic_write_json(
         journal_path.clone(),
