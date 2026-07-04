@@ -1506,13 +1506,14 @@ impl OpenedFile {
         let cached = lock_or_recover(&self.plaintext_cache);
         let cached = cached.as_ref()?;
         let cache_end = cached.offset.saturating_add(cached.bytes.len());
-        let request_end = offset.saturating_add(length);
+        let request_end = offset.saturating_add(length).min(cache_end);
         if offset < cached.offset || request_end > cache_end {
             return None;
         }
         let start = offset - cached.offset;
         let end = start + length;
-        Some(cached.bytes[start..end].to_vec())
+        let clamped_end = end.min(cached.bytes.len());
+        Some(cached.bytes[start..clamped_end].to_vec())
     }
 
     pub fn snapshot_id(&self) -> &str {
@@ -1978,5 +1979,47 @@ mod tests {
 
         let refresh = vfs.writeback("second").unwrap();
         assert!(refresh.namespace_changed);
+    }
+
+    #[test]
+    fn open_file_cache_serves_suffix_reads_past_eof_without_origin_retry() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_repo(&repo_root);
+
+        let snapshot_id = commit_message(&repo_root, "first", "alpha");
+        let vfs =
+            ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root.clone(), snapshot_id))
+                .unwrap();
+
+        let handle = vfs.open_file("tracked.txt").unwrap();
+        let first = vfs.read(&handle, 0, 32).unwrap();
+        assert_eq!(first, b"alpha");
+
+        *lock_or_recover(&vfs.plaintext_cache) =
+            PlaintextCache::new(vfs.plaintext_memory_cache_budget_bytes);
+
+        let snapshot = vfs
+            .read_service
+            .open_snapshot(handle.snapshot_id())
+            .unwrap();
+        let file = vfs
+            .read_service
+            .open_file(&snapshot, "tracked.txt")
+            .unwrap();
+        for chunk_id in file.debug_chunk_ids() {
+            let chunk_path = repo_root
+                .join(".e2v")
+                .join("objects")
+                .join(format!("{chunk_id}.json"));
+            let mut bytes = fs::read(&chunk_path).unwrap();
+            let last_index = bytes.len() - 1;
+            bytes[last_index] ^= 0x01;
+            fs::write(chunk_path, bytes).unwrap();
+        }
+
+        let suffix = vfs.read(&handle, 1, 32).unwrap();
+        assert_eq!(suffix, b"lpha");
     }
 }

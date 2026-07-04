@@ -517,6 +517,95 @@ fn oversized_first_read_that_reaches_eof_populates_cache_without_a_second_origin
 }
 
 #[test]
+fn cached_full_file_read_can_serve_later_suffix_past_eof_without_origin_retry() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let snapshot_id = commit_message(&repo_root, "first", "alpha");
+    let vfs = ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root.clone(), snapshot_id))
+        .unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let first = vfs.read(&handle, 0, 32).unwrap();
+    assert_eq!(String::from_utf8(first).unwrap(), "alpha");
+    assert_eq!(
+        String::from_utf8(opened_file_cached_plaintext(&handle).unwrap()).unwrap(),
+        "alpha"
+    );
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(handle.snapshot_id()).unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    for chunk_id in file.debug_chunk_ids() {
+        let chunk_path = repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{chunk_id}.json"));
+        let mut bytes = fs::read(&chunk_path).unwrap();
+        let last_index = bytes.len() - 1;
+        bytes[last_index] ^= 0x01;
+        fs::write(chunk_path, bytes).unwrap();
+    }
+
+    let cached_suffix = vfs.read(&handle, 1, 32).unwrap();
+    assert_eq!(String::from_utf8(cached_suffix).unwrap(), "lpha");
+}
+
+#[test]
+fn cached_full_file_read_survives_suffix_past_eof_after_global_cache_reset() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    fs::write(repo_root.join("second.txt"), "beta!").unwrap();
+    let snapshot_id = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap()
+        .snapshot_id;
+    let vfs = ReadOnlyVfs::mount_snapshot(
+        VfsMountConfig::snapshot(repo_root.clone(), snapshot_id)
+            .with_plaintext_memory_cache_budget_bytes(5),
+    )
+    .unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+    let first = vfs.read(&handle, 0, 32).unwrap();
+    assert_eq!(String::from_utf8(first).unwrap(), "alpha");
+    assert_eq!(
+        String::from_utf8(opened_file_cached_plaintext(&handle).unwrap()).unwrap(),
+        "alpha"
+    );
+
+    let second = vfs.open_file("second.txt").unwrap();
+    let second_bytes = vfs.read(&second, 0, 32).unwrap();
+    assert_eq!(String::from_utf8(second_bytes).unwrap(), "beta!");
+
+    let read_service = RepositoryFacade::new().read_service(&repo_root).unwrap();
+    let snapshot = read_service.open_snapshot(handle.snapshot_id()).unwrap();
+    let file = read_service.open_file(&snapshot, "tracked.txt").unwrap();
+    for chunk_id in file.debug_chunk_ids() {
+        let chunk_path = repo_root
+            .join(".e2v")
+            .join("objects")
+            .join(format!("{chunk_id}.json"));
+        let mut bytes = fs::read(&chunk_path).unwrap();
+        let last_index = bytes.len() - 1;
+        bytes[last_index] ^= 0x01;
+        fs::write(chunk_path, bytes).unwrap();
+    }
+
+    let cached_suffix = vfs.read(&handle, 1, 32).unwrap();
+    assert_eq!(String::from_utf8(cached_suffix).unwrap(), "lpha");
+}
+
+#[test]
 fn plaintext_memory_cache_evicts_older_entries_when_budget_is_exceeded() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
