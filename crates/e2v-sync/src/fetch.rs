@@ -733,6 +733,12 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
     let remote_pointer_bytes = read_remote_keyring_pointer_bytes(remote)?;
     let remote_pointer: KeyringPointer = serde_json::from_slice(&remote_pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
+    validate_remote_relative_name(&remote_pointer.current).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid remote keyring path {}: {error}",
+            remote_pointer.current
+        )
+    })?;
     let remote_state: KeyringStateSummary = serde_json::from_slice(
         &remote.get_physical(&format!("control/keyring/{}", remote_pointer.current))?,
     )
@@ -1903,5 +1909,73 @@ mod tests {
         let preserve = local_keyring_is_newer_than_remote(&control_dir, &control_plane).unwrap();
 
         assert!(!preserve);
+    }
+
+    #[test]
+    fn classify_repository_sync_mode_rejects_remote_keyring_pointer_path_traversal() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-sync-mode-malicious-pointer".to_string(),
+            },
+        )
+        .unwrap();
+
+        let malicious_pointer = serde_json::to_vec(&serde_json::json!({
+            "generation": 1u64,
+            "current": "../../evil.json"
+        }))
+        .unwrap();
+        let pointer_token = RefToken::new(format!(
+            "keyring/{}",
+            e2v_core::sync_support::read_repo_id(&repo_root).unwrap()
+        ));
+        let expected_version = remote.read_ref(&pointer_token).unwrap().map(|stored| stored.version);
+        remote
+            .compare_and_swap_ref(
+                &pointer_token,
+                expected_version,
+                e2v_store::EncryptedRef::new(malicious_pointer),
+            )
+            .unwrap();
+        remote
+            .put_physical(
+                "control/keyring/../../evil.json",
+                &remote.get_physical("control/keyring/keyring.1").unwrap(),
+            )
+            .unwrap();
+
+        let error = classify_repository_sync_mode(&remote, &repo_root.join(".e2v")).unwrap_err();
+
+        assert!(
+            error.to_string().contains("invalid remote keyring path")
+                || error.to_string().contains("path traversal")
+                || error.to_string().contains("path escapes"),
+            "unexpected error: {error:#}"
+        );
     }
 }
