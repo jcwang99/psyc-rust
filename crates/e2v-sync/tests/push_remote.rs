@@ -6803,6 +6803,74 @@ fn push_idempotent_noop_avoids_remote_inventory_listing_when_ref_already_matches
 }
 
 #[test]
+fn push_rejects_remote_root_that_already_contains_another_repository_keyring_ref() {
+    let temp = tempdir().unwrap();
+    let first_repo_root = temp.path().join("first");
+    let second_repo_root = temp.path().join("second");
+    fs::create_dir_all(&first_repo_root).unwrap();
+    fs::create_dir_all(&second_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let first_state = facade
+        .init(InitOptions {
+            repo_root: first_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(first_repo_root.join("first.txt"), b"first").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: first_repo_root.clone(),
+            message: "first".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: first_repo_root,
+            branch_token: first_state.branch.token_hex,
+            operation_id: "seed-foreign-remote-root".to_string(),
+        },
+    )
+    .unwrap();
+
+    let second_state = facade
+        .init(InitOptions {
+            repo_root: second_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(second_repo_root.join("second.txt"), b"second").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: second_repo_root.clone(),
+            message: "second".to_string(),
+        })
+        .unwrap();
+
+    let error = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: second_repo_root,
+            branch_token: second_state.branch.token_hex,
+            operation_id: "push-foreign-remote-root".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("different repository"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn packed_push_lists_remote_objects_only_once_while_publishing_and_verifying() {
     let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();

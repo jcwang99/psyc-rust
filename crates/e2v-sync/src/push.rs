@@ -606,6 +606,31 @@ pub(crate) fn remote_keyring_matches<R: RemoteBackend>(
     })
 }
 
+fn ensure_remote_root_matches_local_repository<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<()> {
+    let local_repo_id = sync_support::read_repo_id(repo_root)?;
+    let expected_keyring_token = format!("keyring/{local_repo_id}");
+    let foreign_keyring_tokens = remote
+        .list_refs()?
+        .into_iter()
+        .filter_map(|listed| {
+            let token = listed.token.value;
+            if token.starts_with("keyring/") && token != expected_keyring_token {
+                Some(token)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        foreign_keyring_tokens.is_empty(),
+        "remote root already contains keyring refs for a different repository"
+    );
+    Ok(())
+}
+
 pub(crate) fn upload_remote_keyring_generations<R: RemoteBackend>(
     remote: &R,
     keyring_files: &[PathBuf],
@@ -871,6 +896,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
 ) -> Result<PushResult> {
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
+    ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
     reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let current_state = facade.open(&options.repo_root)?;
     ensure!(
@@ -1100,6 +1126,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
 ) -> Result<ResumeResult> {
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
+    ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
     reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let current_state = facade.open(&options.repo_root)?;
     ensure!(
