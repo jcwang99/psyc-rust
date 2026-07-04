@@ -81,27 +81,32 @@ fn atomic_write_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
             .unwrap_or("tmp")
     ));
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    match std::fs::remove_file(&temp_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    std::fs::write(&temp_path, bytes)?;
+    remove_path_if_exists(&temp_path)?;
+    std::fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
     match std::fs::rename(&temp_path, path) {
         Ok(()) => Ok(()),
         Err(error) if cfg!(windows) => {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(remove_error) => return Err(remove_error.into()),
-            }
-            std::fs::rename(&temp_path, path)?;
+            remove_path_if_exists(path)?;
+            std::fs::rename(&temp_path, path)
+                .with_context(|| format!("failed to publish {}", path.display()))?;
             Ok(())
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error).with_context(|| format!("failed to publish {}", path.display())),
     }
+}
+
+fn remove_path_if_exists(path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn trusted_state_file_path(repo_id: &str) -> Result<PathBuf> {
@@ -205,6 +210,28 @@ mod tests {
         assert!(
             leftover_temps.is_empty(),
             "expected no leftover trusted-state temp files, found {leftover_temps:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_state_store_recovers_from_temp_path_conflict() {
+        let temp = tempdir().unwrap();
+        let _guard = override_trusted_state_dir_for_test(temp.path().to_path_buf());
+        let state = TrustedRemoteState {
+            repo_id: "repo-123".to_string(),
+            min_layout_generation: 7,
+            min_keyring_generation: 11,
+            min_ref_generations: BTreeMap::from([("branch-123".to_string(), 13)]),
+        };
+        let temp_path = temp.path().join("repo-123.json.tmp");
+        std::fs::create_dir(&temp_path).unwrap();
+
+        store_trusted_remote_state(&state).unwrap();
+
+        assert!(temp.path().join("repo-123.json").is_file());
+        assert!(
+            !temp_path.exists(),
+            "trusted state publish should replace temp-path conflicts with a real temp file during atomic write"
         );
     }
 
