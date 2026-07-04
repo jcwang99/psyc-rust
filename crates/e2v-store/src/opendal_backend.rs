@@ -628,8 +628,10 @@ impl RefStore for OpendalMemoryBackend {
                 Some((path, token))
             })
             .map(|(path, token)| -> Result<ListedRef> {
+                let token = RefToken::new(token);
+                token.validate()?;
                 Ok(ListedRef {
-                    token: RefToken::new(token),
+                    token,
                     stored: serde_json::from_slice(&self.get_physical(&path)?)
                         .context("failed to decode remote branch ref")?,
                 })
@@ -709,8 +711,10 @@ impl RefStore for OpendalWebdavBackend {
                 Some((path, token))
             })
             .map(|(path, token)| -> Result<ListedRef> {
+                let token = RefToken::new(token);
+                token.validate()?;
                 Ok(ListedRef {
-                    token: RefToken::new(token),
+                    token,
                     stored: serde_json::from_slice(&self.get_physical(&path)?)
                         .context("failed to decode remote branch ref")?,
                 })
@@ -1031,8 +1035,10 @@ impl RefStore for OpendalS3Backend {
                 Some((path, token))
             })
             .map(|(path, token)| -> Result<ListedRef> {
+                let token = RefToken::new(token);
+                token.validate()?;
                 Ok(ListedRef {
-                    token: RefToken::new(token),
+                    token,
                     stored: serde_json::from_slice(&self.get_physical(&path)?)
                         .context("failed to decode remote branch ref")?,
                 })
@@ -1480,6 +1486,28 @@ mod tests {
                 .iter()
                 .any(|listed| listed.token == token),
             "nested ref token should be discoverable via list_refs"
+        );
+    }
+
+    #[test]
+    fn opendal_memory_backend_rejects_invalid_physical_ref_tokens() {
+        let backend = OpendalMemoryBackend::new().unwrap();
+        let stored = StoredRef {
+            version: RefVersion { value: 1 },
+            value: EncryptedRef::new(vec![1, 2, 3]),
+        };
+        backend
+            .put_physical(
+                "control/refs/by-token/../evil.json",
+                &serde_json::to_vec(&stored).unwrap(),
+            )
+            .unwrap();
+
+        let error = backend.list_refs().unwrap_err();
+
+        assert!(
+            error.to_string().contains("ref token") || error.to_string().contains("path"),
+            "unexpected error: {error:#}"
         );
     }
 }

@@ -339,8 +339,10 @@ impl RefStore for LocalFolderBackend {
                 Some((path, token))
             })
             .map(|(path, token)| -> Result<ListedRef> {
+                let token = RefToken::new(token);
+                token.validate()?;
                 Ok(ListedRef {
-                    token: RefToken::new(token),
+                    token,
                     stored: serde_json::from_slice(&self.get_physical(&path)?)
                         .context("failed to decode remote branch ref")?,
                 })
@@ -449,7 +451,7 @@ mod tests {
 
     use crate::capability::WriterMode;
     use crate::opendal_backend::RemoteBackend;
-    use crate::ref_store::{EncryptedRef, RefStore, RefToken};
+    use crate::ref_store::{EncryptedRef, RefStore, RefToken, RefVersion, StoredRef};
 
     use tempfile::tempdir;
 
@@ -703,6 +705,33 @@ mod tests {
                 .iter()
                 .any(|listed| listed.token == token),
             "nested ref token should be discoverable via list_refs"
+        );
+    }
+
+    #[test]
+    fn list_refs_rejects_invalid_physical_ref_tokens() {
+        let temp = tempdir().unwrap();
+        let backend = LocalFolderBackend::new(temp.path());
+        let stored = StoredRef {
+            version: RefVersion { value: 1 },
+            value: EncryptedRef::new(vec![1, 2, 3]),
+        };
+        let invalid_path = temp
+            .path()
+            .join("control")
+            .join("refs")
+            .join("by-token")
+            .join(".json");
+        fs::create_dir_all(invalid_path.parent().unwrap()).unwrap();
+        fs::write(&invalid_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let error = backend.list_refs().unwrap_err();
+
+        assert!(
+            error.to_string().contains("ref token")
+                || error.to_string().contains("path")
+                || error.to_string().contains("empty"),
+            "unexpected error: {error:#}"
         );
     }
 }
