@@ -1579,12 +1579,27 @@ fn restore_local_branch_mirrors_from_remote<R: RemoteBackend>(
 
 fn remove_local_index_if_present(repo_root: &Path) -> Result<()> {
     let index_path = repo_root.join(".e2v").join("index.sqlite3");
-    match std::fs::remove_file(&index_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to remove local index {}", index_path.display())),
+    for path in [
+        index_path.clone(),
+        sqlite_sidecar_path(&index_path, "-wal"),
+        sqlite_sidecar_path(&index_path, "-shm"),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to remove local index {}", path.display()));
+            }
+        }
     }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os_string = db_path.as_os_str().to_os_string();
+    os_string.push(suffix);
+    PathBuf::from(os_string)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

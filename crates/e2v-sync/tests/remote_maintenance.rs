@@ -1064,7 +1064,7 @@ fn plan_historical_rewrite_uses_local_checkpoint_during_interrupted_rewrite() {
     assert!(
         first_error
             .to_string()
-            .contains("injected put failure for history rewrite batch"),
+            .contains("injected put failure for operation batch"),
         "unexpected interruption error: {first_error:#}"
     );
 
@@ -2040,6 +2040,9 @@ fn historical_rewrite_remote_leaves_stale_loose_refs_for_gc_grace_period_cleanup
     e2v_core::testing::rotate_active_epoch_for_test(&repo_root, "correct horse battery staple")
         .unwrap();
     let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let index_dir = repo_root.join(".e2v");
+    fs::write(index_dir.join("index.sqlite3-wal"), b"stale wal").unwrap();
+    fs::write(index_dir.join("index.sqlite3-shm"), b"stale shm").unwrap();
 
     let result = historical_rewrite_remote(
         &remote,
@@ -2059,6 +2062,14 @@ fn historical_rewrite_remote_leaves_stale_loose_refs_for_gc_grace_period_cleanup
     assert!(
         !repo_root.join(".e2v").join("index.sqlite3").exists(),
         "historical rewrite should invalidate the local sqlite index after publication"
+    );
+    assert!(
+        !repo_root.join(".e2v").join("index.sqlite3-wal").exists(),
+        "historical rewrite should also remove sqlite wal sidecars during index invalidation"
+    );
+    assert!(
+        !repo_root.join(".e2v").join("index.sqlite3-shm").exists(),
+        "historical rewrite should also remove sqlite shm sidecars during index invalidation"
     );
 
     let pack_root_bytes = remote
@@ -2326,7 +2337,7 @@ fn historical_rewrite_remote_resumes_with_remote_only_branch_added_after_interru
     assert!(
         first_error
             .to_string()
-            .contains("injected put failure for history rewrite batch"),
+            .contains("injected put failure for operation batch"),
         "unexpected interruption error: {first_error:#}"
     );
 
@@ -2450,7 +2461,7 @@ fn historical_rewrite_remote_stores_rewrite_checkpoint_without_plaintext_object_
     assert!(
         first_error
             .to_string()
-            .contains("injected put failure for history rewrite batch"),
+            .contains("injected put failure for operation batch"),
         "unexpected interruption error: {first_error:#}"
     );
 
@@ -2577,7 +2588,7 @@ fn historical_rewrite_remote_recovers_from_checkpoint_path_conflict() {
     assert!(
         first_error
             .to_string()
-            .contains("injected put failure for history rewrite batch"),
+            .contains("injected put failure for operation batch"),
         "unexpected interruption error: {first_error:#}"
     );
     assert!(
@@ -2640,7 +2651,7 @@ fn historical_rewrite_remote_recovers_from_corrupted_checkpoint() {
     assert!(
         first_error
             .to_string()
-            .contains("injected put failure for history rewrite batch"),
+            .contains("injected put failure for operation batch"),
         "unexpected interruption error: {first_error:#}"
     );
 
@@ -2742,7 +2753,7 @@ fn historical_rewrite_remote_resumes_after_pack_segment_upload_interruption() {
     assert!(
         first_error
             .to_string()
-            .contains("injected put failure for history rewrite batch"),
+            .contains("injected put failure for operation batch"),
         "unexpected interruption error: {first_error:#}"
     );
     let expected_segment_count = plan_historical_rewrite(

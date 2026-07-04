@@ -16,7 +16,9 @@ use e2v_api::{
 };
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
 use e2v_sync::{ServeOptions, serve_local_web};
-use e2v_vfs::{MountLaunchSummary, start_live_branch_mount, start_snapshot_mount};
+use e2v_vfs::{
+    MountLaunchState, MountLaunchSummary, start_live_branch_mount, start_snapshot_mount,
+};
 #[cfg(not(windows))]
 use e2v_vfs::{mount_live_branch, mount_snapshot};
 
@@ -889,8 +891,13 @@ fn format_mount_summary(summary: &MountLaunchSummary) -> String {
     } else {
         "disk-like"
     };
+    let launch_verb = match summary.launch_state {
+        MountLaunchState::SummaryOnly => "prepared",
+        MountLaunchState::HostActive => "mounted",
+    };
     format!(
-        "mounted {} at {} with {:?}, {}, {} ({})\n",
+        "{} {} at {} with {:?}, {}, {} ({})\n",
+        launch_verb,
         summary.mount_mode,
         summary.mount_point.display(),
         summary.cache_policy,
@@ -898,4 +905,31 @@ fn format_mount_summary(summary: &MountLaunchSummary) -> String {
         io_mode,
         summary.status_message
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_mount_summary;
+    use e2v_vfs::{CachePolicy, MountLaunchState, MountLaunchSummary};
+    use std::path::PathBuf;
+
+    #[test]
+    fn summary_only_mount_output_does_not_claim_host_is_mounted() {
+        let summary = MountLaunchSummary {
+            mount_mode: "snapshot-pinned".to_string(),
+            mount_point: PathBuf::from("Z:\\"),
+            cache_policy: CachePolicy::DirectIoFallback,
+            read_only: true,
+            stream_only: true,
+            launch_state: MountLaunchState::SummaryOnly,
+            status_message: "host not started".to_string(),
+        };
+
+        let rendered = format_mount_summary(&summary);
+
+        assert!(
+            rendered.starts_with("prepared snapshot-pinned"),
+            "summary-only launch should not claim an active mount, got: {rendered:?}"
+        );
+    }
 }
