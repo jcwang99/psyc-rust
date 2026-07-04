@@ -46,6 +46,7 @@ pub(crate) struct RemoteKeyringPointerSummary {
 
 #[derive(Debug, Deserialize)]
 struct KeyringStateSummary {
+    generation: u64,
     repo_id: String,
 }
 
@@ -584,6 +585,12 @@ fn local_keyring_is_newer_than_remote(
         }
         Err(error) => return Err(error).context("failed to decode local keyring state"),
     };
+    if _local_keyring.generation != local_pointer.generation {
+        if !has_local_objects {
+            return Ok(false);
+        }
+        anyhow::bail!("local keyring pointer generation mismatch");
+    }
     if e2v_core::sync_support::open_repo_secrets_for_sync(control_dir).is_err()
         && e2v_core::sync_support::unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
             control_dir,
@@ -742,6 +749,12 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
         }
         Err(error) => return Err(error).context("failed to decode local keyring state"),
     };
+    if local_state.generation != local_pointer.generation {
+        if !has_local_objects {
+            return Ok(RepositorySyncMode::ReplaceLocalState);
+        }
+        anyhow::bail!("local keyring pointer generation mismatch");
+    }
     let remote_pointer_bytes = read_remote_keyring_pointer_bytes(remote)?;
     let remote_pointer: KeyringPointer = serde_json::from_slice(&remote_pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
@@ -1982,6 +1995,62 @@ mod tests {
     }
 
     #[test]
+    fn local_keyring_is_newer_than_remote_rejects_local_pointer_generation_mismatch() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-local-pointer-generation-mismatch".to_string(),
+            },
+        )
+        .unwrap();
+
+        let default_ref = remote
+            .read_ref(&e2v_store::RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .unwrap();
+        let control_plane =
+            read_remote_control_plane(&remote, default_ref.value.bytes.clone()).unwrap();
+        let control_dir = repo_root.join(".e2v");
+        fs::write(
+            control_dir.join("keyring").join("keyring.current"),
+            br#"{"generation":99,"current":"keyring.1"}"#,
+        )
+        .unwrap();
+
+        let error = local_keyring_is_newer_than_remote(&control_dir, &control_plane).unwrap_err();
+
+        assert!(
+            error.to_string().contains("generation mismatch")
+                || error.to_string().contains("keyring pointer generation mismatch"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn classify_repository_sync_mode_rejects_local_pointer_path_traversal() {
         let temp = tempdir().unwrap();
         let repo_root = temp.path().join("repo");
@@ -2029,6 +2098,57 @@ mod tests {
             error.to_string().contains("invalid local keyring path")
                 || error.to_string().contains("path traversal")
                 || error.to_string().contains("path escapes"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn classify_repository_sync_mode_rejects_local_pointer_generation_mismatch() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-sync-mode-local-pointer-generation-mismatch"
+                    .to_string(),
+            },
+        )
+        .unwrap();
+
+        let control_dir = repo_root.join(".e2v");
+        fs::write(
+            control_dir.join("keyring").join("keyring.current"),
+            br#"{"generation":99,"current":"keyring.1"}"#,
+        )
+        .unwrap();
+
+        let error = classify_repository_sync_mode(&remote, &control_dir).unwrap_err();
+
+        assert!(
+            error.to_string().contains("generation mismatch")
+                || error.to_string().contains("keyring pointer generation mismatch"),
             "unexpected error: {error:#}"
         );
     }
