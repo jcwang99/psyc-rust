@@ -654,6 +654,15 @@ fn publish_remote_keyring_pointer<R: RemoteBackend>(
         .as_str()
         .context("local keyring state is missing repo_id")?
         .to_string();
+    let current_keyring_generation = serde_json::from_slice::<RemoteKeyringStateSummary>(
+        &std::fs::read(current_keyring)?,
+    )
+    .context("failed to decode local current keyring generation state")?
+    .generation;
+    ensure!(
+        current_keyring_generation == generation,
+        "local keyring pointer generation mismatch"
+    );
     let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
     let current_pointer = remote.read_ref(&pointer_token)?;
     if let Some(current) = &current_pointer
@@ -1942,6 +1951,46 @@ mod tests {
             remote.keyring_pointer_ref_read_count(),
             1,
             "publish_remote_keyring_pointer should reuse the first remote ref read instead of re-reading the same keyring pointer ref before CAS"
+        );
+    }
+
+    #[test]
+    fn publish_remote_keyring_pointer_rejects_local_pointer_generation_mismatch() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+
+        let keyring_dir = repo_root.join(".e2v").join("keyring");
+        std::fs::write(
+            keyring_dir.join("keyring.current"),
+            serde_json::to_vec(&serde_json::json!({
+                "generation": 99u64,
+                "current": "keyring.1"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let keyring_files = e2v_core::sync_support::list_keyring_files(&repo_root).unwrap();
+        let remote = MemoryBackend::new();
+
+        let error = publish_remote_keyring_pointer(&remote, &keyring_files).unwrap_err();
+
+        assert!(
+            error.to_string().contains("generation mismatch")
+                || error
+                    .to_string()
+                    .contains("local keyring pointer generation mismatch"),
+            "unexpected error: {error:#}"
         );
     }
 }
