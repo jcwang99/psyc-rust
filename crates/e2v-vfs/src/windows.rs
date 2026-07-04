@@ -2544,22 +2544,25 @@ impl WinfspMountContext {
     }
 
     fn stage_handle_bytes(&self, handle: &mut WinfspOpenHandle) -> Result<()> {
-        let Some(bytes) = handle.pending_bytes.clone() else {
+        let Some(bytes) = handle.pending_bytes.take() else {
             return Ok(());
         };
         let WinfspVfs::Writable(vfs) = &self.vfs else {
+            handle.pending_bytes = Some(bytes);
             anyhow::bail!("write staging is not available for read-only mounts");
         };
         let mut vfs = lock_writable_vfs(vfs)?;
         vfs.write_file(handle.logical_path(), bytes)?;
-        let _ = vfs.writeback("winfsp writeback")?;
+        if let Err(error) = vfs.writeback("winfsp writeback") {
+            handle.pending_bytes = vfs.take_overlay_file_bytes(handle.logical_path());
+            return Err(error);
+        }
         let reopened = vfs.open_file(handle.logical_path())?;
         handle.snapshot_id = reopened.snapshot_id().to_string();
         handle.layout_generation = reopened.layout_generation();
         handle.file_object_id = reopened.file_object_id().to_string();
         handle.inode_id = reopened.inode_id();
         handle.opened_file = Some(reopened);
-        handle.pending_bytes = None;
         Ok(())
     }
 

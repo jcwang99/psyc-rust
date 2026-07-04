@@ -3554,6 +3554,36 @@ fn windows_mount_context_source_does_not_expect_security_descriptor_parse_succes
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_mount_context_source_stages_pending_file_bytes_without_cloning_them() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    let staging_body = source
+        .split("fn stage_handle_bytes(&self, handle: &mut WinfspOpenHandle) -> Result<()> {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    fn flush_handle").next())
+        .expect("expected WinFSP stage_handle_bytes implementation");
+
+    assert!(
+        !staging_body.contains("handle.pending_bytes.clone()"),
+        "WinFSP write staging should not duplicate the entire pending file buffer before writeback"
+    );
+    assert!(
+        !staging_body.contains("bytes.clone()"),
+        "WinFSP write staging should avoid fallback full-buffer clones while handing data into writable VFS state"
+    );
+    assert!(
+        staging_body.contains("handle.pending_bytes.take()"),
+        "WinFSP write staging should consume pending file bytes in-place before writeback"
+    );
+}
+
 #[test]
 fn linux_mount_adapter_exposes_a_future_fuse_boundary() {
     let temp = tempdir().unwrap();

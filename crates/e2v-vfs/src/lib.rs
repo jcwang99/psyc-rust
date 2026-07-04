@@ -780,6 +780,10 @@ impl WritableVfs {
 
     pub fn write_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
         let normalized = normalize_vfs_path(path);
+        self.write_file_normalized(normalized, bytes)
+    }
+
+    fn write_file_normalized(&mut self, normalized: String, bytes: Vec<u8>) -> Result<()> {
         anyhow::ensure!(!normalized.is_empty(), "file path must not be empty");
         let parent = parent_vfs_path(&normalized);
         anyhow::ensure!(
@@ -797,6 +801,10 @@ impl WritableVfs {
         }
         self.overlay.upserted_files.insert(normalized, bytes);
         Ok(())
+    }
+
+    pub(crate) fn take_overlay_file_bytes(&mut self, path: &str) -> Option<Vec<u8>> {
+        self.overlay.upserted_files.remove(path)
     }
 
     pub fn writeback(&mut self, message: &str) -> Result<RefreshOutcome> {
