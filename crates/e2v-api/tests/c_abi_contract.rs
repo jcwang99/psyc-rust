@@ -202,28 +202,26 @@ fn c_abi_maps_missing_repo_to_not_found() {
 }
 
 #[test]
-fn c_abi_catches_panics_and_returns_internal_panic() {
-    let mut error: *mut c_abi::e2v_error_t = std::ptr::null_mut();
-
-    let code = c_abi::test_only_force_panic_for_contract(&mut error);
-
-    assert_eq!(code, c_abi::E2V_INTERNAL_PANIC);
-    assert!(!error.is_null());
-    assert_eq!(
-        unsafe { c_abi::e2v_error_code(error) },
-        c_abi::E2V_INTERNAL_PANIC
-    );
-    unsafe {
-        c_abi::e2v_error_free(error);
-    }
-}
-
-#[test]
 fn c_abi_header_does_not_expose_test_only_panic_probe() {
     let header = read_header_file();
     assert!(
         !header.contains("e2v_test_only_force_panic"),
         "public C header must not expose test-only panic probes"
+    );
+}
+
+#[test]
+fn c_abi_source_does_not_export_test_only_panic_probe_as_public_rust_api() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("c_abi.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !source.contains("pub fn test_only_force_panic_for_contract"),
+        "test-only ffi panic probe should not remain a public Rust API in release builds"
     );
 }
 

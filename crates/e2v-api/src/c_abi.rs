@@ -157,13 +157,6 @@ where
     }
 }
 
-#[doc(hidden)]
-pub fn test_only_force_panic_for_contract(error_out: *mut *mut e2v_error_t) -> e2v_error_code_t {
-    ffi_call(error_out, || -> crate::SdkResult<()> {
-        panic!("forced ffi panic");
-    })
-}
-
 fn ffi_call_with_json<T, F>(
     json_out: *mut e2v_string_t,
     error_out: *mut *mut e2v_error_t,
@@ -1173,4 +1166,25 @@ pub unsafe extern "C" fn e2v_reshuffle_oblivious_layout_default_remote_json(
 
 pub fn header_text() -> String {
     include_str!("../include/e2v_api.h").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffi_call_catches_panics_and_returns_internal_panic() {
+        let mut error: *mut e2v_error_t = ptr::null_mut();
+
+        let code = ffi_call(&mut error, || -> crate::SdkResult<()> {
+            panic!("forced ffi panic");
+        });
+
+        assert_eq!(code, E2V_INTERNAL_PANIC);
+        assert!(!error.is_null());
+        assert_eq!(unsafe { e2v_error_code(error) }, E2V_INTERNAL_PANIC);
+        unsafe {
+            e2v_error_free(error);
+        }
+    }
 }
