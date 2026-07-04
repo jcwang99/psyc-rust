@@ -293,10 +293,15 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
     let reachable_object_count = if let Some(rewrite_checkpoint) = rewrite_checkpoint {
         rewrite_checkpoint.rewritten_object_ids.len()
     } else {
+        let remote_validation_secrets =
+            resolve_historical_rewrite_plan_validation_secrets(remote, &options.repo_root)?;
         let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
-        let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
         let pack_locations =
-            load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+            load_remote_active_pack_locations_with_local_cache(
+                remote,
+                &control_dir,
+                &remote_validation_secrets,
+            )?;
         let validation_root = RemoteValidationRoot {
             path: next_validation_root(&options.repo_root)?,
             cache_control_dir: Some(control_dir.clone()),
@@ -307,7 +312,7 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
             remote_loose_object_ids: &remote_loose_object_ids,
             pack_locations: &pack_locations,
             validation_root: &validation_root,
-            validation_secrets: &secrets,
+            validation_secrets: &remote_validation_secrets,
             pack_cache: &mut pack_cache,
         };
         let mut reachable_object_ids = GcReachabilityStore::new(&options.repo_root)?;
@@ -323,9 +328,14 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         if let Some((remote_loose_object_ids, pack_locations)) = cached_remote_inventory {
             (remote_loose_object_ids.len(), pack_locations.len())
         } else {
-            let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+            let remote_validation_secrets =
+                resolve_historical_rewrite_plan_validation_secrets(remote, &options.repo_root)?;
             let pack_locations =
-                load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+                load_remote_active_pack_locations_with_local_cache(
+                    remote,
+                    &control_dir,
+                    &remote_validation_secrets,
+                )?;
             let remote_loose_object_count = load_remote_loose_object_ids(remote)?.len();
             (remote_loose_object_count, pack_locations.len())
         };
@@ -1799,6 +1809,23 @@ fn load_maintenance_validation_secrets(
         remote_current_keyring_bytes,
     )
     .or_else(|_| sync_support::open_repo_secrets_for_sync(control_dir))
+}
+
+fn resolve_historical_rewrite_plan_validation_secrets<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<RepoSecrets> {
+    let control_dir = repo_root.join(".e2v");
+    match read_remote_current_keyring_bytes(remote, repo_root)? {
+        Some(bytes) => {
+            let current_keyring_path = control_dir.join("keyring").join("keyring.current");
+            if current_keyring_path.is_file() {
+                let _ = reconcile_local_keyring_with_remote_if_needed(remote, repo_root);
+            }
+            load_maintenance_validation_secrets(&control_dir, &bytes)
+        }
+        None => sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir),
+    }
 }
 
 fn collect_recent_unpublished_local_reachable_object_ids<R: RemoteBackend>(
