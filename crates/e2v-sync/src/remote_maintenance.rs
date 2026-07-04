@@ -281,6 +281,7 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         .map(|remote_old_epoch_count| remote_old_epoch_count.max(local_old_epoch_count))
         .unwrap_or(local_old_epoch_count);
     let rewrite_checkpoint = load_historical_rewrite_checkpoint(&control_dir)?;
+    let mut cached_remote_inventory = None;
     let reachable_object_count = if let Some(rewrite_checkpoint) = rewrite_checkpoint {
         rewrite_checkpoint.rewritten_object_ids.len()
     } else {
@@ -307,13 +308,19 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
             &mut traversal,
             &mut reachable_object_ids,
         )?;
+        cached_remote_inventory = Some((remote_loose_object_ids, pack_locations));
         reachable_object_ids.object_count()?
     };
-    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
-    let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
-    let remote_loose_object_count = load_remote_loose_object_ids(remote)?.len();
-    let remote_pack_object_count = pack_locations.len();
+    let (remote_loose_object_count, remote_pack_object_count) =
+        if let Some((remote_loose_object_ids, pack_locations)) = cached_remote_inventory {
+            (remote_loose_object_ids.len(), pack_locations.len())
+        } else {
+            let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
+            let pack_locations =
+                load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+            let remote_loose_object_count = load_remote_loose_object_ids(remote)?.len();
+            (remote_loose_object_count, pack_locations.len())
+        };
     let large_repo_advisory = if reachable_object_count >= 10_000
         || remote_loose_object_count >= 10_000
         || remote_pack_object_count >= 10_000

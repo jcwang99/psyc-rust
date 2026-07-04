@@ -61,6 +61,14 @@ struct RemoteKeyringStateValidation {
     envelopes: Vec<KeyringEnvelopeSummary>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DefaultRefRecordSummary {
+    #[allow(dead_code)]
+    branch_name: String,
+    ref_token_hex: String,
+    head_snapshot_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RepositorySyncMode {
     SameRepositoryPointerUnchanged,
@@ -190,6 +198,26 @@ struct RemoteFetchValidationInputs<'a> {
     device_validation_secrets: Option<&'a RepoSecrets>,
     default_ref_bytes: &'a [u8],
     remote_loose_object_ids: &'a BTreeSet<String>,
+    pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
+}
+
+struct RemoteValidationContext<'a, R: RemoteBackend> {
+    repo_root: &'a Path,
+    remote: &'a R,
+    control_plane: &'a RemoteControlPlane,
+    validation_secrets: &'a RepoSecrets,
+    remote_loose_object_ids: &'a BTreeSet<String>,
+    pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
+}
+
+struct RemoteRefConsistencyInputs<'a, R: RemoteBackend> {
+    remote: &'a R,
+    repo_root: &'a Path,
+    requested_branch_token: &'a str,
+    control_plane: &'a RemoteControlPlane,
+    default_ref_bytes: &'a [u8],
+    validation_secrets: Option<&'a RepoSecrets>,
+    remote_loose_object_ids: Option<&'a BTreeSet<String>>,
     pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
 }
 
@@ -368,12 +396,16 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
         )
     {
         validate_remote_ref_consistency_if_locally_unlocked(
-            remote,
-            &options.repo_root,
-            &requested_branch_token,
-            &stored_ref_bytes,
-            Some(&remote_loose_object_ids),
-            &pack_locations,
+            RemoteRefConsistencyInputs {
+                remote,
+                repo_root: &options.repo_root,
+                requested_branch_token: &requested_branch_token,
+                control_plane: &control_plane,
+                default_ref_bytes: &stored_ref_bytes,
+                validation_secrets: pack_index_secrets.as_ref().or(local_repo_secrets.as_ref()),
+                remote_loose_object_ids: Some(&remote_loose_object_ids),
+                pack_locations: &pack_locations,
+            },
         )?;
     }
     if matches!(
@@ -914,40 +946,27 @@ fn remote_object_bytes<R: RemoteBackend>(
 }
 
 fn remote_object_authenticates_for_repo<R: RemoteBackend>(
-    repo_root: &Path,
-    remote: &R,
-    loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    context: &RemoteValidationContext<'_, R>,
     object_id: &str,
     expected_type: &str,
 ) -> Result<()> {
-    let control_dir = repo_root.join(".e2v");
-    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let validation_root = RemoteValidationRoot {
-        path: next_validation_root(repo_root)?,
-        cache_control_dir: Some(control_dir.clone()),
+        path: next_validation_root(context.repo_root)?,
+        cache_control_dir: Some(context.repo_root.join(".e2v")),
     };
     let validation_control = validation_root.control_dir();
     (|| -> Result<()> {
-        std::fs::create_dir_all(validation_control.join("objects"))?;
-        std::fs::create_dir_all(validation_control.join("keyring"))?;
-        std::fs::create_dir_all(validation_control.join("refs"))?;
-        std::fs::copy(
-            control_dir.join("layout_root.json"),
-            validation_control.join("layout_root.json"),
-        )?;
-        std::fs::copy(
-            control_dir.join("refs").join("default.json"),
-            validation_control.join("refs").join("default.json"),
-        )?;
-        let pointer_bytes = std::fs::read(control_dir.join("keyring").join("keyring.current"))?;
-        std::fs::write(
-            validation_control.join("keyring").join("keyring.current"),
-            pointer_bytes,
-        )?;
-
-        let store = e2v_store::DirectLayoutObjectStore::new(&validation_control, secrets);
-        let bytes = remote_object_bytes(remote, loose_object_ids, pack_locations, object_id)?
+        write_remote_control_plane_to_validation_root(&validation_root, context.control_plane)?;
+        let store = e2v_store::DirectLayoutObjectStore::new(
+            &validation_control,
+            context.validation_secrets.clone(),
+        );
+        let bytes = remote_object_bytes(
+            context.remote,
+            context.remote_loose_object_ids,
+            context.pack_locations,
+            object_id,
+        )?
             .with_context(|| format!("missing remote object {object_id}"))?;
         let object_file_name = validation_object_file_name(object_id)?;
         let target_path = validation_control.join("objects").join(object_file_name);
@@ -958,72 +977,59 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
 }
 
 fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
-    repo_root: &Path,
-    remote: &R,
-    loose_object_ids: &BTreeSet<String>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    context: &RemoteValidationContext<'_, R>,
     snapshot_id: &str,
 ) -> Result<()> {
-    remote_object_authenticates_for_repo(
-        repo_root,
-        remote,
-        loose_object_ids,
-        pack_locations,
-        snapshot_id,
-        "snapshot",
-    )
-    .context("failed to authenticate remote head snapshot object")?;
+    remote_object_authenticates_for_repo(context, snapshot_id, "snapshot")
+        .context("failed to authenticate remote head snapshot object")?;
 
-    let control_dir = repo_root.join(".e2v");
-    let secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let validation_root = RemoteValidationRoot {
-        path: next_validation_root(repo_root)?,
-        cache_control_dir: Some(control_dir.clone()),
+        path: next_validation_root(context.repo_root)?,
+        cache_control_dir: Some(context.repo_root.join(".e2v")),
     };
-    let validation_control = validation_root.control_dir();
     let mut pack_cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     (|| -> Result<()> {
-        std::fs::create_dir_all(validation_control.join("objects"))?;
-        std::fs::create_dir_all(validation_control.join("keyring"))?;
-        std::fs::create_dir_all(validation_control.join("refs"))?;
-        std::fs::copy(
-            control_dir.join("layout_root.json"),
-            validation_control.join("layout_root.json"),
-        )?;
-        std::fs::copy(
-            control_dir.join("refs").join("default.json"),
-            validation_control.join("refs").join("default.json"),
-        )?;
-        let pointer_bytes = std::fs::read(control_dir.join("keyring").join("keyring.current"))?;
-        std::fs::write(
-            validation_control.join("keyring").join("keyring.current"),
-            pointer_bytes,
-        )?;
+        write_remote_control_plane_to_validation_root(&validation_root, context.control_plane)?;
 
         let reachable_object_ids = collect_remote_reachable_object_ids(
-            remote,
-            loose_object_ids,
-            pack_locations,
+            context.remote,
+            context.remote_loose_object_ids,
+            context.pack_locations,
             &validation_root,
-            &secrets,
+            context.validation_secrets,
             &mut pack_cache,
             snapshot_id,
         )?;
         materialize_remote_objects_into_validation_root(
-            remote,
-            loose_object_ids,
-            pack_locations,
+            context.remote,
+            context.remote_loose_object_ids,
+            context.pack_locations,
             &validation_root,
             &mut pack_cache,
             &reachable_object_ids,
         )?;
         e2v_core::sync_support::verify_snapshot_with_secrets_for_sync(
             &validation_root.path,
-            secrets,
+            context.validation_secrets.clone(),
             snapshot_id,
         )?;
         Ok(())
     })()
+}
+
+fn decode_default_ref_record_with_secrets(
+    secrets: &RepoSecrets,
+    encrypted_ref_bytes: &[u8],
+) -> Result<(String, Option<String>)> {
+    let plaintext = e2v_core::sync_support::decrypt_control_record_for_sync(
+        secrets,
+        "default",
+        "ref",
+        encrypted_ref_bytes,
+    )?;
+    let record: DefaultRefRecordSummary =
+        postcard_from_bytes(&plaintext).context("failed to decode ref record")?;
+    Ok((record.ref_token_hex, record.head_snapshot_id))
 }
 
 pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
@@ -1252,16 +1258,16 @@ fn validation_object_file_name(object_id: &str) -> Result<String> {
 }
 
 fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
-    _remote: &R,
-    repo_root: &Path,
-    requested_branch_token: &str,
-    default_ref_bytes: &[u8],
-    remote_loose_object_ids: Option<&BTreeSet<String>>,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+    inputs: RemoteRefConsistencyInputs<'_, R>,
 ) -> Result<()> {
-    let (decoded_ref_token_hex, head_snapshot_id) =
-        match e2v_core::sync_support::decode_default_ref_record(repo_root, default_ref_bytes) {
-            Ok(decoded) => decoded,
+    let (decoded_ref_token_hex, head_snapshot_id) = match inputs.validation_secrets {
+        Some(secrets) => decode_default_ref_record_with_secrets(secrets, inputs.default_ref_bytes),
+        None => match e2v_core::sync_support::decode_default_ref_record(
+            inputs.repo_root,
+            inputs.default_ref_bytes,
+        )
+        {
+            Ok(decoded) => Ok(decoded),
             Err(error)
                 if error.to_string().contains("locked")
                     || error.to_string().contains("unlock")
@@ -1269,20 +1275,24 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
             {
                 return Ok(());
             }
-            Err(error) => return Err(error).context("failed to decode remote branch ref"),
-        };
+            Err(error) => Err(error),
+        },
+    }
+    .context("failed to decode remote branch ref")?;
 
     ensure!(
-        decoded_ref_token_hex == requested_branch_token,
-        "remote ref token mismatch: requested {requested_branch_token}, decoded {decoded_ref_token_hex}"
+        decoded_ref_token_hex == inputs.requested_branch_token,
+        "remote ref token mismatch: requested {}, decoded {decoded_ref_token_hex}",
+        inputs.requested_branch_token
     );
 
     if let Some(head_snapshot_id) = head_snapshot_id {
         let owned_loose_object_ids;
-        let loose_object_ids = if let Some(remote_loose_object_ids) = remote_loose_object_ids {
+        let loose_object_ids = if let Some(remote_loose_object_ids) = inputs.remote_loose_object_ids
+        {
             remote_loose_object_ids
         } else {
-            let listed = _remote.list_physical("objects/")?;
+            let listed = inputs.remote.list_physical("objects/")?;
             let mut derived_loose_object_ids = BTreeSet::new();
             for relative_path in listed {
                 let Some(object_id) = relative_path
@@ -1300,16 +1310,21 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
         };
         ensure!(
             loose_object_ids.contains(&head_snapshot_id)
-                || pack_locations.contains_key(&head_snapshot_id),
+                || inputs.pack_locations.contains_key(&head_snapshot_id),
             "remote ref points to missing head snapshot {head_snapshot_id}"
         );
-        remote_snapshot_graph_authenticates_for_repo(
-            repo_root,
-            _remote,
-            loose_object_ids,
-            pack_locations,
-            &head_snapshot_id,
-        )
+        let Some(validation_secrets) = inputs.validation_secrets else {
+            return Ok(());
+        };
+        let validation = RemoteValidationContext {
+            repo_root: inputs.repo_root,
+            remote: inputs.remote,
+            control_plane: inputs.control_plane,
+            validation_secrets,
+            remote_loose_object_ids: loose_object_ids,
+            pack_locations: inputs.pack_locations,
+        };
+        remote_snapshot_graph_authenticates_for_repo(&validation, &head_snapshot_id)
         .with_context(|| {
             format!("remote ref points to unreadable head snapshot graph {head_snapshot_id}")
         })?;

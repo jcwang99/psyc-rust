@@ -1098,6 +1098,205 @@ fn plan_historical_rewrite_uses_local_checkpoint_during_interrupted_rewrite() {
 }
 
 #[test]
+fn plan_historical_rewrite_reuses_remote_inventory_without_checkpoint() {
+    #[derive(Clone, Debug)]
+    struct HistoricalRewritePlanInventoryCountingBackend {
+        capability: BackendCapability,
+        inner: MemoryBackend,
+        object_list_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pack_index_root_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HistoricalRewritePlanInventoryCountingBackend {
+        fn new(inner: MemoryBackend) -> Self {
+            Self {
+                capability: inner.capability().clone(),
+                inner,
+                object_list_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                pack_index_root_reads: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
+            }
+        }
+
+        fn object_list_calls(&self) -> usize {
+            self.object_list_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn pack_index_root_reads(&self) -> usize {
+            self.pack_index_root_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl BlobStore for HistoricalRewritePlanInventoryCountingBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(
+            &self,
+            relative_path: &str,
+            bytes: &[u8],
+        ) -> anyhow::Result<bool> {
+            self.inner.put_physical_if_absent(relative_path, bytes)
+        }
+
+        fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+            if relative_path == "pack-index/root.json" {
+                self.pack_index_root_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            if prefix == "objects/" {
+                self.object_list_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl RefStore for HistoricalRewritePlanInventoryCountingBackend {
+        fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+            self.inner.read_ref(token)
+        }
+
+        fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+            self.inner.list_refs()
+        }
+
+        fn compare_and_swap_ref(
+            &self,
+            token: &RefToken,
+            expected: Option<e2v_store::RefVersion>,
+            next: EncryptedRef,
+        ) -> anyhow::Result<e2v_store::CasResult> {
+            self.inner.compare_and_swap_ref(token, expected, next)
+        }
+    }
+
+    impl LayoutRootStore for HistoricalRewritePlanInventoryCountingBackend {
+        fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+            self.inner.read_layout_root()
+        }
+
+        fn compare_and_swap_layout_root(
+            &self,
+            expected: e2v_store::LayoutRootVersion,
+            next: e2v_store::LayoutRoot,
+        ) -> anyhow::Result<e2v_store::CasResult> {
+            self.inner.compare_and_swap_layout_root(expected, next)
+        }
+
+        fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+            self.inner.list_retained_layout_roots()
+        }
+    }
+
+    impl e2v_store::RemoteBackend for HistoricalRewritePlanInventoryCountingBackend {
+        fn capability(&self) -> &BackendCapability {
+            &self.capability
+        }
+    }
+
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..64usize {
+        fs::write(
+            repo_root.join(format!("tracked-{index:03}.txt")),
+            format!("payload-{index:03}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "history-plan-inventory-reuse".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-plan-inventory-reuse-op".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(
+        remote.exists_physical("pack-index/root.json"),
+        "expected packed push setup to publish pack-index/root.json for the inventory reuse regression"
+    );
+
+    let counted = HistoricalRewritePlanInventoryCountingBackend::new(remote.clone());
+    let plan = plan_historical_rewrite(
+        &counted,
+        HistoricalRewritePlanOptions {
+            repo_root: repo_root.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        plan.reachable_object_count > 0,
+        "expected planning to inspect at least one reachable object"
+    );
+    assert!(
+        plan.remote_pack_object_count > 0,
+        "expected packed remote inventory so the regression exercises pack-index/root.json reads"
+    );
+    assert_eq!(
+        counted.object_list_calls(),
+        1,
+        "historical rewrite planning should reuse the first remote objects/ inventory scan instead of listing it again for summary counts"
+    );
+    assert_eq!(
+        counted.pack_index_root_reads(),
+        1,
+        "historical rewrite planning should reuse the first pack-index root load instead of re-reading it for summary counts"
+    );
+}
+
+#[test]
 fn plan_historical_rewrite_rejects_corrupted_remote_current_keyring_pointer() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
