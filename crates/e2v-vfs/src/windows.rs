@@ -345,7 +345,7 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
     let mut mount_context = Box::new(WinfspMountContext::from_request(request)?);
     let host_config = launcher.host_config(&mount_context);
     let volume_params = WinfspVolumeParams::from_host_config(&host_config);
-    let runtime_paths = WinfspRuntimePaths::from_candidate_roots_for_test(
+    let runtime_paths = WinfspRuntimePaths::from_candidate_roots(
         &[
             PathBuf::from(r"C:\Program Files (x86)\WinFsp"),
             PathBuf::from(r"C:\Program Files\WinFsp"),
@@ -536,7 +536,7 @@ pub struct WinfspRuntimePaths {
 }
 
 impl WinfspRuntimePaths {
-    pub(crate) fn from_install_root_for_test(install_root: PathBuf, arch: &str) -> Result<Self> {
+    pub(crate) fn from_install_root(install_root: PathBuf, arch: &str) -> Result<Self> {
         let dll_name = match arch {
             "x86_64" => "winfsp-x64.dll",
             "x86" => "winfsp-x86.dll",
@@ -555,12 +555,9 @@ impl WinfspRuntimePaths {
         })
     }
 
-    pub(crate) fn from_candidate_roots_for_test(
-        candidate_roots: &[PathBuf],
-        arch: &str,
-    ) -> Result<Self> {
+    pub(crate) fn from_candidate_roots(candidate_roots: &[PathBuf], arch: &str) -> Result<Self> {
         for root in candidate_roots {
-            if let Ok(paths) = Self::from_install_root_for_test(root.clone(), arch) {
+            if let Ok(paths) = Self::from_install_root(root.clone(), arch) {
                 return Ok(paths);
             }
         }
@@ -654,7 +651,7 @@ impl WinfspRuntimeLibrary {
         &self.dll_path
     }
 
-    pub(crate) fn get_symbol_address_for_test(&self, symbol_name: &str) -> Result<usize> {
+    pub(crate) fn get_symbol_address_public(&self, symbol_name: &str) -> Result<usize> {
         Self::get_symbol_address(self.handle, symbol_name)
     }
 
@@ -683,7 +680,7 @@ impl WinfspRuntimeLibrary {
         })
     }
 
-    pub(crate) fn resolve_mount_exports_for_test(&self) -> Result<WinfspMountExports> {
+    pub(crate) fn resolve_mount_exports_public(&self) -> Result<WinfspMountExports> {
         Ok(self.mount_exports)
     }
 
@@ -721,12 +718,12 @@ impl WinfspRuntimeLibrary {
 }
 
 impl WinfspHostSession {
-    pub(crate) fn new_for_test(
+    pub(crate) fn new(
         runtime: WinfspRuntimeLibrary,
         host_config: WinfspHostConfig,
         volume_params: WinfspVolumeParams,
     ) -> Result<Self> {
-        let exports = runtime.resolve_mount_exports_for_test()?;
+        let exports = runtime.resolve_mount_exports_public()?;
         Ok(Self {
             runtime,
             host_config,
@@ -758,11 +755,11 @@ impl WinfspHostSession {
             && !self.runtime.dll_path().as_os_str().is_empty()
     }
 
-    pub(crate) fn is_mounted_for_test(&self) -> bool {
+    pub(crate) fn is_mounted(&self) -> bool {
         self.mounted
     }
 
-    pub(crate) fn build_native_create_request_for_test(&self) -> Result<WinfspNativeCreateRequest> {
+    pub(crate) fn build_native_create_request(&self) -> Result<WinfspNativeCreateRequest> {
         Ok(WinfspNativeCreateRequest {
             device_path: "WinFsp.Disk".to_string(),
             mount_point: self.host_config.mount_point.clone(),
@@ -774,7 +771,7 @@ impl WinfspHostSession {
         })
     }
 
-    pub(crate) fn create_filesystem_handle_for_test(&mut self) -> Result<()> {
+    pub(crate) fn create_filesystem_handle(&mut self) -> Result<()> {
         if self.native_filesystem.is_some() {
             return Ok(());
         }
@@ -803,11 +800,11 @@ impl WinfspHostSession {
         Ok(())
     }
 
-    pub(crate) fn has_native_filesystem_handle_for_test(&self) -> bool {
+    pub(crate) fn has_native_filesystem_handle(&self) -> bool {
         self.native_filesystem.is_some()
     }
 
-    pub(crate) fn destroy_filesystem_handle_for_test(&mut self) {
+    pub(crate) fn destroy_filesystem_handle(&mut self) {
         if let Some(filesystem) = self.native_filesystem.take() {
             let delete = self.exports.delete_fn();
             unsafe {
@@ -816,7 +813,7 @@ impl WinfspHostSession {
         }
     }
 
-    pub(crate) fn run_mount_lifecycle_for_test(
+    pub(crate) fn run_mount_lifecycle(
         &mut self,
         driver: &impl WinfspHostDriver,
         mount_point: PathBuf,

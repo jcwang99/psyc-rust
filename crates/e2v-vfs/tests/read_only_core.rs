@@ -1228,6 +1228,40 @@ fn winfsp_directory_callbacks_do_not_reload_the_runtime_library() {
 
 #[cfg(windows)]
 #[test]
+fn winfsp_production_mount_startup_does_not_call_test_named_helpers() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    let startup_body = source
+        .split("fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("\n#[derive(Debug, Clone, PartialEq, Eq)]")
+                .next()
+        })
+        .expect("expected WinFSP start_mount_request implementation");
+
+    for forbidden in [
+        "_for_test(",
+        "from_candidate_roots_for_test(",
+        "from_install_root_for_test(",
+        "resolve_mount_exports_for_test(",
+        "new_for_test(",
+        "run_mount_lifecycle_for_test(",
+    ] {
+        assert!(
+            !startup_body.contains(forbidden),
+            "WinFSP production mount startup should not depend on test-named helper {forbidden}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn winfsp_debug_output_is_gated_behind_an_explicit_opt_in() {
     let source = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))

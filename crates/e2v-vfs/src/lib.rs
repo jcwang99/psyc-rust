@@ -1782,27 +1782,27 @@ pub mod testing {
         install_root: PathBuf,
         arch: &str,
     ) -> Result<WinfspRuntimePaths> {
-        WinfspRuntimePaths::from_install_root_for_test(install_root, arch)
+        WinfspRuntimePaths::from_install_root(install_root, arch)
     }
 
     pub fn winfsp_runtime_paths_from_candidate_roots(
         candidate_roots: &[PathBuf],
         arch: &str,
     ) -> Result<WinfspRuntimePaths> {
-        WinfspRuntimePaths::from_candidate_roots_for_test(candidate_roots, arch)
+        WinfspRuntimePaths::from_candidate_roots(candidate_roots, arch)
     }
 
     pub fn winfsp_runtime_get_symbol_address(
         runtime: &WinfspRuntimeLibrary,
         symbol_name: &str,
     ) -> Result<usize> {
-        runtime.get_symbol_address_for_test(symbol_name)
+        runtime.get_symbol_address_public(symbol_name)
     }
 
     pub fn winfsp_runtime_resolve_mount_exports(
         runtime: &WinfspRuntimeLibrary,
     ) -> Result<WinfspMountExports> {
-        runtime.resolve_mount_exports_for_test()
+        runtime.resolve_mount_exports_public()
     }
 
     pub fn winfsp_host_session_new(
@@ -1810,29 +1810,29 @@ pub mod testing {
         host_config: WinfspHostConfig,
         volume_params: WinfspVolumeParams,
     ) -> Result<WinfspHostSession> {
-        WinfspHostSession::new_for_test(runtime, host_config, volume_params)
+        WinfspHostSession::new(runtime, host_config, volume_params)
     }
 
     pub fn winfsp_session_is_mounted(session: &WinfspHostSession) -> bool {
-        session.is_mounted_for_test()
+        session.is_mounted()
     }
 
     pub fn winfsp_session_build_native_create_request(
         session: &WinfspHostSession,
     ) -> Result<WinfspNativeCreateRequest> {
-        session.build_native_create_request_for_test()
+        session.build_native_create_request()
     }
 
     pub fn winfsp_session_create_filesystem_handle(session: &mut WinfspHostSession) -> Result<()> {
-        session.create_filesystem_handle_for_test()
+        session.create_filesystem_handle()
     }
 
     pub fn winfsp_session_has_native_filesystem_handle(session: &WinfspHostSession) -> bool {
-        session.has_native_filesystem_handle_for_test()
+        session.has_native_filesystem_handle()
     }
 
     pub fn winfsp_session_destroy_filesystem_handle(session: &mut WinfspHostSession) {
-        session.destroy_filesystem_handle_for_test();
+        session.destroy_filesystem_handle();
     }
 
     pub fn winfsp_session_run_mount_lifecycle(
@@ -1841,7 +1841,7 @@ pub mod testing {
         mount_point: PathBuf,
         thread_count: u32,
     ) -> Result<()> {
-        session.run_mount_lifecycle_for_test(driver, mount_point, thread_count)
+        session.run_mount_lifecycle(driver, mount_point, thread_count)
     }
 }
 
