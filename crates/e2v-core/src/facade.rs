@@ -23,7 +23,8 @@ use crate::chunker::FastCdcChunker;
 use crate::keyring::{
     KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_password,
     cache_unlocked_secrets, generate_local_device_credential, open_repo_secrets,
-    read_current_keyring_state, read_local_device_credential, seal_repo_secrets,
+    read_current_keyring_state, read_current_keyring_state_with_pointer,
+    read_local_device_credential, seal_repo_secrets,
     seal_repo_secrets_for_device, unlock_repo_secrets, unlock_repo_secrets_from_generation_file,
     unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
     unlock_repo_secrets_with_local_device, write_local_device_credential,
@@ -796,9 +797,7 @@ impl RepositoryFacade {
         let repo_root = repo_root.as_ref().to_path_buf();
         let control_dir = repo_root.join(CONTROL_DIR);
         let repo_secrets = unlock_repo_secrets_uncached(&control_dir, old_password)?;
-        let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
-        let current_state: KeyringState =
-            read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+        let (_, current_state) = read_current_keyring_state_with_pointer(&control_dir)?;
         let next_generation = current_state.generation + 1;
         let next_file_name = format!("keyring.{next_generation}");
         let next_state = KeyringState {
@@ -1369,9 +1368,7 @@ impl RepositoryFacade {
         ensure_local_share_admin(&control_dir)?;
         let mut repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let password = options.password;
-        let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
-        let current_state: KeyringState =
-            read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+        let (_, current_state) = read_current_keyring_state_with_pointer(&control_dir)?;
         let target_device = current_state
             .devices
             .iter()
@@ -1458,9 +1455,7 @@ impl RepositoryFacade {
         ensure_local_share_admin(&control_dir)?;
         let mut repo_secrets = open_or_unlock_repo_secrets_with_local_device(&control_dir)?;
         let password = options.password;
-        let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
-        let current_state: KeyringState =
-            read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+        let (_, current_state) = read_current_keyring_state_with_pointer(&control_dir)?;
         ensure!(
             current_state
                 .actors
@@ -1562,9 +1557,7 @@ impl RepositoryFacade {
             "share invite bundle targets a different repository"
         );
 
-        let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
-        let current_state: KeyringState =
-            read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+        let (_, current_state) = read_current_keyring_state_with_pointer(&control_dir)?;
         if create_actor {
             ensure!(
                 !current_state
@@ -2199,9 +2192,7 @@ pub(crate) fn rotate_active_epoch_for_test(
     let repo_root = repo_root.as_ref().to_path_buf();
     let control_dir = repo_root.join(CONTROL_DIR);
     let mut repo_secrets = unlock_repo_secrets_uncached(&control_dir, password)?;
-    let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
-    let current_state: KeyringState =
-        read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+    let (_, current_state) = read_current_keyring_state_with_pointer(&control_dir)?;
     let next_generation = current_state.generation + 1;
     let next_file_name = format!("keyring.{next_generation}");
 
@@ -2257,9 +2248,7 @@ pub fn reconcile_remote_keyring_for_sync(
 ) -> Result<bool> {
     let repo_root = repo_root.as_ref().to_path_buf();
     let control_dir = repo_root.join(CONTROL_DIR);
-    let current_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
-    let local_state: KeyringState =
-        read_json(control_dir.join(KEYRING_DIR).join(&current_pointer.current))?;
+    let (_, local_state) = read_current_keyring_state_with_pointer(&control_dir)?;
     let remote_state: KeyringState = serde_json::from_slice(remote_keyring_bytes)
         .context("failed to decode remote keyring state")?;
     ensure!(

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, ensure};
@@ -190,6 +190,8 @@ pub fn unlock_repo_secrets_from_generation_file(
     keyring_file_name: &str,
     password: &str,
 ) -> Result<RepoSecrets> {
+    validate_keyring_file_name(keyring_file_name)
+        .with_context(|| format!("invalid keyring file name {}", keyring_file_name))?;
     let keyring: KeyringState = read_json(control_dir.join(KEYRING_DIR).join(keyring_file_name))?;
     unlock_repo_secrets_from_state(&keyring, password)
 }
@@ -419,6 +421,12 @@ pub fn seal_repo_secrets_for_device(
 
 pub fn read_current_keyring_state(control_dir: &Path) -> Result<KeyringState> {
     let keyring_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+    validate_keyring_file_name(&keyring_pointer.current).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid current keyring path {}: {error}",
+            keyring_pointer.current
+        )
+    })?;
     let keyring: KeyringState =
         read_json(control_dir.join(KEYRING_DIR).join(&keyring_pointer.current))?;
     ensure!(
@@ -426,6 +434,46 @@ pub fn read_current_keyring_state(control_dir: &Path) -> Result<KeyringState> {
         "keyring pointer generation mismatch"
     );
     Ok(keyring)
+}
+
+pub(crate) fn read_current_keyring_pointer(control_dir: &Path) -> Result<KeyringPointer> {
+    let keyring_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+    validate_keyring_file_name(&keyring_pointer.current).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid current keyring path {}: {error}",
+            keyring_pointer.current
+        )
+    })?;
+    Ok(keyring_pointer)
+}
+
+pub(crate) fn read_current_keyring_state_with_pointer(
+    control_dir: &Path,
+) -> Result<(KeyringPointer, KeyringState)> {
+    let keyring_pointer = read_current_keyring_pointer(control_dir)?;
+    let keyring: KeyringState =
+        read_json(control_dir.join(KEYRING_DIR).join(&keyring_pointer.current))?;
+    ensure!(
+        keyring_pointer.generation == keyring.generation,
+        "keyring pointer generation mismatch"
+    );
+    Ok((keyring_pointer, keyring))
+}
+
+fn validate_keyring_file_name(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    ensure!(!value.trim().is_empty(), "keyring file name must not be empty");
+    ensure!(!path.is_absolute(), "keyring file name must be relative");
+    ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "keyring path traversal is not allowed"
+    );
+    ensure!(
+        path.components().count() == 1,
+        "keyring file name must be a single path segment"
+    );
+    Ok(())
 }
 
 fn decrypt_password_envelope(
@@ -731,6 +779,21 @@ mod tests {
         }
     }
 
+    fn sample_keyring_state() -> KeyringState {
+        KeyringState {
+            format_version: 1,
+            generation: 1,
+            repo_id: "repo".to_string(),
+            active_epoch: 1,
+            crypto_suite: "xchacha20poly1305".to_string(),
+            kdf: "argon2id".to_string(),
+            actors: Vec::new(),
+            devices: Vec::new(),
+            epochs: Vec::new(),
+            envelopes: Vec::new(),
+        }
+    }
+
     #[test]
     fn decode_epoch_keys_requires_latest_epoch_maps() {
         let mut sealed = sample_sealed_repo_secrets();
@@ -756,6 +819,36 @@ mod tests {
         assert_eq!(decoded[&1].nonce_key, [8u8; 32]);
         assert_eq!(decoded[&2].manifest_enc_key, [7u8; 32]);
         assert_eq!(decoded[&2].nonce_key, [9u8; 32]);
+    }
+
+    #[test]
+    fn read_current_keyring_state_rejects_pointer_path_traversal() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path().join("control");
+        std::fs::create_dir_all(control_dir.join(KEYRING_DIR)).unwrap();
+        std::fs::write(
+            control_dir.join(KEYRING_CURRENT_FILE),
+            serde_json::to_vec(&KeyringPointer {
+                generation: 1,
+                current: "../../outside.json".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("outside.json"),
+            serde_json::to_vec(&sample_keyring_state()).unwrap(),
+        )
+        .unwrap();
+
+        let error = read_current_keyring_state(&control_dir).unwrap_err();
+
+        assert!(
+            error.to_string().contains("invalid current keyring path")
+                || error.to_string().contains("path traversal")
+                || error.to_string().contains("single path segment"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
