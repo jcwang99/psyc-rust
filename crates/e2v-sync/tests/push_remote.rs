@@ -130,6 +130,39 @@ fn sync_testing_surface_does_not_keep_redundant_cached_pack_ref_probe() {
 }
 
 #[test]
+fn sync_internal_modules_do_not_duplicate_remote_inventory_or_pack_cache_persist_helpers() {
+    let push_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("push.rs"),
+    )
+    .unwrap();
+    let remote_maintenance_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("remote_maintenance.rs"),
+    )
+    .unwrap();
+    let fetch_source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("fetch.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        !(push_source.contains("fn load_remote_loose_object_ids")
+            && remote_maintenance_source.contains("fn load_remote_loose_object_ids")),
+        "remote loose-object inventory helper should live in one internal implementation to avoid sync-path drift"
+    );
+    assert!(
+        !(fetch_source.contains("fn persist_cached_pack_data")
+            && remote_maintenance_source.contains("fn persist_cached_pack_data")),
+        "pack-data cache persistence helper should live in one internal implementation to avoid fetch/maintenance drift"
+    );
+}
+
+#[test]
 fn sync_root_does_not_reexport_internal_transaction_publisher_types() {
     let source = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

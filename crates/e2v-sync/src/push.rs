@@ -19,6 +19,7 @@ use crate::pack_index::{
     next_pack_index_segment_paths, publish_pack_index_root,
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
+use crate::remote_maintenance::load_remote_loose_object_ids;
 use crate::transaction::{PublishPlan, PublishedObject};
 
 const KEYRING_LOCK_FILE: &str = "keyring.lock";
@@ -105,24 +106,6 @@ fn inventory_has_object(
     object_id: &str,
 ) -> bool {
     loose_object_ids.contains(object_id) || pack_locations.contains_key(object_id)
-}
-
-pub(crate) fn load_remote_loose_object_ids<R: RemoteBackend>(
-    remote: &R,
-) -> Result<BTreeSet<String>> {
-    let mut object_ids = BTreeSet::new();
-    for relative_path in remote.list_physical("objects/")? {
-        let Some(object_id) = relative_path
-            .strip_prefix("objects/")
-            .and_then(|value| value.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        if validate_object_id_value(object_id).is_ok() {
-            object_ids.insert(object_id.to_string());
-        }
-    }
-    Ok(object_ids)
 }
 
 fn load_remote_object_inventory<R: RemoteBackend>(

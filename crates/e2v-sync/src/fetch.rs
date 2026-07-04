@@ -10,8 +10,9 @@ use crate::object_type::candidate_object_types;
 use crate::oram::load_remote_active_pack_locations_with_local_cache;
 use crate::pack::{PackedObjectLocation, read_packed_object};
 use crate::pack_cache::{
-    cache_pack_data_bytes, prune_stale_cached_pack_data, remote_object_bytes_with_pack_cache,
+    prune_stale_cached_pack_data, remote_object_bytes_with_pack_cache,
 };
+use crate::remote_maintenance::persist_cached_pack_data;
 use crate::trusted_state::{
     TrustedRemoteState, load_trusted_remote_state, store_trusted_remote_state,
 };
@@ -640,16 +641,6 @@ fn prepare_remote_fetch_plan<R: RemoteBackend>(
         validation_root,
         reachable_object_ids,
     })
-}
-
-fn persist_cached_pack_data(
-    control_dir: PathBuf,
-    pack_cache: &BTreeMap<String, Vec<u8>>,
-) -> Result<()> {
-    for (container_id, pack_bytes) in pack_cache {
-        cache_pack_data_bytes(&control_dir, container_id, pack_bytes)?;
-    }
-    Ok(())
 }
 
 fn write_requested_branch_mirror(

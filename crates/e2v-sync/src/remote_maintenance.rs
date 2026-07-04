@@ -30,7 +30,6 @@ use crate::pack_index::{next_pack_index_segment_paths, publish_pack_index_root};
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::push::{
     cleanup_completed_operation_markers, list_operation_pack_index_segment_paths,
-    load_remote_loose_object_ids as load_push_remote_loose_object_ids,
     mirror_remote_keyring_pointer, publish_remote_keyring_pointer_with_retry,
     read_remote_current_keyring_bytes, reconcile_local_keyring_with_remote_if_needed,
     upload_objects_as_pack_segments, upload_remote_keyring_generations,
@@ -293,7 +292,7 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
     let reachable_object_count = if let Some(rewrite_checkpoint) = rewrite_checkpoint {
         rewrite_checkpoint.rewritten_object_ids.len()
     } else {
-        let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
+        let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
         let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
         let pack_locations =
             load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
@@ -321,7 +320,7 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
     let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
-    let remote_loose_object_count = load_push_remote_loose_object_ids(remote)?.len();
+    let remote_loose_object_count = load_remote_loose_object_ids(remote)?.len();
     let remote_pack_object_count = pack_locations.len();
     let large_repo_advisory = if reachable_object_count >= 10_000
         || remote_loose_object_count >= 10_000
@@ -451,7 +450,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     let local_branch_refs = collect_local_branch_ref_bytes(&options.repo_root)?;
     let remote_branch_refs = list_remote_branch_refs(remote, &options.repo_root)?;
 
-    let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
+    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let stale_loose_paths = rewrite_state
         .rewritten_object_ids
         .iter()
@@ -628,7 +627,7 @@ fn hydrate_remote_branch_history_for_rewrite<R: RemoteBackend>(
 
     let control_dir = repo_root.join(".e2v");
     let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
-    let remote_loose_object_ids = load_push_remote_loose_object_ids(remote)?;
+    let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
     prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
@@ -1449,7 +1448,9 @@ fn sample_object_ids(object_ids: &[String], sample_percent: u8) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn load_remote_loose_object_ids<R: RemoteBackend>(remote: &R) -> Result<BTreeSet<String>> {
+pub(crate) fn load_remote_loose_object_ids<R: RemoteBackend>(
+    remote: &R,
+) -> Result<BTreeSet<String>> {
     let mut object_ids = BTreeSet::new();
     for relative_path in remote.list_physical("objects/")? {
         let Some(object_id) = relative_path
@@ -1465,10 +1466,11 @@ fn load_remote_loose_object_ids<R: RemoteBackend>(remote: &R) -> Result<BTreeSet
     Ok(object_ids)
 }
 
-fn persist_cached_pack_data(
-    control_dir: &Path,
+pub(crate) fn persist_cached_pack_data(
+    control_dir: impl AsRef<Path>,
     pack_cache: &BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
+    let control_dir = control_dir.as_ref();
     for (container_id, pack_bytes) in pack_cache {
         cache_pack_data_bytes(control_dir, container_id, pack_bytes)?;
     }
