@@ -429,9 +429,20 @@ fn collect_and_hydrate_remote_reachable_object_ids_for_oram_publish<R: RemoteBac
     repo_root: &Path,
     secrets: &RepoSecrets,
 ) -> Result<Vec<String>> {
-    let remote_branch_refs = list_remote_branch_refs(remote, repo_root)?;
+    let mut remote_branch_refs = list_remote_branch_refs(remote, repo_root)?;
     if remote_branch_refs.is_empty() {
-        return Ok(Vec::new());
+        let local_default_ref_bytes = sync_support::read_default_ref_bytes(repo_root)?;
+        let (default_branch_token, _) =
+            sync_support::decode_default_ref_record(repo_root, &local_default_ref_bytes)?;
+        let default_ref = remote
+            .read_ref(&e2v_store::RefToken::new(default_branch_token.clone()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("remote branch ref not found for {default_branch_token}")
+            })?;
+        remote_branch_refs.push(e2v_store::ListedRef {
+            token: e2v_store::RefToken::new(default_branch_token),
+            stored: default_ref,
+        });
     }
 
     let mut object_ids = Vec::new();

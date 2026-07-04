@@ -495,6 +495,98 @@ fn enable_oblivious_layout_does_not_publish_objects_only_reachable_from_unpublis
 }
 
 #[test]
+fn enable_oblivious_layout_falls_back_to_default_branch_ref_when_remote_ref_listing_is_unavailable()
+{
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-oram-hidden-list-refs".to_string(),
+        },
+    )
+    .unwrap();
+
+    let hidden_refs_remote = BranchRefListingUnavailableRemote::new(remote.clone());
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    enable_oblivious_layout(
+        &hidden_refs_remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pack_root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let segment_paths = pack_root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !segment_paths.is_empty(),
+        "ORAM enablement should still publish reachable segments when remote ref listing is unavailable"
+    );
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut published = std::collections::BTreeSet::new();
+    for segment_path in segment_paths {
+        let segment = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+            &repo_root.join(".e2v"),
+            segment_path,
+            &remote.get_physical(segment_path).unwrap(),
+        )
+        .unwrap();
+        for entry in segment["entries"].as_array().unwrap() {
+            published.insert(
+                entry["object_id"]
+                    .as_str()
+                    .expect("pack entry object id")
+                    .to_string(),
+            );
+        }
+    }
+
+    assert!(
+        reachable.is_subset(&published),
+        "ORAM enablement should cover default-branch reachable objects even without branch ref listing"
+    );
+}
+
+#[test]
 fn gc_under_oblivious_layout_does_not_require_pack_index_root() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -4311,6 +4403,108 @@ struct FailCurrentKeyringReadAfterPointerAdvanceBackend {
     capability: BackendCapability,
     repo_id: String,
     initial_current_file: String,
+}
+
+#[derive(Clone, Debug)]
+struct BranchRefListingUnavailableRemote {
+    inner: MemoryBackend,
+    capability: BackendCapability,
+}
+
+impl BranchRefListingUnavailableRemote {
+    fn new(inner: MemoryBackend) -> Self {
+        Self {
+            capability: inner.capability().clone(),
+            inner,
+        }
+    }
+}
+
+impl BlobStore for BranchRefListingUnavailableRemote {
+    fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_physical(relative_path, bytes)
+    }
+
+    fn put_physical_if_absent(&self, relative_path: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+        self.inner.put_physical_if_absent(relative_path, bytes)
+    }
+
+    fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical(relative_path)
+    }
+
+    fn get_physical_range(
+        &self,
+        relative_path: &str,
+        offset: usize,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_physical_range(relative_path, offset, length)
+    }
+
+    fn delete_physical(&self, relative_path: &str) -> anyhow::Result<()> {
+        self.inner.delete_physical(relative_path)
+    }
+
+    fn exists_physical(&self, relative_path: &str) -> bool {
+        self.inner.exists_physical(relative_path)
+    }
+
+    fn stat_physical(&self, relative_path: &str) -> anyhow::Result<e2v_store::ObjectStat> {
+        self.inner.stat_physical(relative_path)
+    }
+
+    fn list_physical(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_physical(prefix)
+    }
+}
+
+impl RefStore for BranchRefListingUnavailableRemote {
+    fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.inner.read_ref(token)
+    }
+
+    fn list_refs(&self) -> anyhow::Result<Vec<e2v_store::ListedRef>> {
+        Ok(self
+            .inner
+            .list_refs()?
+            .into_iter()
+            .filter(|listed| listed.token.value.starts_with("keyring/"))
+            .collect())
+    }
+
+    fn compare_and_swap_ref(
+        &self,
+        token: &RefToken,
+        expected: Option<e2v_store::RefVersion>,
+        next: EncryptedRef,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_ref(token, expected, next)
+    }
+}
+
+impl LayoutRootStore for BranchRefListingUnavailableRemote {
+    fn read_layout_root(&self) -> anyhow::Result<e2v_store::LayoutRoot> {
+        self.inner.read_layout_root()
+    }
+
+    fn compare_and_swap_layout_root(
+        &self,
+        expected: e2v_store::LayoutRootVersion,
+        next: e2v_store::LayoutRoot,
+    ) -> anyhow::Result<e2v_store::CasResult> {
+        self.inner.compare_and_swap_layout_root(expected, next)
+    }
+
+    fn list_retained_layout_roots(&self) -> anyhow::Result<Vec<e2v_store::LayoutRoot>> {
+        self.inner.list_retained_layout_roots()
+    }
+}
+
+impl e2v_store::RemoteBackend for BranchRefListingUnavailableRemote {
+    fn capability(&self) -> &BackendCapability {
+        &self.capability
+    }
 }
 
 impl FailCurrentKeyringReadAfterPointerAdvanceBackend {
