@@ -264,6 +264,237 @@ fn enable_and_reshuffle_oblivious_layout_publish_new_generations() {
 }
 
 #[test]
+fn enable_oblivious_layout_resumes_after_pack_segment_upload_interruption() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    for index in 0..300usize {
+        fs::write(
+            repo_root.join(format!("tracked-{index:03}.txt")),
+            format!("oram-payload-{index:03}"),
+        )
+        .unwrap();
+    }
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-oram-enable-resume".to_string(),
+        },
+    )
+    .unwrap();
+
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let interrupted_remote = FailOnceOnPutBackend::for_operation_index_batch(
+        remote.clone(),
+        &format!(
+            "oblivious-enable-{:020}",
+            remote.read_layout_root().unwrap().generation + 1
+        ),
+        1,
+    );
+
+    let first_error = enable_oblivious_layout(
+        &interrupted_remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("injected put failure for operation batch"),
+        "unexpected interruption error: {first_error:#}"
+    );
+
+    let expected_segment_count = ManifestStore::new(&repo_root)
+        .collect_reachable_object_ids(
+            &facade
+                .read_service(&repo_root)
+                .unwrap()
+                .resolve_branch(&state.branch.token_hex)
+                .unwrap()
+                .snapshot_id,
+        )
+        .unwrap()
+        .len()
+        .div_ceil(256);
+
+    let interrupted_segments = remote
+        .list_physical("packs/index/")
+        .unwrap()
+        .into_iter()
+        .filter(|path| path.starts_with("packs/index/oblivious-enable-"))
+        .collect::<Vec<_>>();
+    assert!(
+        interrupted_segments.len() < expected_segment_count,
+        "interrupted ORAM enablement should leave fewer published segments than the completed publish"
+    );
+
+    let resumed = enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pack_root_bytes = remote.get_physical("pack-index/root.json").unwrap();
+    let pack_root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &pack_root_bytes,
+    )
+    .unwrap();
+    let segments = pack_root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .filter(|path| path.starts_with("packs/index/oblivious-enable-"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(resumed.layout_mode, "oblivious");
+    assert_eq!(
+        segments.len(),
+        expected_segment_count,
+        "resumed ORAM enablement should publish every segment after a later-batch upload interruption"
+    );
+}
+
+#[test]
+fn enable_oblivious_layout_does_not_publish_objects_only_reachable_from_unpublished_local_branch() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("base.txt"), b"base").unwrap();
+    let base = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-oram-unpublished-main".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade.create_branch(&repo_root, "feature").unwrap();
+    let feature_state = facade.checkout_branch(&repo_root, "feature").unwrap();
+    fs::write(repo_root.join("feature.txt"), b"local-only-feature").unwrap();
+    let feature = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "feature-local-only".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let base_reachable = manifest_store
+        .collect_reachable_object_ids(&base.snapshot_id)
+        .unwrap();
+    let feature_reachable = manifest_store
+        .collect_reachable_object_ids(&feature.snapshot_id)
+        .unwrap();
+    let feature_only_object_id = feature_reachable
+        .iter()
+        .find(|object_id| !base_reachable.contains(*object_id))
+        .cloned()
+        .expect("object only reachable from unpublished local feature branch");
+
+    facade.checkout_branch(&repo_root, "main").unwrap();
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    enable_oblivious_layout(
+        &remote,
+        EnableObliviousLayoutOptions {
+            repo_root: repo_root.clone(),
+            policy_profile: "balanced".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pack_root = e2v_sync::testing::decode_pack_index_root_value_for_test(
+        &repo_root.join(".e2v"),
+        &remote.get_physical("pack-index/root.json").unwrap(),
+    )
+    .unwrap();
+    let segment_paths = pack_root["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>();
+
+    let mut published_object_ids = std::collections::BTreeSet::new();
+    for segment_path in segment_paths {
+        let segment = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+            &repo_root.join(".e2v"),
+            segment_path,
+            &remote.get_physical(segment_path).unwrap(),
+        )
+        .unwrap();
+        for entry in segment["entries"].as_array().unwrap() {
+            published_object_ids.insert(
+                entry["object_id"]
+                    .as_str()
+                    .expect("pack entry object id")
+                    .to_string(),
+            );
+        }
+    }
+
+    assert!(
+        !published_object_ids.contains(&feature_only_object_id),
+        "ORAM enablement should not publish objects that are only reachable from unpublished local branches"
+    );
+    assert_eq!(
+        remote
+            .read_ref(&RefToken::new(feature_state.branch.token_hex.clone()))
+            .unwrap(),
+        None,
+        "sanity check failed: unpublished feature branch should not have been pushed to the remote"
+    );
+}
+
+#[test]
 fn gc_under_oblivious_layout_does_not_require_pack_index_root() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -3967,13 +4198,21 @@ struct FailOnceOnPutBackend {
 }
 
 impl FailOnceOnPutBackend {
-    fn for_history_rewrite_index_batch(inner: MemoryBackend, batch_index: usize) -> Self {
+    fn for_operation_index_batch(
+        inner: MemoryBackend,
+        operation_id: &str,
+        batch_index: usize,
+    ) -> Self {
         Self {
             capability: inner.capability().clone(),
             inner,
-            target_path: format!("packs/index/history-rewrite-{batch_index:08}.json"),
+            target_path: format!("packs/index/{operation_id}-{batch_index:08}.json"),
             failed_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    fn for_history_rewrite_index_batch(inner: MemoryBackend, batch_index: usize) -> Self {
+        Self::for_operation_index_batch(inner, "history-rewrite", batch_index)
     }
 }
 
@@ -3984,7 +4223,7 @@ impl BlobStore for FailOnceOnPutBackend {
                 .failed_once
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            anyhow::bail!("injected put failure for history rewrite batch {relative_path}");
+            anyhow::bail!("injected put failure for operation batch {relative_path}");
         }
         self.inner.put_physical(relative_path, bytes)
     }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
+use e2v_core::{RepositoryFacade, sync_support};
 use e2v_store::{
     DedupMode, LayoutCostPolicy, LayoutMode, LayoutRoot, LayoutSchedulePolicy, LayoutTrafficPolicy,
     RemoteBackend, RepoSecrets, validate_object_id_value,
@@ -314,12 +314,21 @@ fn publish_oblivious_segments<R: RemoteBackend + Clone>(
     session: &PublishSession,
 ) -> Result<Vec<String>> {
     let existing_paths = list_operation_pack_index_segment_paths(remote, operation_id)?;
-    if !existing_paths.is_empty() {
-        return Ok(existing_paths);
-    }
+    let total_batches = reachable_object_ids
+        .len()
+        .div_ceil(OBLIVIOUS_OBJECT_BATCH_SIZE);
+    let mut published_paths = Vec::with_capacity(total_batches.max(existing_paths.len()));
 
-    let mut published_paths = Vec::new();
-    for batch in reachable_object_ids.chunks(OBLIVIOUS_OBJECT_BATCH_SIZE) {
+    for batch_index in 0..total_batches {
+        let batch_start = batch_index * OBLIVIOUS_OBJECT_BATCH_SIZE;
+        let batch_end =
+            ((batch_index + 1) * OBLIVIOUS_OBJECT_BATCH_SIZE).min(reachable_object_ids.len());
+        let batch = &reachable_object_ids[batch_start..batch_end];
+        let expected_index_path = crate::pack::pack_paths(&operation_id.value, batch_index)?.2;
+        if existing_paths.contains(&expected_index_path) {
+            published_paths.push(expected_index_path);
+            continue;
+        }
         let uploaded = upload_objects_as_pack_segments(
             remote,
             repo_root,
@@ -412,50 +421,21 @@ fn collect_oram_publish_object_ids<R: RemoteBackend>(
     repo_root: &Path,
     secrets: &RepoSecrets,
 ) -> Result<Vec<String>> {
-    let mut object_ids = collect_local_branch_reachable_object_ids(repo_root)?;
-    hydrate_remote_only_branch_objects_for_oram_publish(
-        remote,
-        repo_root,
-        secrets,
-        &mut object_ids,
-    )?;
-    Ok(object_ids)
+    collect_and_hydrate_remote_reachable_object_ids_for_oram_publish(remote, repo_root, secrets)
 }
 
-fn collect_local_branch_reachable_object_ids(repo_root: &Path) -> Result<Vec<String>> {
-    let facade = RepositoryFacade::new();
-    let manifest_store = ManifestStore::new(repo_root);
-    let mut object_ids = BTreeSet::new();
-    for branch in facade.list_branches(repo_root)? {
-        let snapshot = facade
-            .read_service(repo_root)?
-            .resolve_branch(&branch.token_hex)
-            .with_context(|| {
-                format!(
-                    "failed to resolve local branch snapshot for ORAM publish {}",
-                    branch.token_hex
-                )
-            })?;
-        for object_id in manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)? {
-            validate_object_id_value(&object_id)?;
-            object_ids.insert(object_id);
-        }
-    }
-    Ok(object_ids.into_iter().collect())
-}
-
-fn hydrate_remote_only_branch_objects_for_oram_publish<R: RemoteBackend>(
+fn collect_and_hydrate_remote_reachable_object_ids_for_oram_publish<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
     secrets: &RepoSecrets,
-    object_ids: &mut Vec<String>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let remote_branch_refs = list_remote_branch_refs(remote, repo_root)?;
     if remote_branch_refs.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let mut unique = object_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut object_ids = Vec::new();
+    let mut unique = BTreeSet::new();
     let control_dir = repo_root.join(".e2v");
     let remote_loose_object_ids = remote
         .list_physical("objects/")?
@@ -534,7 +514,7 @@ fn hydrate_remote_only_branch_objects_for_oram_publish<R: RemoteBackend>(
         }
     }
 
-    Ok(())
+    Ok(object_ids)
 }
 
 fn policy_for_profile(profile: &str) -> LayoutSchedulePolicy {
