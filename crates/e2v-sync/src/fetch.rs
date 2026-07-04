@@ -9,12 +9,8 @@ use crate::journal::validate_sync_identifier;
 use crate::object_type::candidate_object_types;
 use crate::oram::load_remote_active_pack_locations_with_local_cache;
 use crate::pack::{PackedObjectLocation, read_packed_object};
-use crate::pack_cache::{
-    prune_stale_cached_pack_data, remote_object_bytes_with_pack_cache,
-};
-use crate::remote_maintenance::{
-    overwrite_local_object_bytes, persist_cached_pack_data,
-};
+use crate::pack_cache::{prune_stale_cached_pack_data, remote_object_bytes_with_pack_cache};
+use crate::remote_maintenance::{overwrite_local_object_bytes, persist_cached_pack_data};
 use crate::trusted_state::{
     TrustedRemoteState, load_trusted_remote_state, store_trusted_remote_state,
 };
@@ -395,18 +391,16 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
                 | RepositorySyncMode::SameRepositoryPointerChanged
         )
     {
-        validate_remote_ref_consistency_if_locally_unlocked(
-            RemoteRefConsistencyInputs {
-                remote,
-                repo_root: &options.repo_root,
-                requested_branch_token: &requested_branch_token,
-                control_plane: &control_plane,
-                default_ref_bytes: &stored_ref_bytes,
-                validation_secrets: pack_index_secrets.as_ref().or(local_repo_secrets.as_ref()),
-                remote_loose_object_ids: Some(&remote_loose_object_ids),
-                pack_locations: &pack_locations,
-            },
-        )?;
+        validate_remote_ref_consistency_if_locally_unlocked(RemoteRefConsistencyInputs {
+            remote,
+            repo_root: &options.repo_root,
+            requested_branch_token: &requested_branch_token,
+            control_plane: &control_plane,
+            default_ref_bytes: &stored_ref_bytes,
+            validation_secrets: pack_index_secrets.as_ref().or(local_repo_secrets.as_ref()),
+            remote_loose_object_ids: Some(&remote_loose_object_ids),
+            pack_locations: &pack_locations,
+        })?;
     }
     if matches!(
         sync_mode,
@@ -967,7 +961,7 @@ fn remote_object_authenticates_for_repo<R: RemoteBackend>(
             context.pack_locations,
             object_id,
         )?
-            .with_context(|| format!("missing remote object {object_id}"))?;
+        .with_context(|| format!("missing remote object {object_id}"))?;
         let object_file_name = validation_object_file_name(object_id)?;
         let target_path = validation_control.join("objects").join(object_file_name);
         std::fs::write(&target_path, &bytes)?;
@@ -1265,8 +1259,7 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
         None => match e2v_core::sync_support::decode_default_ref_record(
             inputs.repo_root,
             inputs.default_ref_bytes,
-        )
-        {
+        ) {
             Ok(decoded) => Ok(decoded),
             Err(error)
                 if error.to_string().contains("locked")
@@ -1324,10 +1317,9 @@ fn validate_remote_ref_consistency_if_locally_unlocked<R: RemoteBackend>(
             remote_loose_object_ids: loose_object_ids,
             pack_locations: inputs.pack_locations,
         };
-        remote_snapshot_graph_authenticates_for_repo(&validation, &head_snapshot_id)
-        .with_context(|| {
-            format!("remote ref points to unreadable head snapshot graph {head_snapshot_id}")
-        })?;
+        remote_snapshot_graph_authenticates_for_repo(&validation, &head_snapshot_id).with_context(
+            || format!("remote ref points to unreadable head snapshot graph {head_snapshot_id}"),
+        )?;
     }
 
     Ok(())
@@ -2060,7 +2052,9 @@ mod tests {
 
         assert!(
             error.to_string().contains("generation mismatch")
-                || error.to_string().contains("keyring pointer generation mismatch"),
+                || error
+                    .to_string()
+                    .contains("keyring pointer generation mismatch"),
             "unexpected error: {error:#}"
         );
     }
@@ -2163,7 +2157,9 @@ mod tests {
 
         assert!(
             error.to_string().contains("generation mismatch")
-                || error.to_string().contains("keyring pointer generation mismatch"),
+                || error
+                    .to_string()
+                    .contains("keyring pointer generation mismatch"),
             "unexpected error: {error:#}"
         );
     }
@@ -2211,7 +2207,10 @@ mod tests {
             "keyring/{}",
             e2v_core::sync_support::read_repo_id(&repo_root).unwrap()
         ));
-        let expected_version = remote.read_ref(&pointer_token).unwrap().map(|stored| stored.version);
+        let expected_version = remote
+            .read_ref(&pointer_token)
+            .unwrap()
+            .map(|stored| stored.version);
         remote
             .compare_and_swap_ref(
                 &pointer_token,

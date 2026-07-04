@@ -1221,9 +1221,7 @@ fn plan_historical_rewrite_reuses_remote_inventory_without_checkpoint() {
                 capability: inner.capability().clone(),
                 inner,
                 object_list_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                pack_index_root_reads: std::sync::Arc::new(
-                    std::sync::atomic::AtomicUsize::new(0),
-                ),
+                pack_index_root_reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -1562,14 +1560,10 @@ fn plan_historical_rewrite_rejects_local_keyring_pointer_path_traversal() {
         br#"{"generation":1,"current":"../../outside.json"}"#,
     )
     .unwrap();
-    fs::write(
-        repo_root.join("outside.json"),
-        br#"{"repo_id":"escape"}"#,
-    )
-    .unwrap();
+    fs::write(repo_root.join("outside.json"), br#"{"repo_id":"escape"}"#).unwrap();
 
-    let error = plan_historical_rewrite(&remote, HistoricalRewritePlanOptions { repo_root })
-        .unwrap_err();
+    let error =
+        plan_historical_rewrite(&remote, HistoricalRewritePlanOptions { repo_root }).unwrap_err();
 
     assert!(
         error.to_string().contains("invalid current keyring path")
@@ -3474,11 +3468,8 @@ fn force_accept_remote_rollback_uses_password_with_stale_local_keyring_after_rem
         })
         .unwrap();
 
-    e2v_core::testing::rotate_active_epoch_for_test(
-        &owner_root,
-        "correct horse battery staple",
-    )
-    .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
     fs::write(owner_root.join("hello.txt"), b"remote epoch two").unwrap();
     let remote_snapshot = facade
         .commit(CommitOptions {

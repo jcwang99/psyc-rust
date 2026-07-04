@@ -115,7 +115,10 @@ fn trusted_state_file_path(repo_id: &str) -> Result<PathBuf> {
         !repo_id.trim().is_empty(),
         "trusted state repo_id must not be empty"
     );
-    anyhow::ensure!(!path.is_absolute(), "trusted state repo_id must be relative");
+    anyhow::ensure!(
+        !path.is_absolute(),
+        "trusted state repo_id must be relative"
+    );
     anyhow::ensure!(
         path.components()
             .all(|component| matches!(component, Component::Normal(_))),

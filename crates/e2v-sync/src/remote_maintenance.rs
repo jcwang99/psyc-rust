@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::fetch::{
     RemoteReachabilityRecorder, RemoteReachabilityTraversal, RemoteValidationRoot,
     assert_remote_generations_meet_local_floor, collect_remote_reachable_object_ids,
-    collect_remote_reachable_object_ids_with_recorder, fetch_remote_object_into_validation_root,
-    next_validation_root, read_remote_control_plane, decode_default_ref_record_with_secrets,
+    collect_remote_reachable_object_ids_with_recorder, decode_default_ref_record_with_secrets,
+    fetch_remote_object_into_validation_root, next_validation_root, read_remote_control_plane,
     update_trusted_remote_state_from_control_plane, write_remote_control_plane_to_validation_root,
 };
 use crate::journal::{OperationId, OperationJournal, RewriteJournalState};
@@ -268,9 +268,10 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
     let facade = RepositoryFacade::new();
     facade.open(&options.repo_root)?;
     let control_dir = options.repo_root.join(".e2v");
-    let keyring: serde_json::Value =
-        serde_json::from_slice(&sync_support::read_current_keyring_bytes(&options.repo_root)?)
-            .context("failed to decode current keyring state")?;
+    let keyring: serde_json::Value = serde_json::from_slice(
+        &sync_support::read_current_keyring_bytes(&options.repo_root)?,
+    )
+    .context("failed to decode current keyring state")?;
     let local_old_epoch_count =
         keyring_epoch_count(&keyring, "current local keyring state")?.saturating_sub(1);
     let remote_old_epoch_count =
@@ -296,12 +297,11 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         let remote_validation_secrets =
             resolve_historical_rewrite_plan_validation_secrets(remote, &options.repo_root)?;
         let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
-        let pack_locations =
-            load_remote_active_pack_locations_with_local_cache(
-                remote,
-                &control_dir,
-                &remote_validation_secrets,
-            )?;
+        let pack_locations = load_remote_active_pack_locations_with_local_cache(
+            remote,
+            &control_dir,
+            &remote_validation_secrets,
+        )?;
         let validation_root = RemoteValidationRoot {
             path: next_validation_root(&options.repo_root)?,
             cache_control_dir: Some(control_dir.clone()),
@@ -330,12 +330,11 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
         } else {
             let remote_validation_secrets =
                 resolve_historical_rewrite_plan_validation_secrets(remote, &options.repo_root)?;
-            let pack_locations =
-                load_remote_active_pack_locations_with_local_cache(
-                    remote,
-                    &control_dir,
-                    &remote_validation_secrets,
-                )?;
+            let pack_locations = load_remote_active_pack_locations_with_local_cache(
+                remote,
+                &control_dir,
+                &remote_validation_secrets,
+            )?;
             let remote_loose_object_count = load_remote_loose_object_ids(remote)?.len();
             (remote_loose_object_count, pack_locations.len())
         };
@@ -1015,14 +1014,15 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
         .read_ref(&RefToken::new(branch_token.clone()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
-    let remote_validation_secrets =
-        sync_support::unlock_repo_secrets_from_keyring_bytes_for_sync(
-            &control_plane.current_keyring_bytes,
-            password,
-        )?;
-    let (decoded_branch_token, head_snapshot_id) =
-        decode_default_ref_record_with_secrets(&remote_validation_secrets, &default_ref.value.bytes)
-            .context("failed to decode remote branch ref during rollback acceptance")?;
+    let remote_validation_secrets = sync_support::unlock_repo_secrets_from_keyring_bytes_for_sync(
+        &control_plane.current_keyring_bytes,
+        password,
+    )?;
+    let (decoded_branch_token, head_snapshot_id) = decode_default_ref_record_with_secrets(
+        &remote_validation_secrets,
+        &default_ref.value.bytes,
+    )
+    .context("failed to decode remote branch ref during rollback acceptance")?;
     ensure!(
         decoded_branch_token == branch_token,
         "remote ref token mismatch: requested {branch_token}, decoded {decoded_branch_token}"
