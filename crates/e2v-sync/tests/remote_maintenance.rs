@@ -3198,6 +3198,127 @@ fn force_accept_remote_rollback_rebuilds_local_fact_view_from_remote_head() {
 }
 
 #[test]
+fn force_accept_remote_rollback_uses_password_with_stale_local_keyring_after_remote_rotation() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let stale_clone_root = temp.path().join("stale-clone");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"remote base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "remote-base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-rollback-stale-keyring-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: stale_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    fs::write(stale_clone_root.join("hello.txt"), b"local ahead").unwrap();
+    let local_snapshot = facade
+        .commit(CommitOptions {
+            repo_root: stale_clone_root.clone(),
+            message: "local-ahead".to_string(),
+        })
+        .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(
+        &owner_root,
+        "correct horse battery staple",
+    )
+    .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"remote epoch two").unwrap();
+    let remote_snapshot = facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "remote-epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-rollback-stale-keyring-epoch-two".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !stale_clone_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.2")
+            .exists(),
+        "expected stale clone to remain on the pre-rotation keyring generation before recovery"
+    );
+
+    let repaired = force_accept_remote_rollback(
+        &remote,
+        RepairRemoteOptions {
+            repo_root: stale_clone_root.clone(),
+        },
+        "correct horse battery staple",
+    )
+    .unwrap();
+
+    assert!(
+        repaired.repaired_objects > 0,
+        "expected rollback acceptance to hydrate remote objects while recovering a stale clone"
+    );
+    let snapshots = facade.snapshots(&stale_clone_root).unwrap();
+    assert_eq!(
+        snapshots.first().unwrap().snapshot_id,
+        remote_snapshot.snapshot_id
+    );
+    assert_ne!(
+        snapshots.first().unwrap().snapshot_id,
+        local_snapshot.snapshot_id
+    );
+    let keyring_pointer: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            stale_clone_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(keyring_pointer["generation"].as_u64(), Some(2));
+    facade.verify_ref(&stale_clone_root).unwrap();
+}
+
+#[test]
 fn force_accept_remote_rollback_repairs_local_object_path_conflict() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

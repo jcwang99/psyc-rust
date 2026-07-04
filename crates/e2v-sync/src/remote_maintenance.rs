@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use e2v_core::{RepositoryFacade, sync_support};
 use e2v_store::{
-    BackendCapability, RefToken, RemoteBackend, is_missing_physical_object_error,
+    BackendCapability, RefToken, RemoteBackend, RepoSecrets, is_missing_physical_object_error,
     validate_object_id_value,
 };
 use rusqlite::OptionalExtension;
@@ -14,7 +14,7 @@ use crate::fetch::{
     RemoteReachabilityRecorder, RemoteReachabilityTraversal, RemoteValidationRoot,
     assert_remote_generations_meet_local_floor, collect_remote_reachable_object_ids,
     collect_remote_reachable_object_ids_with_recorder, fetch_remote_object_into_validation_root,
-    next_validation_root, read_remote_control_plane,
+    next_validation_root, read_remote_control_plane, decode_default_ref_record_with_secrets,
     update_trusted_remote_state_from_control_plane, write_remote_control_plane_to_validation_root,
 };
 use crate::journal::{OperationId, OperationJournal, RewriteJournalState};
@@ -996,15 +996,27 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     let default_ref = remote
         .read_ref(&RefToken::new(branch_token.clone()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-    let (_, head_snapshot_id) =
-        sync_support::decode_default_ref_record(&options.repo_root, &default_ref.value.bytes)?;
+    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    let remote_validation_secrets =
+        sync_support::unlock_repo_secrets_from_keyring_bytes_for_sync(
+            &control_plane.current_keyring_bytes,
+            password,
+        )?;
+    let (decoded_branch_token, head_snapshot_id) =
+        decode_default_ref_record_with_secrets(&remote_validation_secrets, &default_ref.value.bytes)
+            .context("failed to decode remote branch ref during rollback acceptance")?;
+    ensure!(
+        decoded_branch_token == branch_token,
+        "remote ref token mismatch: requested {branch_token}, decoded {decoded_branch_token}"
+    );
 
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;
-    let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
-    let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+    let pack_locations = load_remote_active_pack_locations_with_local_cache(
+        remote,
+        &control_dir,
+        &remote_validation_secrets,
+    )?;
     let mut pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations)?;
-    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
         cache_control_dir: Some(control_dir.clone()),
@@ -1016,7 +1028,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
             &remote_loose_object_ids,
             &pack_locations,
             &validation_root,
-            &secrets,
+            &remote_validation_secrets,
             &mut pack_cache,
             head_snapshot_id,
         )?,
@@ -1047,8 +1059,16 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
         }
     }
 
-    rewrite_local_control_plane_from_remote(&control_dir, &control_plane)?;
-    restore_local_branch_mirrors_from_remote(remote, &options.repo_root)?;
+    rewrite_local_control_plane_from_remote(
+        &control_dir,
+        &control_plane,
+        &remote_validation_secrets,
+    )?;
+    restore_local_branch_mirrors_from_remote(
+        remote,
+        &options.repo_root,
+        &remote_validation_secrets,
+    )?;
     update_trusted_remote_state_from_control_plane(&branch_token, &default_ref, &control_plane)?;
     RepositoryFacade::new().unlock(&options.repo_root, password)?;
     RepositoryFacade::new().verify_ref(&options.repo_root)?;
@@ -1523,6 +1543,7 @@ fn list_fresh_marker_paths<R: RemoteBackend>(
 fn rewrite_local_control_plane_from_remote(
     control_dir: &std::path::Path,
     control_plane: &crate::fetch::RemoteControlPlane,
+    validation_secrets: &RepoSecrets,
 ) -> Result<()> {
     std::fs::create_dir_all(control_dir.join("keyring"))?;
     std::fs::create_dir_all(control_dir.join("refs"))?;
@@ -1534,20 +1555,19 @@ fn rewrite_local_control_plane_from_remote(
         control_dir.join("refs").join("default.json"),
         &control_plane.default_ref_bytes,
     )?;
-    let repo_root = control_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("control directory has no repository root"))?;
-    let secrets = sync_support::open_repo_secrets_for_sync(control_dir)?;
-    let (branch_token, _) =
-        sync_support::decode_default_ref_record(repo_root, &control_plane.default_ref_bytes)?;
+    let (branch_token, _) = decode_default_ref_record_with_secrets(
+        validation_secrets,
+        &control_plane.default_ref_bytes,
+    )
+    .context("failed to decode remote default ref while rewriting local control plane")?;
     let branch_plaintext = sync_support::decrypt_control_record_for_sync(
-        &secrets,
+        validation_secrets,
         "default",
         "ref",
         &control_plane.default_ref_bytes,
     )?;
     let branch_ref_bytes = sync_support::encrypt_control_record_for_sync(
-        &secrets,
+        validation_secrets,
         &format!("branch-ref:{branch_token}"),
         "ref",
         &branch_plaintext,
@@ -1572,21 +1592,21 @@ fn rewrite_local_control_plane_from_remote(
 fn restore_local_branch_mirrors_from_remote<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
+    validation_secrets: &RepoSecrets,
 ) -> Result<()> {
     let control_dir = repo_root.join(".e2v");
     let branch_dir = control_dir.join("refs").join("branches");
     std::fs::create_dir_all(&branch_dir)?;
-    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
 
     for listed_ref in list_remote_branch_refs(remote, repo_root)? {
         let plaintext = sync_support::decrypt_control_record_for_sync(
-            &secrets,
+            validation_secrets,
             "default",
             "ref",
             &listed_ref.stored.value.bytes,
         )?;
         let local_branch_ref_bytes = sync_support::encrypt_control_record_for_sync(
-            &secrets,
+            validation_secrets,
             &format!("branch-ref:{}", listed_ref.token.value),
             "ref",
             &plaintext,

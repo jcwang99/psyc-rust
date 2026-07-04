@@ -1017,7 +1017,7 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
     })()
 }
 
-fn decode_default_ref_record_with_secrets(
+pub(crate) fn decode_default_ref_record_with_secrets(
     secrets: &RepoSecrets,
     encrypted_ref_bytes: &[u8],
 ) -> Result<(String, Option<String>)> {
