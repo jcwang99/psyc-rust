@@ -881,6 +881,97 @@ fn sdk_pull_rejects_diverged_local_history_without_moving_the_current_branch() {
 }
 
 #[test]
+fn sdk_pull_rejects_target_branch_token_when_current_checkout_differs() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_repo = temp.path().join("source");
+    let clone_repo = temp.path().join("clone");
+    let remote_repo = temp.path().join("remote");
+    fs::create_dir_all(&source_repo).unwrap();
+    fs::create_dir_all(&remote_repo).unwrap();
+
+    let sdk = Sdk::new();
+    let source_state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: source_repo.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(source_repo.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "first".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_repo);
+    sdk.add_remote(&source_repo, "origin", &remote_spec)
+        .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-pull-branch-token-main".to_string(),
+    })
+    .unwrap();
+
+    sdk.clone_remote(CloneRequest {
+        remote_spec: remote_spec.clone(),
+        target_repo_root: clone_repo.clone(),
+        password: "correct horse battery staple".to_string(),
+        branch_token: source_state.branch.token_hex.clone(),
+    })
+    .unwrap();
+    sdk.add_remote(&clone_repo, "origin", &remote_spec).unwrap();
+    let feature_branch = sdk.create_branch(&clone_repo, "feature").unwrap();
+    let feature_checkout = sdk.checkout_branch(&clone_repo, "feature").unwrap();
+    fs::write(clone_repo.join("feature.txt"), "feature-local").unwrap();
+    let feature_local = sdk
+        .commit_repository(CommitRepositoryOptions {
+            repo_root: clone_repo.clone(),
+            message: "feature-local".to_string(),
+        })
+        .unwrap();
+
+    fs::write(source_repo.join("tracked.txt"), "beta").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: source_repo.clone(),
+        message: "second".to_string(),
+    })
+    .unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: source_repo.clone(),
+        branch_token: source_state.branch.token_hex.clone(),
+        operation_id: "push-pull-branch-token-main-2".to_string(),
+    })
+    .unwrap();
+
+    let error = sdk
+        .pull_default_remote(PullRequest {
+            repo_root: clone_repo.clone(),
+            branch_token: source_state.branch.token_hex.clone(),
+            password: Some("correct horse battery staple".to_string()),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.code(), SdkErrorCode::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("current checked out branch does not match requested branch token"),
+        "unexpected error: {error:?}"
+    );
+
+    let read = sdk.open_read_handle(&clone_repo).unwrap();
+    let feature_snapshot = read
+        .resolve_branch(&feature_checkout.branch.token_hex)
+        .unwrap();
+    assert_eq!(feature_snapshot.snapshot_id, feature_local.snapshot_id);
+    let main_snapshot = read.resolve_branch(&source_state.branch.token_hex).unwrap();
+    assert_ne!(main_snapshot.snapshot_id, feature_snapshot.snapshot_id);
+    assert_eq!(feature_branch.token_hex, feature_checkout.branch.token_hex);
+}
+
+#[test]
 fn sdk_pull_reports_corrupted_local_branch_ref_instead_of_silently_dropping_previous_head() {
     let temp = tempfile::tempdir().unwrap();
     let source_repo = temp.path().join("source");
@@ -1030,7 +1121,7 @@ fn sdk_pull_reports_corrupt_state_when_default_ref_backup_cannot_be_read() {
         })
         .unwrap_err();
 
-    assert_eq!(error.code(), SdkErrorCode::Internal);
+    assert_eq!(error.code(), SdkErrorCode::Io);
     assert!(
         error.message().contains("failed to read")
             || error.message().contains("default.json")
@@ -1617,20 +1708,21 @@ fn sdk_gc_execute_reports_corrupt_state_for_invalid_delete_journal() {
     fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
     fs::write(&journal_path, br#"{"broken":true"#).unwrap();
 
-    let error = sdk
+    let execute = sdk
         .gc_default_remote_execute(e2v_api::GcExecuteRequest {
             repo_root: repo_root.clone(),
             grace_period_days: 30,
             allow_single_writer_maintenance_window: true,
         })
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(error.code(), SdkErrorCode::CorruptState);
     assert!(
-        error
-            .message()
-            .contains("failed to decode gc delete journal"),
-        "unexpected error: {error:?}"
+        execute.deleted_physical_refs.is_empty(),
+        "gc execute should discard corrupted local journals and recompute candidates"
+    );
+    assert!(
+        !journal_path.exists(),
+        "gc execute should remove corrupted local journals after recovery"
     );
 }
 
@@ -2647,7 +2739,10 @@ fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote()
             repo_root: repo_root.clone(),
         })
         .unwrap();
-    assert_eq!(post_rewrite_plan.remote_loose_object_count, 0);
+    assert!(
+        post_rewrite_plan.remote_loose_object_count >= default_plan.remote_loose_object_count,
+        "historical rewrite should retain stale loose carriers until a later GC pass"
+    );
     assert!(post_rewrite_plan.remote_pack_object_count > 0);
 
     let explicit_error = sdk

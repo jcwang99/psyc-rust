@@ -728,12 +728,29 @@ impl Sdk {
     }
 
     pub fn pull_default_remote(&self, request: PullRequest) -> SdkResult<PullResponse> {
+        let current_repo = self.facade.open(&request.repo_root).map_err(map_error)?;
+        if current_repo.branch.token_hex != request.branch_token {
+            return Err(map_error(anyhow::anyhow!(
+                "current checked out branch does not match requested branch token"
+            )));
+        }
         let default_ref_path = request
             .repo_root
             .join(".e2v")
             .join("refs")
             .join("default.json");
+        let branch_ref_path = request
+            .repo_root
+            .join(".e2v")
+            .join("refs")
+            .join("branches")
+            .join(format!("{}.json", request.branch_token));
         let original_default_ref = match std::fs::read(&default_ref_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(map_error(error.into())),
+        };
+        let original_branch_ref = match std::fs::read(&branch_ref_path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(map_error(error.into())),
@@ -754,9 +771,15 @@ impl Sdk {
 
         let fetched_snapshot_id = self
             .facade
-            .default_head_snapshot_id(&request.repo_root)
+            .read_service(&request.repo_root)
             .map_err(map_error)?
-            .ok_or_else(|| anyhow::anyhow!("remote branch ref does not point to a snapshot"))
+            .resolve_branch(&request.branch_token)
+            .map(|snapshot| snapshot.snapshot_id)
+            .map_err(map_error)?;
+
+        restore_original_ref_file(&default_ref_path, original_default_ref.as_deref())
+            .map_err(map_error)?;
+        restore_original_ref_file(&branch_ref_path, original_branch_ref.as_deref())
             .map_err(map_error)?;
 
         if let Err(error) = self.facade.update_branch_head_if_fast_forward(
@@ -764,9 +787,8 @@ impl Sdk {
             &request.branch_token,
             Some(&fetched_snapshot_id),
         ) {
-            if let Some(original_default_ref) = original_default_ref.as_deref() {
-                let _ = std::fs::write(&default_ref_path, original_default_ref);
-            }
+            let _ = restore_original_ref_file(&default_ref_path, original_default_ref.as_deref());
+            let _ = restore_original_ref_file(&branch_ref_path, original_branch_ref.as_deref());
             let _ = self
                 .facade
                 .restore_default_ref_from_branch(&request.repo_root, &request.branch_token);
@@ -1343,6 +1365,23 @@ fn pull_response_from_snapshot(snapshot_id: String, fast_forward_applied: bool) 
     }
 }
 
+fn restore_original_ref_file(path: &Path, original_bytes: Option<&[u8]>) -> anyhow::Result<()> {
+    match original_bytes {
+        Some(bytes) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, bytes)?;
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+    }
+    Ok(())
+}
+
 fn verify_remote_response_from_result(
     result: e2v_sync::VerifyRemoteResult,
 ) -> VerifyRemoteResponse {
@@ -1479,6 +1518,7 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains("invalid remote url")
         || lower.contains("invalid snapshot id")
         || lower.contains("invalid snapshot path")
+        || lower.contains("current checked out branch does not match requested branch token")
         || lower.contains("path traversal")
         || lower.contains("must not be empty")
         || lower.contains("sample percent must be between")
