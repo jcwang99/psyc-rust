@@ -184,7 +184,8 @@ pub mod sync_support {
 
     pub fn read_current_keyring_bytes(repo_root: impl AsRef<Path>) -> Result<Vec<u8>> {
         let control_dir = repo_root.as_ref().join(".e2v");
-        let (pointer, _keyring) = crate::keyring::read_current_keyring_state_with_pointer(&control_dir)?;
+        let (pointer, _keyring) =
+            crate::keyring::read_current_keyring_state_with_pointer(&control_dir)?;
         std::fs::read(control_dir.join("keyring").join(pointer.current))
             .context("failed to read current keyring bytes")
     }

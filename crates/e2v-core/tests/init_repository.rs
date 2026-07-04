@@ -2742,8 +2742,97 @@ fn open_rejects_pointer_generation_mismatch_even_with_cached_secrets() {
 
     assert!(
         error.to_string().contains("generation mismatch")
-            || error.to_string().contains("keyring pointer generation mismatch")
+            || error
+                .to_string()
+                .contains("keyring pointer generation mismatch")
             || error.to_string().contains("keyring"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn open_reports_corrupted_current_keyring_pointer_even_with_cached_secrets() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    let control_dir = repo_root.join(".e2v");
+    let current_pointer_path = control_dir.join("keyring").join("keyring.current");
+    let opened = facade.open(&repo_root).unwrap();
+    assert_eq!(opened.branch.name, "main");
+
+    fs::write(&current_pointer_path, br#"{"broken":true"#).unwrap();
+
+    let error = facade.open(&repo_root).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to decode current keyring pointer"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn sync_support_read_current_keyring_bytes_reports_corrupted_current_pointer() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+        br#"{"broken":true"#,
+    )
+    .unwrap();
+
+    let error = e2v_core::sync_support::read_current_keyring_bytes(&repo_root).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to decode current keyring pointer"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn sync_support_read_current_keyring_bytes_rejects_pointer_generation_mismatch() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    facade.init(init_options(&repo_root)).unwrap();
+
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generation": 99u64,
+            "current": "keyring.1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = e2v_core::sync_support::read_current_keyring_bytes(&repo_root).unwrap_err();
+
+    assert!(
+        error.to_string().contains("generation mismatch")
+            || error
+                .to_string()
+                .contains("keyring pointer generation mismatch"),
         "unexpected error: {error:#}"
     );
 }
@@ -6053,10 +6142,9 @@ fn reconcile_remote_keyring_for_sync_advances_stale_local_device_clone_to_remote
     assert_eq!(before["generation"].as_u64(), Some(2));
     assert_eq!(before["active_epoch"].as_u64(), Some(1));
     let recipient_keyring_dir = recipient_root.join(".e2v").join("keyring");
-    let recipient_pointer: serde_json::Value = serde_json::from_slice(
-        &fs::read(recipient_keyring_dir.join("keyring.current")).unwrap(),
-    )
-    .unwrap();
+    let recipient_pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(recipient_keyring_dir.join("keyring.current")).unwrap())
+            .unwrap();
     let recipient_current = recipient_pointer["current"].as_str().unwrap();
     let recipient_keyring_bytes = fs::read(recipient_keyring_dir.join(recipient_current)).unwrap();
     assert!(
@@ -6065,11 +6153,8 @@ fn reconcile_remote_keyring_for_sync_advances_stale_local_device_clone_to_remote
         "expected owner to import the recipient device envelope before rotating epochs"
     );
 
-    e2v_core::testing::rotate_active_epoch_for_test(
-        &owner_root,
-        "correct horse battery staple",
-    )
-    .unwrap();
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
     let owner_rotated = read_current_keyring_json(&owner_root);
     assert_eq!(owner_rotated["active_epoch"].as_u64(), Some(2));
 
@@ -6080,9 +6165,11 @@ fn reconcile_remote_keyring_for_sync_advances_stale_local_device_clone_to_remote
     let owner_current = owner_pointer["current"].as_str().unwrap();
     let remote_keyring_bytes = fs::read(owner_keyring_dir.join(owner_current)).unwrap();
 
-    let reconciled =
-        e2v_core::testing::reconcile_remote_keyring_for_test(&recipient_root, &remote_keyring_bytes)
-            .unwrap();
+    let reconciled = e2v_core::testing::reconcile_remote_keyring_for_test(
+        &recipient_root,
+        &remote_keyring_bytes,
+    )
+    .unwrap();
 
     assert!(
         reconciled,

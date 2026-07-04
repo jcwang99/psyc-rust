@@ -150,10 +150,19 @@ struct DeviceEnvelopeRecord {
 
 fn current_keyring_cache_material(control_dir: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     let pointer_path = control_dir.join(KEYRING_CURRENT_FILE);
-    let pointer_bytes = std::fs::read(&pointer_path)
-        .with_context(|| format!("failed to read {}", pointer_path.display()))?;
-    let keyring_pointer: KeyringPointer = serde_json::from_slice(&pointer_bytes)
-        .with_context(|| format!("failed to decode {}", pointer_path.display()))?;
+    let pointer_bytes = std::fs::read(&pointer_path).with_context(|| {
+        format!(
+            "failed to read current keyring pointer {}",
+            pointer_path.display()
+        )
+    })?;
+    let keyring_pointer: KeyringPointer =
+        serde_json::from_slice(&pointer_bytes).with_context(|| {
+            format!(
+                "failed to decode current keyring pointer {}",
+                pointer_path.display()
+            )
+        })?;
     validate_keyring_file_name(&keyring_pointer.current).map_err(|error| {
         anyhow::anyhow!(
             "invalid current keyring path {}: {error}",
@@ -481,24 +490,25 @@ pub fn seal_repo_secrets_for_device(
 }
 
 pub fn read_current_keyring_state(control_dir: &Path) -> Result<KeyringState> {
-    let keyring_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
-    validate_keyring_file_name(&keyring_pointer.current).map_err(|error| {
-        anyhow::anyhow!(
-            "invalid current keyring path {}: {error}",
-            keyring_pointer.current
-        )
-    })?;
-    let keyring: KeyringState =
-        read_json(control_dir.join(KEYRING_DIR).join(&keyring_pointer.current))?;
-    ensure!(
-        keyring_pointer.generation == keyring.generation,
-        "keyring pointer generation mismatch"
-    );
+    let (_keyring_pointer, keyring) = read_current_keyring_state_with_pointer(control_dir)?;
     Ok(keyring)
 }
 
 pub(crate) fn read_current_keyring_pointer(control_dir: &Path) -> Result<KeyringPointer> {
-    let keyring_pointer: KeyringPointer = read_json(control_dir.join(KEYRING_CURRENT_FILE))?;
+    let pointer_path = control_dir.join(KEYRING_CURRENT_FILE);
+    let pointer_bytes = std::fs::read(&pointer_path).with_context(|| {
+        format!(
+            "failed to read current keyring pointer {}",
+            pointer_path.display()
+        )
+    })?;
+    let keyring_pointer: KeyringPointer =
+        serde_json::from_slice(&pointer_bytes).with_context(|| {
+            format!(
+                "failed to decode current keyring pointer {}",
+                pointer_path.display()
+            )
+        })?;
     validate_keyring_file_name(&keyring_pointer.current).map_err(|error| {
         anyhow::anyhow!(
             "invalid current keyring path {}: {error}",
@@ -523,7 +533,10 @@ pub(crate) fn read_current_keyring_state_with_pointer(
 
 pub(crate) fn validate_keyring_file_name(value: &str) -> Result<()> {
     let path = Path::new(value);
-    ensure!(!value.trim().is_empty(), "keyring file name must not be empty");
+    ensure!(
+        !value.trim().is_empty(),
+        "keyring file name must not be empty"
+    );
     ensure!(!path.is_absolute(), "keyring file name must be relative");
     ensure!(
         path.components()
@@ -908,6 +921,27 @@ mod tests {
             error.to_string().contains("invalid current keyring path")
                 || error.to_string().contains("path traversal")
                 || error.to_string().contains("single path segment"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn read_current_keyring_pointer_reports_decode_failure_with_stable_context() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path().join("control");
+        std::fs::create_dir_all(control_dir.join(KEYRING_DIR)).unwrap();
+        std::fs::write(control_dir.join(KEYRING_CURRENT_FILE), br#"{"broken":true"#).unwrap();
+
+        let error = read_current_keyring_pointer(&control_dir).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode current keyring pointer"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("keyring.current"),
             "unexpected error: {error:#}"
         );
     }
