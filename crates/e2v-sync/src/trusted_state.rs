@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -110,9 +110,16 @@ fn remove_path_if_exists(path: &std::path::Path) -> Result<()> {
 }
 
 fn trusted_state_file_path(repo_id: &str) -> Result<PathBuf> {
+    let path = Path::new(repo_id);
     anyhow::ensure!(
         !repo_id.trim().is_empty(),
         "trusted state repo_id must not be empty"
+    );
+    anyhow::ensure!(!path.is_absolute(), "trusted state repo_id must be relative");
+    anyhow::ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "trusted state repo_id path traversal is not allowed"
     );
     Ok(trusted_state_root()?.join(format!("{repo_id}.json")))
 }
@@ -256,6 +263,31 @@ mod tests {
         assert!(
             !store_fn.contains("std::fs::write(&path, bytes)"),
             "trusted state persistence should not directly overwrite the final fact file"
+        );
+    }
+
+    #[test]
+    fn trusted_state_rejects_repo_id_path_traversal_before_touching_disk() {
+        let temp = tempdir().unwrap();
+        let _guard = override_trusted_state_dir_for_test(temp.path().to_path_buf());
+        let state = TrustedRemoteState {
+            repo_id: "../escape".to_string(),
+            min_layout_generation: 7,
+            min_keyring_generation: 11,
+            min_ref_generations: BTreeMap::new(),
+        };
+
+        let error = store_trusted_remote_state(&state).unwrap_err();
+
+        assert!(
+            error.to_string().contains("path traversal")
+                || error.to_string().contains("path separators")
+                || error.to_string().contains("relative"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            temp.path().read_dir().unwrap().next().is_none(),
+            "trusted state store should reject traversal repo ids before creating any local files"
         );
     }
 
