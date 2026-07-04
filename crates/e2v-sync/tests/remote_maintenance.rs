@@ -1214,6 +1214,65 @@ fn plan_historical_rewrite_rejects_remote_current_keyring_with_invalid_epochs_sh
 }
 
 #[test]
+fn plan_historical_rewrite_rejects_local_keyring_pointer_path_traversal() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-history-plan-local-pointer-traversal".to_string(),
+        },
+    )
+    .unwrap();
+
+    fs::write(
+        repo_root
+            .join(".e2v")
+            .join("keyring")
+            .join("keyring.current"),
+        br#"{"generation":1,"current":"../../outside.json"}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo_root.join("outside.json"),
+        br#"{"repo_id":"escape"}"#,
+    )
+    .unwrap();
+
+    let error = plan_historical_rewrite(&remote, HistoricalRewritePlanOptions { repo_root })
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("invalid current keyring path")
+            || error.to_string().contains("path traversal")
+            || error.to_string().contains("single path segment"),
+        "unexpected planning error: {error:#}"
+    );
+}
+
+#[test]
 fn repair_remote_restores_missing_local_object_from_remote_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

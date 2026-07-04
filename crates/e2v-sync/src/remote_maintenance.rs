@@ -260,17 +260,9 @@ pub fn plan_historical_rewrite<R: RemoteBackend>(
     let facade = RepositoryFacade::new();
     facade.open(&options.repo_root)?;
     let control_dir = options.repo_root.join(".e2v");
-    let keyring_pointer: serde_json::Value = serde_json::from_slice(&std::fs::read(
-        control_dir.join("keyring").join("keyring.current"),
-    )?)
-    .context("failed to decode current keyring pointer")?;
-    let current_keyring_name = keyring_pointer["current"]
-        .as_str()
-        .context("keyring pointer missing current generation file")?;
-    let keyring: serde_json::Value = serde_json::from_slice(&std::fs::read(
-        control_dir.join("keyring").join(current_keyring_name),
-    )?)
-    .context("failed to decode current keyring state")?;
+    let keyring: serde_json::Value =
+        serde_json::from_slice(&sync_support::read_current_keyring_bytes(&options.repo_root)?)
+            .context("failed to decode current keyring state")?;
     let local_old_epoch_count =
         keyring_epoch_count(&keyring, "current local keyring state")?.saturating_sub(1);
     let remote_old_epoch_count =

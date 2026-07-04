@@ -182,6 +182,13 @@ pub mod sync_support {
         Ok(keyring.repo_id)
     }
 
+    pub fn read_current_keyring_bytes(repo_root: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let control_dir = repo_root.as_ref().join(".e2v");
+        let (pointer, _keyring) = crate::keyring::read_current_keyring_state_with_pointer(&control_dir)?;
+        std::fs::read(control_dir.join("keyring").join(pointer.current))
+            .context("failed to read current keyring bytes")
+    }
+
     pub fn list_local_object_files(repo_root: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let objects_dir = repo_root.as_ref().join(".e2v").join("objects");
         let mut files = std::fs::read_dir(&objects_dir)?
