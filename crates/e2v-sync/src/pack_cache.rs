@@ -96,24 +96,6 @@ pub(crate) fn cache_pack_data_bytes(
     write_cached_pack_data_bytes(control_dir, container_id, pack_bytes)
 }
 
-pub(crate) fn preload_cached_pack_data(
-    control_dir: &Path,
-    pack_locations: &BTreeMap<String, PackedObjectLocation>,
-    pack_cache: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<()> {
-    for location in pack_locations.values() {
-        let physical_ref = location.physical_ref()?;
-        let container_id = &physical_ref.container_id;
-        if pack_cache.contains_key(container_id) {
-            continue;
-        }
-        if let Some(bytes) = read_cached_pack_data_bytes(control_dir, container_id)? {
-            pack_cache.insert(container_id.clone(), bytes);
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn prune_stale_cached_pack_data(
     control_dir: &Path,
     pack_locations: &BTreeMap<String, PackedObjectLocation>,

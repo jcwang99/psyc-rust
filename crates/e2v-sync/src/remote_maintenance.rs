@@ -24,8 +24,7 @@ use crate::oram::{
 };
 use crate::pack::PackedObjectLocation;
 use crate::pack_cache::{
-    cache_pack_data_bytes, preload_cached_pack_data, prune_stale_cached_pack_data,
-    remote_object_bytes_with_pack_cache,
+    cache_pack_data_bytes, prune_stale_cached_pack_data, remote_object_bytes_with_pack_cache,
 };
 use crate::pack_index::{next_pack_index_segment_paths, publish_pack_index_root};
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
@@ -727,6 +726,14 @@ fn cache_pack_data_from_map(
     Ok(())
 }
 
+fn initialize_maintenance_pack_cache(
+    control_dir: &Path,
+    pack_locations: &BTreeMap<String, PackedObjectLocation>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    prune_stale_cached_pack_data(control_dir, pack_locations)?;
+    Ok(BTreeMap::new())
+}
+
 fn retained_active_segment_paths_for_unrewritten_objects<R: RemoteBackend>(
     remote: &R,
     control_dir: &Path,
@@ -998,9 +1005,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
-    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
-    let mut pack_cache = BTreeMap::new();
-    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
+    let mut pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
@@ -1072,9 +1077,7 @@ pub fn verify_remote<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
-    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
-    let mut pack_cache = BTreeMap::new();
-    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
+    let mut pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations)?;
     let facade = RepositoryFacade::new();
     let mut repaired_local_objects = 0usize;
 
@@ -1171,9 +1174,7 @@ pub fn repair_remote<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
-    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
-    let mut pack_cache = BTreeMap::new();
-    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
+    let mut pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
@@ -1248,7 +1249,6 @@ pub fn gc_dry_run<R: RemoteBackend>(
     let secrets = sync_support::open_repo_secrets_for_sync(&control_dir)?;
     let pack_locations =
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
-    prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
     assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
@@ -1256,8 +1256,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
         cache_control_dir: Some(control_dir.clone()),
     };
     write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
-    let mut pack_cache = BTreeMap::new();
-    preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
+    let mut pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations)?;
     let mut traversal = RemoteReachabilityTraversal {
         remote,
         remote_loose_object_ids: &remote_loose_object_ids,
@@ -2156,6 +2155,40 @@ mod tests {
             bytes,
             serde_json::to_vec(&journal).unwrap(),
             "gc delete journal should not store pretty-printed JSON whitespace"
+        );
+    }
+
+    #[test]
+    fn maintenance_pack_cache_starts_empty_even_when_disk_cache_exists() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path().join(".e2v");
+        let container_id = "packs/data/pack-00000001.bin";
+        let pack_locations = BTreeMap::from([(
+            object_id('a'),
+            PackedObjectLocation {
+                data_path: container_id.to_string(),
+                offset: 0,
+                length: 13,
+            },
+        )]);
+
+        cache_pack_data_bytes(&control_dir, container_id, b"packed-object").unwrap();
+
+        let pack_cache = initialize_maintenance_pack_cache(&control_dir, &pack_locations).unwrap();
+
+        assert!(
+            pack_cache.is_empty(),
+            "maintenance flows should lazily hydrate pack bytes instead of preloading all cached packs into memory"
+        );
+        assert!(
+            control_dir
+                .join("cache")
+                .join("pack-data")
+                .join("packs")
+                .join("data")
+                .join("pack-00000001.bin")
+                .is_file(),
+            "initializing the maintenance pack cache should preserve the on-disk cache for later lazy reuse"
         );
     }
 }
