@@ -1226,6 +1226,27 @@ fn winfsp_directory_callbacks_do_not_reload_the_runtime_library() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn winfsp_debug_output_is_gated_behind_an_explicit_opt_in() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("windows.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        source.contains("if *WINFSP_DEBUG_ENABLED {")
+            && source.contains("eprintln!(\"[e2v-winfsp] {event}: {detail}\");"),
+        "WinFSP host should guard stderr debug output behind an explicit cached opt-in check"
+    );
+    assert!(
+        source.contains("E2V_WINFSP_DEBUG"),
+        "WinFSP debug output should be guarded behind an explicit environment opt-in"
+    );
+}
+
 #[test]
 fn vfs_root_does_not_reexport_winfsp_host_internals() {
     let source = fs::read_to_string(

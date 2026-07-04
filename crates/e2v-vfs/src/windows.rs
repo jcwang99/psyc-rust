@@ -38,6 +38,7 @@ const VOLUME_PARAMS_ALWAYS_USE_DOUBLE_BUFFERING_BIT: u32 = 1 << 12;
 const VOLUME_PARAMS_VOLUME_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 0;
 const VOLUME_PARAMS_DIR_INFO_TIMEOUT_VALID_BIT: u32 = 1 << 1;
 const FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE: i32 = 0;
+const E2V_WINFSP_DEBUG_ENV: &str = "E2V_WINFSP_DEBUG";
 
 static READ_ONLY_SECURITY_DESCRIPTOR_BYTES: LazyLock<Result<Arc<SecurityDescriptorBytes>>> =
     LazyLock::new(|| {
@@ -1349,7 +1350,18 @@ fn normalized_logical_path_from_windows_path(file_name: *const u16) -> String {
 }
 
 fn debug_winfsp(event: &str, detail: &str) {
-    eprintln!("[e2v-winfsp] {event}: {detail}");
+    static WINFSP_DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os(E2V_WINFSP_DEBUG_ENV)
+            .map(|value| {
+                let value = value.to_string_lossy();
+                !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    });
+
+    if *WINFSP_DEBUG_ENABLED {
+        eprintln!("[e2v-winfsp] {event}: {detail}");
+    }
 }
 
 fn unsupported_winfsp_status(event: &str, status: i32) -> i32 {
