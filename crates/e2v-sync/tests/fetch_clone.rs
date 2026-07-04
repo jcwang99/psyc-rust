@@ -7611,6 +7611,57 @@ fn accepted_member_bootstrap_fetch_then_open_supports_clone_equivalent_readiness
 }
 
 #[test]
+fn password_clone_remains_openable_after_unlock_cache_is_cleared() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let clone_root = temp.path().join("clone");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("hello.txt"), b"clone-openable").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "clone-openable".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root,
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "clone-openable-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::clear_unlocked_keyring_cache_for_test(&clone_root.join(".e2v"));
+    let reopened = facade.open(&clone_root).unwrap();
+
+    assert_eq!(reopened.branch.token_hex, state.branch.token_hex);
+}
+
+#[test]
 fn remote_keyring_generation_rollback_via_pointer_ref_is_rejected() {
     let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
     let trusted_state_root = temp.path().join("trusted-state");

@@ -353,6 +353,22 @@ fn push_command_uses_the_default_remote_for_the_current_branch() {
 }
 
 #[test]
+fn push_command_exposes_and_delegates_single_writer_risk_confirmation_flag() {
+    let source = cli_lib_source_without_whitespace();
+
+    for expected in [
+        "long=\"force-single-writer-risk\"",
+        "force_single_writer_risk:bool",
+        "sdk.push_default_remote_allowing_single_writer_risk(",
+    ] {
+        assert!(
+            source.contains(expected),
+            "expected CLI push command to expose and delegate single-writer risk confirmation via {expected}"
+        );
+    }
+}
+
+#[test]
 fn fetch_command_uses_the_default_remote_for_the_current_branch() {
     let temp = tempdir().unwrap();
     let source_repo = temp.path().join("source");

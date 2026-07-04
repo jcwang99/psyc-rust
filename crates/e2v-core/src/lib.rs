@@ -99,6 +99,13 @@ pub mod testing {
     ) -> Result<bool> {
         crate::facade::reconcile_remote_keyring_for_sync(repo_root, remote_keyring_bytes)
     }
+
+    pub fn bootstrap_password_clone_local_device_for_test(
+        repo_root: impl AsRef<std::path::Path>,
+        password: &str,
+    ) -> Result<()> {
+        crate::facade::bootstrap_password_clone_local_device(repo_root, password)
+    }
 }
 
 pub use facade::{

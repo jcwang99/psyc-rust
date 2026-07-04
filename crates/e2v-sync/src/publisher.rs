@@ -40,6 +40,111 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             remote_backend,
         }
     }
+
+    pub fn begin_allowing_risky_single_writer(
+        &self,
+        plan: PublishPlan,
+        allow_risky_single_writer: bool,
+    ) -> Result<PublishSession> {
+        validate_sync_identifier("branch token", &plan.target_branch_token)?;
+        let advertised_writer_mode = self.capability.writer_mode();
+        let effective_writer_mode = if allow_risky_single_writer
+            && advertised_writer_mode == e2v_store::WriterMode::SingleWriter
+            && self.capability.push_write_mode() == e2v_store::WriterMode::ReadOnly
+        {
+            e2v_store::WriterMode::SingleWriter
+        } else {
+            self.capability.push_write_mode()
+        };
+        if advertised_writer_mode == e2v_store::WriterMode::SingleWriter
+            && effective_writer_mode == e2v_store::WriterMode::ReadOnly
+        {
+            anyhow::bail!("risky single-writer backend capabilities are disabled by default");
+        }
+        anyhow::ensure!(
+            effective_writer_mode != e2v_store::WriterMode::ReadOnly,
+            "read-only backend capabilities cannot publish"
+        );
+        let writer_mode = effective_writer_mode;
+        let lease_path = if writer_mode == e2v_store::WriterMode::SingleWriter
+            && self.capability.supports_atomic_create_if_absent
+        {
+            let lease_path = format!("leases/{}.lock", plan.target_branch_token);
+            let initial_lease_bytes =
+                serde_json::to_vec(&build_writer_lease_marker(&plan, 0, 1, 1))?;
+            if !self
+                .remote_backend
+                .put_physical_if_absent(&lease_path, initial_lease_bytes.as_slice())?
+            {
+                let observed_now = observe_remote_now_with_probe(
+                    &self.remote_backend,
+                    ".e2v/publish-remote-time.probe",
+                )?;
+                let lease_is_fresh = marker_is_fresh_at(
+                    &self.remote_backend,
+                    &lease_path,
+                    observed_now,
+                    INTENT_EXPIRY_HOURS,
+                )?;
+                if lease_is_fresh {
+                    anyhow::bail!(
+                        "writer lease acquisition failed for {}",
+                        plan.target_branch_token
+                    );
+                }
+                let lease_bytes = self.remote_backend.get_physical(&lease_path)?;
+                if let Ok(existing) =
+                    serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes)
+                    && existing.target_branch_token != plan.target_branch_token
+                {
+                    anyhow::bail!(
+                        "writer lease acquisition failed for {}",
+                        plan.target_branch_token
+                    );
+                }
+                self.remote_backend.delete_physical(&lease_path)?;
+                let reacquired = self
+                    .remote_backend
+                    .put_physical_if_absent(&lease_path, initial_lease_bytes.as_slice())?;
+                anyhow::ensure!(
+                    reacquired,
+                    "writer lease acquisition failed for {}",
+                    plan.target_branch_token
+                );
+            }
+            let observed_at = remote_observed_at_unix_ms(&self.remote_backend, &lease_path)?;
+            self.remote_backend.put_physical(
+                &lease_path,
+                serde_json::to_vec(&build_writer_lease_marker(&plan, observed_at, 1, 1))?
+                    .as_slice(),
+            )?;
+            Some(lease_path)
+        } else {
+            None
+        };
+        let active_intent_path = format!("transactions/active/{}.intent", plan.operation_id.value);
+        self.remote_backend.put_physical(
+            &active_intent_path,
+            serde_json::to_vec(&build_write_intent_marker(&plan, 0, 1))?.as_slice(),
+        )?;
+        let observed_at = remote_observed_at_unix_ms(&self.remote_backend, &active_intent_path)?;
+        self.remote_backend.put_physical(
+            &active_intent_path,
+            serde_json::to_vec(&build_write_intent_marker(&plan, observed_at, 1))?.as_slice(),
+        )?;
+        Ok(PublishSession {
+            operation_id: plan.operation_id,
+            target_branch_token: plan.target_branch_token,
+            expected_ref_version: plan.expected_ref_version,
+            planned_snapshot_id: plan.planned_snapshot_id,
+            writer_mode,
+            started_at_remote_unix_ms: observed_at,
+            next_layout_root: None,
+            next_layout_root_bytes: None,
+            active_intent_path,
+            lease_path,
+        })
+    }
     fn renew_intent_if_needed(
         &self,
         path: &str,
@@ -226,94 +331,7 @@ fn validate_lease_marker_for_session(
 
 impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
     fn begin(&self, plan: PublishPlan) -> Result<PublishSession> {
-        validate_sync_identifier("branch token", &plan.target_branch_token)?;
-        let advertised_writer_mode = self.capability.writer_mode();
-        let writer_mode = self.capability.push_write_mode();
-        if advertised_writer_mode == e2v_store::WriterMode::SingleWriter
-            && writer_mode == e2v_store::WriterMode::ReadOnly
-        {
-            anyhow::bail!("risky single-writer backend capabilities are disabled by default");
-        }
-        anyhow::ensure!(
-            writer_mode != e2v_store::WriterMode::ReadOnly,
-            "read-only backend capabilities cannot publish"
-        );
-        let lease_path = if writer_mode == e2v_store::WriterMode::SingleWriter {
-            let lease_path = format!("leases/{}.lock", plan.target_branch_token);
-            let initial_lease_bytes =
-                serde_json::to_vec(&build_writer_lease_marker(&plan, 0, 1, 1))?;
-            if !self
-                .remote_backend
-                .put_physical_if_absent(&lease_path, initial_lease_bytes.as_slice())?
-            {
-                let observed_now = observe_remote_now_with_probe(
-                    &self.remote_backend,
-                    ".e2v/publish-remote-time.probe",
-                )?;
-                let lease_is_fresh = marker_is_fresh_at(
-                    &self.remote_backend,
-                    &lease_path,
-                    observed_now,
-                    INTENT_EXPIRY_HOURS,
-                )?;
-                if lease_is_fresh {
-                    anyhow::bail!(
-                        "writer lease acquisition failed for {}",
-                        plan.target_branch_token
-                    );
-                }
-                let lease_bytes = self.remote_backend.get_physical(&lease_path)?;
-                if let Ok(existing) =
-                    serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes)
-                    && existing.target_branch_token != plan.target_branch_token
-                {
-                    anyhow::bail!(
-                        "writer lease acquisition failed for {}",
-                        plan.target_branch_token
-                    );
-                }
-                self.remote_backend.delete_physical(&lease_path)?;
-                let reacquired = self
-                    .remote_backend
-                    .put_physical_if_absent(&lease_path, initial_lease_bytes.as_slice())?;
-                anyhow::ensure!(
-                    reacquired,
-                    "writer lease acquisition failed for {}",
-                    plan.target_branch_token
-                );
-            }
-            let observed_at = remote_observed_at_unix_ms(&self.remote_backend, &lease_path)?;
-            self.remote_backend.put_physical(
-                &lease_path,
-                serde_json::to_vec(&build_writer_lease_marker(&plan, observed_at, 1, 1))?
-                    .as_slice(),
-            )?;
-            Some(lease_path)
-        } else {
-            None
-        };
-        let active_intent_path = format!("transactions/active/{}.intent", plan.operation_id.value);
-        self.remote_backend.put_physical(
-            &active_intent_path,
-            serde_json::to_vec(&build_write_intent_marker(&plan, 0, 1))?.as_slice(),
-        )?;
-        let observed_at = remote_observed_at_unix_ms(&self.remote_backend, &active_intent_path)?;
-        self.remote_backend.put_physical(
-            &active_intent_path,
-            serde_json::to_vec(&build_write_intent_marker(&plan, observed_at, 1))?.as_slice(),
-        )?;
-        Ok(PublishSession {
-            operation_id: plan.operation_id,
-            target_branch_token: plan.target_branch_token,
-            expected_ref_version: plan.expected_ref_version,
-            planned_snapshot_id: plan.planned_snapshot_id,
-            writer_mode,
-            started_at_remote_unix_ms: observed_at,
-            next_layout_root: None,
-            next_layout_root_bytes: None,
-            active_intent_path,
-            lease_path,
-        })
+        self.begin_allowing_risky_single_writer(plan, false)
     }
 
     fn record_uploaded(&self, session: &PublishSession, object: PublishedObject) -> Result<()> {
@@ -793,6 +811,103 @@ mod tests {
     }
 
     impl e2v_store::RemoteBackend for RaceInjectingLeaseBackend {
+        fn capability(&self) -> &BackendCapability {
+            self.inner.capability()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct UnsupportedIfAbsentLeaseBackend {
+        inner: e2v_store::MemoryBackend,
+    }
+
+    impl UnsupportedIfAbsentLeaseBackend {
+        fn new() -> Self {
+            Self {
+                inner: e2v_store::MemoryBackend::new(),
+            }
+        }
+    }
+
+    impl BlobStore for UnsupportedIfAbsentLeaseBackend {
+        fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_physical(relative_path, bytes)
+        }
+
+        fn put_physical_if_absent(&self, _relative_path: &str, _bytes: &[u8]) -> Result<bool> {
+            anyhow::bail!(
+                "Unsupported (permanent) at write => The service webdav does not support the operation write with the arguments if_not_exists."
+            );
+        }
+
+        fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            self.inner.get_physical(relative_path)
+        }
+
+        fn get_physical_range(
+            &self,
+            relative_path: &str,
+            offset: usize,
+            length: usize,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_physical_range(relative_path, offset, length)
+        }
+
+        fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            self.inner.delete_physical(relative_path)
+        }
+
+        fn exists_physical(&self, relative_path: &str) -> bool {
+            self.inner.exists_physical(relative_path)
+        }
+
+        fn stat_physical(&self, relative_path: &str) -> Result<e2v_store::ObjectStat> {
+            self.inner.stat_physical(relative_path)
+        }
+
+        fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list_physical(prefix)
+        }
+    }
+
+    impl RefStore for UnsupportedIfAbsentLeaseBackend {
+        fn read_ref(&self, token: &RefToken) -> Result<Option<StoredRef>> {
+            self.inner.read_ref(token)
+        }
+
+        fn list_refs(&self) -> Result<Vec<ListedRef>> {
+            self.inner.list_refs()
+        }
+
+        fn compare_and_swap_ref(
+            &self,
+            token: &RefToken,
+            expected: Option<RefVersion>,
+            next: EncryptedRef,
+        ) -> Result<CasResult> {
+            self.inner.compare_and_swap_ref(token, expected, next)
+        }
+    }
+
+    impl LayoutRootStore for UnsupportedIfAbsentLeaseBackend {
+        fn read_layout_root(&self) -> Result<LayoutRoot> {
+            self.inner.read_layout_root()
+        }
+
+        fn compare_and_swap_layout_root(
+            &self,
+            expected: u64,
+            next: LayoutRoot,
+        ) -> Result<CasResult> {
+            self.inner.compare_and_swap_layout_root(expected, next)
+        }
+
+        fn list_retained_layout_roots(&self) -> Result<Vec<LayoutRoot>> {
+            self.inner.list_retained_layout_roots()
+        }
+    }
+
+    impl e2v_store::RemoteBackend for UnsupportedIfAbsentLeaseBackend {
         fn capability(&self) -> &BackendCapability {
             self.inner.capability()
         }
@@ -1578,8 +1693,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-heartbeat-intent-mismatch".to_string())
-                    .unwrap(),
+                operation_id: OperationId::new("op-heartbeat-intent-mismatch".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 planned_snapshot_id: Some("snapshot-heartbeat".to_string()),
@@ -1618,8 +1732,7 @@ mod tests {
         let error = publisher.heartbeat(&session).unwrap_err();
 
         assert!(
-            error.to_string().contains("active intent")
-                && error.to_string().contains("branch")
+            error.to_string().contains("active intent") && error.to_string().contains("branch")
                 || error.to_string().contains("invalid active intent marker"),
             "unexpected error: {error:#}"
         );
@@ -1653,8 +1766,7 @@ mod tests {
 
         let session = publisher
             .begin(PublishPlan {
-                operation_id: OperationId::new("op-heartbeat-lease-mismatch".to_string())
-                    .unwrap(),
+                operation_id: OperationId::new("op-heartbeat-lease-mismatch".to_string()).unwrap(),
                 target_branch_token: "branch-token".to_string(),
                 expected_ref_version: None,
                 planned_snapshot_id: Some("snapshot-heartbeat".to_string()),
@@ -1691,8 +1803,7 @@ mod tests {
         let error = publisher.heartbeat(&session).unwrap_err();
 
         assert!(
-            error.to_string().contains("writer lease")
-                && error.to_string().contains("branch")
+            error.to_string().contains("writer lease") && error.to_string().contains("branch")
                 || error.to_string().contains("invalid writer lease marker"),
             "unexpected error: {error:#}"
         );
@@ -1768,6 +1879,51 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("risky"));
+    }
+
+    #[test]
+    fn begin_allowing_risky_single_writer_can_continue_without_remote_lease_primitive() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = UnsupportedIfAbsentLeaseBackend::new();
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: false,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: false,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: false,
+                supports_object_generation_or_etag: false,
+                supports_layout_root_cas: false,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin_allowing_risky_single_writer(
+                PublishPlan {
+                    operation_id: OperationId::new("op-risky-no-lease".to_string()).unwrap(),
+                    target_branch_token: "branch-token".to_string(),
+                    expected_ref_version: None,
+                    planned_snapshot_id: None,
+                    writer_mode: WriterMode::ReadOnly,
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(session.writer_mode, WriterMode::SingleWriter);
+        assert!(session.lease_path.is_none());
+        assert!(
+            remote.exists_physical("transactions/active/op-risky-no-lease.intent"),
+            "explicit risky single-writer mode should still publish an active intent marker"
+        );
     }
 
     #[test]

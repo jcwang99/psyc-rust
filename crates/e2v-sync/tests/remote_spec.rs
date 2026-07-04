@@ -203,7 +203,27 @@ fn parse_remote_spec_decodes_alist_token_url_into_remote_config() {
         e2v_sync::RemoteSpec::Webdav(WebdavRemoteConfig {
             flavor: WebdavFlavor::Alist,
             endpoint: "https://example.com".to_string(),
-            root: "/remote-root".to_string(),
+            root: "/dav/remote-root".to_string(),
+            username: None,
+            password: None,
+            token: Some("token".to_string()),
+            disable_create_dir: false,
+            verified_capabilities: WebdavVerifiedCapabilities::default(),
+        })
+    );
+}
+
+#[test]
+fn parse_remote_spec_preserves_explicit_alist_dav_prefix() {
+    let spec =
+        e2v_sync::RemoteSpec::parse("alist+https://token@example.com/dav/remote-root").unwrap();
+
+    assert_eq!(
+        spec,
+        e2v_sync::RemoteSpec::Webdav(WebdavRemoteConfig {
+            flavor: WebdavFlavor::Alist,
+            endpoint: "https://example.com".to_string(),
+            root: "/dav/remote-root".to_string(),
             username: None,
             password: None,
             token: Some("token".to_string()),

@@ -402,6 +402,7 @@ Important:
 
 - the credentials in these examples are placeholders only
 - never keep real credentials in public scripts, chat logs, or tickets
+- `alist+` remotes are normalized for AList WebDAV compatibility, so `alist+https://token@example.com/remote-root` and `alist+https://token@example.com/dav/remote-root` target the same `/dav/...` root
 
 ### 9.2 Add a Default Remote
 
@@ -429,7 +430,7 @@ Notes:
 Usage:
 
 ```powershell
-cargo run -p e2v-cli -- push --repo <REPO>
+cargo run -p e2v-cli -- push --repo <REPO> [--force-single-writer-risk]
 ```
 
 Prerequisites:
@@ -441,6 +442,7 @@ Behavior:
 
 - publishes the current branch head to the default remote
 - prints the published snapshot prefix
+- conservative single-writer WebDAV/AList backends stay blocked by default unless you explicitly pass `--force-single-writer-risk`
 
 Typical workflow:
 

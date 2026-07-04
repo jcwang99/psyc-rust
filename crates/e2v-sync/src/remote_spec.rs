@@ -48,11 +48,7 @@ impl RemoteSpec {
         } else {
             format!("{}://{}", parsed.scheme(), host)
         };
-        let root = if parsed.path().is_empty() {
-            "/".to_string()
-        } else {
-            parsed.path().to_string()
-        };
+        let root = normalize_webdav_root(flavor, parsed.path());
         let username = if parsed.username().is_empty() {
             None
         } else if flavor == WebdavFlavor::Webdav {
@@ -102,6 +98,22 @@ impl RemoteSpec {
             }
         }
     }
+}
+
+fn normalize_webdav_root(flavor: WebdavFlavor, raw_path: &str) -> String {
+    let path = if raw_path.is_empty() { "/" } else { raw_path };
+    if flavor != WebdavFlavor::Alist {
+        return path.to_string();
+    }
+
+    if path == "/" {
+        return "/dav".to_string();
+    }
+    if path == "/dav" || path.starts_with("/dav/") {
+        return path.to_string();
+    }
+    let trimmed = path.trim_start_matches('/');
+    format!("/dav/{trimmed}")
 }
 
 pub enum RemoteBackendRef<'a> {

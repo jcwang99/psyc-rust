@@ -12,7 +12,8 @@ use tempfile::tempdir;
 
 use e2v_sync::{
     CloneOptions, EnableObliviousLayoutOptions, PushOptions, ResumeOptions, clone_remote,
-    enable_oblivious_layout, fetch_remote, push_head, resume_push,
+    enable_oblivious_layout, fetch_remote, push_head, push_head_with_single_writer_risk,
+    resume_push,
 };
 
 #[test]
@@ -2407,6 +2408,51 @@ fn push_rejects_conservative_webdav_backend_by_default() {
     .unwrap_err();
 
     assert!(error.to_string().contains("risky"));
+}
+
+#[test]
+fn push_allows_conservative_webdav_backend_with_explicit_single_writer_risk_confirmation() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello webdav confirmed").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "webdav-risky-confirmed".to_string(),
+        })
+        .unwrap();
+
+    let remote = WebdavAlistMockBackend::webdav();
+    let pushed = push_head_with_single_writer_risk(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "webdav-risky-confirmed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(pushed.published_snapshot_id, commit.snapshot_id);
+    assert!(pushed.uploaded_objects > 0);
+    assert!(
+        remote.exists_physical(&format!(
+            "control/refs/by-token/{}.json",
+            state.branch.token_hex
+        )),
+        "confirmed single-writer push should publish the branch ref"
+    );
 }
 
 #[test]

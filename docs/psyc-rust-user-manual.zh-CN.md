@@ -371,6 +371,7 @@ cargo run -p e2v-cli -- serve --repo .\demo-repo
 - S3 兼容远端：`s3+https://...`
 - WebDAV 远端：`webdav+https://...`
 - Alist 远端：`alist+https://...`
+- `alist+` 远端会自动做 AList WebDAV 兼容规范化：`alist+https://token@example.com/remote-root` 和 `alist+https://token@example.com/dav/remote-root` 会落到同一个 `/dav/...` 根路径
 
 基于测试中已经验证的格式，示例如下。
 
@@ -429,7 +430,7 @@ cargo run -p e2v-cli -- remote --repo .\demo-repo add origin file:///C:/remote-s
 用法：
 
 ```powershell
-cargo run -p e2v-cli -- push --repo <REPO>
+cargo run -p e2v-cli -- push --repo <REPO> [--force-single-writer-risk]
 ```
 
 前提：

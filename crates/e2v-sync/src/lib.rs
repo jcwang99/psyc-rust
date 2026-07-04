@@ -26,7 +26,10 @@ pub use oram::{
     ReshuffleObliviousLayoutOptions, enable_oblivious_layout, plan_oblivious_layout,
     reshuffle_oblivious_layout, status_oblivious_layout,
 };
-pub use push::{PushOptions, PushResult, ResumeOptions, ResumeResult, push_head, resume_push};
+pub use push::{
+    PushOptions, PushResult, ResumeOptions, ResumeResult, push_head,
+    push_head_with_single_writer_risk, resume_push,
+};
 pub use remote_maintenance::{
     GcDryRunOptions, GcDryRunReport, GcExecuteCapabilityStatus, GcExecuteOptions, GcExecuteResult,
     HistoricalRewriteOptions, HistoricalRewritePlan, HistoricalRewritePlanOptions,

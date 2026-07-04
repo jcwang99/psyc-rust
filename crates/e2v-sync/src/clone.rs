@@ -66,7 +66,18 @@ pub fn clone_remote<R: RemoteBackend>(remote: &R, options: CloneOptions) -> Resu
         }
     } else {
         match facade.unlock(&options.repo_root, &options.password) {
-            Ok(reopened) => reopened,
+            Ok(reopened) => {
+                if let Err(error) =
+                    e2v_core::testing::bootstrap_password_clone_local_device_for_test(
+                        &options.repo_root,
+                        &options.password,
+                    )
+                {
+                    let _ = std::fs::remove_dir_all(options.repo_root.join(".e2v"));
+                    return Err(error);
+                }
+                reopened
+            }
             Err(error) => {
                 let _ = std::fs::remove_dir_all(options.repo_root.join(".e2v"));
                 return Err(error);

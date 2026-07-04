@@ -10,6 +10,7 @@ use e2v_store::{
     is_missing_physical_object_error, validate_object_id_value,
 };
 
+use crate::fetch::validate_remote_relative_name;
 use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_sync_identifier};
 use crate::object_type::infer_object_type_from_hint;
 use crate::oram::load_remote_active_pack_locations_with_local_cache;
@@ -19,9 +20,8 @@ use crate::pack_index::{
     next_pack_index_segment_paths, publish_pack_index_root,
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
-use crate::fetch::validate_remote_relative_name;
-use crate::remote_markers::{RemoteWriteIntentMarker, RemoteWriterLeaseMarker};
 use crate::remote_maintenance::load_remote_loose_object_ids;
+use crate::remote_markers::{RemoteWriteIntentMarker, RemoteWriterLeaseMarker};
 use crate::transaction::{PublishPlan, PublishedObject};
 
 const KEYRING_LOCK_FILE: &str = "keyring.lock";
@@ -654,11 +654,10 @@ fn publish_remote_keyring_pointer<R: RemoteBackend>(
         .as_str()
         .context("local keyring state is missing repo_id")?
         .to_string();
-    let current_keyring_generation = serde_json::from_slice::<RemoteKeyringStateSummary>(
-        &std::fs::read(current_keyring)?,
-    )
-    .context("failed to decode local current keyring generation state")?
-    .generation;
+    let current_keyring_generation =
+        serde_json::from_slice::<RemoteKeyringStateSummary>(&std::fs::read(current_keyring)?)
+            .context("failed to decode local current keyring generation state")?
+            .generation;
     ensure!(
         current_keyring_generation == generation,
         "local keyring pointer generation mismatch"
@@ -780,21 +779,19 @@ pub(crate) fn cleanup_completed_operation_markers<R: RemoteBackend>(
     let lease_path = format!("leases/{branch_token}.lock");
     match remote.get_physical(&lease_path) {
         Ok(lease_bytes) => {
-            let should_remove = match serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes)
-            {
-                Ok(lease_marker) => {
-                    lease_marker.operation_id == operation_id.value
-                        && lease_marker.target_branch_token == branch_token
-                }
-                Err(_) if had_current_intent => {
-                    !other_active_intent_may_own_branch_lease(
+            let should_remove =
+                match serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes) {
+                    Ok(lease_marker) => {
+                        lease_marker.operation_id == operation_id.value
+                            && lease_marker.target_branch_token == branch_token
+                    }
+                    Err(_) if had_current_intent => !other_active_intent_may_own_branch_lease(
                         remote,
                         &intent_path,
                         branch_token,
-                    )?
-                }
-                Err(_) => false,
-            };
+                    )?,
+                    Err(_) => false,
+                };
             if should_remove {
                 match remote.delete_physical(&lease_path) {
                     Ok(()) => {}
@@ -854,6 +851,23 @@ pub fn push_head<R: RemoteBackend + Clone>(
     facade: &RepositoryFacade,
     remote: &R,
     options: PushOptions,
+) -> Result<PushResult> {
+    push_head_inner(facade, remote, options, false)
+}
+
+pub fn push_head_with_single_writer_risk<R: RemoteBackend + Clone>(
+    facade: &RepositoryFacade,
+    remote: &R,
+    options: PushOptions,
+) -> Result<PushResult> {
+    push_head_inner(facade, remote, options, true)
+}
+
+fn push_head_inner<R: RemoteBackend + Clone>(
+    facade: &RepositoryFacade,
+    remote: &R,
+    options: PushOptions,
+    allow_risky_single_writer: bool,
 ) -> Result<PushResult> {
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
@@ -954,13 +968,16 @@ pub fn push_head<R: RemoteBackend + Clone>(
         remote.clone(),
     );
     let layout_root: LayoutRoot = serde_json::from_slice(&layout_root_bytes)?;
-    let session = publisher.begin(PublishPlan {
-        operation_id: operation_id.clone(),
-        target_branch_token: options.branch_token.clone(),
-        expected_ref_version,
-        planned_snapshot_id: Some(snapshot.snapshot_id.clone()),
-        writer_mode: remote.capability().push_write_mode(),
-    })?;
+    let session = publisher.begin_allowing_risky_single_writer(
+        PublishPlan {
+            operation_id: operation_id.clone(),
+            target_branch_token: options.branch_token.clone(),
+            expected_ref_version,
+            planned_snapshot_id: Some(snapshot.snapshot_id.clone()),
+            writer_mode: remote.capability().push_write_mode(),
+        },
+        allow_risky_single_writer,
+    )?;
     let session = crate::transaction::PublishSession {
         next_layout_root: Some(layout_root.clone()),
         next_layout_root_bytes: Some(layout_root_bytes.clone()),
@@ -1547,8 +1564,7 @@ mod tests {
     fn cleanup_completed_operation_markers_keeps_corrupted_lease_when_current_intent_is_foreign() {
         let remote = MemoryBackend::new();
         let operation_id = OperationId::new("cleanup-current-operation".to_string()).unwrap();
-        let foreign_operation =
-            OperationId::new("cleanup-foreign-operation".to_string()).unwrap();
+        let foreign_operation = OperationId::new("cleanup-foreign-operation".to_string()).unwrap();
         remote
             .put_physical(
                 &format!("transactions/active/{}.intent", operation_id.value),
@@ -1825,7 +1841,10 @@ mod tests {
             "keyring/{}",
             e2v_core::sync_support::read_repo_id(&repo_root).unwrap()
         ));
-        let expected_version = remote.read_ref(&pointer_token).unwrap().map(|stored| stored.version);
+        let expected_version = remote
+            .read_ref(&pointer_token)
+            .unwrap()
+            .map(|stored| stored.version);
         remote
             .compare_and_swap_ref(
                 &pointer_token,
@@ -1891,7 +1910,10 @@ mod tests {
             "keyring/{}",
             e2v_core::sync_support::read_repo_id(&repo_root).unwrap()
         ));
-        let expected_version = remote.read_ref(&pointer_token).unwrap().map(|stored| stored.version);
+        let expected_version = remote
+            .read_ref(&pointer_token)
+            .unwrap()
+            .map(|stored| stored.version);
         let mismatched_pointer = serde_json::to_vec(&serde_json::json!({
             "generation": 99u64,
             "current": "keyring.1"

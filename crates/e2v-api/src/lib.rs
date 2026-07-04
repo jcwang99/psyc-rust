@@ -711,9 +711,38 @@ impl Sdk {
         .map_err(map_error)
     }
 
+    pub fn push_remote_allowing_single_writer_risk(
+        &self,
+        remote_spec: &str,
+        request: PushRequest,
+    ) -> SdkResult<PushResponse> {
+        let remote_spec = RemoteSpec::parse(remote_spec).map_err(map_error)?;
+        with_remote_backend!(&remote_spec, |backend| {
+            e2v_sync::push_head_with_single_writer_risk(
+                &self.facade,
+                backend,
+                PushOptions {
+                    repo_root: request.repo_root,
+                    branch_token: request.branch_token,
+                    operation_id: request.operation_id,
+                },
+            )
+        })
+        .map(push_response_from_result)
+        .map_err(map_error)
+    }
+
     pub fn push_default_remote(&self, request: PushRequest) -> SdkResult<PushResponse> {
         let stored = self.load_default_remote(&request.repo_root)?;
         self.push_remote(&stored.spec, request)
+    }
+
+    pub fn push_default_remote_allowing_single_writer_risk(
+        &self,
+        request: PushRequest,
+    ) -> SdkResult<PushResponse> {
+        let stored = self.load_default_remote(&request.repo_root)?;
+        self.push_remote_allowing_single_writer_risk(&stored.spec, request)
     }
 
     pub fn fetch_remote(

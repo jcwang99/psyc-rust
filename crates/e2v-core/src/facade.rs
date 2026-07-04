@@ -24,8 +24,8 @@ use crate::keyring::{
     KEYRING_CURRENT_FILE, KEYRING_DIR, KeyringPointer, KeyringState, cache_unlocked_password,
     cache_unlocked_secrets, generate_local_device_credential, open_repo_secrets,
     read_current_keyring_state, read_current_keyring_state_with_pointer,
-    read_local_device_credential, seal_repo_secrets,
-    seal_repo_secrets_for_device, unlock_repo_secrets, unlock_repo_secrets_from_generation_file,
+    read_local_device_credential, seal_repo_secrets, seal_repo_secrets_for_device,
+    unlock_repo_secrets, unlock_repo_secrets_from_generation_file,
     unlock_repo_secrets_from_keyring_bytes_with_local_device, unlock_repo_secrets_uncached,
     unlock_repo_secrets_with_local_device, validate_keyring_file_name,
     write_local_device_credential,
@@ -2244,6 +2244,84 @@ pub(crate) fn unlock_with_local_device_for_test(
     RepositoryFacade::new().open(&repo_root)
 }
 
+pub(crate) fn bootstrap_password_clone_local_device(
+    repo_root: impl AsRef<Path>,
+    password: &str,
+) -> Result<()> {
+    let repo_root = repo_root.as_ref().to_path_buf();
+    let control_dir = repo_root.join(CONTROL_DIR);
+    let device_path = control_dir.join(crate::keyring::LOCAL_DEVICE_FILE);
+    if device_path.is_file() {
+        return Ok(());
+    }
+
+    let repo_secrets = unlock_repo_secrets(&control_dir, password)?;
+    let (_, current_state) = read_current_keyring_state_with_pointer(&control_dir)?;
+    let actor_id = current_state
+        .actors
+        .first()
+        .map(|actor| actor.actor_id.clone())
+        .unwrap_or_else(|| "owner-admin".to_string());
+    let local_device = generate_local_device_credential(
+        actor_id.clone(),
+        format!("device-{}", random_hex_identifier()?),
+        "cloned-device".to_string(),
+    )?;
+
+    let mut devices = current_state.devices.clone();
+    devices.push(crate::keyring::DeviceRecord {
+        device_id: local_device.device_id.clone(),
+        actor_id: actor_id.clone(),
+        label: local_device.label.clone(),
+        device_pubkey_hex: local_device.public_key_hex.clone(),
+        status: "active".to_string(),
+    });
+    devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+
+    let mut next_state = current_state.clone();
+    next_state.generation += 1;
+    next_state.devices = devices;
+    next_state.envelopes = {
+        let mut envelopes = Vec::new();
+        if let Some(password_envelope) = select_password_envelope_for_active_epoch(
+            &current_state,
+            &current_state,
+            repo_secrets.active_epoch,
+        )? {
+            envelopes.push(password_envelope);
+        }
+        envelopes.extend(build_device_envelopes_for_active_devices(
+            &current_state.repo_id,
+            &next_state.devices,
+            repo_secrets.active_epoch,
+            &repo_secrets,
+        )?);
+        envelopes.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then(left.actor_id.cmp(&right.actor_id))
+                .then(left.device_id.cmp(&right.device_id))
+                .then(left.envelope_id.cmp(&right.envelope_id))
+        });
+        envelopes
+    };
+    let next_file_name = format!("keyring.{}", next_state.generation);
+    let next_pointer = KeyringPointer {
+        generation: next_state.generation,
+        current: next_file_name.clone(),
+    };
+    write_keyring_generation_and_pointer(
+        &control_dir,
+        &next_file_name,
+        &next_state,
+        &next_pointer,
+    )?;
+    write_local_device_credential(&control_dir, &local_device)?;
+    cache_unlocked_secrets(&control_dir, &repo_secrets);
+    cache_unlocked_password(&control_dir, password);
+    Ok(())
+}
+
 pub fn reconcile_remote_keyring_for_sync(
     repo_root: impl AsRef<Path>,
     remote_keyring_bytes: &[u8],
@@ -2325,9 +2403,9 @@ pub fn reconcile_remote_keyring_for_sync(
 
     let local_content = comparable_keyring_state(&local_state);
     let merged_content = comparable_keyring_state(&merged_state);
-    let local_pointer_matches_remote_generation =
-        local_state.active_epoch == merged_state.active_epoch
-            && local_state.generation == merged_state.generation;
+    let local_pointer_matches_remote_generation = local_state.active_epoch
+        == merged_state.active_epoch
+        && local_state.generation == merged_state.generation;
     if local_content == merged_content && local_pointer_matches_remote_generation {
         return Ok(false);
     }

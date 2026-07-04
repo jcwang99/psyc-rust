@@ -59,6 +59,8 @@ enum Command {
     Push {
         #[arg(long)]
         repo: PathBuf,
+        #[arg(long = "force-single-writer-risk", default_value_t = false)]
+        force_single_writer_risk: bool,
     },
     Fetch {
         #[arg(long)]
@@ -348,13 +350,21 @@ fn execute(cli: Cli) -> Result<String> {
                 target_dir.display()
             ))
         }
-        Command::Push { repo } => {
+        Command::Push {
+            repo,
+            force_single_writer_risk,
+        } => {
             let branch_token = sdk.open_repository(&repo)?.branch.token_hex;
-            let pushed = sdk.push_default_remote(PushRequest {
+            let request = PushRequest {
                 repo_root: repo,
                 branch_token,
                 operation_id: cli_operation_id("push")?,
-            })?;
+            };
+            let pushed = if force_single_writer_risk {
+                sdk.push_default_remote_allowing_single_writer_risk(request)?
+            } else {
+                sdk.push_default_remote(request)?
+            };
             Ok(format!(
                 "pushed {}\n",
                 &pushed.published_snapshot_id[..pushed.published_snapshot_id.len().min(8)]
