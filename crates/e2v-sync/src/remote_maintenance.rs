@@ -27,14 +27,14 @@ use crate::pack_cache::{
     cache_pack_data_bytes, preload_cached_pack_data, prune_stale_cached_pack_data,
     remote_object_bytes_with_pack_cache,
 };
-use crate::pack_index::publish_pack_index_root;
+use crate::pack_index::{next_pack_index_segment_paths, publish_pack_index_root};
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::push::{
     cleanup_completed_operation_markers, list_operation_pack_index_segment_paths,
     load_remote_loose_object_ids as load_push_remote_loose_object_ids,
     mirror_remote_keyring_pointer, publish_remote_keyring_pointer_with_retry,
-    reconcile_local_keyring_with_remote_if_needed, upload_objects_as_pack_segments,
-    upload_remote_keyring_generations,
+    read_remote_current_keyring_bytes, reconcile_local_keyring_with_remote_if_needed,
+    upload_objects_as_pack_segments, upload_remote_keyring_generations,
 };
 use crate::remote_markers::{
     INTENT_EXPIRY_HOURS, marker_is_fresh_at, observe_remote_now_with_probe,
@@ -371,7 +371,13 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     let journal = OperationJournal::new(control_dir.join("journal").join("sync"))?;
     let facade = RepositoryFacade::new();
     reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let historical_segment_secrets = read_remote_current_keyring_bytes(remote, &options.repo_root)?
+        .map(|bytes| {
+            sync_support::unlock_repo_secrets_from_keyring_bytes_for_sync(&bytes, &options.password)
+        })
+        .transpose()?;
     let mut rewrite_state = load_historical_rewrite_checkpoint(&control_dir)?;
+    let resuming_rewrite = rewrite_state.is_some();
     let current_repo_state = facade.open(&options.repo_root)?;
     if rewrite_state.is_none() {
         let current_layout_root_bytes = sync_support::read_layout_root_bytes(&options.repo_root)?;
@@ -477,12 +483,36 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     upload_remote_keyring_generations(remote, &keyring_files)?;
     publisher.publish_layout_if_needed(&session)?;
     if !published_pack_index_segments.is_empty() {
+        let rewritten_object_ids = rewrite_state
+            .rewritten_object_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let retained_segments = retained_active_segment_paths_for_unrewritten_objects(
+            remote,
+            &control_dir,
+            historical_segment_secrets.as_ref(),
+            &rewritten_object_ids,
+        )?;
+        let mut active_segment_paths = retained_segments;
+        for segment_path in &published_pack_index_segments {
+            if !active_segment_paths.contains(segment_path) {
+                active_segment_paths.push(segment_path.clone());
+            }
+        }
+        if !resuming_rewrite && active_segment_paths.is_empty() {
+            active_segment_paths = next_pack_index_segment_paths(
+                remote,
+                &published_pack_index_segments,
+                Some(&pack_index_secrets),
+            )?;
+        }
         publish_pack_index_root(
             remote,
             &pack_index_secrets,
             &layout_root.layout_id,
             layout_root.generation,
-            published_pack_index_segments.clone(),
+            active_segment_paths,
         )?;
     }
     publisher.pre_commit_verify(&session)?;
@@ -598,7 +628,11 @@ fn hydrate_remote_branch_history_for_rewrite<R: RemoteBackend>(
     for listed_ref in remote_branch_refs {
         let control_plane =
             read_remote_control_plane(remote, listed_ref.stored.value.bytes.clone())?;
-        assert_remote_generations_meet_local_floor(&listed_ref.stored, &control_plane)?;
+        assert_remote_generations_meet_local_floor(
+            &listed_ref.token.value,
+            &listed_ref.stored,
+            &control_plane,
+        )?;
         write_remote_control_plane_to_validation_root(&validation_root, &control_plane)?;
         let (decoded_branch_token, head_snapshot_id) =
             sync_support::decode_default_ref_record(repo_root, &listed_ref.stored.value.bytes)?;
@@ -677,6 +711,39 @@ fn cache_pack_data_from_map(
         cache_pack_data_bytes(control_dir, container_id, pack_bytes)?;
     }
     Ok(())
+}
+
+fn retained_active_segment_paths_for_unrewritten_objects<R: RemoteBackend>(
+    remote: &R,
+    control_dir: &Path,
+    historical_segment_secrets: Option<&e2v_store::RepoSecrets>,
+    rewritten_object_ids: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(control_dir)?;
+    let active_segment_paths = load_remote_active_pack_segment_paths(remote, &secrets)?;
+    let mut retained = Vec::new();
+    for segment_path in active_segment_paths {
+        let segment_bytes = remote.get_physical(&segment_path)?;
+        let object_ids =
+            crate::pack_index::read_segment_object_ids(&segment_path, &segment_bytes, &secrets)
+                .or_else(|error| {
+                    let Some(historical_segment_secrets) = historical_segment_secrets else {
+                        return Err(error);
+                    };
+                    crate::pack_index::read_segment_object_ids(
+                        &segment_path,
+                        &segment_bytes,
+                        historical_segment_secrets,
+                    )
+                })?;
+        if object_ids
+            .iter()
+            .any(|object_id| !rewritten_object_ids.contains(object_id))
+        {
+            retained.push(segment_path);
+        }
+    }
+    Ok(retained)
 }
 
 fn upload_rewrite_segments_with_resume<R: RemoteBackend + Clone>(
@@ -965,7 +1032,7 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
 
     rewrite_local_control_plane_from_remote(&control_dir, &control_plane)?;
     restore_local_branch_mirrors_from_remote(remote, &options.repo_root)?;
-    update_trusted_remote_state_from_control_plane(&default_ref, &control_plane)?;
+    update_trusted_remote_state_from_control_plane(&branch_token, &default_ref, &control_plane)?;
     RepositoryFacade::new().unlock(&options.repo_root, password)?;
     RepositoryFacade::new().verify_ref(&options.repo_root)?;
     Ok(RepairRemoteResult { repaired_objects })
@@ -998,7 +1065,7 @@ pub fn verify_remote<R: RemoteBackend>(
     let mut repaired_local_objects = 0usize;
 
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
-    assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
+    assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
         cache_control_dir: Some(control_dir.clone()),
@@ -1068,7 +1135,7 @@ pub fn verify_remote<R: RemoteBackend>(
         }
     }
 
-    update_trusted_remote_state_from_control_plane(&default_ref, &control_plane)?;
+    update_trusted_remote_state_from_control_plane(&branch_token, &default_ref, &control_plane)?;
     Ok(VerifyRemoteResult {
         sampled_objects: sampled_object_ids.len(),
         repaired_local_objects,
@@ -1094,7 +1161,7 @@ pub fn repair_remote<R: RemoteBackend>(
     let mut pack_cache = BTreeMap::new();
     preload_cached_pack_data(&control_dir, &pack_locations, &mut pack_cache)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
-    assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
+    assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
         cache_control_dir: Some(control_dir.clone()),
@@ -1147,7 +1214,7 @@ pub fn repair_remote<R: RemoteBackend>(
         }
     }
 
-    update_trusted_remote_state_from_control_plane(&default_ref, &control_plane)?;
+    update_trusted_remote_state_from_control_plane(&branch_token, &default_ref, &control_plane)?;
     Ok(RepairRemoteResult { repaired_objects })
 }
 
@@ -1169,7 +1236,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
         load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
     prune_stale_cached_pack_data(&control_dir, &pack_locations)?;
     let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
-    assert_remote_generations_meet_local_floor(&default_ref, &control_plane)?;
+    assert_remote_generations_meet_local_floor(&branch_token, &default_ref, &control_plane)?;
     let validation_root = RemoteValidationRoot {
         path: next_validation_root(&options.repo_root)?,
         cache_control_dir: Some(control_dir.clone()),

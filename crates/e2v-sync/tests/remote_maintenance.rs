@@ -1933,6 +1933,146 @@ fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
 }
 
 #[test]
+fn historical_rewrite_remote_resumes_with_remote_only_branch_added_after_interruption() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let contributor_root = temp.path().join("contributor");
+    let feature_clone_root = temp.path().join("feature-clone");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-resume-remote-only-main-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(owner_root.join("future.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "history-resume-remote-only-main-epoch-two".to_string(),
+        },
+    )
+    .unwrap();
+
+    let _pack_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let interrupted_remote =
+        FailOnceOnPutBackend::for_history_rewrite_index_batch(remote.clone(), 0);
+    let first_error = historical_rewrite_remote(
+        &interrupted_remote,
+        HistoricalRewriteOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("injected put failure for history rewrite batch"),
+        "unexpected interruption error: {first_error:#}"
+    );
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: contributor_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    facade.create_branch(&contributor_root, "feature").unwrap();
+    let contributor_feature = facade
+        .checkout_branch(&contributor_root, "feature")
+        .unwrap();
+    fs::write(contributor_root.join("feature.txt"), b"remote-only-feature").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: contributor_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: contributor_root.clone(),
+            branch_token: contributor_feature.branch.token_hex.clone(),
+            operation_id: "history-resume-remote-only-feature-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    historical_rewrite_remote(
+        &remote,
+        HistoricalRewriteOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            confirm_full_reencryption: true,
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: feature_clone_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: contributor_feature.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    let opened = facade.open(&feature_clone_root).unwrap();
+    assert_eq!(
+        opened.branch.token_hex,
+        contributor_feature.branch.token_hex
+    );
+    let read_service = facade.read_service(&feature_clone_root).unwrap();
+    let snapshot = read_service
+        .resolve_branch(&contributor_feature.branch.token_hex)
+        .unwrap();
+    let file = read_service.open_file(&snapshot, "feature.txt").unwrap();
+    let bytes = read_service.read_range(&file, 0, 64).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "remote-only-feature");
+}
+
+#[test]
 fn historical_rewrite_remote_stores_rewrite_checkpoint_without_plaintext_object_ids_or_stage() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
@@ -2763,7 +2903,9 @@ fn force_accept_remote_rollback_can_reset_local_high_water_after_explicit_accept
             "repo_id": repo_id,
             "min_layout_generation": 9u64,
             "min_keyring_generation": 1u64,
-            "min_ref_generation": 1u64
+            "min_ref_generations": {
+                state.branch.token_hex.clone(): 1u64
+            }
         }))
         .unwrap(),
     )
@@ -6445,7 +6587,9 @@ fn verify_remote_rejects_remote_layout_generation_rollback_below_local_high_wate
             "repo_id": repo_id,
             "min_layout_generation": 9u64,
             "min_keyring_generation": 1u64,
-            "min_ref_generation": 1u64
+            "min_ref_generations": {
+                state.branch.token_hex.clone(): 1u64
+            }
         }))
         .unwrap(),
     )

@@ -5669,7 +5669,9 @@ fn fetch_rejects_remote_layout_generation_rollback_below_local_high_water() {
             "repo_id": repo_id,
             "min_layout_generation": 9u64,
             "min_keyring_generation": 1u64,
-            "min_ref_generation": 1u64
+            "min_ref_generations": {
+                state.branch.token_hex.clone(): 1u64
+            }
         }))
         .unwrap(),
     )
@@ -5789,7 +5791,9 @@ fn clone_rejects_remote_layout_generation_rollback_below_external_high_water() {
             "repo_id": repo_id,
             "min_layout_generation": 9u64,
             "min_keyring_generation": 1u64,
-            "min_ref_generation": 1u64
+            "min_ref_generations": {
+                state.branch.token_hex.clone(): 1u64
+            }
         }))
         .unwrap(),
     )
@@ -7621,7 +7625,9 @@ fn remote_keyring_generation_rollback_via_pointer_ref_is_rejected() {
             "repo_id": repo_id,
             "min_layout_generation": 1u64,
             "min_keyring_generation": 2u64,
-            "min_ref_generation": 1u64
+            "min_ref_generations": {
+                branch_token.clone(): 1u64
+            }
         }))
         .unwrap(),
     )
@@ -7654,4 +7660,117 @@ fn remote_keyring_generation_rollback_via_pointer_ref_is_rejected() {
             || error.to_string().contains("critical rollback detected"),
         "expected rollback detection error, got: {error:#}"
     );
+}
+
+#[test]
+fn clone_remote_only_branch_does_not_treat_lower_unseen_ref_generation_as_rollback() {
+    let temp = tempdir().unwrap();
+    let owner_root = temp.path().join("owner");
+    let contributor_root = temp.path().join("contributor");
+    fs::create_dir_all(&owner_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: owner_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(owner_root.join("base.txt"), b"base").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "base".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "clone-remote-only-trusted-main-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    e2v_core::testing::rotate_active_epoch_for_test(&owner_root, "correct horse battery staple")
+        .unwrap();
+    fs::write(owner_root.join("future.txt"), b"epoch-two").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: owner_root.clone(),
+            message: "epoch-two".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "clone-remote-only-trusted-main-epoch-two".to_string(),
+        },
+    )
+    .unwrap();
+
+    let trusted_state_root = temp.path().join("trusted-state");
+    fs::create_dir_all(&trusted_state_root).unwrap();
+    let _trusted_state_guard =
+        e2v_sync::testing::override_trusted_state_dir_for_test(trusted_state_root.clone());
+
+    fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: owner_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: contributor_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: state.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    facade.create_branch(&contributor_root, "feature").unwrap();
+    let contributor_feature = facade
+        .checkout_branch(&contributor_root, "feature")
+        .unwrap();
+    fs::write(contributor_root.join("feature.txt"), b"remote-only-feature").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: contributor_root.clone(),
+            message: "feature".to_string(),
+        })
+        .unwrap();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: contributor_root.clone(),
+            branch_token: contributor_feature.branch.token_hex.clone(),
+            operation_id: "clone-remote-only-trusted-feature-seed".to_string(),
+        },
+    )
+    .unwrap();
+
+    let validation = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: contributor_root.clone(),
+            branch_token: contributor_feature.branch.token_hex.clone(),
+        },
+    )
+    .unwrap();
+    assert!(validation.downloaded_objects <= 1);
 }

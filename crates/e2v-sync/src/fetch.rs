@@ -254,7 +254,11 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
             && !control_plane.keyring_pointer.current.trim().is_empty(),
         "invalid remote keyring pointer"
     );
-    assert_remote_generations_meet_local_floor(&stored_ref, &control_plane)?;
+    assert_remote_generations_meet_local_floor(
+        &requested_branch_token,
+        &stored_ref,
+        &control_plane,
+    )?;
     let local_repo_secrets = e2v_core::sync_support::open_repo_secrets_for_sync(&control_dir).ok();
     let remote_current_device_secrets = if matches!(
         sync_mode,
@@ -528,7 +532,11 @@ pub fn fetch_remote<R: RemoteBackend>(remote: &R, options: FetchOptions) -> Resu
     ) {
         clear_unlocked_keyring_cache(&control_dir);
     }
-    update_trusted_remote_state_from_control_plane(&stored_ref, &control_plane)?;
+    update_trusted_remote_state_from_control_plane(
+        &requested_branch_token,
+        &stored_ref,
+        &control_plane,
+    )?;
 
     Ok(FetchResult { downloaded_objects })
 }
@@ -1107,11 +1115,12 @@ pub(crate) fn validate_remote_branch_control_plane<R: RemoteBackend>(
         .read_ref(&RefToken::new(branch_token.to_string()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found"))?;
     let control_plane = read_remote_control_plane(remote, stored_ref.value.bytes.clone())?;
-    assert_remote_generations_meet_local_floor(&stored_ref, &control_plane)?;
+    assert_remote_generations_meet_local_floor(branch_token, &stored_ref, &control_plane)?;
     Ok(())
 }
 
 pub(crate) fn assert_remote_generations_meet_local_floor(
+    branch_token: &str,
     remote_default_ref: &e2v_store::StoredRef,
     control_plane: &RemoteControlPlane,
 ) -> Result<()> {
@@ -1140,15 +1149,18 @@ pub(crate) fn assert_remote_generations_meet_local_floor(
             remote_keyring_pointer.generation >= trusted_state.min_keyring_generation,
             "CRITICAL_ROLLBACK_DETECTED: remote keyring generation rollback detected"
         );
-        ensure!(
-            remote_default_ref.version.value >= trusted_state.min_ref_generation,
-            "CRITICAL_ROLLBACK_DETECTED: remote ref generation rollback detected"
-        );
+        if let Some(min_ref_generation) = trusted_state.min_ref_generations.get(branch_token) {
+            ensure!(
+                remote_default_ref.version.value >= *min_ref_generation,
+                "CRITICAL_ROLLBACK_DETECTED: remote ref generation rollback detected"
+            );
+        }
     }
     Ok(())
 }
 
 pub(crate) fn update_trusted_remote_state_from_control_plane(
+    branch_token: &str,
     remote_default_ref: &e2v_store::StoredRef,
     control_plane: &RemoteControlPlane,
 ) -> Result<()> {
@@ -1162,7 +1174,10 @@ pub(crate) fn update_trusted_remote_state_from_control_plane(
         repo_id: control_plane.repo_id.clone(),
         min_layout_generation: remote_layout_root.generation,
         min_keyring_generation: remote_keyring_pointer.generation,
-        min_ref_generation: remote_default_ref.version.value,
+        min_ref_generations: std::collections::BTreeMap::from([(
+            branch_token.to_string(),
+            remote_default_ref.version.value,
+        )]),
     };
     match load_trusted_remote_state(&next.repo_id)? {
         Some(current) => store_trusted_remote_state(&TrustedRemoteState {
@@ -1173,10 +1188,27 @@ pub(crate) fn update_trusted_remote_state_from_control_plane(
             min_keyring_generation: current
                 .min_keyring_generation
                 .max(next.min_keyring_generation),
-            min_ref_generation: current.min_ref_generation.max(next.min_ref_generation),
+            min_ref_generations: merge_min_ref_generations(
+                current.min_ref_generations,
+                next.min_ref_generations,
+            ),
         }),
         None => store_trusted_remote_state(&next),
     }
+}
+
+fn merge_min_ref_generations(
+    current: std::collections::BTreeMap<String, u64>,
+    next: std::collections::BTreeMap<String, u64>,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut merged = current;
+    for (branch_token, min_generation) in next {
+        merged
+            .entry(branch_token)
+            .and_modify(|current_min| *current_min = (*current_min).max(min_generation))
+            .or_insert(min_generation);
+    }
+    merged
 }
 
 fn validate_remote_relative_name(value: &str) -> Result<()> {

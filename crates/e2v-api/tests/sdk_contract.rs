@@ -1610,6 +1610,14 @@ fn sdk_can_inspect_default_remote_and_write_doctor_bundle() {
     assert!(inspection.gc_execute_blockers.is_empty());
     assert!(inspection.trusted_state.is_some());
     assert!(!inspection.repo_id.trim().is_empty());
+    assert!(
+        inspection
+            .trusted_state
+            .as_ref()
+            .unwrap()
+            .min_ref_generations
+            .contains_key(&state.branch.token_hex)
+    );
 
     sdk.write_doctor_bundle(&bundle_root, &inspection).unwrap();
 

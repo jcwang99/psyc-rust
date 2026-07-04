@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -12,7 +13,8 @@ pub struct TrustedRemoteState {
     pub repo_id: String,
     pub min_layout_generation: u64,
     pub min_keyring_generation: u64,
-    pub min_ref_generation: u64,
+    #[serde(default)]
+    pub min_ref_generations: BTreeMap<String, u64>,
 }
 
 #[doc(hidden)]
@@ -138,7 +140,7 @@ mod tests {
             repo_id: "repo-123".to_string(),
             min_layout_generation: 7,
             min_keyring_generation: 11,
-            min_ref_generation: 13,
+            min_ref_generations: BTreeMap::from([("branch-123".to_string(), 13)]),
         };
 
         store_trusted_remote_state(&state).unwrap();

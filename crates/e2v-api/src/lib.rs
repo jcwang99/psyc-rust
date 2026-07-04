@@ -364,7 +364,7 @@ pub struct TrustedRemoteStateInfo {
     pub repo_id: String,
     pub min_layout_generation: u64,
     pub min_keyring_generation: u64,
-    pub min_ref_generation: u64,
+    pub min_ref_generations: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1587,7 +1587,7 @@ fn trusted_remote_state_info_from_state(
         repo_id: state.repo_id,
         min_layout_generation: state.min_layout_generation,
         min_keyring_generation: state.min_keyring_generation,
-        min_ref_generation: state.min_ref_generation,
+        min_ref_generations: state.min_ref_generations,
     }
 }
 

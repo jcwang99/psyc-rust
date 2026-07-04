@@ -197,6 +197,19 @@ pub fn load_remote_operation_pack_locations_with_secrets<B: BlobStore>(
     Ok(locations)
 }
 
+pub(crate) fn read_segment_object_ids(
+    segment_path: &str,
+    segment_bytes: &[u8],
+    secrets: &RepoSecrets,
+) -> Result<Vec<String>> {
+    Ok(
+        read_segment_entries(segment_path, segment_bytes, Some(secrets))?
+            .into_iter()
+            .map(|entry| entry.object_id)
+            .collect(),
+    )
+}
+
 #[doc(hidden)]
 pub(crate) fn decode_pack_index_root_value_for_test(
     control_dir: &Path,
