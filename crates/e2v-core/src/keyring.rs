@@ -24,6 +24,12 @@ const KEYRING_DEVICE_OBJECT_TYPE: &str = "keyring-device-envelope";
 static UNLOCKED_KEYRINGS: OnceLock<Mutex<HashMap<PathBuf, RepoSecrets>>> = OnceLock::new();
 static UNLOCKED_PASSWORDS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyringEnvelope {
     pub kind: String,
@@ -136,22 +142,22 @@ struct DeviceEnvelopeRecord {
 
 pub fn cache_unlocked_secrets(control_dir: &Path, secrets: &RepoSecrets) {
     let cache = UNLOCKED_KEYRINGS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap();
+    let mut cache = lock_or_recover(cache);
     cache.insert(control_dir.to_path_buf(), secrets.clone());
 }
 
 pub fn cache_unlocked_password(control_dir: &Path, password: &str) {
     let cache = UNLOCKED_PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap();
+    let mut cache = lock_or_recover(cache);
     cache.insert(control_dir.to_path_buf(), password.to_string());
 }
 
 pub fn clear_unlocked_keyring_cache(control_dir: &Path) {
     if let Some(cache) = UNLOCKED_KEYRINGS.get() {
-        cache.lock().unwrap().remove(control_dir);
+        lock_or_recover(cache).remove(control_dir);
     }
     if let Some(cache) = UNLOCKED_PASSWORDS.get() {
-        cache.lock().unwrap().remove(control_dir);
+        lock_or_recover(cache).remove(control_dir);
     }
 }
 
@@ -257,7 +263,7 @@ fn unlock_repo_secrets_from_state_with_local_device(
 
 pub fn open_repo_secrets(control_dir: &Path) -> Result<RepoSecrets> {
     let cache = UNLOCKED_KEYRINGS.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache = cache.lock().unwrap();
+    let cache = lock_or_recover(cache);
     cache
         .get(control_dir)
         .cloned()
@@ -688,6 +694,11 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{self, AssertUnwindSafe};
+    use std::path::PathBuf;
+
+    use tempfile::tempdir;
+
     use super::*;
 
     fn hex_key(byte: u8) -> String {
@@ -731,5 +742,62 @@ mod tests {
         assert_eq!(decoded[&1].nonce_key, [8u8; 32]);
         assert_eq!(decoded[&2].manifest_enc_key, [7u8; 32]);
         assert_eq!(decoded[&2].nonce_key, [9u8; 32]);
+    }
+
+    #[test]
+    fn open_repo_secrets_recovers_from_poisoned_unlocked_keyring_cache() {
+        let temp = tempdir().unwrap();
+        let control_dir = temp.path().join("control");
+        let expected = RepoSecrets {
+            repo_id: "repo".to_string(),
+            active_epoch: 1,
+            repo_dedup_key: [1u8; 32],
+            repo_ref_key: [2u8; 32],
+            repo_manifest_enc_key: [3u8; 32],
+            repo_nonce_key: [4u8; 32],
+            repo_path_index_key: [5u8; 32],
+            epoch_keys: BTreeMap::from([(
+                1,
+                EpochSecrets {
+                    manifest_enc_key: [6u8; 32],
+                    nonce_key: [7u8; 32],
+                },
+            )]),
+        };
+        cache_unlocked_secrets(&control_dir, &expected);
+
+        let cache = UNLOCKED_KEYRINGS.get_or_init(|| Mutex::new(HashMap::new()));
+        let poisoned = cache;
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison unlocked keyring cache");
+        }));
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| open_repo_secrets(&control_dir)));
+
+        assert!(result.is_ok(), "open_repo_secrets should not panic");
+        assert_eq!(result.unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn clear_unlocked_keyring_cache_recovers_from_poisoned_password_cache() {
+        let control_dir = PathBuf::from("repo-control");
+        cache_unlocked_password(&control_dir, "password");
+
+        let cache = UNLOCKED_PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()));
+        let poisoned = cache;
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison unlocked password cache");
+        }));
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_unlocked_keyring_cache(&control_dir);
+        }));
+
+        assert!(
+            result.is_ok(),
+            "clear_unlocked_keyring_cache should not panic when the password cache is poisoned"
+        );
     }
 }
