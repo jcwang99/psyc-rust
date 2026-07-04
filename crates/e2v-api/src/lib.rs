@@ -1610,6 +1610,8 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         || lower.contains(" rollback detected")
     {
         SdkErrorCode::RollbackDetected
+    } else if lower.contains("permission denied") || lower.contains("owner-admin local device") {
+        SdkErrorCode::PermissionDenied
     } else if lower.contains("authentication failed")
         || lower.contains("tampered")
         || lower.contains("stale-layout fallback unavailable")
@@ -1675,8 +1677,6 @@ pub(crate) fn map_error(error: anyhow::Error) -> SdkError {
         SdkErrorCode::NotFound
     } else if lower.contains("already exists") || lower.contains("must be empty before init") {
         SdkErrorCode::AlreadyExists
-    } else if lower.contains("permission denied") || lower.contains("owner-admin local device") {
-        SdkErrorCode::PermissionDenied
     } else if lower.contains("wrong password")
         || lower.contains("unlock")
         || lower.contains("password")
@@ -1745,6 +1745,17 @@ mod tests {
         let mapped = map_error(error);
 
         assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_prefers_permission_denied_over_corrupt_state_for_trusted_state_reads() {
+        let error = anyhow::anyhow!(
+            "failed to read trusted state C:/tmp/e2v/trusted-state/repo.json: Permission denied"
+        );
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::PermissionDenied);
     }
 
     #[test]
@@ -1888,6 +1899,16 @@ mod tests {
         let mapped = map_error(error);
 
         assert_eq!(mapped.code(), SdkErrorCode::CorruptState);
+    }
+
+    #[test]
+    fn map_error_prefers_permission_denied_over_corrupt_state_for_layout_root_reads() {
+        let error =
+            anyhow::anyhow!("failed to read C:\\repo\\.e2v\\layout_root.json: Permission denied");
+
+        let mapped = map_error(error);
+
+        assert_eq!(mapped.code(), SdkErrorCode::PermissionDenied);
     }
 
     #[test]
