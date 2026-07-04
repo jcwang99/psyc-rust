@@ -283,6 +283,7 @@ impl WindowsMountLauncher {
             cache_policy,
             read_only,
             stream_only: true,
+            launch_state: "summary-only".to_string(),
             status_message: WINDOWS_ADAPTER_STATUS.to_string(),
         })
     }
@@ -423,6 +424,7 @@ fn start_mount_request(request: MountRequest) -> Result<MountedFilesystem> {
         cache_policy,
         read_only: host_config.read_only,
         stream_only: true,
+        launch_state: "host-active".to_string(),
         status_message: "winfsp host mount active".to_string(),
     };
     Ok(MountedFilesystem::with_windows_host(

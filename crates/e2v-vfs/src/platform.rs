@@ -39,6 +39,7 @@ impl PlatformMountAdapter for LinuxMountAdapter {
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
+            launch_state: "summary-only".to_string(),
             status_message: "linux adapter not implemented yet".to_string(),
         })
     }
@@ -61,6 +62,7 @@ impl PlatformMountAdapter for MacosMountAdapter {
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
+            launch_state: "summary-only".to_string(),
             status_message: "macos adapter not implemented yet".to_string(),
         })
     }
@@ -83,6 +85,7 @@ pub fn try_mount_snapshot_on_current_platform(
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
+            launch_state: "summary-only".to_string(),
             status_message: "not supported on this platform yet".to_string(),
         })
     }
@@ -105,6 +108,7 @@ pub fn try_mount_live_branch_on_current_platform(
             cache_policy: vfs.cache_policy(),
             read_only: true,
             stream_only: true,
+            launch_state: "summary-only".to_string(),
             status_message: "not supported on this platform yet".to_string(),
         })
     }

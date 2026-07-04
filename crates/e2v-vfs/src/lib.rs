@@ -322,6 +322,7 @@ pub struct MountLaunchSummary {
     pub cache_policy: CachePolicy,
     pub read_only: bool,
     pub stream_only: bool,
+    pub launch_state: String,
     pub status_message: String,
 }
 
