@@ -20,6 +20,7 @@ use crate::pack_index::{
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::fetch::validate_remote_relative_name;
+use crate::remote_markers::{RemoteWriteIntentMarker, RemoteWriterLeaseMarker};
 use crate::remote_maintenance::load_remote_loose_object_ids;
 use crate::transaction::{PublishPlan, PublishedObject};
 
@@ -753,14 +754,20 @@ pub(crate) fn cleanup_completed_operation_markers<R: RemoteBackend>(
     let lease_path = format!("leases/{branch_token}.lock");
     match remote.get_physical(&lease_path) {
         Ok(lease_bytes) => {
-            let should_remove = match serde_json::from_slice::<serde_json::Value>(&lease_bytes) {
+            let should_remove = match serde_json::from_slice::<RemoteWriterLeaseMarker>(&lease_bytes)
+            {
                 Ok(lease_marker) => {
-                    lease_marker
-                        .get("operation_id")
-                        .and_then(|value| value.as_str())
-                        == Some(operation_id.value.as_str())
+                    lease_marker.operation_id == operation_id.value
+                        && lease_marker.target_branch_token == branch_token
                 }
-                Err(_) => had_current_intent,
+                Err(_) if had_current_intent => {
+                    !other_active_intent_may_own_branch_lease(
+                        remote,
+                        &intent_path,
+                        branch_token,
+                    )?
+                }
+                Err(_) => false,
             };
             if should_remove {
                 match remote.delete_physical(&lease_path) {
@@ -775,6 +782,32 @@ pub(crate) fn cleanup_completed_operation_markers<R: RemoteBackend>(
     }
 
     Ok(())
+}
+
+fn other_active_intent_may_own_branch_lease<R: RemoteBackend>(
+    remote: &R,
+    current_intent_path: &str,
+    branch_token: &str,
+) -> Result<bool> {
+    for intent_path in remote.list_physical("transactions/active/")? {
+        if intent_path == current_intent_path {
+            continue;
+        }
+        let intent_bytes = match remote.get_physical(&intent_path) {
+            Ok(bytes) => bytes,
+            Err(error) if is_missing_physical_object_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        match serde_json::from_slice::<RemoteWriteIntentMarker>(&intent_bytes) {
+            Ok(intent_marker) => {
+                if intent_marker.target_branch_token == branch_token {
+                    return Ok(true);
+                }
+            }
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn list_operation_pack_index_segment_paths<R: RemoteBackend>(
@@ -1482,6 +1515,44 @@ mod tests {
         cleanup_completed_operation_markers(&remote, &operation_id, "branch-token").unwrap();
 
         assert!(remote.exists_physical("leases/branch-token.lock"));
+    }
+
+    #[test]
+    fn cleanup_completed_operation_markers_keeps_corrupted_lease_when_current_intent_is_foreign() {
+        let remote = MemoryBackend::new();
+        let operation_id = OperationId::new("cleanup-current-operation".to_string()).unwrap();
+        let foreign_operation =
+            OperationId::new("cleanup-foreign-operation".to_string()).unwrap();
+        remote
+            .put_physical(
+                &format!("transactions/active/{}.intent", operation_id.value),
+                br#"{"stale":true}"#,
+            )
+            .unwrap();
+        remote
+            .put_physical(
+                &format!("transactions/active/{}.intent", foreign_operation.value),
+                br#"{"active":true}"#,
+            )
+            .unwrap();
+        remote
+            .put_physical("leases/branch-token.lock", br#"{"broken":true"#)
+            .unwrap();
+
+        cleanup_completed_operation_markers(&remote, &operation_id, "branch-token").unwrap();
+
+        assert!(
+            remote.exists_physical("leases/branch-token.lock"),
+            "cleanup for one completed operation must not delete a corrupted branch lease that could belong to another active operation"
+        );
+        assert!(!remote.exists_physical(&format!(
+            "transactions/active/{}.intent",
+            operation_id.value
+        )));
+        assert!(remote.exists_physical(&format!(
+            "transactions/active/{}.intent",
+            foreign_operation.value
+        )));
     }
 
     #[test]
