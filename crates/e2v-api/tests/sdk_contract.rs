@@ -1561,6 +1561,85 @@ fn sdk_can_verify_repair_accept_rollback_and_gc_default_remote() {
 }
 
 #[test]
+fn sdk_can_inspect_default_remote_and_write_doctor_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let remote_root = temp.path().join("remote");
+    let trusted_state_root = temp.path().join("trusted-state");
+    let bundle_root = temp.path().join("doctor-bundle");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+    fs::create_dir_all(&trusted_state_root).unwrap();
+    let _trusted_state_guard =
+        e2v_sync::testing::override_trusted_state_dir_for_test(trusted_state_root.clone());
+
+    let sdk = Sdk::new();
+    let state = sdk
+        .init_repository(InitRepositoryOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("tracked.txt"), "alpha").unwrap();
+    sdk.commit_repository(CommitRepositoryOptions {
+        repo_root: repo_root.clone(),
+        message: "seed".to_string(),
+    })
+    .unwrap();
+
+    let remote_spec = file_remote_spec(&remote_root);
+    sdk.add_remote(&repo_root, "origin", &remote_spec).unwrap();
+    sdk.push_default_remote(PushRequest {
+        repo_root: repo_root.clone(),
+        branch_token: state.branch.token_hex.clone(),
+        operation_id: "push-doctor-inspect".to_string(),
+    })
+    .unwrap();
+    sdk.verify_default_remote(e2v_api::VerifyRemoteRequest {
+        repo_root: repo_root.clone(),
+        sample_percent: 100,
+    })
+    .unwrap();
+
+    let inspection = sdk.inspect_default_remote(&repo_root).unwrap();
+    assert_eq!(inspection.repo_root, repo_root);
+    assert_eq!(inspection.remote_kind, "local-folder");
+    assert_eq!(inspection.remote_spec, remote_spec);
+    assert!(inspection.gc_execute_supported);
+    assert!(inspection.gc_execute_blockers.is_empty());
+    assert!(inspection.trusted_state.is_some());
+    assert!(!inspection.repo_id.trim().is_empty());
+
+    sdk.write_doctor_bundle(&bundle_root, &inspection).unwrap();
+
+    let bundle_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle_root.join("doctor-summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        bundle_summary["repo_id"].as_str(),
+        Some(inspection.repo_id.as_str())
+    );
+    assert_eq!(bundle_summary["remote_kind"].as_str(), Some("local-folder"));
+    assert_eq!(
+        bundle_summary["remote_spec_redacted"].as_str(),
+        Some("file://<redacted>")
+    );
+    assert_eq!(bundle_summary["gc_execute_supported"].as_bool(), Some(true));
+    assert_eq!(
+        bundle_summary["trusted_state_present"].as_bool(),
+        Some(true)
+    );
+
+    let trusted_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle_root.join("trusted-state.json")).unwrap()).unwrap();
+    assert_eq!(
+        trusted_state["repo_id"].as_str(),
+        Some(inspection.repo_id.as_str())
+    );
+}
+
+#[test]
 fn sdk_can_run_maintenance_with_explicit_remote_spec_without_default_remote_registration() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path().join("repo");

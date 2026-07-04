@@ -14,17 +14,11 @@ use e2v_api::{
     ShareInviteDeviceRequest, ShareInviteMemberRequest, ShareRevokeDeviceRequest,
     ShareRevokeMemberRequest, VerifyRemoteRequest,
 };
-use e2v_core::sync_support::read_repo_id;
 use e2v_core::{MetadataSearchQuery, RepositoryFacade};
-use e2v_store::{BackendCapability, RemoteBackend};
-use e2v_sync::{
-    RemoteBackendRef, ServeOptions, gc_execute_capability_status,
-    load_trusted_remote_state_for_repo, serve_local_web,
-};
+use e2v_sync::{ServeOptions, serve_local_web};
 use e2v_vfs::{MountLaunchSummary, start_live_branch_mount, start_snapshot_mount};
 #[cfg(not(windows))]
 use e2v_vfs::{mount_live_branch, mount_snapshot};
-use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "e2v")]
@@ -285,27 +279,6 @@ enum MountCommand {
         #[arg(long = "mount-point")]
         mount_point: PathBuf,
     },
-}
-
-#[derive(Debug, Serialize)]
-struct DoctorSummary {
-    repo_root: PathBuf,
-    repo_id: String,
-    trusted_state: Option<e2v_sync::TrustedRemoteState>,
-    remote_spec: String,
-    remote_kind: String,
-    gc_execute_supported: bool,
-    gc_execute_blockers: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct DoctorBundleSummary {
-    repo_id: String,
-    trusted_state_present: bool,
-    remote_kind: String,
-    remote_spec_redacted: String,
-    gc_execute_supported: bool,
-    gc_execute_blockers: Vec<String>,
 }
 
 pub fn run_from_env() -> Result<()> {
@@ -785,35 +758,9 @@ fn execute(cli: Cli) -> Result<String> {
             }
         },
         Command::Doctor { repo, bundle } => {
-            let stored_remote = sdk.load_default_remote(&repo)?;
-            let repo_id = read_repo_id(&repo)?;
-            let trusted_state = load_trusted_remote_state_for_repo(&repo_id)?;
-            let remote_spec = parse_default_remote_spec(&sdk, &repo)?;
-            let (remote_kind, gc_execute_supported, gc_execute_blockers) = remote_spec
-                .with_backend(|remote| {
-                    let capability = remote_capability(&remote);
-                    let gc_status = gc_execute_capability_status(capability);
-                    Ok((
-                        remote_kind_label(&remote).to_string(),
-                        gc_status.supported,
-                        gc_status
-                            .blockers
-                            .into_iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    ))
-                })?;
-            let summary = DoctorSummary {
-                repo_root: repo.clone(),
-                repo_id,
-                trusted_state,
-                remote_spec: stored_remote.spec,
-                remote_kind,
-                gc_execute_supported,
-                gc_execute_blockers,
-            };
+            let summary = sdk.inspect_default_remote(&repo)?;
             if let Some(bundle_root) = bundle {
-                write_doctor_bundle(&bundle_root, &summary)?;
+                sdk.write_doctor_bundle(&bundle_root, &summary)?;
                 Ok(format!(
                     "{}\nbundle={}\n",
                     serde_json::to_string_pretty(&summary)?,
@@ -929,62 +876,6 @@ fn cli_operation_id(prefix: &str) -> Result<String> {
         .map_err(|error| anyhow::anyhow!("system clock error: {error}"))?
         .as_millis();
     Ok(format!("cli-{prefix}-{millis}"))
-}
-
-fn remote_capability<'a>(remote: &'a RemoteBackendRef<'a>) -> &'a BackendCapability {
-    match remote {
-        RemoteBackendRef::LocalFolder(remote) => remote.capability(),
-        RemoteBackendRef::S3(remote) => remote.capability(),
-        RemoteBackendRef::Webdav(remote) => remote.capability(),
-    }
-}
-
-fn remote_kind_label(remote: &RemoteBackendRef<'_>) -> &'static str {
-    match remote {
-        RemoteBackendRef::LocalFolder(_) => "local-folder",
-        RemoteBackendRef::S3(_) => "s3",
-        RemoteBackendRef::Webdav(_) => "webdav",
-    }
-}
-
-fn write_doctor_bundle(bundle_root: &std::path::Path, summary: &DoctorSummary) -> Result<()> {
-    std::fs::create_dir_all(bundle_root)?;
-    let bundle_summary = DoctorBundleSummary {
-        repo_id: summary.repo_id.clone(),
-        trusted_state_present: summary.trusted_state.is_some(),
-        remote_kind: summary.remote_kind.clone(),
-        remote_spec_redacted: redact_remote_spec(&summary.remote_spec),
-        gc_execute_supported: summary.gc_execute_supported,
-        gc_execute_blockers: summary.gc_execute_blockers.clone(),
-    };
-    std::fs::write(
-        bundle_root.join("doctor-summary.json"),
-        serde_json::to_vec_pretty(&bundle_summary)?,
-    )?;
-    let trusted_state_bytes = match &summary.trusted_state {
-        Some(trusted_state) => serde_json::to_vec_pretty(trusted_state)?,
-        None => serde_json::to_vec_pretty(&serde_json::Value::Null)?,
-    };
-    std::fs::write(bundle_root.join("trusted-state.json"), trusted_state_bytes)?;
-    Ok(())
-}
-
-fn redact_remote_spec(spec: &str) -> String {
-    if spec.starts_with("file://") || spec.starts_with("file+") {
-        return "file://<redacted>".to_string();
-    }
-    if let Ok(url) = url::Url::parse(spec) {
-        return format!("{}://<redacted>", url.scheme());
-    }
-    "<redacted>".to_string()
-}
-
-fn parse_default_remote_spec(
-    sdk: &Sdk,
-    repo_root: &std::path::Path,
-) -> Result<e2v_sync::RemoteSpec> {
-    let stored = sdk.load_default_remote(repo_root)?;
-    e2v_sync::RemoteSpec::parse(&stored.spec)
 }
 
 fn format_mount_summary(summary: &MountLaunchSummary) -> String {

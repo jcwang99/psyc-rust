@@ -10,6 +10,7 @@ use e2v_core::{
     ShareInviteMemberOptions, ShareListResult, ShareRevokeDeviceOptions, ShareRevokeMemberOptions,
     SnapshotHandle, SnapshotSummary,
 };
+use e2v_store::RemoteBackend;
 use e2v_sync::{
     CloneOptions, EnableObliviousLayoutOptions, FetchOptions, GcDryRunOptions, GcExecuteOptions,
     HistoricalRewriteOptions, HistoricalRewritePlanOptions, PushOptions, RemoteSpec,
@@ -356,6 +357,35 @@ pub struct GcExecuteRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcExecuteResponse {
     pub deleted_physical_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedRemoteStateInfo {
+    pub repo_id: String,
+    pub min_layout_generation: u64,
+    pub min_keyring_generation: u64,
+    pub min_ref_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultRemoteInspection {
+    pub repo_root: PathBuf,
+    pub repo_id: String,
+    pub remote_spec: String,
+    pub remote_kind: String,
+    pub gc_execute_supported: bool,
+    pub gc_execute_blockers: Vec<String>,
+    pub trusted_state: Option<TrustedRemoteStateInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorBundleSummary {
+    pub repo_id: String,
+    pub trusted_state_present: bool,
+    pub remote_kind: String,
+    pub remote_spec_redacted: String,
+    pub gc_execute_supported: bool,
+    pub gc_execute_blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1092,6 +1122,94 @@ impl Sdk {
         let stored = self.load_default_remote(&request.repo_root)?;
         self.gc_remote_execute(&stored.spec, request)
     }
+
+    pub fn inspect_default_remote(
+        &self,
+        repo_root: impl AsRef<Path>,
+    ) -> SdkResult<DefaultRemoteInspection> {
+        let repo_root = repo_root.as_ref().to_path_buf();
+        let stored_remote = self.load_default_remote(&repo_root)?;
+        let repo_id = e2v_core::sync_support::read_repo_id(&repo_root).map_err(map_error)?;
+        let trusted_state = e2v_sync::load_trusted_remote_state_for_repo(&repo_id)
+            .map_err(map_error)?
+            .map(trusted_remote_state_info_from_state);
+        let remote_spec = RemoteSpec::parse(&stored_remote.spec).map_err(map_error)?;
+        let (remote_kind, gc_execute_supported, gc_execute_blockers) = remote_spec
+            .with_backend(|remote| {
+                let capability = match remote {
+                    e2v_sync::RemoteBackendRef::LocalFolder(remote) => remote.capability(),
+                    e2v_sync::RemoteBackendRef::S3(remote) => remote.capability(),
+                    e2v_sync::RemoteBackendRef::Webdav(remote) => remote.capability(),
+                };
+                let gc_status = e2v_sync::gc_execute_capability_status(capability);
+                Ok((
+                    match remote {
+                        e2v_sync::RemoteBackendRef::LocalFolder(_) => "local-folder",
+                        e2v_sync::RemoteBackendRef::S3(_) => "s3",
+                        e2v_sync::RemoteBackendRef::Webdav(_) => "webdav",
+                    }
+                    .to_string(),
+                    gc_status.supported,
+                    gc_status
+                        .blockers
+                        .into_iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .map_err(map_error)?;
+
+        Ok(DefaultRemoteInspection {
+            repo_root,
+            repo_id,
+            remote_spec: stored_remote.spec,
+            remote_kind,
+            gc_execute_supported,
+            gc_execute_blockers,
+            trusted_state,
+        })
+    }
+
+    pub fn write_doctor_bundle(
+        &self,
+        bundle_root: impl AsRef<Path>,
+        inspection: &DefaultRemoteInspection,
+    ) -> SdkResult<()> {
+        let bundle_root = bundle_root.as_ref();
+        std::fs::create_dir_all(bundle_root)
+            .map_err(anyhow::Error::from)
+            .map_err(map_error)?;
+
+        let bundle_summary = DoctorBundleSummary {
+            repo_id: inspection.repo_id.clone(),
+            trusted_state_present: inspection.trusted_state.is_some(),
+            remote_kind: inspection.remote_kind.clone(),
+            remote_spec_redacted: redact_remote_spec(&inspection.remote_spec),
+            gc_execute_supported: inspection.gc_execute_supported,
+            gc_execute_blockers: inspection.gc_execute_blockers.clone(),
+        };
+        std::fs::write(
+            bundle_root.join("doctor-summary.json"),
+            serde_json::to_vec_pretty(&bundle_summary)
+                .map_err(anyhow::Error::from)
+                .map_err(map_error)?,
+        )
+        .map_err(anyhow::Error::from)
+        .map_err(map_error)?;
+
+        let trusted_state_bytes = match &inspection.trusted_state {
+            Some(trusted_state) => serde_json::to_vec_pretty(trusted_state)
+                .map_err(anyhow::Error::from)
+                .map_err(map_error)?,
+            None => serde_json::to_vec_pretty(&serde_json::Value::Null)
+                .map_err(anyhow::Error::from)
+                .map_err(map_error)?,
+        };
+        std::fs::write(bundle_root.join("trusted-state.json"), trusted_state_bytes)
+            .map_err(anyhow::Error::from)
+            .map_err(map_error)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1460,6 +1578,27 @@ fn gc_execute_response_from_result(result: e2v_sync::GcExecuteResult) -> GcExecu
     GcExecuteResponse {
         deleted_physical_refs: result.deleted_physical_refs,
     }
+}
+
+fn trusted_remote_state_info_from_state(
+    state: e2v_sync::TrustedRemoteState,
+) -> TrustedRemoteStateInfo {
+    TrustedRemoteStateInfo {
+        repo_id: state.repo_id,
+        min_layout_generation: state.min_layout_generation,
+        min_keyring_generation: state.min_keyring_generation,
+        min_ref_generation: state.min_ref_generation,
+    }
+}
+
+fn redact_remote_spec(spec: &str) -> String {
+    if spec.starts_with("file://") || spec.starts_with("file+") {
+        return "file://<redacted>".to_string();
+    }
+    if let Some((scheme, _)) = spec.split_once("://") {
+        return format!("{scheme}://<redacted>");
+    }
+    "<redacted>".to_string()
 }
 
 pub(crate) fn map_error(error: anyhow::Error) -> SdkError {

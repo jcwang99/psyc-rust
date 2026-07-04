@@ -1536,6 +1536,30 @@ fn historical_rewrite_commands_delegate_through_the_sdk_boundary() {
 }
 
 #[test]
+fn doctor_command_delegates_through_the_sdk_boundary() {
+    let source = cli_lib_source_without_whitespace();
+
+    for legacy_call in [
+        "load_trusted_remote_state_for_repo(",
+        "gc_execute_capability_status(",
+        "RemoteSpec::parse(",
+        ".with_backend(|remote|",
+    ] {
+        assert!(
+            !source.contains(legacy_call),
+            "expected CLI doctor command to delegate through e2v_api::Sdk instead of {legacy_call}"
+        );
+    }
+
+    for sdk_call in ["sdk.inspect_default_remote(", "sdk.write_doctor_bundle("] {
+        assert!(
+            source.contains(sdk_call),
+            "expected CLI doctor command to use SDK call {sdk_call}"
+        );
+    }
+}
+
+#[test]
 fn oram_commands_surface_plan_status_enable_and_reshuffle() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
