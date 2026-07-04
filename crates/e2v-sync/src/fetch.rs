@@ -559,6 +559,12 @@ fn local_keyring_is_newer_than_remote(
     if local_pointer.generation <= control_plane.keyring_pointer.generation {
         return Ok(false);
     }
+    validate_remote_relative_name(&local_pointer.current).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid local keyring path {}: {error}",
+            local_pointer.current
+        )
+    })?;
     let local_keyring_path = control_dir.join("keyring").join(&local_pointer.current);
     let local_keyring_bytes = match std::fs::read(&local_keyring_path) {
         Ok(bytes) => bytes,
@@ -712,6 +718,12 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
             return Err(error).context("failed to decode local keyring pointer");
         }
     };
+    validate_remote_relative_name(&local_pointer.current).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid local keyring path {}: {error}",
+            local_pointer.current
+        )
+    })?;
     let local_keyring_path = control_dir.join("keyring").join(&local_pointer.current);
     let local_state_bytes = match std::fs::read(&local_keyring_path) {
         Ok(bytes) => bytes,
@@ -1909,6 +1921,116 @@ mod tests {
         let preserve = local_keyring_is_newer_than_remote(&control_dir, &control_plane).unwrap();
 
         assert!(!preserve);
+    }
+
+    #[test]
+    fn local_keyring_is_newer_than_remote_rejects_local_pointer_path_traversal() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-local-pointer-traversal".to_string(),
+            },
+        )
+        .unwrap();
+
+        let default_ref = remote
+            .read_ref(&e2v_store::RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .unwrap();
+        let control_plane =
+            read_remote_control_plane(&remote, default_ref.value.bytes.clone()).unwrap();
+        let control_dir = repo_root.join(".e2v");
+        fs::write(
+            control_dir.join("keyring").join("keyring.current"),
+            br#"{"generation":2,"current":"../../outside.json"}"#,
+        )
+        .unwrap();
+        fs::write(control_dir.join("outside.json"), b"malicious").unwrap();
+
+        let error = local_keyring_is_newer_than_remote(&control_dir, &control_plane).unwrap_err();
+
+        assert!(
+            error.to_string().contains("invalid local keyring path")
+                || error.to_string().contains("path traversal")
+                || error.to_string().contains("path escapes"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn classify_repository_sync_mode_rejects_local_pointer_path_traversal() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "seed".to_string(),
+            })
+            .unwrap();
+
+        let remote = MemoryBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "push-op-fetch-sync-mode-local-pointer-traversal".to_string(),
+            },
+        )
+        .unwrap();
+
+        let control_dir = repo_root.join(".e2v");
+        fs::write(
+            control_dir.join("keyring").join("keyring.current"),
+            br#"{"generation":1,"current":"../../outside.json"}"#,
+        )
+        .unwrap();
+        fs::write(control_dir.join("outside.json"), br#"{"repo_id":"escape"}"#).unwrap();
+
+        let error = classify_repository_sync_mode(&remote, &control_dir).unwrap_err();
+
+        assert!(
+            error.to_string().contains("invalid local keyring path")
+                || error.to_string().contains("path traversal")
+                || error.to_string().contains("path escapes"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
