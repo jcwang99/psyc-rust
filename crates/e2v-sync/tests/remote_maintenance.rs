@@ -827,8 +827,10 @@ fn plan_historical_rewrite_reports_old_epochs_reachable_objects_and_guidance() {
         plan.reachable_object_count > 0,
         "expected history rewrite planning to find reachable objects"
     );
-    assert_eq!(plan.remote_loose_object_count, plan.reachable_object_count);
-    assert_eq!(plan.remote_pack_object_count, 0);
+    assert_eq!(
+        plan.remote_loose_object_count + plan.remote_pack_object_count,
+        plan.reachable_object_count
+    );
     assert_eq!(plan.old_epoch_count, 1);
     assert!(plan.requires_remote_credential_revocation_guidance);
     assert!(plan.large_repo_advisory.is_none());

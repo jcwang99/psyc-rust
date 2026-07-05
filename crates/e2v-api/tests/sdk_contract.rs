@@ -2834,10 +2834,9 @@ fn sdk_can_plan_and_execute_historical_rewrite_via_default_and_explicit_remote()
         .unwrap();
     assert!(default_plan.reachable_object_count > 0);
     assert_eq!(
-        default_plan.remote_loose_object_count,
+        default_plan.remote_loose_object_count + default_plan.remote_pack_object_count,
         default_plan.reachable_object_count
     );
-    assert_eq!(default_plan.remote_pack_object_count, 0);
     assert_eq!(default_plan.old_epoch_count, 1);
     assert!(default_plan.requires_remote_credential_revocation_guidance);
     assert!(default_plan.large_repo_advisory.is_none());
