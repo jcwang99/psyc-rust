@@ -2474,6 +2474,8 @@ fn historical_rewrite_remote_preserves_remote_active_device_envelopes() {
 
 #[test]
 fn historical_rewrite_remote_leaves_stale_loose_refs_for_gc_grace_period_cleanup() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2648,6 +2650,8 @@ fn historical_rewrite_remote_leaves_stale_loose_refs_for_gc_grace_period_cleanup
 
 #[test]
 fn historical_rewrite_remote_resumes_after_stale_loose_purge_interruption() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -3083,6 +3087,8 @@ fn historical_rewrite_remote_recovers_from_checkpoint_path_conflict() {
 
 #[test]
 fn historical_rewrite_remote_recovers_from_corrupted_checkpoint() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();

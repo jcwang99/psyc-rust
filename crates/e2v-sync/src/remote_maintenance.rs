@@ -820,7 +820,7 @@ fn upload_rewrite_segments_with_resume<R: RemoteBackend + Clone>(
                 Ok(())
             },
         )?;
-        published_segments.extend(uploaded);
+        published_segments.extend(uploaded.index_paths);
     }
     published_segments.sort();
     Ok(published_segments)

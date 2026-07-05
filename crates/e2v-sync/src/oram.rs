@@ -339,7 +339,7 @@ fn publish_oblivious_segments<R: RemoteBackend + Clone>(
                 Ok(())
             },
         )?;
-        published_paths.extend(uploaded);
+        published_paths.extend(uploaded.index_paths);
     }
     published_paths.sort();
     Ok(published_paths)

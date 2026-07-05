@@ -1131,6 +1131,7 @@ struct ExistsCountingBackend {
     exists_calls: Arc<Mutex<usize>>,
     list_calls: Arc<Mutex<usize>>,
     object_put_calls: Arc<Mutex<usize>>,
+    get_paths: Arc<Mutex<Vec<String>>>,
     range_read_paths: Arc<Mutex<Vec<String>>>,
 }
 
@@ -1155,6 +1156,7 @@ impl ExistsCountingBackend {
             exists_calls: Arc::new(Mutex::new(0)),
             list_calls: Arc::new(Mutex::new(0)),
             object_put_calls: Arc::new(Mutex::new(0)),
+            get_paths: Arc::new(Mutex::new(Vec::new())),
             range_read_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -1171,11 +1173,16 @@ impl ExistsCountingBackend {
         *self.exists_calls.lock().unwrap() = 0;
         *self.list_calls.lock().unwrap() = 0;
         *self.object_put_calls.lock().unwrap() = 0;
+        self.get_paths.lock().unwrap().clear();
         self.range_read_paths.lock().unwrap().clear();
     }
 
     fn object_put_call_count(&self) -> usize {
         *self.object_put_calls.lock().unwrap()
+    }
+
+    fn get_paths(&self) -> Vec<String> {
+        self.get_paths.lock().unwrap().clone()
     }
 
     fn range_read_paths(&self) -> Vec<String> {
@@ -1199,6 +1206,10 @@ impl BlobStore for ExistsCountingBackend {
     }
 
     fn get_physical(&self, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_paths
+            .lock()
+            .unwrap()
+            .push(relative_path.to_string());
         self.inner.get_physical(relative_path)
     }
 
@@ -2321,7 +2332,11 @@ fn push_uploads_reachable_objects_and_publishes_remote_ref() {
         .unwrap()
         .unwrap();
     assert!(!stored_ref.value.bytes.is_empty());
-    assert!(!remote.list_physical("objects/").unwrap().is_empty());
+    assert!(
+        !remote.list_physical("objects/").unwrap().is_empty()
+            || !remote.list_physical("packs/data/").unwrap().is_empty(),
+        "push should publish reachable objects either as loose objects or pack payloads"
+    );
     assert_eq!(
         remote.read_layout_root().unwrap().generation,
         state.layout_generation
@@ -2756,7 +2771,8 @@ fn push_avoids_per_object_remote_exists_checks_when_validating_remote_ancestor_g
 
 #[test]
 fn push_refreshes_single_writer_heartbeat_during_long_running_upload_before_interruption() {
-    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -2819,6 +2835,8 @@ fn push_refreshes_single_writer_heartbeat_during_long_running_upload_before_inte
 
 #[test]
 fn resume_avoids_per_object_remote_exists_checks_for_pending_objects() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -3659,6 +3677,8 @@ fn push_rejects_invalid_pack_index_root_instead_of_falling_back_to_segment_listi
 
 #[test]
 fn resume_skips_uploaded_objects_and_republishes_missing_ref() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -3730,6 +3750,8 @@ fn resume_skips_uploaded_objects_and_republishes_missing_ref() {
 
 #[test]
 fn resume_reuploads_missing_remote_objects_from_journal() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -3901,7 +3923,7 @@ fn resume_uses_pack_uploads_for_small_repository_when_journal_missing_set_contai
 
 #[test]
 fn resume_without_journal_uses_pack_uploads_for_small_repository_when_multiple_missing_objects_exist()
-{
+ {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -3972,14 +3994,14 @@ fn resume_without_journal_uses_pack_uploads_for_small_repository_when_multiple_m
     .unwrap();
 
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
-    assert!(
-        remote.list_physical("packs/index/").unwrap().len() > pack_index_count_before_resume
-    );
+    assert!(remote.list_physical("packs/index/").unwrap().len() > pack_index_count_before_resume);
     assert!(remote.list_physical("packs/data/").unwrap().len() > pack_data_count_before_resume);
 }
 
 #[test]
 fn resume_repairs_corrupted_existing_remote_object_instead_of_marking_it_verified() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -4072,6 +4094,8 @@ fn resume_repairs_corrupted_existing_remote_object_instead_of_marking_it_verifie
 
 #[test]
 fn resume_uploads_objects_missing_after_interrupted_push() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -4211,6 +4235,8 @@ fn resume_counts_skipped_uploaded_objects_across_multiple_journal_batches() {
 
 #[test]
 fn resume_restores_missing_control_plane_files_before_republishing_ref() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -4980,6 +5006,8 @@ fn resume_cleans_up_stale_single_writer_lease_when_remote_state_is_already_compl
 
 #[test]
 fn resume_reacquires_expired_single_writer_lease_before_republishing_missing_ref() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -5121,6 +5149,8 @@ fn resume_rejects_stale_remote_ref_and_requires_rebase_recovery() {
 
 #[test]
 fn resume_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -5460,6 +5490,8 @@ fn push_rejects_branch_token_with_path_traversal_before_mutating_remote_state() 
 
 #[test]
 fn push_rejects_corrupted_remote_parent_snapshot_even_when_object_path_exists() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -5654,6 +5686,8 @@ fn push_validates_healthy_remote_parent_without_rewriting_local_ancestor_object(
 
 #[test]
 fn push_rejects_remote_parent_snapshot_when_reachable_chunk_is_corrupted() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -5977,6 +6011,8 @@ fn push_does_not_advance_branch_ref_when_keyring_pointer_ref_publish_conflicts()
 
 #[test]
 fn resume_does_not_advance_branch_ref_when_keyring_pointer_ref_publish_conflicts() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -7121,6 +7157,53 @@ fn packed_push_lists_remote_objects_only_once_while_publishing_and_verifying() {
         remote.list_call_count(),
         2,
         "packed push should list remote objects once plus one pack-index segment scan"
+    );
+}
+
+#[test]
+fn packed_push_does_not_reread_current_operation_pack_indexes_after_upload() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello packed").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "packed-no-index-reread".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    let operation_id = "packed-no-index-reread-op";
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root,
+            branch_token: state.branch.token_hex,
+            operation_id: operation_id.to_string(),
+        },
+    )
+    .unwrap();
+
+    let operation_index_reads = remote
+        .get_paths()
+        .into_iter()
+        .filter(|path| path.starts_with(&format!("packs/index/{operation_id}-")))
+        .count();
+    assert_eq!(
+        operation_index_reads, 0,
+        "packed push should reuse in-memory pack locations instead of rereading current operation pack indexes"
     );
 }
 

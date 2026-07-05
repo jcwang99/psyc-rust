@@ -66,6 +66,106 @@ fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     ))
 }
 
+#[derive(Debug)]
+struct RemotePackedObjectForTest {
+    data_path: String,
+    offset: usize,
+    length: usize,
+}
+
+fn find_remote_packed_object_for_test(
+    remote: &MemoryBackend,
+    control_dir: &std::path::Path,
+    object_id: &str,
+) -> Option<RemotePackedObjectForTest> {
+    let root_bytes = remote.get_physical("pack-index/root.json").ok()?;
+    let root =
+        e2v_sync::testing::decode_pack_index_root_value_for_test(control_dir, &root_bytes).ok()?;
+    for segment_path in root["segments"].as_array()? {
+        let segment_path = segment_path.as_str()?;
+        let segment = e2v_sync::testing::decode_pack_index_segment_value_for_test(
+            control_dir,
+            segment_path,
+            &remote.get_physical(segment_path).ok()?,
+        )
+        .ok()?;
+        let data_path = segment["data_path"].as_str()?.to_string();
+        for entry in segment["entries"].as_array()? {
+            if entry["object_id"].as_str() == Some(object_id) {
+                return Some(RemotePackedObjectForTest {
+                    data_path,
+                    offset: entry["offset"].as_u64()? as usize,
+                    length: entry["length"].as_u64()? as usize,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn delete_remote_object_for_test(
+    remote: &MemoryBackend,
+    control_dir: &std::path::Path,
+    object_id: &str,
+) {
+    let loose_path = format!("objects/{object_id}.json");
+    if remote.exists_physical(&loose_path) {
+        remote.delete_physical(&loose_path).unwrap();
+        return;
+    }
+    let packed = find_remote_packed_object_for_test(remote, control_dir, object_id)
+        .unwrap_or_else(|| panic!("missing remote object storage for {object_id}"));
+    remote.delete_physical(&packed.data_path).unwrap();
+}
+
+fn corrupt_remote_object_for_test(
+    remote: &MemoryBackend,
+    control_dir: &std::path::Path,
+    object_id: &str,
+) {
+    let loose_path = format!("objects/{object_id}.json");
+    if remote.exists_physical(&loose_path) {
+        let mut bytes = remote.get_physical(&loose_path).unwrap();
+        let flip_index = bytes.len() / 2;
+        bytes[flip_index] ^= 0x01;
+        remote.put_physical(&loose_path, &bytes).unwrap();
+        return;
+    }
+    let packed = find_remote_packed_object_for_test(remote, control_dir, object_id)
+        .unwrap_or_else(|| panic!("missing remote object storage for {object_id}"));
+    assert!(
+        packed.length > 0,
+        "packed object {object_id} has empty length"
+    );
+    let mut pack_bytes = remote.get_physical(&packed.data_path).unwrap();
+    let flip_index = packed.offset + packed.length / 2;
+    pack_bytes[flip_index] ^= 0x01;
+    remote.put_physical(&packed.data_path, &pack_bytes).unwrap();
+}
+
+fn clear_local_pack_data_cache_for_test(repo_root: &std::path::Path) {
+    let _ = fs::remove_dir_all(repo_root.join(".e2v").join("cache").join("pack-data"));
+}
+
+fn first_remote_backed_local_object_for_test(
+    remote: &MemoryBackend,
+    local_repo_root: &std::path::Path,
+    remote_control_dir: &std::path::Path,
+) -> (String, std::path::PathBuf) {
+    for path in e2v_core::sync_support::list_local_object_files(local_repo_root).unwrap() {
+        let object_id = path.file_stem().unwrap().to_string_lossy().to_string();
+        if remote.exists_physical(&format!("objects/{object_id}.json"))
+            || find_remote_packed_object_for_test(remote, remote_control_dir, &object_id).is_some()
+        {
+            return (object_id, path);
+        }
+    }
+    panic!(
+        "expected at least one local object in {} to remain backed by the remote",
+        local_repo_root.display()
+    );
+}
+
 #[derive(Clone, Debug)]
 struct KeyringPointerDisappearsAfterRefReadRemote {
     inner: MemoryBackend,
@@ -2188,7 +2288,7 @@ fn local_object_envelope_static_health_check_accepts_a_healthy_downloaded_object
 
 #[test]
 fn fetch_does_not_overwrite_locked_local_object_with_corrupted_remote_bytes() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
     let target_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&target_repo_root).unwrap();
     let local = RepositoryFacade::new();
@@ -2210,27 +2310,15 @@ fn fetch_does_not_overwrite_locked_local_object_with_corrupted_remote_bytes() {
     )
     .unwrap();
 
-    let target_object_path = e2v_core::sync_support::list_local_object_files(&target_repo_root)
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
+    let (object_id, target_object_path) = first_remote_backed_local_object_for_test(
+        &remote,
+        &target_repo_root,
+        &source_repo_root.join(".e2v"),
+    );
     let original_local_bytes = fs::read(&target_object_path).unwrap();
-    let object_id = target_object_path
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
 
-    let mut corrupted_remote_bytes = original_local_bytes.clone();
-    let flip_index = corrupted_remote_bytes.len() / 2;
-    corrupted_remote_bytes[flip_index] ^= 0x01;
-    remote
-        .put_physical(
-            &format!("objects/{object_id}.json"),
-            &corrupted_remote_bytes,
-        )
-        .unwrap();
+    corrupt_remote_object_for_test(&remote, &source_repo_root.join(".e2v"), &object_id);
+    clear_local_pack_data_cache_for_test(&target_repo_root);
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&target_repo_root.join(".e2v"));
 
@@ -4180,9 +4268,7 @@ fn clone_cleans_up_control_dir_when_remote_head_snapshot_is_missing() {
         .unwrap()
         .snapshot_id
         .clone();
-    remote
-        .delete_physical(&format!("objects/{head_snapshot_id}.json"))
-        .unwrap();
+    delete_remote_object_for_test(&remote, &source_repo_root.join(".e2v"), &head_snapshot_id);
 
     let error = clone_remote(
         &remote,
@@ -4679,9 +4765,7 @@ fn fetch_rejects_remote_ref_that_points_to_missing_head_snapshot_when_local_ref_
         .unwrap()
         .snapshot_id
         .clone();
-    remote
-        .delete_physical(&format!("objects/{head_snapshot_id}.json"))
-        .unwrap();
+    delete_remote_object_for_test(&remote, &target_repo_root.join(".e2v"), &head_snapshot_id);
 
     let error = fetch_remote(
         &remote,
@@ -4765,9 +4849,7 @@ fn fetch_rejects_remote_ref_that_points_to_missing_head_snapshot_after_password_
         .unwrap()
         .snapshot_id
         .clone();
-    remote
-        .delete_physical(&format!("objects/{head_snapshot_id}.json"))
-        .unwrap();
+    delete_remote_object_for_test(&remote, &target_repo_root.join(".e2v"), &head_snapshot_id);
 
     let error = fetch_remote(
         &remote,
@@ -4835,11 +4917,8 @@ fn fetch_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted_for_unlo
                 .is_ok()
         })
         .unwrap();
-    let remote_chunk_path = format!("objects/{chunk_id}.json");
-    let mut bytes = remote.get_physical(&remote_chunk_path).unwrap();
-    let last_index = bytes.len() - 1;
-    bytes[last_index] ^= 0x01;
-    remote.put_physical(&remote_chunk_path, &bytes).unwrap();
+    corrupt_remote_object_for_test(&remote, &target_repo_root.join(".e2v"), &chunk_id);
+    clear_local_pack_data_cache_for_test(&target_repo_root);
 
     let original_ref_bytes = fs::read(
         target_repo_root
@@ -4863,6 +4942,7 @@ fn fetch_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted_for_unlo
 
     assert!(
         error.to_string().contains("authentication")
+            || error.to_string().contains("object id mismatch")
             || error.to_string().contains("snapshot")
             || error.to_string().contains("failed"),
         "unexpected error: {error:#}"
@@ -4905,11 +4985,7 @@ fn clone_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted() {
                 .is_ok()
         })
         .unwrap();
-    let remote_chunk_path = format!("objects/{chunk_id}.json");
-    let mut bytes = remote.get_physical(&remote_chunk_path).unwrap();
-    let last_index = bytes.len() - 1;
-    bytes[last_index] ^= 0x01;
-    remote.put_physical(&remote_chunk_path, &bytes).unwrap();
+    corrupt_remote_object_for_test(&remote, &source_repo_root.join(".e2v"), &chunk_id);
 
     let clone_repo_root = temp.path().join("clone-target");
     let error = clone_remote(
@@ -4924,6 +5000,7 @@ fn clone_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted() {
 
     assert!(
         error.to_string().contains("authentication")
+            || error.to_string().contains("object id mismatch")
             || error.to_string().contains("snapshot")
             || error.to_string().contains("failed"),
         "unexpected error: {error:#}"
@@ -4952,11 +5029,7 @@ fn fetch_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted_for_empt
                 .is_ok()
         })
         .unwrap();
-    let remote_chunk_path = format!("objects/{chunk_id}.json");
-    let mut bytes = remote.get_physical(&remote_chunk_path).unwrap();
-    let last_index = bytes.len() - 1;
-    bytes[last_index] ^= 0x01;
-    remote.put_physical(&remote_chunk_path, &bytes).unwrap();
+    corrupt_remote_object_for_test(&remote, &source_repo_root.join(".e2v"), &chunk_id);
 
     let target_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&target_repo_root).unwrap();
@@ -4980,6 +5053,7 @@ fn fetch_rejects_remote_head_snapshot_when_reachable_chunk_is_corrupted_for_empt
 
     assert!(
         error.to_string().contains("authentication")
+            || error.to_string().contains("object id mismatch")
             || error.to_string().contains("snapshot")
             || error.to_string().contains("failed"),
         "unexpected error: {error:#}"

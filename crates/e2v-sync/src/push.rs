@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 
 use e2v_core::{ManifestStore, ManifestStoreApi, RepositoryFacade, sync_support};
 use e2v_store::{
-    EncryptedRef, LayoutMode, LayoutRoot, RefToken, RemoteBackend,
+    EncryptedRef, LayoutMode, LayoutRoot, RefToken, RemoteBackend, RepoSecrets,
     is_missing_physical_object_error, validate_object_id_value,
 };
 
@@ -14,10 +14,10 @@ use crate::fetch::validate_remote_relative_name;
 use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_sync_identifier};
 use crate::object_type::infer_object_type_from_hint;
 use crate::oram::load_remote_active_pack_locations_with_local_cache;
-use crate::pack::{ObjectPackBuilder, PackedObjectLocation, pack_paths};
+use crate::pack::{ObjectPackBuilder, ObjectPackIndex, PackedObjectLocation, pack_paths};
 use crate::pack_index::{
-    encode_pack_index_segment_bytes_for_sync, load_remote_operation_pack_locations_with_secrets,
-    next_pack_index_segment_paths, publish_pack_index_root,
+    encode_pack_index_segment_bytes_for_sync, next_pack_index_segment_paths,
+    publish_pack_index_root,
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::remote_maintenance::load_remote_loose_object_ids;
@@ -178,13 +178,32 @@ fn inventory_has_object(
     loose_object_ids.contains(object_id) || pack_locations.contains_key(object_id)
 }
 
+fn open_remote_pack_index_secrets<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<RepoSecrets> {
+    let control_dir = repo_root.join(".e2v");
+    if let Some(remote_keyring_bytes) = read_remote_current_keyring_bytes(remote, repo_root)? {
+        if let Ok(secrets) =
+            sync_support::unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
+                &control_dir,
+                &remote_keyring_bytes,
+            )
+        {
+            return Ok(secrets);
+        }
+    }
+    sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)
+}
+
 fn load_remote_object_inventory<R: RemoteBackend>(
-    control_dir: &Path,
+    repo_root: &Path,
     remote: &R,
 ) -> Result<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
-    let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(control_dir)?;
+    let control_dir = repo_root.join(".e2v");
+    let secrets = open_remote_pack_index_secrets(remote, repo_root)?;
     let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, control_dir, &secrets)?;
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
     Ok((load_remote_loose_object_ids(remote)?, pack_locations))
 }
 
@@ -315,13 +334,13 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
 }
 
 fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
-    control_dir: &Path,
+    repo_root: &Path,
     remote: &'a R,
     inventory: &'a mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
 ) -> Result<&'a (BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
     match inventory {
         Some(inventory) => Ok(inventory),
-        None => Ok(inventory.insert(load_remote_object_inventory(control_dir, remote)?)),
+        None => Ok(inventory.insert(load_remote_object_inventory(repo_root, remote)?)),
     }
 }
 
@@ -355,9 +374,8 @@ fn remote_object_authenticates_for_resume<R: RemoteBackend>(
         return Ok(false);
     }
 
-    let control_dir = context.repo_root.join(".e2v");
     let (remote_loose_object_ids, remote_pack_locations) = ensure_remote_object_inventory_loaded(
-        &control_dir,
+        context.repo_root,
         context.remote,
         context.remote_inventory_cache,
     )?;
@@ -429,6 +447,40 @@ fn next_pack_batch_index<R: RemoteBackend>(
         .count())
 }
 
+#[derive(Default)]
+pub(crate) struct PublishedPackUploads {
+    pub(crate) index_paths: Vec<String>,
+    pub(crate) locations: BTreeMap<String, PackedObjectLocation>,
+}
+
+#[derive(Debug)]
+struct PublishedPackBatch {
+    index_path: String,
+    locations: BTreeMap<String, PackedObjectLocation>,
+}
+
+fn pack_locations_from_index(
+    index: &ObjectPackIndex,
+) -> Result<BTreeMap<String, PackedObjectLocation>> {
+    let mut locations = BTreeMap::new();
+    for entry in &index.entries {
+        let location = PackedObjectLocation {
+            data_path: index.data_path.clone(),
+            offset: entry.offset as usize,
+            length: entry.length as usize,
+        };
+        location.validate()?;
+        ensure!(
+            locations
+                .insert(entry.object_id.clone(), location)
+                .is_none(),
+            "duplicate packed object id {}",
+            entry.object_id
+        );
+    }
+    Ok(locations)
+}
+
 fn upload_object_batch<R, F>(
     remote: &R,
     repo_root: &Path,
@@ -437,7 +489,7 @@ fn upload_object_batch<R, F>(
     pack_enabled: bool,
     pack_batch_index: &mut usize,
     mut on_uploaded: F,
-) -> Result<Option<String>>
+) -> Result<Option<PublishedPackBatch>>
 where
     R: RemoteBackend,
     F: FnMut(&str) -> Result<()>,
@@ -470,6 +522,7 @@ where
         && !packed_object_ids.is_empty()
     {
         let (index, payload) = builder.finish();
+        let locations = pack_locations_from_index(&index)?;
         let (_, data_path, index_path) = pack_paths(&operation_id.value, *pack_batch_index)?;
         let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(repo_root.join(".e2v"))?;
         remote.put_physical(&data_path, &payload)?;
@@ -485,7 +538,10 @@ where
         for object_id in &packed_object_ids {
             on_uploaded(object_id)?;
         }
-        return Ok(Some(index_path));
+        return Ok(Some(PublishedPackBatch {
+            index_path,
+            locations,
+        }));
     }
 
     Ok(None)
@@ -498,22 +554,22 @@ pub(crate) fn upload_objects_with_policy<R, F>(
     object_ids: &[String],
     pack_enabled: bool,
     mut on_uploaded: F,
-) -> Result<Vec<String>>
+) -> Result<PublishedPackUploads>
 where
     R: RemoteBackend,
     F: FnMut(&str) -> Result<()>,
 {
     if object_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PublishedPackUploads::default());
     }
     let mut pack_batch_index = if pack_enabled {
         next_pack_batch_index(remote, operation_id)?
     } else {
         0
     };
-    let mut published_pack_index_segments = Vec::new();
+    let mut published_pack_uploads = PublishedPackUploads::default();
     for object_batch in object_ids.chunks(SMALL_OBJECT_PACK_BATCH_SIZE) {
-        if let Some(index_path) = upload_object_batch(
+        if let Some(pack_batch) = upload_object_batch(
             remote,
             repo_root,
             operation_id,
@@ -522,10 +578,15 @@ where
             &mut pack_batch_index,
             &mut on_uploaded,
         )? {
-            published_pack_index_segments.push(index_path);
+            published_pack_uploads
+                .index_paths
+                .push(pack_batch.index_path);
+            published_pack_uploads
+                .locations
+                .extend(pack_batch.locations);
         }
     }
-    Ok(published_pack_index_segments)
+    Ok(published_pack_uploads)
 }
 
 fn use_segment_only_uploads(layout_root: &LayoutRoot) -> bool {
@@ -538,19 +599,19 @@ pub(crate) fn upload_objects_as_pack_segments<R, F>(
     operation_id: &OperationId,
     object_ids: &[String],
     mut on_uploaded: F,
-) -> Result<Vec<String>>
+) -> Result<PublishedPackUploads>
 where
     R: RemoteBackend,
     F: FnMut(&str) -> Result<()>,
 {
     if object_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PublishedPackUploads::default());
     }
 
     let control_dir = repo_root.join(".e2v");
     let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
     let mut pack_batch_index = next_pack_batch_index(remote, operation_id)?;
-    let mut published_pack_index_segments = Vec::new();
+    let mut published_pack_uploads = PublishedPackUploads::default();
     for object_batch in object_ids.chunks(SMALL_OBJECT_PACK_BATCH_SIZE) {
         let mut pack_builder = ObjectPackBuilder::new(&operation_id.value, pack_batch_index)?;
         for object_id in object_batch {
@@ -559,6 +620,7 @@ where
             pack_builder.push_object(object_id.clone(), &bytes);
         }
         let (index, payload) = pack_builder.finish();
+        let locations = pack_locations_from_index(&index)?;
         let (_, data_path, index_path) = pack_paths(&operation_id.value, pack_batch_index)?;
         remote.put_physical(&data_path, &payload)?;
         remote.put_physical(
@@ -573,9 +635,10 @@ where
         for object_id in object_batch {
             on_uploaded(object_id)?;
         }
-        published_pack_index_segments.push(index_path);
+        published_pack_uploads.index_paths.push(index_path);
+        published_pack_uploads.locations.extend(locations);
     }
-    Ok(published_pack_index_segments)
+    Ok(published_pack_uploads)
 }
 
 fn remote_physical_matches<R: RemoteBackend>(
@@ -1014,7 +1077,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
     let control_dir = options.repo_root.join(".e2v");
     let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
     let (mut remote_loose_object_ids, mut remote_pack_locations) =
-        load_remote_object_inventory(&control_dir, remote)?;
+        load_remote_object_inventory(&options.repo_root, remote)?;
     let mut remote_pack_cache = BTreeMap::new();
     for ancestor_snapshot_id in &snapshot.ancestor_snapshot_ids {
         if !inventory_has_object(
@@ -1086,7 +1149,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
     for object_id in &reachable_object_ids {
         journal.plan_object(&operation_id, object_id, "object")?;
     }
-    let published_pack_index_segments = if segment_only_uploads {
+    let published_pack_uploads = if segment_only_uploads {
         upload_objects_as_pack_segments(
             remote,
             &options.repo_root,
@@ -1127,10 +1190,10 @@ fn push_head_inner<R: RemoteBackend + Clone>(
 
     upload_remote_keyring_generations(remote, &keyring_files)?;
     publisher.publish_layout_if_needed(&session)?;
-    if !published_pack_index_segments.is_empty() {
+    if !published_pack_uploads.index_paths.is_empty() {
         let segment_paths = next_pack_index_segment_paths(
             remote,
-            &published_pack_index_segments,
+            &published_pack_uploads.index_paths,
             Some(&pack_index_secrets),
         )?;
         publish_pack_index_root(
@@ -1144,15 +1207,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
     publisher.pre_commit_verify(&session)?;
 
     if !missing_object_ids.is_empty() {
-        let current_operation_pack_locations = if pack_enabled {
-            load_remote_operation_pack_locations_with_secrets(
-                remote,
-                &operation_id.value,
-                &pack_index_secrets,
-            )?
-        } else {
-            BTreeMap::new()
-        };
+        let current_operation_pack_locations = published_pack_uploads.locations;
         for object_id in &missing_object_ids {
             if !current_operation_pack_locations.contains_key(object_id) {
                 remote_loose_object_ids.insert(object_id.clone());
@@ -1270,25 +1325,27 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             total_tracked_objects,
         )?;
         if segment_only_uploads {
-            published_pack_index_segments.extend(upload_objects_as_pack_segments(
+            let batch_pack_uploads = upload_objects_as_pack_segments(
                 remote,
                 &options.repo_root,
                 &operation_id,
                 &missing_object_ids,
                 |object_id| journal.record_verified(&operation_id, object_id, "object"),
-            )?);
+            )?;
+            published_pack_index_segments.extend(batch_pack_uploads.index_paths);
+            remote_pack_locations.extend(batch_pack_uploads.locations);
         } else {
-            published_pack_index_segments.extend(upload_objects_with_policy(
+            let batch_pack_uploads = upload_objects_with_policy(
                 remote,
                 &options.repo_root,
                 &operation_id,
                 &missing_object_ids,
                 pack_enabled,
                 |object_id| journal.record_verified(&operation_id, object_id, "object"),
-            )?);
+            )?;
+            published_pack_index_segments.extend(batch_pack_uploads.index_paths);
+            remote_pack_locations.extend(batch_pack_uploads.locations);
         }
-        remote_pack_locations =
-            load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
         remote_inventory = None;
         remote_pack_cache.clear();
         resume_remote_auth = ResumeRemoteAuthContext {
@@ -1303,8 +1360,8 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     }
 
     if !saw_journal_objects {
-        let (remote_loose_object_ids, remote_pack_locations) =
-            load_remote_object_inventory(&control_dir, remote)?;
+        let (remote_loose_object_ids, mut remote_pack_locations) =
+            load_remote_object_inventory(&options.repo_root, remote)?;
         let manifest_store = ManifestStore::new(&options.repo_root);
         let reachable_object_ids =
             manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
@@ -1345,27 +1402,31 @@ pub fn resume_push<R: RemoteBackend + Clone>(
                 missing_object_ids.push(object_id.clone());
             }
             if segment_only_uploads {
-                published_pack_index_segments.extend(upload_objects_as_pack_segments(
+                let batch_pack_uploads = upload_objects_as_pack_segments(
                     remote,
                     &options.repo_root,
                     &operation_id,
                     &missing_object_ids,
                     |object_id| journal.record_verified(&operation_id, object_id, "object"),
-                )?);
+                )?;
+                published_pack_index_segments.extend(batch_pack_uploads.index_paths);
+                remote_pack_locations.extend(batch_pack_uploads.locations);
             } else {
                 let pack_enabled = should_pack_current_upload_set(
                     &options.repo_root,
                     &missing_object_ids,
                     reachable_object_ids.len(),
                 )?;
-                published_pack_index_segments.extend(upload_objects_with_policy(
+                let batch_pack_uploads = upload_objects_with_policy(
                     remote,
                     &options.repo_root,
                     &operation_id,
                     &missing_object_ids,
                     pack_enabled,
                     |object_id| journal.record_verified(&operation_id, object_id, "object"),
-                )?);
+                )?;
+                published_pack_index_segments.extend(batch_pack_uploads.index_paths);
+                remote_pack_locations.extend(batch_pack_uploads.locations);
             }
         }
     }
