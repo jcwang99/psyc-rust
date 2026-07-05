@@ -3923,16 +3923,24 @@ fn resume_without_journal_uses_pack_uploads_for_small_repository_when_multiple_m
         .unwrap();
 
     let remote = MemoryBackend::new();
-    push_head(
-        &facade,
-        &remote,
-        PushOptions {
-            repo_root: repo_root.clone(),
-            branch_token: state.branch.token_hex.clone(),
-            operation_id: "adaptive-pack-resume-fallback-seed-op".to_string(),
-        },
-    )
-    .unwrap();
+    {
+        let _large_guard =
+            e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+        let _small_guard =
+            e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root: repo_root.clone(),
+                branch_token: state.branch.token_hex.clone(),
+                operation_id: "adaptive-pack-resume-fallback-seed-op".to_string(),
+            },
+        )
+        .unwrap();
+    }
+    assert!(remote.list_physical("packs/index/").unwrap().is_empty());
+    assert!(remote.list_physical("packs/data/").unwrap().is_empty());
 
     let manifest_store = ManifestStore::new(&repo_root);
     let reachable_object_ids = manifest_store
@@ -3948,6 +3956,8 @@ fn resume_without_journal_uses_pack_uploads_for_small_repository_when_multiple_m
             .unwrap();
     }
 
+    let pack_index_count_before_resume = remote.list_physical("packs/index/").unwrap().len();
+    let pack_data_count_before_resume = remote.list_physical("packs/data/").unwrap().len();
     let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
     let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(2);
     let resumed = resume_push(
@@ -3962,8 +3972,10 @@ fn resume_without_journal_uses_pack_uploads_for_small_repository_when_multiple_m
     .unwrap();
 
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
-    assert!(!remote.list_physical("packs/index/").unwrap().is_empty());
-    assert!(!remote.list_physical("packs/data/").unwrap().is_empty());
+    assert!(
+        remote.list_physical("packs/index/").unwrap().len() > pack_index_count_before_resume
+    );
+    assert!(remote.list_physical("packs/data/").unwrap().len() > pack_data_count_before_resume);
 }
 
 #[test]
