@@ -8,8 +8,8 @@ use crate::capability::{BackendCapability, ConsistencyClass};
 use crate::layout::LayoutRoot;
 use crate::layout_root_store::{LayoutRootStore, LayoutRootVersion};
 use crate::opendal_backend::RemoteBackend;
-use crate::remote_telemetry::{RemoteOperationKind, RemoteTelemetryHandle};
 use crate::ref_store::{CasResult, ListedRef, RefStore, RefToken, RefVersion, StoredRef};
+use crate::remote_telemetry::{RemoteOperationKind, RemoteTelemetryHandle};
 
 pub trait BlobStore {
     fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()>;
@@ -288,8 +288,9 @@ impl BlobStore for LocalFolderBackend {
                         let _ = error;
                         Ok(false)
                     }
-                    Err(error) => Err(error)
-                        .with_context(|| format!("failed to create object {}", full_path.display())),
+                    Err(error) => Err(error).with_context(|| {
+                        format!("failed to create object {}", full_path.display())
+                    }),
                 }
             },
             |_| (0, 0),

@@ -34,10 +34,7 @@ struct TelemetryOperator {
 }
 
 impl TelemetryOperator {
-    fn new(
-        inner: opendal::blocking::Operator,
-        telemetry: Option<RemoteTelemetryHandle>,
-    ) -> Self {
+    fn new(inner: opendal::blocking::Operator, telemetry: Option<RemoteTelemetryHandle>) -> Self {
         Self { inner, telemetry }
     }
 
@@ -71,9 +68,13 @@ impl TelemetryOperator {
 
     fn write(&self, path: &str, bytes: Vec<u8>) -> opendal::Result<opendal::Metadata> {
         let bytes_sent = bytes.len() as u64;
-        self.record_result(RemoteOperationKind::Write, path, bytes_sent, move |operator| {
-            operator.write(path, bytes)
-        }, |_| (0, 0))
+        self.record_result(
+            RemoteOperationKind::Write,
+            path,
+            bytes_sent,
+            move |operator| operator.write(path, bytes),
+            |_| (0, 0),
+        )
     }
 
     fn write_options(
@@ -93,9 +94,13 @@ impl TelemetryOperator {
     }
 
     fn read(&self, path: &str) -> opendal::Result<opendal::Buffer> {
-        self.record_result(RemoteOperationKind::Read, path, 0, |operator| operator.read(path), |buffer| {
-            (buffer.len() as u64, 0)
-        })
+        self.record_result(
+            RemoteOperationKind::Read,
+            path,
+            0,
+            |operator| operator.read(path),
+            |buffer| (buffer.len() as u64, 0),
+        )
     }
 
     fn read_options(
@@ -113,27 +118,43 @@ impl TelemetryOperator {
     }
 
     fn delete(&self, path: &str) -> opendal::Result<()> {
-        self.record_result(RemoteOperationKind::Delete, path, 0, |operator| operator.delete(path), |_| {
-            (0, 0)
-        })
+        self.record_result(
+            RemoteOperationKind::Delete,
+            path,
+            0,
+            |operator| operator.delete(path),
+            |_| (0, 0),
+        )
     }
 
     fn exists(&self, path: &str) -> opendal::Result<bool> {
-        self.record_result(RemoteOperationKind::Exists, path, 0, |operator| operator.exists(path), |_| {
-            (0, 0)
-        })
+        self.record_result(
+            RemoteOperationKind::Exists,
+            path,
+            0,
+            |operator| operator.exists(path),
+            |_| (0, 0),
+        )
     }
 
     fn stat(&self, path: &str) -> opendal::Result<opendal::Metadata> {
-        self.record_result(RemoteOperationKind::Stat, path, 0, |operator| operator.stat(path), |_| {
-            (0, 0)
-        })
+        self.record_result(
+            RemoteOperationKind::Stat,
+            path,
+            0,
+            |operator| operator.stat(path),
+            |_| (0, 0),
+        )
     }
 
     fn list(&self, path: &str) -> opendal::Result<Vec<opendal::Entry>> {
-        self.record_result(RemoteOperationKind::List, path, 0, |operator| operator.list(path), |entries| {
-            (0, entries.len() as u64)
-        })
+        self.record_result(
+            RemoteOperationKind::List,
+            path,
+            0,
+            |operator| operator.list(path),
+            |entries| (0, entries.len() as u64),
+        )
     }
 
     fn list_options(
@@ -177,9 +198,7 @@ impl OpendalMemoryBackend {
     }
 
     #[cfg(test)]
-    fn from_operator(
-        operator: opendal::blocking::Operator,
-    ) -> Self {
+    fn from_operator(operator: opendal::blocking::Operator) -> Self {
         Self::from_operator_with_telemetry(operator, None)
     }
 

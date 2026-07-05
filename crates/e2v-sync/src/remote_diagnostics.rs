@@ -81,8 +81,13 @@ impl RemoteDiagnosticsReport {
     }
 }
 
-pub fn run_remote_diagnostics(options: RemoteDiagnosticsOptions) -> Result<RemoteDiagnosticsReport> {
-    anyhow::ensure!(options.file_count > 0, "file_count must be greater than zero");
+pub fn run_remote_diagnostics(
+    options: RemoteDiagnosticsOptions,
+) -> Result<RemoteDiagnosticsReport> {
+    anyhow::ensure!(
+        options.file_count > 0,
+        "file_count must be greater than zero"
+    );
     anyhow::ensure!(
         options.payload_bytes > 0,
         "payload_bytes must be greater than zero"
@@ -424,9 +429,7 @@ fn measure_clone_phase(
     let started = std::time::Instant::now();
     let clone_options_local = clone_options.clone();
     let (result, metrics) = with_instrumented_remote_backend(remote_spec, |remote| match remote {
-        RemoteBackendRef::LocalFolder(remote) => {
-            clone_remote(remote, clone_options_local.clone())
-        }
+        RemoteBackendRef::LocalFolder(remote) => clone_remote(remote, clone_options_local.clone()),
         RemoteBackendRef::S3(remote) => clone_remote(remote, clone_options_local.clone()),
         RemoteBackendRef::Webdav(remote) => clone_remote(remote, clone_options_local.clone()),
     })?;
@@ -456,9 +459,7 @@ fn measure_fetch_phase(
     let started = std::time::Instant::now();
     let fetch_options_local = fetch_options.clone();
     let (result, metrics) = with_instrumented_remote_backend(remote_spec, |remote| match remote {
-        RemoteBackendRef::LocalFolder(remote) => {
-            fetch_remote(remote, fetch_options_local.clone())
-        }
+        RemoteBackendRef::LocalFolder(remote) => fetch_remote(remote, fetch_options_local.clone()),
         RemoteBackendRef::S3(remote) => fetch_remote(remote, fetch_options_local.clone()),
         RemoteBackendRef::Webdav(remote) => fetch_remote(remote, fetch_options_local.clone()),
     })?;
@@ -511,11 +512,11 @@ fn write_payload_files(
     for index in 0..file_count {
         let prefix = format!("{version}-payload-{index:04}-");
         let repeated = prefix.repeat((payload_bytes / prefix.len()).max(1));
-        let payload = repeated
-            .chars()
-            .take(payload_bytes)
-            .collect::<String>();
-        fs::write(repo_root.join(format!("diagnostic-{index:04}.txt")), payload)?;
+        let payload = repeated.chars().take(payload_bytes).collect::<String>();
+        fs::write(
+            repo_root.join(format!("diagnostic-{index:04}.txt")),
+            payload,
+        )?;
     }
     Ok(())
 }

@@ -96,10 +96,13 @@ impl RemotePathStats {
         self.bytes_sent = self.bytes_sent.saturating_add(bytes_sent);
         self.bytes_received = self.bytes_received.saturating_add(bytes_received);
         self.listed_entries = self.listed_entries.saturating_add(listed_entries);
-        self.operations
-            .entry(kind)
-            .or_default()
-            .record(elapsed, bytes_sent, bytes_received, listed_entries, success);
+        self.operations.entry(kind).or_default().record(
+            elapsed,
+            bytes_sent,
+            bytes_received,
+            listed_entries,
+            success,
+        );
     }
 
     fn subtract(&self, earlier: &Self) -> Self {
@@ -228,15 +231,20 @@ impl RemoteTelemetryHandle {
         snapshot.bytes_sent = snapshot.bytes_sent.saturating_add(bytes_sent);
         snapshot.bytes_received = snapshot.bytes_received.saturating_add(bytes_received);
         snapshot.listed_entries = snapshot.listed_entries.saturating_add(listed_entries);
-        snapshot
-            .operations
-            .entry(kind)
-            .or_default()
-            .record(elapsed, bytes_sent, bytes_received, listed_entries, success);
-        snapshot
-            .paths
-            .entry(path.to_string())
-            .or_default()
-            .record(kind, elapsed, bytes_sent, bytes_received, listed_entries, success);
+        snapshot.operations.entry(kind).or_default().record(
+            elapsed,
+            bytes_sent,
+            bytes_received,
+            listed_entries,
+            success,
+        );
+        snapshot.paths.entry(path.to_string()).or_default().record(
+            kind,
+            elapsed,
+            bytes_sent,
+            bytes_received,
+            listed_entries,
+            success,
+        );
     }
 }

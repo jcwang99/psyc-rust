@@ -6,8 +6,8 @@ mod logical_object_store;
 mod memory_backend;
 mod oblivious_layout;
 mod opendal_backend;
-mod remote_telemetry;
 mod ref_store;
+mod remote_telemetry;
 mod storage_layout;
 
 pub use capability::{BackendCapability, ConsistencyClass, WriterMode};
@@ -29,13 +29,13 @@ pub use opendal_backend::{
     S3CompatibleMockBackend, S3RemoteConfig, WebdavAlistMockBackend, WebdavFlavor,
     WebdavRemoteConfig, WebdavVerifiedCapabilities,
 };
-pub use remote_telemetry::{
-    RemoteOperationKind, RemoteOperationStats, RemotePathStats, RemoteTelemetryHandle,
-    RemoteTelemetrySnapshot,
-};
 pub use ref_store::{
     CasResult, EncryptedRef, ListedRef, RefStore, RefToken, RefVersion, StoredRef,
     validate_ref_token_value,
+};
+pub use remote_telemetry::{
+    RemoteOperationKind, RemoteOperationStats, RemotePathStats, RemoteTelemetryHandle,
+    RemoteTelemetrySnapshot,
 };
 pub use storage_layout::{
     DirectStorageLayout, LayoutObjectLocation, LogicalReadRequest, LogicalResponseWindow,
