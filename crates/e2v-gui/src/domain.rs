@@ -17,6 +17,8 @@ pub enum Message {
     History(crate::pages::history::HistoryMessage),
     Overview(crate::pages::overview::OverviewMessage),
     OverviewJobFinished(Result<crate::pages::overview::OverviewJobResult, AppError>),
+    Sync(crate::pages::sync::SyncMessage),
+    SyncJobFinished(Result<crate::pages::sync::SyncJobResult, AppError>),
     NoOp,
 }
 
@@ -41,6 +43,12 @@ impl From<crate::pages::history::HistoryMessage> for Message {
 impl From<crate::pages::overview::OverviewMessage> for Message {
     fn from(message: crate::pages::overview::OverviewMessage) -> Self {
         Self::Overview(message)
+    }
+}
+
+impl From<crate::pages::sync::SyncMessage> for Message {
+    fn from(message: crate::pages::sync::SyncMessage) -> Self {
+        Self::Sync(message)
     }
 }
 
@@ -144,6 +152,7 @@ pub struct RepositoryHomeCard {
     pub repo_root: PathBuf,
     pub display_name: String,
     pub branch_name: String,
+    pub branch_token: String,
     pub head_snapshot_id: Option<String>,
     pub remote_configured: bool,
 }
@@ -161,6 +170,14 @@ pub enum JobState {
     Running,
     Succeeded,
     Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingConfirmation {
+    SingleWriterRiskPush {
+        repo_root: PathBuf,
+        branch_token: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

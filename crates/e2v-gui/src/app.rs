@@ -4,9 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use iced::widget::{container, text};
 use iced::{Element, Task};
 
-use crate::domain::{JobRecord, JobState, Message, Screen};
+use crate::domain::{JobRecord, JobState, Message, PendingConfirmation, Screen};
 use crate::pages::home::{HomeJobResult, HomeState};
 use crate::pages::overview::{OverviewJobResult, OverviewState};
+use crate::pages::sync::SyncJobResult;
 use crate::pages::workbench::WorkbenchState;
 use crate::services::AppServices;
 
@@ -19,6 +20,7 @@ pub struct PsycGuiApp {
     pub home: HomeState,
     pub workbench: WorkbenchState,
     pub jobs: Vec<JobRecord>,
+    pub pending_confirmation: Option<PendingConfirmation>,
     next_job_id: u64,
 }
 
@@ -36,6 +38,7 @@ pub fn boot_with_services(services: AppServices) -> (PsycGuiApp, Task<Message>) 
             home: HomeState::default(),
             workbench: WorkbenchState::default(),
             jobs: Vec::new(),
+            pending_confirmation: None,
             next_job_id: 1,
         },
         Task::none(),
@@ -54,6 +57,11 @@ pub fn update(app: &mut PsycGuiApp, message: Message) -> Task<Message> {
         Message::Overview(message) => crate::pages::overview::update_overview(app, message),
         Message::OverviewJobFinished(result) => {
             handle_overview_job_result(app, result);
+            Task::none()
+        }
+        Message::Sync(message) => crate::pages::sync::update_sync(app, message),
+        Message::SyncJobFinished(result) => {
+            handle_sync_job_result(app, result);
             Task::none()
         }
         Message::NoOp => Task::none(),
@@ -131,6 +139,7 @@ pub(crate) fn activate_repository(app: &mut PsycGuiApp, card: crate::domain::Rep
         .touch_recent(card.repo_root.clone(), current_unix_ms());
     app.selected_repository = Some(card.repo_root.clone());
     sync_workbench_from_card(&mut app.workbench.overview, &card);
+    app.workbench.branch_token = card.branch_token.clone();
     if let Ok(rows) = app
         .services
         .repository
@@ -162,6 +171,66 @@ fn sync_workbench_from_card(
 ) {
     overview.branch_name = card.branch_name.clone();
     overview.head_snapshot_id = card.head_snapshot_id.clone();
+}
+
+fn handle_sync_job_result(
+    app: &mut PsycGuiApp,
+    result: Result<SyncJobResult, crate::domain::AppError>,
+) {
+    match result {
+        Ok(SyncJobResult::RemoteAdded { repo_root }) => {
+            mark_latest_job_succeeded(app, &repo_root);
+            if let Some(card) = app
+                .home
+                .cards
+                .iter_mut()
+                .find(|existing| existing.repo_root == repo_root)
+            {
+                card.remote_configured = true;
+            }
+            app.workbench.sync.validation_error = None;
+        }
+        Ok(SyncJobResult::Pushed { repo_root, .. })
+        | Ok(SyncJobResult::Fetched { repo_root, .. }) => {
+            mark_latest_job_succeeded(app, &repo_root);
+            app.workbench.sync.validation_error = None;
+        }
+        Ok(SyncJobResult::Pulled {
+            repo_root,
+            snapshot_id,
+        }) => {
+            mark_latest_job_succeeded(app, &repo_root);
+            app.workbench.sync.validation_error = None;
+            app.workbench.overview.head_snapshot_id = Some(snapshot_id.clone());
+            if let Some(card) = app
+                .home
+                .cards
+                .iter_mut()
+                .find(|existing| existing.repo_root == repo_root)
+            {
+                card.head_snapshot_id = Some(snapshot_id);
+            }
+        }
+        Err(error) => {
+            if let Some(job) = app
+                .jobs
+                .iter_mut()
+                .rev()
+                .find(|job| matches!(job.state, JobState::Running))
+            {
+                job.state = JobState::Failed(error.message.clone());
+            }
+            app.workbench.sync.validation_error = Some(error.message);
+        }
+    }
+}
+
+fn mark_latest_job_succeeded(app: &mut PsycGuiApp, repo_root: &std::path::Path) {
+    if let Some(job) = app.jobs.iter_mut().rev().find(|job| {
+        job.repo_root.as_deref() == Some(repo_root) && matches!(job.state, JobState::Running)
+    }) {
+        job.state = JobState::Succeeded;
+    }
 }
 
 fn current_unix_ms() -> u64 {

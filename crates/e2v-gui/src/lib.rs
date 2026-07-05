@@ -6,18 +6,20 @@ pub mod pages {
     pub mod history;
     pub mod home;
     pub mod overview;
+    pub mod sync;
     pub mod workbench;
 }
 pub mod services;
 pub mod testing;
 pub mod widgets {
+    pub mod confirmation_sheet;
     pub mod job_drawer;
 }
 
 pub use app::{PsycGuiApp, boot, boot_with_services};
 pub use domain::{
-    AppError, JobRecord, JobState, Message, RecentRepositoryEntry, RepositoryHomeCard,
-    RepositoryRegistry, Screen, WorkbenchPage,
+    AppError, JobRecord, JobState, Message, PendingConfirmation, RecentRepositoryEntry,
+    RepositoryHomeCard, RepositoryRegistry, Screen, WorkbenchPage,
 };
 
 pub fn run() -> iced::Result {

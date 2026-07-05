@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use e2v_api::{
-    CheckoutSnapshotOptions, CloneRequest, CommitInfo, CommitRepositoryOptions,
-    InitRepositoryOptions, Sdk, SdkErrorCode,
+    CheckoutSnapshotOptions, CloneRequest, CommitInfo, CommitRepositoryOptions, FetchRequest,
+    FetchResponse, InitRepositoryOptions, PullRequest, PullResponse, PushRequest, PushResponse,
+    Sdk, SdkErrorCode,
 };
 
 use crate::domain::{AppError, RepositoryHomeCard};
@@ -61,6 +62,32 @@ pub trait RepositoryService: Send + Sync + std::fmt::Debug + 'static {
     ) -> Result<RepositoryHomeCard, AppError>;
 
     fn delete_branch(&self, repo_root: PathBuf, name: String) -> Result<(), AppError>;
+
+    fn add_remote(&self, repo_root: PathBuf, name: String, spec: String) -> Result<(), AppError>;
+
+    fn push_default_remote(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<PushResponse, AppError>;
+
+    fn push_default_remote_allowing_single_writer_risk(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<PushResponse, AppError>;
+
+    fn fetch_default_remote(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<FetchResponse, AppError>;
+
+    fn pull_default_remote(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<PullResponse, AppError>;
 
     fn load_repository_summary(&self, repo_root: PathBuf) -> Result<RepositoryHomeCard, AppError>;
 }
@@ -215,6 +242,69 @@ impl RepositoryService for RealRepositoryService {
             .map_err(AppError::from_sdk)
     }
 
+    fn add_remote(&self, repo_root: PathBuf, name: String, spec: String) -> Result<(), AppError> {
+        self.sdk
+            .add_remote(&repo_root, &name, &spec)
+            .map(|_| ())
+            .map_err(AppError::from_sdk)
+    }
+
+    fn push_default_remote(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<PushResponse, AppError> {
+        self.sdk
+            .push_default_remote(PushRequest {
+                repo_root,
+                branch_token,
+                operation_id: "gui-push".into(),
+            })
+            .map_err(AppError::from_sdk)
+    }
+
+    fn push_default_remote_allowing_single_writer_risk(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<PushResponse, AppError> {
+        self.sdk
+            .push_default_remote_allowing_single_writer_risk(PushRequest {
+                repo_root,
+                branch_token,
+                operation_id: "gui-push".into(),
+            })
+            .map_err(AppError::from_sdk)
+    }
+
+    fn fetch_default_remote(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<FetchResponse, AppError> {
+        self.sdk
+            .fetch_default_remote(FetchRequest {
+                repo_root,
+                branch_token,
+                password: None,
+            })
+            .map_err(AppError::from_sdk)
+    }
+
+    fn pull_default_remote(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<PullResponse, AppError> {
+        self.sdk
+            .pull_default_remote(PullRequest {
+                repo_root,
+                branch_token,
+                password: None,
+            })
+            .map_err(AppError::from_sdk)
+    }
+
     fn load_repository_summary(&self, repo_root: PathBuf) -> Result<RepositoryHomeCard, AppError> {
         let repository = self
             .sdk
@@ -234,6 +324,7 @@ impl RepositoryService for RealRepositoryService {
             repo_root: repo_root.clone(),
             display_name: Self::display_name(&repo_root),
             branch_name: repository.branch.name,
+            branch_token: repository.branch.token_hex,
             head_snapshot_id: snapshots
                 .first()
                 .map(|snapshot| snapshot.snapshot_id.clone()),

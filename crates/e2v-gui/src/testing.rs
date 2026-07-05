@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use e2v_api::CommitInfo;
+use e2v_api::{CommitInfo, FetchResponse, PullResponse, PushResponse};
 
 use crate::domain::{AppError, RepositoryHomeCard};
 use crate::services::RepositoryService;
@@ -34,6 +34,7 @@ impl FakeRepositoryService {
                 display_name: display_name(&repo_root),
                 repo_root,
                 branch_name: branch_name.into(),
+                branch_token: "branch-token".into(),
                 head_snapshot_id: head_snapshot_id.map(str::to_owned),
                 remote_configured: false,
             },
@@ -64,6 +65,7 @@ impl FakeRepositoryService {
                 display_name: display_name(&repo_root),
                 repo_root: repo_root.clone(),
                 branch_name: branch_name.into(),
+                branch_token: "branch-token".into(),
                 head_snapshot_id: Some(head_snapshot_id.clone()),
                 remote_configured: false,
             },
@@ -173,6 +175,7 @@ impl crate::services::RepositoryService for FakeRepositoryService {
             display_name: display_name(&repo_root),
             repo_root: repo_root.clone(),
             branch_name,
+            branch_token: "branch-token".into(),
             head_snapshot_id: None,
             remote_configured: false,
         };
@@ -230,6 +233,7 @@ impl crate::services::RepositoryService for FakeRepositoryService {
                     display_name: display_name(&repo_root),
                     repo_root,
                     branch_name: "main".into(),
+                    branch_token: "branch-token".into(),
                     head_snapshot_id: Some(result.snapshot_id.clone()),
                     remote_configured: false,
                 },
@@ -322,6 +326,7 @@ impl crate::services::RepositoryService for FakeRepositoryService {
             .get_mut(&repo_root)
             .ok_or_else(|| AppError::internal("missing fake repository summary"))?;
         summary.branch_name = name;
+        summary.branch_token = "branch-token".into();
         summary.head_snapshot_id = head_snapshot_id;
         Ok(summary.clone())
     }
@@ -335,6 +340,57 @@ impl crate::services::RepositoryService for FakeRepositoryService {
             rows.retain(|row| row.name != name);
         }
         Ok(())
+    }
+
+    fn add_remote(&self, repo_root: PathBuf, _name: String, _spec: String) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake repository service state poisoned"))?;
+        if let Some(summary) = state.summaries.get_mut(&repo_root) {
+            summary.remote_configured = true;
+        }
+        Ok(())
+    }
+
+    fn push_default_remote(
+        &self,
+        _repo_root: PathBuf,
+        _branch_token: String,
+    ) -> Result<PushResponse, AppError> {
+        Ok(PushResponse {
+            published_snapshot_id: "push-snapshot".into(),
+            uploaded_objects: 1,
+        })
+    }
+
+    fn push_default_remote_allowing_single_writer_risk(
+        &self,
+        repo_root: PathBuf,
+        branch_token: String,
+    ) -> Result<PushResponse, AppError> {
+        self.push_default_remote(repo_root, branch_token)
+    }
+
+    fn fetch_default_remote(
+        &self,
+        _repo_root: PathBuf,
+        _branch_token: String,
+    ) -> Result<FetchResponse, AppError> {
+        Ok(FetchResponse {
+            downloaded_objects: 1,
+        })
+    }
+
+    fn pull_default_remote(
+        &self,
+        _repo_root: PathBuf,
+        _branch_token: String,
+    ) -> Result<PullResponse, AppError> {
+        Ok(PullResponse {
+            snapshot_id: "pulled-snapshot".into(),
+            fast_forward_applied: true,
+        })
     }
 
     fn load_repository_summary(&self, repo_root: PathBuf) -> Result<RepositoryHomeCard, AppError> {
