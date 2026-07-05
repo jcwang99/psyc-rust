@@ -27,6 +27,10 @@ pub struct HomeState {
 
 #[derive(Debug, Clone)]
 pub enum HomeMessage {
+    SetOpenRepositoryPath(String),
+    SetNewRepositoryPath(String),
+    SetNewRepositoryPassword(String),
+    SetNewRepositoryBranch(String),
     SubmitCreateRepository,
     SubmitOpenRepository,
     SelectRepository(PathBuf),
@@ -42,6 +46,22 @@ pub fn update_home(
     message: HomeMessage,
 ) -> iced::Task<crate::domain::Message> {
     match message {
+        HomeMessage::SetOpenRepositoryPath(value) => {
+            app.home.open_repository_path = value;
+            iced::Task::none()
+        }
+        HomeMessage::SetNewRepositoryPath(value) => {
+            app.home.new_repository.repo_root_text = value;
+            iced::Task::none()
+        }
+        HomeMessage::SetNewRepositoryPassword(value) => {
+            app.home.new_repository.password_text = value;
+            iced::Task::none()
+        }
+        HomeMessage::SetNewRepositoryBranch(value) => {
+            app.home.new_repository.branch_name_text = value;
+            iced::Task::none()
+        }
         HomeMessage::SubmitCreateRepository => {
             if app.home.new_repository.password_text.trim().is_empty() {
                 app.home.validation_error = Some("Password is required".into());

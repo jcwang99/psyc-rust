@@ -19,6 +19,7 @@ pub enum Message {
     OverviewJobFinished(Result<crate::pages::overview::OverviewJobResult, AppError>),
     Sync(crate::pages::sync::SyncMessage),
     SyncJobFinished(Result<crate::pages::sync::SyncJobResult, AppError>),
+    Workbench(crate::pages::workbench::WorkbenchMessage),
     NoOp,
 }
 
@@ -49,6 +50,12 @@ impl From<crate::pages::overview::OverviewMessage> for Message {
 impl From<crate::pages::sync::SyncMessage> for Message {
     fn from(message: crate::pages::sync::SyncMessage) -> Self {
         Self::Sync(message)
+    }
+}
+
+impl From<crate::pages::workbench::WorkbenchMessage> for Message {
+    fn from(message: crate::pages::workbench::WorkbenchMessage) -> Self {
+        Self::Workbench(message)
     }
 }
 
@@ -163,6 +170,10 @@ pub enum WorkbenchPage {
     History,
     Branches,
     Sync,
+    Search,
+    Sharing,
+    Preview,
+    Advanced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -13,7 +13,10 @@ pub mod services;
 pub mod testing;
 pub mod widgets {
     pub mod confirmation_sheet;
+    pub mod home_screen;
     pub mod job_drawer;
+    pub mod status_badge;
+    pub mod workbench_shell;
 }
 
 pub use app::{PsycGuiApp, boot, boot_with_services};

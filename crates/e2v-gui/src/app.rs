@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced::widget::{container, text};
 use iced::{Element, Task};
 
 use crate::domain::{JobRecord, JobState, Message, PendingConfirmation, Screen};
@@ -64,17 +63,16 @@ pub fn update(app: &mut PsycGuiApp, message: Message) -> Task<Message> {
             handle_sync_job_result(app, result);
             Task::none()
         }
+        Message::Workbench(message) => crate::pages::workbench::update_workbench(app, message),
         Message::NoOp => Task::none(),
     }
 }
 
 pub fn view(app: &PsycGuiApp) -> Element<'_, Message> {
-    let title = match app.screen {
-        Screen::Home => "Repositories",
-        Screen::Workbench => "Workbench",
-    };
-
-    container(text(title).size(32)).into()
+    match app.screen {
+        Screen::Home => crate::widgets::home_screen::view_home(app),
+        Screen::Workbench => crate::widgets::workbench_shell::view_workbench(app),
+    }
 }
 
 fn handle_home_job_result(

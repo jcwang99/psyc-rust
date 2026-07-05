@@ -14,6 +14,8 @@ pub struct HistoryState {
 
 #[derive(Debug, Clone)]
 pub enum HistoryMessage {
+    SelectSnapshot(String),
+    SetCheckoutTargetDir(String),
     SubmitCheckout,
 }
 
@@ -22,6 +24,14 @@ pub fn update_history(
     message: HistoryMessage,
 ) -> iced::Task<crate::domain::Message> {
     match message {
+        HistoryMessage::SelectSnapshot(snapshot_id) => {
+            app.workbench.history.selected_snapshot_id = Some(snapshot_id);
+            iced::Task::none()
+        }
+        HistoryMessage::SetCheckoutTargetDir(value) => {
+            app.workbench.history.checkout_target_dir = value;
+            iced::Task::none()
+        }
         HistoryMessage::SubmitCheckout => {
             let Some(snapshot_id) = app.workbench.history.selected_snapshot_id.clone() else {
                 app.workbench.history.validation_error =
@@ -57,4 +67,53 @@ pub fn update_history(
             }
         }
     }
+}
+
+pub fn view_history(app: &crate::app::PsycGuiApp) -> iced::Element<'_, crate::domain::Message> {
+    use iced::widget::{button, column, container, text, text_input};
+
+    let selected_snapshot = app.workbench.history.selected_snapshot_id.as_deref();
+    let rows = if app.workbench.history.rows.is_empty() {
+        column![text("No snapshots loaded yet.")]
+    } else {
+        app.workbench
+            .history
+            .rows
+            .iter()
+            .fold(column![].spacing(8), |column, snapshot| {
+                let label = if selected_snapshot == Some(snapshot.snapshot_id.as_str()) {
+                    format!("> {} - {}", snapshot.snapshot_id, snapshot.message)
+                } else {
+                    format!("{} - {}", snapshot.snapshot_id, snapshot.message)
+                };
+                column.push(
+                    button(text(label))
+                        .on_press(HistoryMessage::SelectSnapshot(snapshot.snapshot_id.clone())),
+                )
+            })
+    };
+
+    let content = {
+        let base = column![
+            text("History").size(28),
+            rows,
+            text_input(
+                "Checkout target directory",
+                &app.workbench.history.checkout_target_dir
+            )
+            .on_input(HistoryMessage::SetCheckoutTargetDir)
+            .padding(10),
+            button("Checkout snapshot").on_press(HistoryMessage::SubmitCheckout),
+        ]
+        .spacing(12);
+
+        if let Some(error) = app.workbench.history.validation_error.as_ref() {
+            base.push(text(error))
+        } else {
+            base
+        }
+    };
+
+    let page: iced::Element<'_, HistoryMessage> = container(content).padding(20).into();
+    page.map(crate::domain::Message::from)
 }

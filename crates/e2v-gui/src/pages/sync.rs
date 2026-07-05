@@ -7,6 +7,8 @@ pub struct SyncState {
 
 #[derive(Debug, Clone)]
 pub enum SyncMessage {
+    SetRemoteName(String),
+    SetRemoteSpec(String),
     SubmitAddRemote,
     SubmitPush,
     SubmitPushWithSingleWriterRisk,
@@ -40,6 +42,14 @@ pub fn update_sync(
     message: SyncMessage,
 ) -> iced::Task<crate::domain::Message> {
     match message {
+        SyncMessage::SetRemoteName(value) => {
+            app.workbench.sync.remote_name = value;
+            iced::Task::none()
+        }
+        SyncMessage::SetRemoteSpec(value) => {
+            app.workbench.sync.remote_spec = value;
+            iced::Task::none()
+        }
         SyncMessage::SubmitAddRemote => submit_add_remote(app),
         SyncMessage::SubmitPush => submit_push(app),
         SyncMessage::SubmitPushWithSingleWriterRisk => {
@@ -191,4 +201,38 @@ fn push_job(app: &mut crate::app::PsycGuiApp, label: &str, repo_root: Option<std
         repo_root,
         state: crate::domain::JobState::Running,
     });
+}
+
+pub fn view_sync(app: &crate::app::PsycGuiApp) -> iced::Element<'_, crate::domain::Message> {
+    use iced::widget::{button, column, container, row, text, text_input};
+
+    let content = {
+        let base = column![
+            text("Sync").size(28),
+            text_input("Remote name", &app.workbench.sync.remote_name)
+                .on_input(SyncMessage::SetRemoteName)
+                .padding(10),
+            text_input("Remote spec", &app.workbench.sync.remote_spec)
+                .on_input(SyncMessage::SetRemoteSpec)
+                .padding(10),
+            row![
+                button("Add remote").on_press(SyncMessage::SubmitAddRemote),
+                button("Push").on_press(SyncMessage::SubmitPush),
+                button("Push (risk)").on_press(SyncMessage::SubmitPushWithSingleWriterRisk),
+                button("Fetch").on_press(SyncMessage::SubmitFetch),
+                button("Pull").on_press(SyncMessage::SubmitPull),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12);
+
+        if let Some(error) = app.workbench.sync.validation_error.as_ref() {
+            base.push(text(error))
+        } else {
+            base
+        }
+    };
+
+    let page: iced::Element<'_, SyncMessage> = container(content).padding(20).into();
+    page.map(crate::domain::Message::from)
 }
