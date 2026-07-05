@@ -1353,12 +1353,17 @@ pub fn resume_push<R: RemoteBackend + Clone>(
                     |object_id| journal.record_verified(&operation_id, object_id, "object"),
                 )?);
             } else {
+                let pack_enabled = should_pack_current_upload_set(
+                    &options.repo_root,
+                    &missing_object_ids,
+                    reachable_object_ids.len(),
+                )?;
                 published_pack_index_segments.extend(upload_objects_with_policy(
                     remote,
                     &options.repo_root,
                     &operation_id,
                     &missing_object_ids,
-                    reachable_object_ids.len() >= small_object_pack_threshold(),
+                    pack_enabled,
                     |object_id| journal.record_verified(&operation_id, object_id, "object"),
                 )?);
             }

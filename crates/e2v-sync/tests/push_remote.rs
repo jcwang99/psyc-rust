@@ -3898,6 +3898,73 @@ fn resume_uses_pack_uploads_for_small_repository_when_journal_missing_set_contai
 }
 
 #[test]
+fn resume_without_journal_uses_pack_uploads_for_small_repository_when_multiple_missing_objects_exist()
+{
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "adaptive-pack-resume-fallback".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "adaptive-pack-resume-fallback-seed-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+    assert!(
+        reachable_object_ids.len() >= 2,
+        "test requires at least two reachable objects"
+    );
+    for object_id in &reachable_object_ids {
+        remote
+            .delete_physical(&format!("objects/{object_id}.json"))
+            .unwrap();
+    }
+
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(2);
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "adaptive-pack-resume-fallback-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert!(!remote.list_physical("packs/index/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/data/").unwrap().is_empty());
+}
+
+#[test]
 fn resume_repairs_corrupted_existing_remote_object_instead_of_marking_it_verified() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
