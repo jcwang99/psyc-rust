@@ -86,9 +86,12 @@ pub fn view_search(app: &crate::app::PsycGuiApp) -> iced::Element<'_, crate::dom
             text_input("Filename or extension", &app.workbench.search.query_text)
                 .on_input(SearchMessage::SetQueryText)
                 .padding(10),
-            text_input("Optional path prefix", &app.workbench.search.path_prefix_text)
-                .on_input(SearchMessage::SetPathPrefixText)
-                .padding(10),
+            text_input(
+                "Optional path prefix",
+                &app.workbench.search.path_prefix_text
+            )
+            .on_input(SearchMessage::SetPathPrefixText)
+            .padding(10),
             button("Search").on_press(SearchMessage::SubmitSearch),
             results,
         ]

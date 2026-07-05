@@ -43,7 +43,10 @@ fn successful_filename_search_populates_result_rows() {
 
     assert_eq!(search.call_count(), 1);
     assert_eq!(harness.app.workbench.search.results.len(), 1);
-    assert_eq!(harness.app.workbench.search.results[0].path, "notes/todo.txt");
+    assert_eq!(
+        harness.app.workbench.search.results[0].path,
+        "notes/todo.txt"
+    );
     assert_eq!(
         search.last_query().unwrap(),
         e2v_gui::services::SearchQuery {

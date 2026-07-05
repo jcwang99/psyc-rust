@@ -949,6 +949,7 @@ name = "e2v-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "e2v-api",
  "e2v-core",
  "iced",
