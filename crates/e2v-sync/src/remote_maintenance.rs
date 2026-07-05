@@ -14,8 +14,9 @@ use crate::fetch::{
     RemoteReachabilityRecorder, RemoteReachabilityTraversal, RemoteValidationRoot,
     assert_remote_generations_meet_local_floor, collect_remote_reachable_object_ids,
     collect_remote_reachable_object_ids_with_recorder, decode_default_ref_record_with_secrets,
-    fetch_remote_object_into_validation_root, next_validation_root, read_remote_control_plane,
-    update_trusted_remote_state_from_control_plane, write_remote_control_plane_to_validation_root,
+    fetch_remote_object_into_validation_root, next_validation_root,
+    read_remote_control_plane_for_repo, update_trusted_remote_state_from_control_plane,
+    write_remote_control_plane_to_validation_root,
 };
 use crate::journal::{OperationId, OperationJournal, RewriteJournalState};
 use crate::object_type::candidate_object_types;
@@ -654,8 +655,11 @@ fn hydrate_remote_branch_history_for_rewrite<R: RemoteBackend>(
     let mut pack_cache = BTreeMap::new();
 
     for listed_ref in remote_branch_refs {
-        let control_plane =
-            read_remote_control_plane(remote, listed_ref.stored.value.bytes.clone())?;
+        let control_plane = read_remote_control_plane_for_repo(
+            remote,
+            repo_root,
+            listed_ref.stored.value.bytes.clone(),
+        )?;
         assert_remote_generations_meet_local_floor(
             &listed_ref.token.value,
             &listed_ref.stored,
@@ -1019,7 +1023,11 @@ pub fn force_accept_remote_rollback<R: RemoteBackend>(
     let default_ref = remote
         .read_ref(&RefToken::new(branch_token.clone()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    let control_plane = read_remote_control_plane_for_repo(
+        remote,
+        &options.repo_root,
+        default_ref.value.bytes.clone(),
+    )?;
     let remote_validation_secrets = sync_support::unlock_repo_secrets_from_keyring_bytes_for_sync(
         &control_plane.current_keyring_bytes,
         password,
@@ -1730,8 +1738,11 @@ fn collect_all_remote_reachable_object_ids<R: RemoteBackend>(
         sync_support::decode_default_ref_record(repo_root, &local_default_ref_bytes)?;
     let mut saw_head_snapshot = false;
     for listed_ref in list_remote_branch_refs(traversal.remote, repo_root)? {
-        let control_plane =
-            read_remote_control_plane(traversal.remote, listed_ref.stored.value.bytes.clone())?;
+        let control_plane = read_remote_control_plane_for_repo(
+            traversal.remote,
+            repo_root,
+            listed_ref.stored.value.bytes.clone(),
+        )?;
         write_remote_control_plane_to_validation_root(traversal.validation_root, &control_plane)?;
         let (decoded_branch_token, head_snapshot_id) = decode_default_ref_record_with_secrets(
             traversal.validation_secrets,
@@ -1788,7 +1799,8 @@ fn load_maintenance_remote_state<R: RemoteBackend>(
     let default_ref = remote
         .read_ref(&RefToken::new(branch_token.to_string()))?
         .ok_or_else(|| anyhow::anyhow!("remote branch ref not found for {branch_token}"))?;
-    let control_plane = read_remote_control_plane(remote, default_ref.value.bytes.clone())?;
+    let control_plane =
+        read_remote_control_plane_for_repo(remote, repo_root, default_ref.value.bytes.clone())?;
     let validation_secrets =
         load_maintenance_validation_secrets(&control_dir, &control_plane.current_keyring_bytes)?;
     let remote_loose_object_ids = load_remote_loose_object_ids(remote)?;

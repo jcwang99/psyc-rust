@@ -781,7 +781,15 @@ fn classify_repository_sync_mode<R: RemoteBackend>(
         }
         anyhow::bail!("local keyring pointer generation mismatch");
     }
-    let remote_pointer_bytes = read_remote_keyring_pointer_bytes(remote)?;
+    let remote_pointer_bytes = if has_local_objects {
+        let repo_root = control_dir
+            .parent()
+            .context("control directory has no repository root")?;
+        crate::push::ensure_remote_root_matches_local_repository(remote, repo_root)?;
+        read_remote_keyring_pointer_bytes_for_repo(remote, repo_root)?
+    } else {
+        read_remote_keyring_pointer_bytes(remote)?
+    };
     let remote_pointer: KeyringPointer = serde_json::from_slice(&remote_pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
     validate_remote_relative_name(&remote_pointer.current).map_err(|error| {
@@ -1031,6 +1039,24 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
     default_ref_bytes: Vec<u8>,
 ) -> Result<RemoteControlPlane> {
     let keyring_pointer_bytes = read_remote_keyring_pointer_bytes(remote)?;
+    read_remote_control_plane_with_pointer_bytes(remote, default_ref_bytes, keyring_pointer_bytes)
+}
+
+pub(crate) fn read_remote_control_plane_for_repo<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+    default_ref_bytes: Vec<u8>,
+) -> Result<RemoteControlPlane> {
+    crate::push::ensure_remote_root_matches_local_repository(remote, repo_root)?;
+    let keyring_pointer_bytes = read_remote_keyring_pointer_bytes_for_repo(remote, repo_root)?;
+    read_remote_control_plane_with_pointer_bytes(remote, default_ref_bytes, keyring_pointer_bytes)
+}
+
+fn read_remote_control_plane_with_pointer_bytes<R: RemoteBackend>(
+    remote: &R,
+    default_ref_bytes: Vec<u8>,
+    keyring_pointer_bytes: Vec<u8>,
+) -> Result<RemoteControlPlane> {
     let keyring_pointer: KeyringPointer = serde_json::from_slice(&keyring_pointer_bytes)
         .context("failed to decode remote keyring pointer")?;
     validate_remote_relative_name(&keyring_pointer.current).map_err(|error| {
@@ -1097,6 +1123,20 @@ pub(crate) fn read_remote_control_plane<R: RemoteBackend>(
         layout_root_bytes,
         default_ref_bytes,
     })
+}
+
+fn read_remote_keyring_pointer_bytes_for_repo<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<Vec<u8>> {
+    let pointer_token = RefToken::new(format!(
+        "keyring/{}",
+        e2v_core::sync_support::read_repo_id(repo_root)?
+    ));
+    remote
+        .read_ref(&pointer_token)?
+        .map(|stored| stored.value.bytes)
+        .ok_or_else(|| anyhow::anyhow!("missing remote keyring pointer ref"))
 }
 
 fn read_remote_keyring_pointer_bytes<R: RemoteBackend>(remote: &R) -> Result<Vec<u8>> {

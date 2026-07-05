@@ -78,6 +78,37 @@ fn read_remote_keyring_pointer_ref_bytes(
         .bytes
 }
 
+fn read_local_keyring_pointer_and_current_bytes(
+    repo_root: &std::path::Path,
+) -> (Vec<u8>, String, Vec<u8>) {
+    let keyring_dir = repo_root.join(".e2v").join("keyring");
+    let pointer_bytes = fs::read(keyring_dir.join("keyring.current")).unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let current = pointer["current"].as_str().unwrap().to_string();
+    let current_bytes = fs::read(keyring_dir.join(&current)).unwrap();
+    (pointer_bytes, current, current_bytes)
+}
+
+fn inject_foreign_keyring_ref_for_test(remote: &MemoryBackend, repo_root: &std::path::Path) {
+    let (pointer_bytes, current, current_bytes) =
+        read_local_keyring_pointer_and_current_bytes(repo_root);
+    let pointer_ref = keyring_pointer_ref_token(repo_root);
+    let applied = remote
+        .compare_and_swap_ref(
+            &pointer_ref,
+            None,
+            e2v_store::EncryptedRef::new(pointer_bytes),
+        )
+        .unwrap();
+    assert!(
+        applied.applied,
+        "foreign keyring pointer ref injection should succeed"
+    );
+    remote
+        .put_physical(&format!("control/keyring/{current}"), &current_bytes)
+        .unwrap();
+}
+
 #[derive(Debug)]
 struct RemotePackedObjectForTest {
     data_path: String,
@@ -3844,7 +3875,10 @@ fn fetch_rejects_remote_state_for_a_different_local_repository() {
     .unwrap_err();
 
     assert!(
-        error.to_string().contains("repository identity mismatch"),
+        error.to_string().contains("repository identity mismatch")
+            || error
+                .to_string()
+                .contains("remote root already contains keyring refs for a different repository"),
         "unexpected error: {error:#}"
     );
     assert_eq!(
@@ -3929,6 +3963,81 @@ fn fetch_rejects_different_remote_even_when_local_keyring_pointer_is_missing() {
     assert_eq!(
         fs::read(target_repo_root.join(".e2v").join("layout_root.json")).unwrap(),
         original_layout_bytes
+    );
+}
+
+#[test]
+fn fetch_existing_repo_rejects_remote_root_with_foreign_keyring_ref_explicitly() {
+    let (temp, facade, source_repo_root, branch_token, remote) = seed_remote();
+    let target_repo_root = temp.path().join("fetch-target");
+
+    clone_remote(
+        &remote,
+        CloneOptions {
+            repo_root: target_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_token: branch_token.clone(),
+        },
+    )
+    .unwrap();
+
+    let foreign_repo_root = temp.path().join("foreign");
+    fs::create_dir_all(&foreign_repo_root).unwrap();
+    facade
+        .init(InitOptions {
+            repo_root: foreign_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(foreign_repo_root.join("foreign.txt"), b"foreign").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: foreign_repo_root.clone(),
+            message: "foreign".to_string(),
+        })
+        .unwrap();
+    facade
+        .change_password(
+            &foreign_repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    inject_foreign_keyring_ref_for_test(&remote, &foreign_repo_root);
+
+    let error = fetch_remote(
+        &remote,
+        FetchOptions {
+            password: Some("correct horse battery staple".to_string()),
+            repo_root: target_repo_root.clone(),
+            branch_token,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("remote root already contains keyring refs for a different repository"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("ambiguous remote keyring pointer refs"),
+        "fetch should fail on explicit foreign-repository validation before the generic pointer scan"
+    );
+    assert_eq!(
+        read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root),
+        fs::read(
+            target_repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap(),
+        "pre-existing local repository state should remain unchanged on the explicit remote-root mismatch path"
     );
 }
 

@@ -517,8 +517,11 @@ fn collect_and_hydrate_remote_reachable_object_ids_for_oram_publish<R: RemoteBac
     let mut pack_cache = BTreeMap::new();
 
     for listed_ref in remote_branch_refs {
-        let control_plane =
-            crate::fetch::read_remote_control_plane(remote, listed_ref.stored.value.bytes.clone())?;
+        let control_plane = crate::fetch::read_remote_control_plane_for_repo(
+            remote,
+            repo_root,
+            listed_ref.stored.value.bytes.clone(),
+        )?;
         crate::fetch::write_remote_control_plane_to_validation_root(
             &validation_root,
             &control_plane,

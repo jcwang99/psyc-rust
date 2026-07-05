@@ -726,7 +726,7 @@ pub(crate) fn remote_keyring_matches<R: RemoteBackend>(
     })
 }
 
-fn ensure_remote_root_matches_local_repository<R: RemoteBackend>(
+pub(crate) fn ensure_remote_root_matches_local_repository<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
 ) -> Result<bool> {

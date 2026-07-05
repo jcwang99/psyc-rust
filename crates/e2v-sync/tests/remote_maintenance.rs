@@ -39,6 +39,36 @@ fn read_remote_keyring_pointer_ref_bytes(
         .bytes
 }
 
+fn read_local_keyring_pointer_and_current_bytes(
+    repo_root: &std::path::Path,
+) -> (Vec<u8>, String, Vec<u8>) {
+    let keyring_dir = repo_root.join(".e2v").join("keyring");
+    let pointer_bytes = fs::read(keyring_dir.join("keyring.current")).unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let current = pointer["current"].as_str().unwrap().to_string();
+    let current_bytes = fs::read(keyring_dir.join(&current)).unwrap();
+    (pointer_bytes, current, current_bytes)
+}
+
+fn inject_foreign_keyring_ref_for_test(remote: &MemoryBackend, repo_root: &std::path::Path) {
+    let (pointer_bytes, current, current_bytes) =
+        read_local_keyring_pointer_and_current_bytes(repo_root);
+    let pointer_ref = RefToken::new(format!(
+        "keyring/{}",
+        e2v_core::sync_support::read_repo_id(repo_root).unwrap()
+    ));
+    let applied = remote
+        .compare_and_swap_ref(&pointer_ref, None, EncryptedRef::new(pointer_bytes))
+        .unwrap();
+    assert!(
+        applied.applied,
+        "foreign keyring pointer ref injection should succeed"
+    );
+    remote
+        .put_physical(&format!("control/keyring/{current}"), &current_bytes)
+        .unwrap();
+}
+
 enum UndeletableCacheEntryGuard {
     #[cfg(unix)]
     Permissions { path: PathBuf, original_mode: u32 },
@@ -7600,6 +7630,98 @@ fn upload_local_objects_to_remote(
             .put_physical(&format!("objects/{object_id}.json"), &bytes)
             .unwrap();
     }
+}
+
+#[test]
+fn verify_remote_rejects_remote_root_with_foreign_keyring_ref_explicitly() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    let foreign_repo_root = temp.path().join("foreign");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&foreign_repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap();
+
+    let remote = MemoryBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "push-op-foreign-keyring-root".to_string(),
+        },
+    )
+    .unwrap();
+
+    facade
+        .init(InitOptions {
+            repo_root: foreign_repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(foreign_repo_root.join("foreign.txt"), b"foreign").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: foreign_repo_root.clone(),
+            message: "foreign".to_string(),
+        })
+        .unwrap();
+    facade
+        .change_password(
+            &foreign_repo_root,
+            "correct horse battery staple",
+            "new horse battery staple",
+        )
+        .unwrap();
+    inject_foreign_keyring_ref_for_test(&remote, &foreign_repo_root);
+
+    let error = verify_remote(
+        &remote,
+        VerifyRemoteOptions {
+            repo_root: repo_root.clone(),
+            sample_percent: 100,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("remote root already contains keyring refs for a different repository"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("ambiguous remote keyring pointer refs"),
+        "verify_remote should fail on explicit foreign-repository validation before the generic pointer scan"
+    );
+    assert_eq!(
+        read_remote_keyring_pointer_ref_bytes(&remote, &repo_root),
+        fs::read(
+            repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap()
+    );
 }
 
 #[test]
