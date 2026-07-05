@@ -34,6 +34,11 @@ const OBLIVIOUS_ROOT_STABLE_NAME: &str = "oblivious-root";
 const OBLIVIOUS_ROOT_OBJECT_TYPE: &str = "oblivious-root";
 const OBLIVIOUS_OBJECT_BATCH_SIZE: usize = 256;
 
+pub(crate) struct ObservedRemoteActivePackLocations {
+    pub(crate) layout_root_generation: u64,
+    pub(crate) pack_locations: BTreeMap<String, PackedObjectLocation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObliviousLayoutPlan {
     pub estimated_real_reads_per_request: u8,
@@ -176,17 +181,34 @@ pub(crate) fn load_remote_active_pack_locations_with_local_cache<R: RemoteBacken
     control_dir: &Path,
     secrets: &RepoSecrets,
 ) -> Result<BTreeMap<String, PackedObjectLocation>> {
-    let layout_root = remote.read_layout_root()?;
-    if !matches!(layout_root.mode, LayoutMode::Oblivious) {
-        return load_remote_pack_locations_with_local_cache(remote, control_dir, Some(secrets));
-    }
-    let segment_paths = load_remote_active_pack_segment_paths(remote, secrets)?;
-    load_remote_pack_locations_from_segment_paths_with_local_cache(
-        remote,
-        control_dir,
-        Some(secrets),
-        &segment_paths,
+    Ok(
+        load_remote_active_pack_locations_with_observed_layout_root(remote, control_dir, secrets)?
+            .pack_locations,
     )
+}
+
+pub(crate) fn load_remote_active_pack_locations_with_observed_layout_root<R: RemoteBackend>(
+    remote: &R,
+    control_dir: &Path,
+    secrets: &RepoSecrets,
+) -> Result<ObservedRemoteActivePackLocations> {
+    let layout_root = remote.read_layout_root()?;
+    let pack_locations = if !matches!(layout_root.mode, LayoutMode::Oblivious) {
+        load_remote_pack_locations_with_local_cache(remote, control_dir, Some(secrets))?
+    } else {
+        let segment_paths =
+            active_pack_segment_paths_for_layout_root(remote, &layout_root, secrets)?;
+        load_remote_pack_locations_from_segment_paths_with_local_cache(
+            remote,
+            control_dir,
+            Some(secrets),
+            &segment_paths,
+        )?
+    };
+    Ok(ObservedRemoteActivePackLocations {
+        layout_root_generation: layout_root.generation,
+        pack_locations,
+    })
 }
 
 pub(crate) fn load_remote_active_pack_segment_paths<R: RemoteBackend>(
@@ -194,6 +216,14 @@ pub(crate) fn load_remote_active_pack_segment_paths<R: RemoteBackend>(
     secrets: &RepoSecrets,
 ) -> Result<Vec<String>> {
     let layout_root = remote.read_layout_root()?;
+    active_pack_segment_paths_for_layout_root(remote, &layout_root, secrets)
+}
+
+fn active_pack_segment_paths_for_layout_root<R: RemoteBackend>(
+    remote: &R,
+    layout_root: &LayoutRoot,
+    secrets: &RepoSecrets,
+) -> Result<Vec<String>> {
     if matches!(layout_root.mode, LayoutMode::Oblivious) {
         let root = remote_oblivious_root_with_secrets(remote, secrets)?.context(
             "remote layout root declares oblivious mode but oblivious/root.json is missing",
@@ -251,6 +281,7 @@ fn execute_oblivious_layout_publish<R: RemoteBackend + Clone>(
         writer_mode: remote.capability().push_write_mode(),
     })?;
     let session = PublishSession {
+        observed_layout_root_generation: Some(current_layout_root.generation),
         next_layout_root: Some(next_layout_root.clone()),
         next_layout_root_bytes: Some(next_layout_root_bytes),
         ..session

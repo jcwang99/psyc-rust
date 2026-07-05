@@ -494,6 +494,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         writer_mode: remote.capability().push_write_mode(),
     })?;
     let session = PublishSession {
+        observed_layout_root_generation: None,
         next_layout_root: Some(layout_root.clone()),
         next_layout_root_bytes: Some(layout_root_bytes.clone()),
         ..session

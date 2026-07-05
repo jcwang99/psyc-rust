@@ -183,6 +183,7 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             planned_snapshot_id: plan.planned_snapshot_id,
             writer_mode,
             started_at_remote_unix_ms: observed_at,
+            observed_layout_root_generation: None,
             next_layout_root: None,
             next_layout_root_bytes: None,
             active_intent_path,
@@ -464,9 +465,12 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
 
     fn publish_layout_if_needed(&self, session: &PublishSession) -> Result<LayoutRootVersion> {
         if let Some(next_layout_root) = &session.next_layout_root {
-            let current_layout_root = self.remote_backend.read_layout_root()?;
+            let expected_generation = match session.observed_layout_root_generation {
+                Some(generation) => generation,
+                None => self.remote_backend.read_layout_root()?.generation,
+            };
             let result = self.remote_backend.compare_and_swap_layout_root(
-                current_layout_root.generation,
+                expected_generation,
                 next_layout_root.clone(),
             )?;
             anyhow::ensure!(
@@ -475,7 +479,10 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             );
             Ok(next_layout_root.generation)
         } else {
-            Ok(self.remote_backend.read_layout_root()?.generation)
+            match session.observed_layout_root_generation {
+                Some(generation) => Ok(generation),
+                None => Ok(self.remote_backend.read_layout_root()?.generation),
+            }
         }
     }
 
@@ -559,6 +566,7 @@ mod tests {
     struct LayoutRootWriteCountingBackend {
         inner: e2v_store::MemoryBackend,
         layout_root_puts: Arc<Mutex<usize>>,
+        layout_root_reads: Arc<Mutex<usize>>,
     }
 
     impl LayoutRootWriteCountingBackend {
@@ -566,11 +574,16 @@ mod tests {
             Self {
                 inner: e2v_store::MemoryBackend::new(),
                 layout_root_puts: Arc::new(Mutex::new(0)),
+                layout_root_reads: Arc::new(Mutex::new(0)),
             }
         }
 
         fn layout_root_put_count(&self) -> usize {
             *self.layout_root_puts.lock().unwrap()
+        }
+
+        fn layout_root_read_count(&self) -> usize {
+            *self.layout_root_reads.lock().unwrap()
         }
     }
 
@@ -637,6 +650,7 @@ mod tests {
 
     impl LayoutRootStore for LayoutRootWriteCountingBackend {
         fn read_layout_root(&self) -> Result<LayoutRoot> {
+            *self.layout_root_reads.lock().unwrap() += 1;
             self.inner.read_layout_root()
         }
 
@@ -645,7 +659,7 @@ mod tests {
             expected: u64,
             next: LayoutRoot,
         ) -> Result<CasResult> {
-            let current = self.read_layout_root()?;
+            let current = self.inner.read_layout_root()?;
             if current.generation != expected {
                 return Ok(CasResult {
                     applied: false,
@@ -1370,6 +1384,43 @@ mod tests {
             remote.layout_root_put_count(),
             1,
             "layout root publish should not rewrite layout_root.json after the layout CAS already stored it"
+        );
+    }
+
+    #[test]
+    fn publish_layout_if_needed_reuses_observed_layout_generation_without_extra_read() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = LayoutRootWriteCountingBackend::new();
+        let publisher =
+            SimpleTransactionPublisher::new(remote.capability().clone(), journal, remote.clone());
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-layout-root-reuse".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: None,
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+        let next_layout_root = LayoutRoot {
+            generation: 2,
+            ..LayoutRoot::direct_default()
+        };
+        let session = PublishSession {
+            observed_layout_root_generation: Some(1),
+            next_layout_root: Some(next_layout_root.clone()),
+            next_layout_root_bytes: Some(serde_json::to_vec(&next_layout_root).unwrap()),
+            ..session
+        };
+
+        publisher.publish_layout_if_needed(&session).unwrap();
+
+        assert_eq!(
+            remote.layout_root_read_count(),
+            0,
+            "layout root publish should reuse the already observed generation instead of reading layout_root.json again before CAS"
         );
     }
 
@@ -2714,6 +2765,7 @@ mod tests {
             planned_snapshot_id: None,
             writer_mode: WriterMode::ReadOnly,
             started_at_remote_unix_ms: 0,
+            observed_layout_root_generation: None,
             next_layout_root: None,
             next_layout_root_bytes: None,
             active_intent_path: "transactions/active/op-invalid-session.intent".to_string(),

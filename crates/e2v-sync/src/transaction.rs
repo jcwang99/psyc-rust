@@ -22,6 +22,8 @@ pub struct PublishSession {
     pub planned_snapshot_id: Option<String>,
     pub writer_mode: WriterMode,
     pub started_at_remote_unix_ms: u64,
+    #[serde(default)]
+    pub observed_layout_root_generation: Option<u64>,
     pub next_layout_root: Option<LayoutRoot>,
     pub next_layout_root_bytes: Option<Vec<u8>>,
     pub active_intent_path: String,

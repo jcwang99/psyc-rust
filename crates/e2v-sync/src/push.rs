@@ -13,7 +13,7 @@ use e2v_store::{
 use crate::fetch::validate_remote_relative_name;
 use crate::journal::{OperationId, OperationJournal, OperationMetadata, validate_sync_identifier};
 use crate::object_type::infer_object_type_from_hint;
-use crate::oram::load_remote_active_pack_locations_with_local_cache;
+use crate::oram::load_remote_active_pack_locations_with_observed_layout_root;
 use crate::pack::{ObjectPackBuilder, ObjectPackIndex, PackedObjectLocation, pack_paths};
 use crate::pack_index::{
     encode_pack_index_segment_bytes_for_sync, next_pack_index_segment_paths,
@@ -182,11 +182,19 @@ fn load_remote_object_inventory<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
     secrets: &RepoSecrets,
-) -> Result<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
+) -> Result<(
+    u64,
+    BTreeSet<String>,
+    BTreeMap<String, PackedObjectLocation>,
+)> {
     let control_dir = repo_root.join(".e2v");
-    let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, secrets)?;
-    Ok((load_remote_loose_object_ids(remote)?, pack_locations))
+    let observed =
+        load_remote_active_pack_locations_with_observed_layout_root(remote, &control_dir, secrets)?;
+    Ok((
+        observed.layout_root_generation,
+        load_remote_loose_object_ids(remote)?,
+        observed.pack_locations,
+    ))
 }
 
 fn load_remote_resume_pack_locations<R: RemoteBackend>(
@@ -323,7 +331,11 @@ fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
 ) -> Result<&'a (BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
     match inventory {
         Some(inventory) => Ok(inventory),
-        None => Ok(inventory.insert(load_remote_object_inventory(repo_root, remote, secrets)?)),
+        None => {
+            let (_, remote_loose_object_ids, remote_pack_locations) =
+                load_remote_object_inventory(repo_root, remote, secrets)?;
+            Ok(inventory.insert((remote_loose_object_ids, remote_pack_locations)))
+        }
     }
 }
 
@@ -1078,7 +1090,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
         };
     let control_dir = options.repo_root.join(".e2v");
     let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
-    let (mut remote_loose_object_ids, mut remote_pack_locations) =
+    let (observed_layout_root_generation, mut remote_loose_object_ids, mut remote_pack_locations) =
         load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
     let mut remote_pack_cache = BTreeMap::new();
     for ancestor_snapshot_id in &snapshot.ancestor_snapshot_ids {
@@ -1127,6 +1139,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
         allow_risky_single_writer,
     )?;
     let session = crate::transaction::PublishSession {
+        observed_layout_root_generation: Some(observed_layout_root_generation),
         next_layout_root: Some(layout_root.clone()),
         next_layout_root_bytes: Some(layout_root_bytes.clone()),
         ..session
@@ -1296,6 +1309,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     let mut remote_pack_locations =
         load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
     let mut remote_inventory = None;
+    let mut observed_layout_root_generation = None;
     let mut remote_pack_cache = BTreeMap::new();
     let mut resume_remote_auth = ResumeRemoteAuthContext {
         repo_root: &options.repo_root,
@@ -1369,8 +1383,9 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     }
 
     if !saw_journal_objects {
-        let (remote_loose_object_ids, mut remote_pack_locations) =
+        let (inventory_layout_root_generation, remote_loose_object_ids, mut remote_pack_locations) =
             load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
+        observed_layout_root_generation = Some(inventory_layout_root_generation);
         let manifest_store = ManifestStore::new(&options.repo_root);
         let reachable_object_ids =
             manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
@@ -1463,6 +1478,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         writer_mode: remote.capability().push_write_mode(),
     })?;
     let session = crate::transaction::PublishSession {
+        observed_layout_root_generation,
         next_layout_root: Some(layout_root.clone()),
         next_layout_root_bytes: Some(layout_root_bytes.clone()),
         ..session
