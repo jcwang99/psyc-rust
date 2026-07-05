@@ -3270,6 +3270,56 @@ fn push_batches_small_objects_into_remote_packs_when_threshold_is_reached() {
 }
 
 #[test]
+fn push_uses_pack_uploads_for_small_repository_when_multiple_small_missing_objects_exist() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(2);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "adaptive-pack-small-push".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+    assert!(
+        reachable_object_ids.len() >= 2,
+        "test requires at least two reachable objects"
+    );
+
+    let remote = MemoryBackend::new();
+    let pushed = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "adaptive-pack-small-push-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert!(pushed.uploaded_objects > 0);
+    assert!(!remote.list_physical("packs/index/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/data/").unwrap().is_empty());
+}
+
+#[test]
 fn push_compacts_pack_index_root_when_l0_segment_bound_is_reached() {
     let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
     let temp = tempdir().unwrap();
@@ -3778,6 +3828,73 @@ fn resume_reuploads_missing_remote_objects_from_journal() {
 
     assert!(resumed.skipped_uploaded_objects > 0);
     assert_eq!(rebuilt.get_physical(&physical).unwrap(), object_bytes);
+}
+
+#[test]
+fn resume_uses_pack_uploads_for_small_repository_when_journal_missing_set_contains_multiple_small_objects()
+ {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(2);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "adaptive-pack-resume".to_string(),
+        })
+        .unwrap();
+
+    let manifest_store = ManifestStore::new(&repo_root);
+    let reachable_object_ids = manifest_store
+        .collect_reachable_object_ids(&commit.snapshot_id)
+        .unwrap();
+    assert!(
+        reachable_object_ids.len() >= 2,
+        "test requires at least two reachable objects"
+    );
+
+    let journal =
+        e2v_sync::OperationJournal::new(repo_root.join(".e2v").join("journal").join("sync"))
+            .unwrap();
+    let operation_id = e2v_sync::OperationId::new("adaptive-pack-resume-op".to_string()).unwrap();
+    journal
+        .begin_operation(
+            &operation_id,
+            e2v_sync::OperationMetadata::push(state.branch.token_hex.clone(), None),
+        )
+        .unwrap();
+    for object_id in &reachable_object_ids {
+        journal
+            .plan_object(&operation_id, object_id, "object")
+            .unwrap();
+    }
+
+    let remote = MemoryBackend::new();
+    let resumed = resume_push(
+        &facade,
+        &remote,
+        ResumeOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: operation_id.value.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
+    assert!(!remote.list_physical("packs/index/").unwrap().is_empty());
+    assert!(!remote.list_physical("packs/data/").unwrap().is_empty());
 }
 
 #[test]

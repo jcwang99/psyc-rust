@@ -1070,7 +1070,6 @@ fn push_head_inner<R: RemoteBackend + Clone>(
     let manifest_store = ManifestStore::new(&options.repo_root);
     let reachable_object_ids =
         manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
-    let pack_enabled = should_pack_small_objects(reachable_object_ids.len());
     let segment_only_uploads = use_segment_only_uploads(&layout_root);
     let missing_object_ids = reachable_object_ids
         .iter()
@@ -1079,6 +1078,11 @@ fn push_head_inner<R: RemoteBackend + Clone>(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let pack_enabled = should_pack_current_upload_set(
+        &options.repo_root,
+        &missing_object_ids,
+        reachable_object_ids.len(),
+    )?;
     for object_id in &reachable_object_ids {
         journal.plan_object(&operation_id, object_id, "object")?;
     }
@@ -1204,7 +1208,6 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             crate::journal::ObjectUploadState::Failed,
         ],
     )?;
-    let pack_enabled = should_pack_small_objects(total_tracked_objects);
     let skipped_uploaded_objects = journal.count_objects_in_states(
         &operation_id,
         &[
@@ -1261,6 +1264,11 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             }
             missing_object_ids.push(record.object_id.clone());
         }
+        let pack_enabled = should_pack_current_upload_set(
+            &options.repo_root,
+            &missing_object_ids,
+            total_tracked_objects,
+        )?;
         if segment_only_uploads {
             published_pack_index_segments.extend(upload_objects_as_pack_segments(
                 remote,
