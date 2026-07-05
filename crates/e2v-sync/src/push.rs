@@ -178,32 +178,14 @@ fn inventory_has_object(
     loose_object_ids.contains(object_id) || pack_locations.contains_key(object_id)
 }
 
-fn open_remote_pack_index_secrets<R: RemoteBackend>(
-    remote: &R,
-    repo_root: &Path,
-) -> Result<RepoSecrets> {
-    let control_dir = repo_root.join(".e2v");
-    if let Some(remote_keyring_bytes) = read_remote_current_keyring_bytes(remote, repo_root)? {
-        if let Ok(secrets) =
-            sync_support::unlock_repo_secrets_from_keyring_bytes_with_local_device_for_sync(
-                &control_dir,
-                &remote_keyring_bytes,
-            )
-        {
-            return Ok(secrets);
-        }
-    }
-    sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)
-}
-
 fn load_remote_object_inventory<R: RemoteBackend>(
     repo_root: &Path,
     remote: &R,
+    secrets: &RepoSecrets,
 ) -> Result<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
     let control_dir = repo_root.join(".e2v");
-    let secrets = open_remote_pack_index_secrets(remote, repo_root)?;
     let pack_locations =
-        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, &secrets)?;
+        load_remote_active_pack_locations_with_local_cache(remote, &control_dir, secrets)?;
     Ok((load_remote_loose_object_ids(remote)?, pack_locations))
 }
 
@@ -336,17 +318,19 @@ fn remote_snapshot_graph_authenticates_for_repo<R: RemoteBackend>(
 fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
     repo_root: &Path,
     remote: &'a R,
+    secrets: &RepoSecrets,
     inventory: &'a mut Option<(BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)>,
 ) -> Result<&'a (BTreeSet<String>, BTreeMap<String, PackedObjectLocation>)> {
     match inventory {
         Some(inventory) => Ok(inventory),
-        None => Ok(inventory.insert(load_remote_object_inventory(repo_root, remote)?)),
+        None => Ok(inventory.insert(load_remote_object_inventory(repo_root, remote, secrets)?)),
     }
 }
 
 struct ResumeRemoteAuthContext<'a, R: RemoteBackend> {
     repo_root: &'a Path,
     remote: &'a R,
+    pack_index_secrets: &'a RepoSecrets,
     current_operation_pack_locations: &'a BTreeMap<String, PackedObjectLocation>,
     allow_full_inventory_lookup: bool,
     remote_inventory_cache:
@@ -377,6 +361,7 @@ fn remote_object_authenticates_for_resume<R: RemoteBackend>(
     let (remote_loose_object_ids, remote_pack_locations) = ensure_remote_object_inventory_loaded(
         context.repo_root,
         context.remote,
+        context.pack_index_secrets,
         context.remote_inventory_cache,
     )?;
     Ok(
@@ -754,6 +739,7 @@ fn ensure_remote_root_matches_local_repository<R: RemoteBackend>(
 pub(crate) fn upload_remote_keyring_generations<R: RemoteBackend>(
     remote: &R,
     keyring_files: &[PathBuf],
+    known_remote_current_file_name: Option<&str>,
 ) -> Result<()> {
     for keyring_file in keyring_files {
         let file_name = keyring_file
@@ -761,6 +747,9 @@ pub(crate) fn upload_remote_keyring_generations<R: RemoteBackend>(
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid keyring path {}", keyring_file.display()))?;
         if file_name == KEYRING_LOCK_FILE || file_name == "keyring.current" {
+            continue;
+        }
+        if Some(file_name) == known_remote_current_file_name {
             continue;
         }
         let bytes = std::fs::read(keyring_file)?;
@@ -844,10 +833,10 @@ pub(crate) fn mirror_remote_keyring_pointer<R: RemoteBackend>(
     Ok(())
 }
 
-pub(crate) fn read_remote_current_keyring_bytes<R: RemoteBackend>(
+fn read_remote_current_keyring<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(String, Vec<u8>)>> {
     let repo_id = e2v_core::sync_support::read_repo_id(repo_root)?;
     let pointer_token = RefToken::new(format!("keyring/{repo_id}"));
     let pointer_bytes = match remote.read_ref(&pointer_token)? {
@@ -867,21 +856,29 @@ pub(crate) fn read_remote_current_keyring_bytes<R: RemoteBackend>(
                 keyring_state.generation == pointer.generation,
                 "remote keyring pointer generation mismatch"
             );
-            Ok(Some(bytes))
+            Ok(Some((current.to_string(), bytes)))
         }
         Err(error) if is_missing_physical_object_error(&error) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
+pub(crate) fn read_remote_current_keyring_bytes<R: RemoteBackend>(
+    remote: &R,
+    repo_root: &Path,
+) -> Result<Option<Vec<u8>>> {
+    Ok(read_remote_current_keyring(remote, repo_root)?.map(|(_, bytes)| bytes))
+}
+
 pub(crate) fn reconcile_local_keyring_with_remote_if_needed<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
-) -> Result<()> {
-    if let Some(remote_keyring_bytes) = read_remote_current_keyring_bytes(remote, repo_root)? {
+) -> Result<Option<String>> {
+    if let Some((current, remote_keyring_bytes)) = read_remote_current_keyring(remote, repo_root)? {
         let _ = sync_support::reconcile_remote_keyring_for_sync(repo_root, &remote_keyring_bytes)?;
+        return Ok(Some(current));
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) fn publish_remote_keyring_pointer_with_retry<R: RemoteBackend>(
@@ -1017,7 +1014,8 @@ fn push_head_inner<R: RemoteBackend + Clone>(
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
     ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
-    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let remote_current_keyring_file_name =
+        reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let current_state = facade.open(&options.repo_root)?;
     ensure!(
         current_state.branch.token_hex == options.branch_token,
@@ -1047,7 +1045,11 @@ fn push_head_inner<R: RemoteBackend + Clone>(
                         });
                     }
                     if remote_ref_matches_local {
-                        upload_remote_keyring_generations(remote, &keyring_files)?;
+                        upload_remote_keyring_generations(
+                            remote,
+                            &keyring_files,
+                            remote_current_keyring_file_name.as_deref(),
+                        )?;
                         if !remote_control_plane_matches(remote, &layout_root_bytes) {
                             remote.put_physical("layout_root.json", &layout_root_bytes)?;
                         }
@@ -1077,7 +1079,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
     let control_dir = options.repo_root.join(".e2v");
     let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
     let (mut remote_loose_object_ids, mut remote_pack_locations) =
-        load_remote_object_inventory(&options.repo_root, remote)?;
+        load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
     let mut remote_pack_cache = BTreeMap::new();
     for ancestor_snapshot_id in &snapshot.ancestor_snapshot_ids {
         if !inventory_has_object(
@@ -1188,7 +1190,11 @@ fn push_head_inner<R: RemoteBackend + Clone>(
         )?
     };
 
-    upload_remote_keyring_generations(remote, &keyring_files)?;
+    upload_remote_keyring_generations(
+        remote,
+        &keyring_files,
+        remote_current_keyring_file_name.as_deref(),
+    )?;
     publisher.publish_layout_if_needed(&session)?;
     if !published_pack_uploads.index_paths.is_empty() {
         let segment_paths = next_pack_index_segment_paths(
@@ -1243,7 +1249,8 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
     ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
-    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let remote_current_keyring_file_name =
+        reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let current_state = facade.open(&options.repo_root)?;
     ensure!(
         current_state.branch.token_hex == options.branch_token,
@@ -1293,6 +1300,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     let mut resume_remote_auth = ResumeRemoteAuthContext {
         repo_root: &options.repo_root,
         remote,
+        pack_index_secrets: &pack_index_secrets,
         current_operation_pack_locations: &remote_pack_locations,
         allow_full_inventory_lookup: false,
         remote_inventory_cache: &mut remote_inventory,
@@ -1351,6 +1359,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         resume_remote_auth = ResumeRemoteAuthContext {
             repo_root: &options.repo_root,
             remote,
+            pack_index_secrets: &pack_index_secrets,
             current_operation_pack_locations: &remote_pack_locations,
             allow_full_inventory_lookup: false,
             remote_inventory_cache: &mut remote_inventory,
@@ -1361,7 +1370,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
 
     if !saw_journal_objects {
         let (remote_loose_object_ids, mut remote_pack_locations) =
-            load_remote_object_inventory(&options.repo_root, remote)?;
+            load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
         let manifest_store = ManifestStore::new(&options.repo_root);
         let reachable_object_ids =
             manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
@@ -1459,7 +1468,11 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         ..session
     };
     if remote_ref_matches_local {
-        upload_remote_keyring_generations(remote, &keyring_files)?;
+        upload_remote_keyring_generations(
+            remote,
+            &keyring_files,
+            remote_current_keyring_file_name.as_deref(),
+        )?;
         let pointer_bytes = publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
         mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
         publisher.publish_layout_if_needed(&session)?;
@@ -1483,7 +1496,11 @@ pub fn resume_push<R: RemoteBackend + Clone>(
             skipped_uploaded_objects,
         });
     }
-    upload_remote_keyring_generations(remote, &keyring_files)?;
+    upload_remote_keyring_generations(
+        remote,
+        &keyring_files,
+        remote_current_keyring_file_name.as_deref(),
+    )?;
     publisher.publish_layout_if_needed(&session)?;
     if !published_pack_index_segments.is_empty() {
         let segment_paths = next_pack_index_segment_paths(
@@ -1506,6 +1523,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     let mut precommit_remote_auth = ResumeRemoteAuthContext {
         repo_root: &options.repo_root,
         remote,
+        pack_index_secrets: &pack_index_secrets,
         current_operation_pack_locations: &remote_pack_locations,
         allow_full_inventory_lookup: false,
         remote_inventory_cache: &mut remote_inventory,

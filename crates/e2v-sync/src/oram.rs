@@ -211,7 +211,7 @@ fn execute_oblivious_layout_publish<R: RemoteBackend + Clone>(
     next_oblivious_generation: u64,
     operation_prefix: &str,
 ) -> Result<ObliviousLayoutStatus> {
-    reconcile_local_keyring_with_remote_if_needed(remote, repo_root)?;
+    let _ = reconcile_local_keyring_with_remote_if_needed(remote, repo_root)?;
     let facade = RepositoryFacade::new();
     let repo_state = facade.open(repo_root)?;
     let current_ref = remote.read_ref(&e2v_store::RefToken::new(
@@ -276,7 +276,7 @@ fn execute_oblivious_layout_publish<R: RemoteBackend + Clone>(
     };
     let remote_root_bytes = encode_oblivious_root_bytes(&secrets, &remote_root)?;
 
-    upload_remote_keyring_generations(remote, &keyring_files)?;
+    upload_remote_keyring_generations(remote, &keyring_files, None)?;
     remote.put_physical(OBLIVIOUS_ROOT_PATH, &remote_root_bytes)?;
     publisher.publish_layout_if_needed(&session)?;
     if !published_segment_paths.is_empty() {

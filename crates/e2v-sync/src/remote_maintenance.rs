@@ -384,7 +384,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
     let operation_id = OperationId::new("history-rewrite".to_string())?;
     let journal = OperationJournal::new(control_dir.join("journal").join("sync"))?;
     let facade = RepositoryFacade::new();
-    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let _ = reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let historical_segment_secrets = read_remote_current_keyring_bytes(remote, &options.repo_root)?
         .map(|bytes| {
             sync_support::unlock_repo_secrets_from_keyring_bytes_for_sync(&bytes, &options.password)
@@ -508,7 +508,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         &session,
     )?;
 
-    upload_remote_keyring_generations(remote, &keyring_files)?;
+    upload_remote_keyring_generations(remote, &keyring_files, None)?;
     publisher.publish_layout_if_needed(&session)?;
     if !published_pack_index_segments.is_empty() {
         let rewritten_object_ids = rewrite_state
@@ -1109,7 +1109,7 @@ pub fn verify_remote<R: RemoteBackend>(
     );
 
     let control_dir = options.repo_root.join(".e2v");
-    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let _ = reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
     let (branch_token, _) =
         sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
@@ -1206,7 +1206,7 @@ pub fn repair_remote<R: RemoteBackend>(
     options: RepairRemoteOptions,
 ) -> Result<RepairRemoteResult> {
     let control_dir = options.repo_root.join(".e2v");
-    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let _ = reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
     let (branch_token, _) =
         sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;
@@ -1280,7 +1280,7 @@ pub fn gc_dry_run<R: RemoteBackend>(
     options: GcDryRunOptions,
 ) -> Result<GcDryRunReport> {
     let control_dir = options.repo_root.join(".e2v");
-    reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let _ = reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
     let local_default_ref_bytes = sync_support::read_default_ref_bytes(&options.repo_root)?;
     let (branch_token, _) =
         sync_support::decode_default_ref_record(&options.repo_root, &local_default_ref_bytes)?;

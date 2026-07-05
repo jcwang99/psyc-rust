@@ -1131,6 +1131,7 @@ struct ExistsCountingBackend {
     exists_calls: Arc<Mutex<usize>>,
     list_calls: Arc<Mutex<usize>>,
     object_put_calls: Arc<Mutex<usize>>,
+    read_ref_tokens: Arc<Mutex<Vec<String>>>,
     get_paths: Arc<Mutex<Vec<String>>>,
     range_read_paths: Arc<Mutex<Vec<String>>>,
 }
@@ -1156,6 +1157,7 @@ impl ExistsCountingBackend {
             exists_calls: Arc::new(Mutex::new(0)),
             list_calls: Arc::new(Mutex::new(0)),
             object_put_calls: Arc::new(Mutex::new(0)),
+            read_ref_tokens: Arc::new(Mutex::new(Vec::new())),
             get_paths: Arc::new(Mutex::new(Vec::new())),
             range_read_paths: Arc::new(Mutex::new(Vec::new())),
         }
@@ -1173,12 +1175,17 @@ impl ExistsCountingBackend {
         *self.exists_calls.lock().unwrap() = 0;
         *self.list_calls.lock().unwrap() = 0;
         *self.object_put_calls.lock().unwrap() = 0;
+        self.read_ref_tokens.lock().unwrap().clear();
         self.get_paths.lock().unwrap().clear();
         self.range_read_paths.lock().unwrap().clear();
     }
 
     fn object_put_call_count(&self) -> usize {
         *self.object_put_calls.lock().unwrap()
+    }
+
+    fn read_ref_tokens(&self) -> Vec<String> {
+        self.read_ref_tokens.lock().unwrap().clone()
     }
 
     fn get_paths(&self) -> Vec<String> {
@@ -1247,6 +1254,10 @@ impl BlobStore for ExistsCountingBackend {
 
 impl RefStore for ExistsCountingBackend {
     fn read_ref(&self, token: &RefToken) -> anyhow::Result<Option<StoredRef>> {
+        self.read_ref_tokens
+            .lock()
+            .unwrap()
+            .push(token.value.clone());
         self.inner.read_ref(token)
     }
 
@@ -7204,6 +7215,88 @@ fn packed_push_does_not_reread_current_operation_pack_indexes_after_upload() {
     assert_eq!(
         operation_index_reads, 0,
         "packed push should reuse in-memory pack locations instead of rereading current operation pack indexes"
+    );
+}
+
+#[test]
+fn push_reuses_the_first_remote_current_keyring_read_for_inventory_loading() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello remote").unwrap();
+    let first_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed-keyring-read-reuse".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    let first_push = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "seed-keyring-read-reuse".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first_push.published_snapshot_id, first_commit.snapshot_id);
+
+    fs::write(repo_root.join("second.txt"), b"second commit").unwrap();
+    let second_commit = facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "second-keyring-read-reuse".to_string(),
+        })
+        .unwrap();
+    let (pointer_bytes, _) = read_local_keyring_pointer_and_current_bytes(&repo_root);
+    let pointer: Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let current = pointer["current"].as_str().unwrap().to_string();
+    let keyring_pointer_token = keyring_pointer_ref_token(&repo_root).value;
+    remote.reset_counts();
+
+    let second_push = push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root: repo_root.clone(),
+            branch_token: state.branch.token_hex.clone(),
+            operation_id: "second-keyring-read-reuse".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second_push.published_snapshot_id, second_commit.snapshot_id);
+
+    let keyring_pointer_reads = remote
+        .read_ref_tokens()
+        .into_iter()
+        .filter(|token| token == &keyring_pointer_token)
+        .count();
+    assert_eq!(
+        keyring_pointer_reads, 2,
+        "push should read the remote keyring pointer ref once for reconcile and once for final publish"
+    );
+
+    let current_keyring_gets = remote
+        .get_paths()
+        .into_iter()
+        .filter(|path| path == &format!("control/keyring/{current}"))
+        .count();
+    assert_eq!(
+        current_keyring_gets, 1,
+        "push should reuse the first remote current keyring read instead of fetching it again for inventory loading"
     );
 }
 
