@@ -19,6 +19,14 @@ Build a standalone Iced desktop application that wraps the repository system's c
 - `e2v-api::Sdk` already owns many mutating operations and should remain the preferred high-level boundary for GUI-triggered actions.
 - `e2v_core::RepositoryFacade` is still used for local browse/search-style reads.
 - `e2v_sync` already owns the local web serving entrypoint logic, and `e2v_vfs` already owns mount launching logic, but the current user-facing lifecycle still lives behind CLI-specific process entrypoints.
+- `e2v-vfs` is no longer just a stub. It already contains:
+  - snapshot-pinned and live-branch mount configuration
+  - cache-policy selection between `KernelCacheWithInvalidation` and `DirectIoFallback`
+  - stream-only semantic gating for unsupported filesystem behaviors
+  - read-side plaintext memory caching
+  - encrypted disk cache support for private local rereads
+  - `WritableVfs` support for live-branch overlay/writeback flows
+  - mount summaries and mounted-handle lifetimes that the GUI can surface directly
 
 ## Locked Product Decisions
 
@@ -237,7 +245,23 @@ Owns:
 - `serve`
 - `mount snapshot`
 - `mount branch`
-- visible service state such as local URL, mount point, mode, and stop/restart controls
+- the repository's VFS-centric local browsing and preview surface
+- visible service state such as local URL, mount point, mode, stop/restart controls, cache policy, access mode, and stream-only status
+
+The `Preview` page should be split into two clear panels:
+
+- **Local Web Preview**
+  - start/stop the local web server
+  - show current local URL
+  - open that URL externally
+
+- **Mounted View / VFS**
+  - mount status and mount point
+  - mount mode: snapshot-pinned or live-branch
+  - access mode: read-only or writable
+  - cache policy: kernel-cache-with-invalidation or direct-I/O fallback
+  - stream-only semantic notice
+  - quick actions such as open in file explorer, remount, unmount, and copy path
 
 #### `Advanced`
 
@@ -343,7 +367,76 @@ The GUI should model them as managed controllers:
 
 This means some CLI-only lifecycle logic will need to move into reusable library-facing helpers. The GUI should never fake these flows by spawning a forever-running CLI subprocess and scraping stdout.
 
-### 9. API Boundary Adjustments
+### 9. VFS Surface And Semantics
+
+VFS is important enough that the GUI should treat it as its own modeled surface, not merely as a button that launches a mount.
+
+The GUI should expose three conceptual VFS use cases:
+
+- **Snapshot Preview**
+  - read-only
+  - pinned to a chosen snapshot
+  - safest mode for historical inspection, stable exports, and reproducible previews
+
+- **Live Branch Browse**
+  - read-only
+  - follows the latest branch head when refreshed
+  - suitable when the user wants to browse the newest branch content without edit risk
+
+- **Live Branch Workspace**
+  - writable
+  - must be intentionally chosen
+  - suitable for branch-mounted editing workflows where VFS writeback semantics are acceptable
+
+Snapshot mounts must always render in the GUI as read-only. The GUI must never imply that a snapshot mount can be edited.
+
+Live-branch mounts must surface the real semantics inherited from `e2v-vfs`:
+
+- writable handles are allowed only in writable live-branch mode
+- byte-range locks are unsupported
+- memory-mapped-write expectations are unsupported
+- writeback caching is unsupported
+- direct-I/O fallback may be active when reliable invalidation is unavailable
+
+The GUI should explain these semantics in user language. In particular, writable branch mounts should be described as a repository-backed workspace with explicit writeback/conflict rules, not as a perfect local disk clone.
+
+### 10. VFS Preview Experience
+
+The repository already relies on VFS for local-preview workflows such as image browsing. The GUI should preserve and improve that path instead of replacing it with an ad hoc downloader.
+
+That means:
+
+- the `Preview` page should favor VFS-backed local preview workflows for repository files
+- when a mount is active, the GUI should offer "open mount in explorer" as the main way to browse large trees and preview assets
+- the GUI should not maintain a second unrelated preview cache for the same repository files when the mounted VFS path already provides local access
+
+For remote-backed repositories, the GUI should acknowledge the real performance mode rather than hiding it. The user should be able to see whether the mounted session is:
+
+- benefiting from kernel cache with invalidation
+- running in direct-I/O fallback mode
+- relying on private local rereads through the existing VFS cache layers
+
+The first GUI slice does not need raw cache tuning controls, but the architecture should preserve room for later advanced options such as showing cache location, cache health, or cache profile. Those later options must remain privacy-preserving and should continue using `e2v-vfs`'s encrypted-disk-cache model rather than inventing a GUI-only file cache.
+
+### 11. Writable VFS And Conflict Visibility
+
+Writable VFS needs explicit GUI modeling because its semantics are different from ordinary app forms.
+
+When the user chooses a writable live-branch mount, the GUI should surface:
+
+- the active branch token or branch identity
+- whether the mount is currently clean or has uncommitted overlay changes
+- the last successful writeback result
+- any writeback conflict that requires user attention
+
+The GUI does not need to re-implement file editing. The host OS and external applications still edit files through the mounted filesystem. But the GUI should remain the supervisory surface for the mounted session:
+
+- show that the workspace is writable
+- show that writeback/conflict semantics exist
+- show that cache invalidation or remount may be required after certain transitions
+- show the result of refresh/writeback lifecycle events when the controller can observe them
+
+### 12. API Boundary Adjustments
 
 The GUI should prefer stable, intention-level calls rather than rebuilding behavior from low-level internals. Where the current crates do not yet expose the right shape, we should add thin library helpers instead of letting `e2v-gui` reach deep into unrelated modules.
 
@@ -382,6 +475,14 @@ The goal is not to move all logic into `e2v-gui`. The goal is to keep `e2v-gui` 
 3. `Preview` shows active status and connection details.
 4. On stop, repository switch, or app shutdown, the GUI disposes the handle cleanly.
 
+### VFS Preview Flow
+
+1. User opens the `Preview` page and starts a snapshot or branch mount.
+2. The mount controller returns a `MountLaunchSummary`.
+3. The GUI renders mount mode, access mode, cache policy, stream-only status, and mount point.
+4. The user opens the mounted path in the host file explorer or another local application.
+5. The GUI remains the status/control surface for remount, unmount, and any later controller-visible refresh/writeback/conflict outcomes.
+
 ## Error Handling
 
 The GUI should present errors in user terms, not in CLI terms.
@@ -409,6 +510,7 @@ Required categories:
   - mount failed to start
   - serve port binding failure
   - active controller already exists
+  - VFS writeback or refresh conflict surfaced by the mounted controller
 
 - **Long-running operation failures**
   - push/fetch/pull failure
@@ -466,14 +568,26 @@ Add focused integration coverage for the first implemented screens so we can pro
 - risky flows stay hidden until intentionally opened
 - live service controllers remain stable across refreshes and navigation
 
-### 5. Manual Windows Validation
+### 5. VFS-Specific Contract Tests
+
+The GUI-facing VFS adapters should be exercised with focused tests that prove:
+
+- snapshot mounts are always rendered as read-only
+- writable live-branch mounts are marked as writable and stream-only
+- `MountLaunchSummary` fields map cleanly into GUI labels and warnings
+- direct-I/O fallback versus kernel-cache modes produce the right user-facing status
+- VFS-specific unsupported semantics are presented as capability notices, not as silent omissions
+
+### 6. Manual Windows Validation
 
 Windows is a first-class target for this GUI. Every slice that touches preview or lifecycle control should include manual validation for:
 
 - snapshot mount
 - branch mount
+- writable live-branch mount behavior and user-visible warnings
 - local web serve start/stop
 - copying URLs and mount paths from the GUI
+- opening mounted image/media assets through the host OS and verifying that local preview remains smooth enough for ordinary browsing
 - closing the app while live controllers exist
 
 ## Implementation Phases
