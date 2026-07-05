@@ -172,10 +172,14 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             serde_json::to_vec(&build_write_intent_marker(&plan, 0, 1))?.as_slice(),
         )?;
         let observed_at = remote_observed_at_unix_ms(&self.remote_backend, &active_intent_path)?;
-        self.remote_backend.put_physical(
-            &active_intent_path,
-            serde_json::to_vec(&build_write_intent_marker(&plan, observed_at, 1))?.as_slice(),
-        )?;
+        if self.capability.supports_reliable_remote_time
+            || self.capability.supports_object_generation_or_etag
+        {
+            self.remote_backend.put_physical(
+                &active_intent_path,
+                serde_json::to_vec(&build_write_intent_marker(&plan, observed_at, 1))?.as_slice(),
+            )?;
+        }
         let session = PublishSession {
             operation_id: plan.operation_id,
             target_branch_token: plan.target_branch_token,
@@ -469,10 +473,9 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
                 Some(generation) => generation,
                 None => self.remote_backend.read_layout_root()?.generation,
             };
-            let result = self.remote_backend.compare_and_swap_layout_root(
-                expected_generation,
-                next_layout_root.clone(),
-            )?;
+            let result = self
+                .remote_backend
+                .compare_and_swap_layout_root(expected_generation, next_layout_root.clone())?;
             anyhow::ensure!(
                 result.applied,
                 "layout root publish failed: generation changed before publish"
@@ -967,18 +970,33 @@ mod tests {
     #[derive(Debug, Clone)]
     struct UnsupportedIfAbsentLeaseBackend {
         inner: e2v_store::MemoryBackend,
+        intent_puts: Arc<Mutex<usize>>,
+        intent_stats: Arc<Mutex<usize>>,
     }
 
     impl UnsupportedIfAbsentLeaseBackend {
         fn new() -> Self {
             Self {
                 inner: e2v_store::MemoryBackend::new(),
+                intent_puts: Arc::new(Mutex::new(0)),
+                intent_stats: Arc::new(Mutex::new(0)),
             }
+        }
+
+        fn intent_put_count(&self) -> usize {
+            *self.intent_puts.lock().unwrap()
+        }
+
+        fn intent_stat_count(&self) -> usize {
+            *self.intent_stats.lock().unwrap()
         }
     }
 
     impl BlobStore for UnsupportedIfAbsentLeaseBackend {
         fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            if relative_path.starts_with("transactions/active/") {
+                *self.intent_puts.lock().unwrap() += 1;
+            }
             self.inner.put_physical(relative_path, bytes)
         }
 
@@ -1010,6 +1028,9 @@ mod tests {
         }
 
         fn stat_physical(&self, relative_path: &str) -> Result<e2v_store::ObjectStat> {
+            if relative_path.starts_with("transactions/active/") {
+                *self.intent_stats.lock().unwrap() += 1;
+            }
             self.inner.stat_physical(relative_path)
         }
 
@@ -2224,6 +2245,60 @@ mod tests {
         assert!(
             remote.exists_physical("transactions/active/op-risky-no-lease.intent"),
             "explicit risky single-writer mode should still publish an active intent marker"
+        );
+    }
+
+    #[test]
+    fn begin_allowing_risky_single_writer_writes_intent_once_without_remote_time_rewrite() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let remote = UnsupportedIfAbsentLeaseBackend::new();
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: false,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: false,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: false,
+                supports_object_generation_or_etag: false,
+                supports_layout_root_cas: false,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin_allowing_risky_single_writer(
+                PublishPlan {
+                    operation_id: OperationId::new("op-risky-single-intent-write".to_string())
+                        .unwrap(),
+                    target_branch_token: "branch-token".to_string(),
+                    expected_ref_version: None,
+                    planned_snapshot_id: None,
+                    writer_mode: WriterMode::ReadOnly,
+                },
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            session.started_at_remote_unix_ms > 0,
+            "the session should still remember the observed remote marker timestamp in memory"
+        );
+        assert_eq!(
+            remote.intent_put_count(),
+            1,
+            "risky single-writer mode without verified remote time should not rewrite the active intent just to persist observed timestamps"
+        );
+        assert_eq!(
+            remote.intent_stat_count(),
+            1,
+            "the publisher may still stat the active intent once to capture an in-memory observed timestamp"
         );
     }
 

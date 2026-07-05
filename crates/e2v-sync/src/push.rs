@@ -729,26 +729,30 @@ pub(crate) fn remote_keyring_matches<R: RemoteBackend>(
 fn ensure_remote_root_matches_local_repository<R: RemoteBackend>(
     remote: &R,
     repo_root: &Path,
-) -> Result<()> {
+) -> Result<bool> {
     let local_repo_id = sync_support::read_repo_id(repo_root)?;
     let expected_keyring_token = format!("keyring/{local_repo_id}");
+    let mut has_matching_keyring_token = false;
     let foreign_keyring_tokens = remote
         .list_refs()?
         .into_iter()
         .filter_map(|listed| {
             let token = listed.token.value;
-            if token.starts_with("keyring/") && token != expected_keyring_token {
-                Some(token)
-            } else {
-                None
+            if !token.starts_with("keyring/") {
+                return None;
             }
+            if token == expected_keyring_token {
+                has_matching_keyring_token = true;
+                return None;
+            }
+            Some(token)
         })
         .collect::<Vec<_>>();
     ensure!(
         foreign_keyring_tokens.is_empty(),
         "remote root already contains keyring refs for a different repository"
     );
-    Ok(())
+    Ok(has_matching_keyring_token)
 }
 
 pub(crate) fn upload_remote_keyring_generations<R: RemoteBackend>(
@@ -1028,9 +1032,13 @@ fn push_head_inner<R: RemoteBackend + Clone>(
 ) -> Result<PushResult> {
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
-    ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
-    let remote_current_keyring_file_name =
-        reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let remote_has_matching_keyring_pointer =
+        ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
+    let remote_current_keyring_file_name = if remote_has_matching_keyring_pointer {
+        reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?
+    } else {
+        None
+    };
     let current_state = facade.open(&options.repo_root)?;
     ensure!(
         current_state.branch.token_hex == options.branch_token,
@@ -1277,9 +1285,13 @@ pub fn resume_push<R: RemoteBackend + Clone>(
 ) -> Result<ResumeResult> {
     validate_sync_identifier("branch token", &options.branch_token)?;
     validate_sync_identifier("operation id", &options.operation_id)?;
-    ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
-    let remote_current_keyring_file_name =
-        reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?;
+    let remote_has_matching_keyring_pointer =
+        ensure_remote_root_matches_local_repository(remote, &options.repo_root)?;
+    let remote_current_keyring_file_name = if remote_has_matching_keyring_pointer {
+        reconcile_local_keyring_with_remote_if_needed(remote, &options.repo_root)?
+    } else {
+        None
+    };
     let current_state = facade.open(&options.repo_root)?;
     ensure!(
         current_state.branch.token_hex == options.branch_token,
@@ -2255,6 +2267,47 @@ mod tests {
             remote.keyring_pointer_ref_read_count(),
             1,
             "publish_remote_keyring_pointer should reuse the first remote ref read instead of re-reading the same keyring pointer ref before CAS"
+        );
+    }
+
+    #[test]
+    fn initial_push_skips_reconciling_a_missing_remote_keyring_pointer() {
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let facade = RepositoryFacade::new();
+        let state = facade
+            .init(InitOptions {
+                repo_root: repo_root.clone(),
+                password: "correct horse battery staple".to_string(),
+                branch_name: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(repo_root.join("hello.txt"), b"hello").unwrap();
+        facade
+            .commit(CommitOptions {
+                repo_root: repo_root.clone(),
+                message: "initial-push".to_string(),
+            })
+            .unwrap();
+
+        let remote = KeyringPointerReadCountingBackend::new();
+        push_head(
+            &facade,
+            &remote,
+            PushOptions {
+                repo_root,
+                branch_token: state.branch.token_hex,
+                operation_id: "initial-push-no-keyring-reconcile".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote.keyring_pointer_ref_read_count(),
+            1,
+            "initial push should skip an empty-root keyring reconcile read and only read the remote keyring pointer when publishing it"
         );
     }
 
