@@ -66,6 +66,18 @@ fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     ))
 }
 
+fn read_remote_keyring_pointer_ref_bytes(
+    remote: &impl RefStore,
+    repo_root: &std::path::Path,
+) -> Vec<u8> {
+    remote
+        .read_ref(&keyring_pointer_ref_token(repo_root))
+        .unwrap()
+        .expect("keyring pointer ref should exist")
+        .value
+        .bytes
+}
+
 #[derive(Debug)]
 struct RemotePackedObjectForTest {
     data_path: String,
@@ -229,12 +241,7 @@ impl RefStore for KeyringPointerDisappearsAfterRefReadRemote {
                 .list_refs()?
                 .into_iter()
                 .find(|listed| listed.token.value.starts_with("keyring/"))
-                .map(|listed| listed.stored.value.bytes)
-                .or_else(|| {
-                    self.inner
-                        .get_physical("control/keyring/keyring.current")
-                        .ok()
-                });
+                .map(|listed| listed.stored.value.bytes);
             if let Some(pointer_bytes) = pointer_token {
                 let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
                 let current = pointer["current"].as_str().unwrap();
@@ -2407,7 +2414,7 @@ fn fetch_updates_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_
         &facade,
         &remote,
         PushOptions {
-            repo_root: source_repo_root,
+            repo_root: source_repo_root.clone(),
             branch_token: branch_token.clone(),
             operation_id: "rotate-password-with-hidden-pointer-file".to_string(),
         },
@@ -2433,9 +2440,7 @@ fn fetch_updates_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_
                 .join("keyring.current")
         )
         .unwrap(),
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap()
+        read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root)
     );
 
     e2v_core::testing::clear_unlocked_keyring_cache_for_test(&target_repo_root.join(".e2v"));
@@ -2487,23 +2492,11 @@ fn fetch_uses_keyring_pointer_ref_when_physical_pointer_file_is_missing() {
     )
     .unwrap();
 
-    let pointer_bytes = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
-    let expected_version = remote
-        .read_ref(&keyring_pointer_ref_token(&source_repo_root))
-        .unwrap()
-        .map(|stored| stored.version);
-    remote
-        .compare_and_swap_ref(
-            &keyring_pointer_ref_token(&source_repo_root),
-            expected_version,
-            e2v_store::EncryptedRef::new(pointer_bytes.clone()),
-        )
-        .unwrap();
-    remote
-        .delete_physical("control/keyring/keyring.current")
-        .unwrap();
+    let pointer_bytes = read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root);
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "push should no longer create the removed remote keyring mirror file"
+    );
 
     fetch_remote(
         &remote,
@@ -2613,9 +2606,7 @@ fn fetch_updates_current_keyring_generation_even_when_remote_keyring_listing_omi
     .unwrap();
 
     let remote_pointer: serde_json::Value = serde_json::from_slice(
-        &remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap(),
+        &read_remote_keyring_pointer_ref_bytes(&remote, &target_repo_root),
     )
     .unwrap();
     let current_file_name = remote_pointer["current"].as_str().unwrap().to_string();
@@ -2682,9 +2673,6 @@ fn fetch_rejects_remote_keyring_pointer_path_traversal_even_when_listing_omits_p
             expected_version,
             e2v_store::EncryptedRef::new(malicious_pointer.clone()),
         )
-        .unwrap();
-    remote
-        .put_physical("control/keyring/keyring.current", &malicious_pointer)
         .unwrap();
     remote
         .put_physical(
@@ -3976,7 +3964,7 @@ fn clone_bootstraps_local_repository_from_remote_head() {
 
 #[test]
 fn clone_writes_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_file() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
     let clone_repo_root = temp.path().join("clone-target");
     let list_hidden_remote = KeyringPointerHiddenFromListRemote::new(remote.clone());
 
@@ -3998,28 +3986,18 @@ fn clone_writes_keyring_pointer_even_when_remote_keyring_listing_omits_pointer_f
                 .join("keyring.current")
         )
         .unwrap(),
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap()
+        read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root)
     );
 }
 
 #[test]
 fn clone_uses_keyring_pointer_ref_when_physical_pointer_file_is_missing() {
     let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
-    let pointer_bytes = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
-    remote
-        .compare_and_swap_ref(
-            &keyring_pointer_ref_token(&source_repo_root),
-            None,
-            e2v_store::EncryptedRef::new(pointer_bytes.clone()),
-        )
-        .unwrap();
-    remote
-        .delete_physical("control/keyring/keyring.current")
-        .unwrap();
+    let pointer_bytes = read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root);
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "push should no longer create the removed remote keyring mirror file"
+    );
     let clone_repo_root = temp.path().join("clone-target");
 
     let cloned = clone_remote(
@@ -4198,9 +4176,6 @@ fn clone_rejects_remote_keyring_pointer_that_references_missing_generation() {
             expected_version,
             e2v_store::EncryptedRef::new(pointer_bytes.clone()),
         )
-        .unwrap();
-    remote
-        .put_physical("control/keyring/keyring.current", &pointer_bytes)
         .unwrap();
     let clone_repo_root = temp.path().join("clone-target");
 
@@ -4447,9 +4422,6 @@ fn fetch_rejects_remote_keyring_pointer_that_references_missing_generation() {
             e2v_store::EncryptedRef::new(pointer_bytes.clone()),
         )
         .unwrap();
-    remote
-        .put_physical("control/keyring/keyring.current", &pointer_bytes)
-        .unwrap();
 
     let target_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&target_repo_root).unwrap();
@@ -4542,7 +4514,7 @@ fn fetch_rejects_remote_keyring_pointer_generation_mismatch() {
 
 #[test]
 fn fetch_rejects_invalid_remote_keyring_pointer_before_mutating_local_control_plane() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
     let target_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&target_repo_root).unwrap();
     let local = RepositoryFacade::new();
@@ -4578,10 +4550,15 @@ fn fetch_rejects_invalid_remote_keyring_pointer_before_mutating_local_control_pl
     remote
         .put_physical(keyring_one_path, &serde_json::to_vec(&keyring_one).unwrap())
         .unwrap();
+    let expected_version = remote
+        .read_ref(&keyring_pointer_ref_token(&source_repo_root))
+        .unwrap()
+        .map(|stored| stored.version);
     remote
-        .put_physical(
-            "control/keyring/keyring.current",
-            br#"{"generation":0,"current":"keyring.1"}"#,
+        .compare_and_swap_ref(
+            &keyring_pointer_ref_token(&source_repo_root),
+            expected_version,
+            e2v_store::EncryptedRef::new(br#"{"generation":0,"current":"keyring.1"}"#.to_vec()),
         )
         .unwrap();
 
@@ -5222,7 +5199,7 @@ fn fetch_heals_default_ref_temp_path_conflict_during_control_plane_publish() {
 
 #[test]
 fn fetch_repairs_empty_local_repository_when_local_keyring_pointer_is_corrupt() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
     let target_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&target_repo_root).unwrap();
 
@@ -5263,15 +5240,13 @@ fn fetch_repairs_empty_local_repository_when_local_keyring_pointer_is_corrupt() 
                 .join("keyring.current")
         )
         .unwrap(),
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap()
+        read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root)
     );
 }
 
 #[test]
 fn fetch_repairs_empty_local_repository_even_when_control_plane_directories_are_missing() {
-    let (temp, _facade, _source_repo_root, branch_token, remote) = seed_remote();
+    let (temp, _facade, source_repo_root, branch_token, remote) = seed_remote();
     let target_repo_root = temp.path().join("fetch-target");
     fs::create_dir_all(&target_repo_root).unwrap();
 
@@ -5306,9 +5281,7 @@ fn fetch_repairs_empty_local_repository_even_when_control_plane_directories_are_
                 .join("keyring.current")
         )
         .unwrap(),
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap()
+        read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root)
     );
     assert_eq!(
         fs::read(
@@ -7712,16 +7685,14 @@ fn password_clone_remains_openable_after_unlock_cache_is_cleared() {
         &facade,
         &remote,
         PushOptions {
-            repo_root: owner_root,
+            repo_root: owner_root.clone(),
             branch_token: state.branch.token_hex.clone(),
             operation_id: "clone-openable-seed".to_string(),
         },
     )
     .unwrap();
 
-    let remote_pointer = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let remote_pointer = read_remote_keyring_pointer_ref_bytes(&remote, &owner_root);
 
     clone_remote(
         &remote,
@@ -7773,9 +7744,7 @@ fn remote_keyring_generation_rollback_via_pointer_ref_is_rejected() {
     )
     .unwrap();
 
-    let current_pointer = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let current_pointer = read_remote_keyring_pointer_ref_bytes(&remote, &source_repo_root);
     remote
         .compare_and_swap_ref(
             &keyring_pointer_ref_token(&source_repo_root),

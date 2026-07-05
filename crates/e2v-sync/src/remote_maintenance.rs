@@ -30,9 +30,9 @@ use crate::pack_index::{next_pack_index_segment_paths, publish_pack_index_root};
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::push::{
     cleanup_completed_operation_markers, list_operation_pack_index_segment_paths,
-    mirror_remote_keyring_pointer, publish_remote_keyring_pointer_with_retry,
-    read_remote_current_keyring_bytes, reconcile_local_keyring_with_remote_if_needed,
-    upload_objects_as_pack_segments, upload_remote_keyring_generations,
+    publish_remote_keyring_pointer_with_retry, read_remote_current_keyring_bytes,
+    reconcile_local_keyring_with_remote_if_needed, upload_objects_as_pack_segments,
+    upload_remote_keyring_generations,
 };
 use crate::remote_markers::{
     INTENT_EXPIRY_HOURS, marker_is_fresh_at, observe_remote_now_with_probe,
@@ -545,7 +545,7 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         )?;
     }
     publisher.pre_commit_verify(&session)?;
-    let pointer_bytes = publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
+    publish_remote_keyring_pointer_with_retry(remote, &options.repo_root)?;
     if !remote_ref_matches_local {
         let publish_result =
             publisher.publish_ref(&session, e2v_store::EncryptedRef::new(default_ref_bytes))?;
@@ -559,7 +559,6 @@ pub fn historical_rewrite_remote<R: RemoteBackend + Clone>(
         &remote_branch_refs,
         &repo_state.branch.token_hex,
     )?;
-    mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
     publisher.complete(session)?;
     cleanup_completed_operation_markers(remote, &operation_id, &repo_state.branch.token_hex)?;
     clear_historical_rewrite_checkpoint(&control_dir)?;

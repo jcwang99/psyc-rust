@@ -23,9 +23,8 @@ use crate::pack_index::{
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::push::{
     cleanup_completed_operation_markers, list_operation_pack_index_segment_paths,
-    mirror_remote_keyring_pointer, publish_remote_keyring_pointer_with_retry,
-    reconcile_local_keyring_with_remote_if_needed, upload_objects_as_pack_segments,
-    upload_remote_keyring_generations,
+    publish_remote_keyring_pointer_with_retry, reconcile_local_keyring_with_remote_if_needed,
+    upload_objects_as_pack_segments, upload_remote_keyring_generations,
 };
 use crate::remote_maintenance::list_remote_branch_refs;
 use crate::transaction::{PublishPlan, PublishSession};
@@ -341,7 +340,7 @@ fn execute_oblivious_layout_publish<R: RemoteBackend + Clone>(
         )?;
     }
     publisher.pre_commit_verify(&session)?;
-    let pointer_bytes = publish_remote_keyring_pointer_with_retry(remote, repo_root)?;
+    publish_remote_keyring_pointer_with_retry(remote, repo_root)?;
     if let Some(current_ref) = current_ref {
         let cas = publisher.publish_ref(&session, current_ref.value)?;
         ensure!(
@@ -349,7 +348,6 @@ fn execute_oblivious_layout_publish<R: RemoteBackend + Clone>(
             "oblivious layout publish failed: remote ref changed"
         );
     }
-    mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
     publisher.complete(session)?;
     cleanup_completed_operation_markers(remote, &operation_id, &repo_state.branch.token_hex)?;
     persist_local_layout_root(repo_root, &next_layout_root)?;

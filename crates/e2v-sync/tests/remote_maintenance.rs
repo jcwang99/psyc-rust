@@ -24,6 +24,21 @@ use e2v_sync::{
     reshuffle_oblivious_layout, status_oblivious_layout, verify_remote,
 };
 
+fn read_remote_keyring_pointer_ref_bytes(
+    remote: &impl RefStore,
+    repo_root: &std::path::Path,
+) -> Vec<u8> {
+    remote
+        .read_ref(&RefToken::new(format!(
+            "keyring/{}",
+            e2v_core::sync_support::read_repo_id(repo_root).unwrap()
+        )))
+        .unwrap()
+        .expect("keyring pointer ref should exist")
+        .value
+        .bytes
+}
+
 enum UndeletableCacheEntryGuard {
     #[cfg(unix)]
     Permissions { path: PathBuf, original_mode: u32 },
@@ -1492,9 +1507,7 @@ fn plan_historical_rewrite_rejects_remote_current_keyring_with_invalid_epochs_sh
     )
     .unwrap();
 
-    let pointer_bytes = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let pointer_bytes = read_remote_keyring_pointer_ref_bytes(&remote, &repo_root);
     let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
     let current_name = pointer["current"].as_str().unwrap();
     let mut current_keyring: serde_json::Value = serde_json::from_slice(

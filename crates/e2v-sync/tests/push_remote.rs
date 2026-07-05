@@ -251,6 +251,18 @@ fn keyring_pointer_ref_token(repo_root: &std::path::Path) -> RefToken {
     ))
 }
 
+fn read_remote_keyring_pointer_ref_bytes(
+    remote: &impl RefStore,
+    repo_root: &std::path::Path,
+) -> Vec<u8> {
+    remote
+        .read_ref(&keyring_pointer_ref_token(repo_root))
+        .unwrap()
+        .expect("keyring pointer ref should exist")
+        .value
+        .bytes
+}
+
 fn read_local_keyring_pointer_and_current_bytes(repo_root: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
     let keyring_dir = repo_root.join(".e2v").join("keyring");
     let pointer_bytes = fs::read(keyring_dir.join("keyring.current")).unwrap();
@@ -584,8 +596,10 @@ impl RefStore for KeyringPointerRetryOnceBackend {
                 *injected = true;
                 let pointer_bytes = self
                     .inner
-                    .get_physical("control/keyring/keyring.current")
-                    .unwrap();
+                    .read_ref(token)?
+                    .expect("keyring pointer ref should exist")
+                    .value
+                    .bytes;
                 let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
                 let current = pointer["current"].as_str().unwrap();
                 let keyring_dir = self.repo_root.join(".e2v").join("keyring");
@@ -614,9 +628,6 @@ impl RefStore for KeyringPointerRetryOnceBackend {
                     current_version,
                     EncryptedRef::new(injected_pointer.clone()),
                 )?;
-                self.inner
-                    .put_physical("control/keyring/keyring.current", &injected_pointer)
-                    .unwrap();
                 return Ok(CasResult {
                     applied: false,
                     current: cas.current,
@@ -4663,7 +4674,7 @@ fn resume_rejects_invalid_layout_root_when_remote_ref_matches_local_head() {
 }
 
 #[test]
-fn resume_restores_missing_keyring_pointer_when_remote_ref_matches_local_head() {
+fn resume_succeeds_without_recreating_removed_keyring_pointer_mirror() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -4713,9 +4724,7 @@ fn resume_restores_missing_keyring_pointer_when_remote_ref_matches_local_head() 
 
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
     assert_eq!(
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap(),
+        read_remote_keyring_pointer_ref_bytes(&remote, &repo_root),
         std::fs::read(
             repo_root
                 .join(".e2v")
@@ -4724,10 +4733,14 @@ fn resume_restores_missing_keyring_pointer_when_remote_ref_matches_local_head() 
         )
         .unwrap()
     );
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "resume should not recreate the removed remote keyring mirror file"
+    );
 }
 
 #[test]
-fn resume_repairs_stale_keyring_pointer_when_remote_ref_matches_local_head() {
+fn resume_ignores_stale_keyring_pointer_mirror_when_remote_ref_matches_local_head() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -4780,9 +4793,7 @@ fn resume_repairs_stale_keyring_pointer_when_remote_ref_matches_local_head() {
 
     assert_eq!(resumed.published_snapshot_id, commit.snapshot_id);
     assert_eq!(
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap(),
+        read_remote_keyring_pointer_ref_bytes(&remote, &repo_root),
         std::fs::read(
             repo_root
                 .join(".e2v")
@@ -4790,6 +4801,12 @@ fn resume_repairs_stale_keyring_pointer_when_remote_ref_matches_local_head() {
                 .join("keyring.current")
         )
         .unwrap()
+    );
+    assert_eq!(
+        remote
+            .get_physical("control/keyring/keyring.current")
+            .unwrap(),
+        br#"{"generation":"stale"}"#
     );
 }
 
@@ -4827,9 +4844,7 @@ fn resume_restores_missing_keyring_generation_when_remote_ref_matches_local_head
     )
     .unwrap();
 
-    let pointer_bytes = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let pointer_bytes = read_remote_keyring_pointer_ref_bytes(&remote, &repo_root);
     let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
     let current = pointer["current"].as_str().unwrap();
     remote
@@ -4987,7 +5002,7 @@ fn resume_cleans_up_stale_single_writer_lease_when_remote_state_is_already_compl
     );
     for keyring_file in e2v_core::sync_support::list_keyring_files(&repo_root).unwrap() {
         let file_name = keyring_file.file_name().unwrap().to_str().unwrap();
-        if file_name == "keyring.lock" {
+        if file_name == "keyring.lock" || file_name == "keyring.current" {
             continue;
         }
         assert_eq!(
@@ -5159,7 +5174,7 @@ fn resume_rejects_stale_remote_ref_and_requires_rebase_recovery() {
 }
 
 #[test]
-fn resume_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
+fn resume_updates_keyring_pointer_ref_even_when_branch_ref_is_stale() {
     let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
     let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
@@ -5193,9 +5208,7 @@ fn resume_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
         },
     )
     .unwrap();
-    let original_keyring_pointer = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let original_keyring_pointer = read_remote_keyring_pointer_ref_bytes(&remote, &repo_root);
 
     facade
         .change_password(
@@ -5244,11 +5257,34 @@ fn resume_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
             || error.to_string().contains("conflict")
     );
     assert_eq!(
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap(),
+        read_remote_keyring_pointer_ref_bytes(&remote, &repo_root),
+        fs::read(
+            repo_root
+                .join(".e2v")
+                .join("keyring")
+                .join("keyring.current")
+        )
+        .unwrap(),
+        "resume should still publish the latest keyring pointer ref before discovering the stale branch ref"
+    );
+    assert_ne!(
+        read_remote_keyring_pointer_ref_bytes(&remote, &repo_root),
         original_keyring_pointer,
-        "resume must not publish a new keyring pointer before ref CAS succeeds"
+        "password rotation should advance the keyring pointer ref even when resume later fails on the stale branch ref"
+    );
+    assert_eq!(
+        remote
+            .read_ref(&RefToken::new(state.branch.token_hex.clone()))
+            .unwrap()
+            .unwrap()
+            .value
+            .bytes,
+        vec![9, 9, 9],
+        "resume must leave the stale branch ref untouched when it reports needs-rebase"
+    );
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "resume should not recreate the removed remote keyring mirror file on the stale-branch path"
     );
 }
 
@@ -5865,7 +5901,7 @@ fn push_does_not_publish_control_ref_mirror_before_ref_cas_succeeds() {
 }
 
 #[test]
-fn push_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
+fn push_leaves_keyring_pointer_ref_unchanged_when_pointer_ref_publish_conflicts() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -5897,9 +5933,7 @@ fn push_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
         },
     )
     .unwrap();
-    let original_keyring_pointer = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let original_keyring_pointer = read_remote_keyring_pointer_ref_bytes(&remote.inner, &repo_root);
 
     facade
         .change_password(
@@ -5928,11 +5962,13 @@ fn push_does_not_publish_new_keyring_pointer_before_ref_cas_succeeds() {
             || error.to_string().contains("conflict")
     );
     assert_eq!(
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap(),
+        read_remote_keyring_pointer_ref_bytes(&remote.inner, &repo_root),
         original_keyring_pointer,
-        "keyring pointer must not be published before ref CAS succeeds"
+        "keyring pointer ref must remain unchanged when publishing that ref itself conflicts"
+    );
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "push should not recreate the removed remote keyring mirror file on the pointer-conflict path"
     );
 }
 
@@ -6238,12 +6274,9 @@ fn push_reports_manual_resolution_for_conflicting_remote_keyring_metadata() {
     )
     .unwrap();
 
-    let remote_pointer: serde_json::Value = serde_json::from_slice(
-        &remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap(),
-    )
-    .unwrap();
+    let remote_pointer: serde_json::Value =
+        serde_json::from_slice(&read_remote_keyring_pointer_ref_bytes(&remote, &owner_root))
+            .unwrap();
     let owner_current = remote_pointer["current"].as_str().unwrap();
     let mut conflicting_remote_keyring: serde_json::Value = serde_json::from_slice(
         &remote
@@ -6283,9 +6316,6 @@ fn push_reports_manual_resolution_for_conflicting_remote_keyring_metadata() {
             expected_pointer_version,
             EncryptedRef::new(pointer_bytes.clone()),
         )
-        .unwrap();
-    remote
-        .put_physical("control/keyring/keyring.current", &pointer_bytes)
         .unwrap();
 
     let error = push_head(
@@ -6380,9 +6410,7 @@ fn push_retries_after_retryable_remote_keyring_pointer_conflict() {
     .unwrap();
 
     assert_eq!(pushed.published_snapshot_id, committed.snapshot_id);
-    let remote_pointer = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let remote_pointer = read_remote_keyring_pointer_ref_bytes(&remote, &recipient_root);
     let local_pointer = fs::read(
         recipient_root
             .join(".e2v")
@@ -6391,6 +6419,10 @@ fn push_retries_after_retryable_remote_keyring_pointer_conflict() {
     )
     .unwrap();
     assert_eq!(remote_pointer, local_pointer);
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "push should not recreate the removed remote keyring mirror file"
+    );
 }
 
 #[test]
@@ -7410,7 +7442,7 @@ fn push_password_rotation_still_republishes_control_plane_even_when_head_is_unch
 }
 
 #[test]
-fn push_control_plane_repair_does_not_rewrite_unchanged_keyring_pointer_mirror() {
+fn push_control_plane_repair_does_not_write_remote_keyring_pointer_mirror() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -7443,6 +7475,15 @@ fn push_control_plane_repair_does_not_rewrite_unchanged_keyring_pointer_mirror()
     )
     .unwrap();
     assert_eq!(first.published_snapshot_id, commit.snapshot_id);
+    assert_eq!(
+        remote.keyring_pointer_mirror_put_count(),
+        0,
+        "push should no longer write the removed keyring pointer mirror file"
+    );
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "push should not create the removed keyring pointer mirror file"
+    );
 
     remote
         .put_physical("layout_root.json", br#"{"stale":true}"#)
@@ -7464,7 +7505,7 @@ fn push_control_plane_repair_does_not_rewrite_unchanged_keyring_pointer_mirror()
     assert_eq!(
         remote.keyring_pointer_mirror_put_count(),
         0,
-        "control-plane repair should not rewrite the mirrored keyring pointer when pointer bytes are unchanged"
+        "control-plane repair should not write the removed keyring pointer mirror file"
     );
 }
 
@@ -7625,9 +7666,7 @@ fn push_republishes_control_plane_when_password_rotates_without_new_snapshot() {
     .unwrap();
     assert_eq!(first.published_snapshot_id, commit.snapshot_id);
 
-    let original_keyring_pointer = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let original_keyring_pointer = read_remote_keyring_pointer_ref_bytes(&remote, &repo_root);
 
     facade
         .change_password(
@@ -7651,15 +7690,17 @@ fn push_republishes_control_plane_when_password_rotates_without_new_snapshot() {
     assert_eq!(second.published_snapshot_id, commit.snapshot_id);
     assert!(remote.exists_physical("control/keyring/keyring.2"));
     assert_ne!(
-        remote
-            .get_physical("control/keyring/keyring.current")
-            .unwrap(),
+        read_remote_keyring_pointer_ref_bytes(&remote, &repo_root),
         original_keyring_pointer
+    );
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "password rotation should advance the keyring pointer ref without recreating the removed mirror file"
     );
 }
 
 #[test]
-fn push_publishes_keyring_pointer_ref_alongside_physical_pointer() {
+fn push_publishes_keyring_pointer_ref_without_physical_pointer_mirror() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
@@ -7692,15 +7733,17 @@ fn push_publishes_keyring_pointer_ref_alongside_physical_pointer() {
     )
     .unwrap();
 
-    let pointer_bytes = remote
-        .get_physical("control/keyring/keyring.current")
-        .unwrap();
+    let pointer_bytes = read_remote_keyring_pointer_ref_bytes(&remote, &repo_root);
     let pointer_ref = remote
         .read_ref(&keyring_pointer_ref_token(&repo_root))
         .unwrap()
         .expect("keyring pointer ref should exist");
 
     assert_eq!(pointer_ref.value.bytes, pointer_bytes);
+    assert!(
+        !remote.exists_physical("control/keyring/keyring.current"),
+        "push should stop writing the removed keyring pointer mirror file"
+    );
 }
 
 #[test]

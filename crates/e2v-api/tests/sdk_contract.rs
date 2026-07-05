@@ -2037,18 +2037,28 @@ fn sdk_verify_default_remote_reports_rollback_detected_for_remote_keyring_genera
     })
     .unwrap();
 
-    let pointer_file_path = remote_root
-        .join("control")
-        .join("keyring")
-        .join("keyring.current");
-    let pointer_file_bytes = fs::read(&pointer_file_path).unwrap();
+    let remote_backend = e2v_store::LocalFolderBackend::new(&remote_root);
+    let pointer_token = e2v_store::RefToken::new(format!(
+        "keyring/{}",
+        e2v_core::sync_support::read_repo_id(&repo_root).unwrap()
+    ));
+    let pointer_file_bytes = e2v_store::RefStore::read_ref(&remote_backend, &pointer_token)
+        .unwrap()
+        .expect("keyring pointer ref should exist")
+        .value
+        .bytes;
     let mut pointer_file_json: serde_json::Value =
         serde_json::from_slice(&pointer_file_bytes).unwrap();
     let current_keyring = pointer_file_json["current"].as_str().unwrap().to_string();
     pointer_file_json["generation"] = serde_json::json!(0);
-    fs::write(
-        &pointer_file_path,
-        serde_json::to_vec(&pointer_file_json).unwrap(),
+    let expected_pointer_version = e2v_store::RefStore::read_ref(&remote_backend, &pointer_token)
+        .unwrap()
+        .map(|stored| stored.version);
+    e2v_store::RefStore::compare_and_swap_ref(
+        &remote_backend,
+        &pointer_token,
+        expected_pointer_version,
+        e2v_store::EncryptedRef::new(serde_json::to_vec(&pointer_file_json).unwrap()),
     )
     .unwrap();
 
