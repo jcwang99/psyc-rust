@@ -39,6 +39,26 @@ impl FakeRepositoryService {
     }
 }
 
+#[derive(Debug)]
+pub struct AppHarness {
+    pub app: crate::app::PsycGuiApp,
+    pub service: FakeRepositoryService,
+}
+
+pub fn boot_with_service(service: FakeRepositoryService) -> AppHarness {
+    let (app, _) =
+        crate::boot_with_services(crate::services::AppServices::new(Arc::new(service.clone())));
+
+    AppHarness { app, service }
+}
+
+pub fn advance(
+    app: &mut crate::app::PsycGuiApp,
+    message: crate::domain::Message,
+) -> iced::Task<crate::domain::Message> {
+    crate::app::update(app, message)
+}
+
 impl crate::services::RepositoryService for FakeRepositoryService {
     fn init_repository(
         &self,

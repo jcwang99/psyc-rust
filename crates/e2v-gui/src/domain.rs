@@ -11,7 +11,15 @@ pub enum Screen {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Home(crate::pages::home::HomeMessage),
+    HomeJobFinished(Result<crate::pages::home::HomeJobResult, AppError>),
     NoOp,
+}
+
+impl From<crate::pages::home::HomeMessage> for Message {
+    fn from(message: crate::pages::home::HomeMessage) -> Self {
+        Self::Home(message)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

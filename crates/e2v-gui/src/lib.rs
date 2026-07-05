@@ -1,5 +1,9 @@
 pub mod app;
 pub mod domain;
+pub mod jobs;
+pub mod pages {
+    pub mod home;
+}
 pub mod services;
 pub mod testing;
 
