@@ -8,9 +8,9 @@ mod pack_cache;
 mod pack_index;
 mod publisher;
 mod push;
+mod remote_diagnostics;
 mod remote_maintenance;
 mod remote_markers;
-mod remote_diagnostics;
 mod remote_spec;
 mod transaction;
 mod trusted_state;
@@ -31,6 +31,10 @@ pub use push::{
     PushOptions, PushResult, ResumeOptions, ResumeResult, push_head,
     push_head_with_single_writer_risk, resume_push,
 };
+pub use remote_diagnostics::{
+    RemoteDiagnosticsOptions, RemoteDiagnosticsPhaseReport, RemoteDiagnosticsReport,
+    RemoteDiagnosticsScenario, run_remote_diagnostics,
+};
 pub use remote_maintenance::{
     GcDryRunOptions, GcDryRunReport, GcExecuteCapabilityStatus, GcExecuteOptions, GcExecuteResult,
     HistoricalRewriteOptions, HistoricalRewritePlan, HistoricalRewritePlanOptions,
@@ -38,10 +42,6 @@ pub use remote_maintenance::{
     VerifyRemoteResult, force_accept_remote_rollback, gc_dry_run, gc_execute,
     gc_execute_capability_status, historical_rewrite_remote, plan_historical_rewrite,
     repair_remote, verify_remote,
-};
-pub use remote_diagnostics::{
-    RemoteDiagnosticsOptions, RemoteDiagnosticsPhaseReport, RemoteDiagnosticsReport,
-    RemoteDiagnosticsScenario, run_remote_diagnostics,
 };
 pub use remote_spec::{RemoteBackendRef, RemoteSpec};
 pub use trusted_state::TrustedRemoteState;
@@ -58,6 +58,8 @@ pub mod testing {
     use anyhow::Result;
     use serde_json::Value;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
 
     pub fn override_small_object_pack_threshold_for_test(
         threshold: usize,
@@ -107,5 +109,11 @@ pub mod testing {
         path: PathBuf,
     ) -> crate::trusted_state::TrustedStateDirGuard {
         crate::trusted_state::override_trusted_state_dir_for_test(path)
+    }
+
+    pub fn override_heartbeat_time_for_test(
+        current_time: Arc<Mutex<SystemTime>>,
+    ) -> crate::publisher::HeartbeatTimeOverrideGuard {
+        crate::publisher::override_heartbeat_time_for_test(current_time)
     }
 }

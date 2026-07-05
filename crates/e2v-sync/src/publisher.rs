@@ -1,3 +1,8 @@
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
 use anyhow::{Context, Result};
 
 use e2v_store::{BackendCapability, CasResult, EncryptedRef, LayoutRootVersion, RemoteBackend};
@@ -10,6 +15,43 @@ use crate::remote_markers::{
     renew_writer_lease_marker, system_time_to_unix_ms, writer_id_for_operation,
 };
 use crate::transaction::{PublishPlan, PublishSession, PublishedObject};
+
+const HEARTBEAT_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+thread_local! {
+    static HEARTBEAT_NOW_OVERRIDE: RefCell<Option<Arc<Mutex<SystemTime>>>> =
+        const { RefCell::new(None) };
+}
+
+fn heartbeat_now() -> SystemTime {
+    HEARTBEAT_NOW_OVERRIDE.with(|override_clock| {
+        override_clock
+            .borrow()
+            .as_ref()
+            .map(|clock| *clock.lock().unwrap())
+            .unwrap_or_else(SystemTime::now)
+    })
+}
+
+pub(crate) fn override_heartbeat_time_for_test(
+    current_time: Arc<Mutex<SystemTime>>,
+) -> HeartbeatTimeOverrideGuard {
+    let previous =
+        HEARTBEAT_NOW_OVERRIDE.with(|override_clock| override_clock.replace(Some(current_time)));
+    HeartbeatTimeOverrideGuard { previous }
+}
+
+pub struct HeartbeatTimeOverrideGuard {
+    previous: Option<Arc<Mutex<SystemTime>>>,
+}
+
+impl Drop for HeartbeatTimeOverrideGuard {
+    fn drop(&mut self) {
+        HEARTBEAT_NOW_OVERRIDE.with(|override_clock| {
+            override_clock.replace(self.previous.take());
+        });
+    }
+}
 
 pub trait TransactionPublisher {
     fn begin(&self, plan: PublishPlan) -> Result<PublishSession>;
@@ -26,6 +68,7 @@ pub struct SimpleTransactionPublisher<R: RemoteBackend> {
     capability: BackendCapability,
     journal: OperationJournal,
     remote_backend: R,
+    heartbeat_observed_at_local: Arc<Mutex<BTreeMap<String, SystemTime>>>,
 }
 
 impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
@@ -38,6 +81,7 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             capability,
             journal,
             remote_backend,
+            heartbeat_observed_at_local: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -132,7 +176,7 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             &active_intent_path,
             serde_json::to_vec(&build_write_intent_marker(&plan, observed_at, 1))?.as_slice(),
         )?;
-        Ok(PublishSession {
+        let session = PublishSession {
             operation_id: plan.operation_id,
             target_branch_token: plan.target_branch_token,
             expected_ref_version: plan.expected_ref_version,
@@ -143,8 +187,11 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             next_layout_root_bytes: None,
             active_intent_path,
             lease_path,
-        })
+        };
+        self.record_heartbeat_observed_now(&session.operation_id, heartbeat_now());
+        Ok(session)
     }
+
     fn renew_intent_if_needed(
         &self,
         path: &str,
@@ -211,6 +258,38 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
                 Ok(recovered)
             }
         }
+    }
+
+    fn record_heartbeat_observed_now(
+        &self,
+        operation_id: &crate::journal::OperationId,
+        now: SystemTime,
+    ) {
+        self.heartbeat_observed_at_local
+            .lock()
+            .unwrap()
+            .insert(operation_id.value.clone(), now);
+    }
+
+    fn should_renew_heartbeat(
+        &self,
+        operation_id: &crate::journal::OperationId,
+        now: SystemTime,
+    ) -> bool {
+        let observed = self.heartbeat_observed_at_local.lock().unwrap();
+        let Some(last_observed) = observed.get(&operation_id.value) else {
+            return true;
+        };
+        now.duration_since(*last_observed)
+            .map(|elapsed| elapsed >= HEARTBEAT_RENEWAL_INTERVAL)
+            .unwrap_or(false)
+    }
+
+    fn clear_heartbeat_state(&self, operation_id: &crate::journal::OperationId) {
+        self.heartbeat_observed_at_local
+            .lock()
+            .unwrap()
+            .remove(&operation_id.value);
     }
 
     fn renew_lease_if_needed(
@@ -348,6 +427,18 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             session,
             "heartbeat failed",
         )?;
+        let lease = if let Some(lease_path) = &session.lease_path {
+            Some((
+                lease_path.as_str(),
+                self.load_or_recover_lease_marker(lease_path, session, "heartbeat failed")?,
+            ))
+        } else {
+            None
+        };
+        let local_now = heartbeat_now();
+        if !self.should_renew_heartbeat(&session.operation_id, local_now) {
+            return Ok(());
+        }
         let observed_now =
             observe_remote_now_with_probe(&self.remote_backend, ".e2v/publish-remote-time.probe")?;
         let observed_at = system_time_to_unix_ms(observed_now)?;
@@ -357,13 +448,12 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             serde_json::to_vec(&renewed_intent)?.as_slice(),
         )?;
 
-        if let Some(lease_path) = &session.lease_path {
-            let lease =
-                self.load_or_recover_lease_marker(lease_path, session, "heartbeat failed")?;
+        if let Some((lease_path, lease)) = lease {
             let renewed_lease = renew_writer_lease_marker(&lease, observed_at);
             self.remote_backend
                 .put_physical(lease_path, serde_json::to_vec(&renewed_lease)?.as_slice())?;
         }
+        self.record_heartbeat_observed_now(&session.operation_id, local_now);
         Ok(())
     }
 
@@ -430,6 +520,7 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
         if let Some(lease_path) = session.lease_path {
             self.remote_backend.delete_physical(&lease_path)?;
         }
+        self.clear_heartbeat_state(&session.operation_id);
         Ok(())
     }
 }
@@ -1496,6 +1587,7 @@ mod tests {
         let initial_ms = fixed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let next_ms = next_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let remote = FixedRemoteTimeBackend::new(fixed_time);
+        let _heartbeat_clock_guard = override_heartbeat_time_for_test(remote.fixed_time.clone());
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,
@@ -1548,6 +1640,58 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_skips_renewal_for_fresh_markers() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let remote = FixedRemoteTimeBackend::new(fixed_time);
+        let _heartbeat_clock_guard = override_heartbeat_time_for_test(remote.fixed_time.clone());
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-fresh-heartbeat".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-fresh-heartbeat".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        publisher.heartbeat(&session).unwrap();
+
+        let intent: serde_json::Value = serde_json::from_slice(
+            &remote
+                .get_physical("transactions/active/op-fresh-heartbeat.intent")
+                .unwrap(),
+        )
+        .unwrap();
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(intent["heartbeat"]["sequence"], 1);
+        assert_eq!(lease["heartbeat"]["sequence"], 1);
+    }
+
+    #[test]
     fn heartbeat_recovers_from_corrupted_stale_active_intent_marker() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
@@ -1556,6 +1700,7 @@ mod tests {
         let initial_ms = initial_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let renewed_ms = renewed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let remote = FixedRemoteTimeBackend::new(initial_time);
+        let _heartbeat_clock_guard = override_heartbeat_time_for_test(remote.fixed_time.clone());
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,

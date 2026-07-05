@@ -2155,6 +2155,10 @@ impl AdvancingTimeInterruptingSingleWriterObjectUploadBackend {
         }
     }
 
+    fn current_time_handle(&self) -> Arc<Mutex<std::time::SystemTime>> {
+        self.current_time.clone()
+    }
+
     fn stamp_current_time(&self, relative_path: &str) -> anyhow::Result<()> {
         e2v_store::testing::override_memory_backend_modified_time(
             &self.inner,
@@ -2778,6 +2782,8 @@ fn push_refreshes_single_writer_heartbeat_during_long_running_upload_before_inte
         1,
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_731_000_000),
     );
+    let _heartbeat_clock_guard =
+        e2v_sync::testing::override_heartbeat_time_for_test(remote.current_time_handle());
     let error = push_head(
         &facade,
         &remote,
