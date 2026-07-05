@@ -1039,7 +1039,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
                         object_type: "object".to_string(),
                     },
                 )?;
-                publisher.heartbeat(&session)?;
+                publisher.heartbeat_if_needed(&session)?;
                 journal.record_verified(&operation_id, object_id, "object")
             },
         )?
@@ -1058,7 +1058,7 @@ fn push_head_inner<R: RemoteBackend + Clone>(
                         object_type: "object".to_string(),
                     },
                 )?;
-                publisher.heartbeat(&session)?;
+                publisher.heartbeat_if_needed(&session)?;
                 journal.record_verified(&operation_id, object_id, "object")
             },
         )?

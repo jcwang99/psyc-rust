@@ -335,7 +335,7 @@ fn publish_oblivious_segments<R: RemoteBackend + Clone>(
             operation_id,
             batch,
             |_object_id| {
-                publisher.heartbeat(session)?;
+                publisher.heartbeat_if_needed(session)?;
                 Ok(())
             },
         )?;

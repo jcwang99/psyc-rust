@@ -292,6 +292,14 @@ impl<R: RemoteBackend> SimpleTransactionPublisher<R> {
             .remove(&operation_id.value);
     }
 
+    pub(crate) fn heartbeat_if_needed(&self, session: &PublishSession) -> Result<()> {
+        let local_now = heartbeat_now();
+        if !self.should_renew_heartbeat(&session.operation_id, local_now) {
+            return Ok(());
+        }
+        TransactionPublisher::heartbeat(self, session)
+    }
+
     fn renew_lease_if_needed(
         &self,
         path: &str,
@@ -436,9 +444,6 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             None
         };
         let local_now = heartbeat_now();
-        if !self.should_renew_heartbeat(&session.operation_id, local_now) {
-            return Ok(());
-        }
         let observed_now =
             observe_remote_now_with_probe(&self.remote_backend, ".e2v/publish-remote-time.probe")?;
         let observed_at = system_time_to_unix_ms(observed_now)?;
@@ -480,7 +485,11 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
             session,
             "pre-commit verify failed",
         )?;
-        let _intent = self.renew_intent_if_needed(&session.active_intent_path, &intent)?;
+        let local_now = heartbeat_now();
+        let should_renew = self.should_renew_heartbeat(&session.operation_id, local_now);
+        if should_renew {
+            let _intent = self.renew_intent_if_needed(&session.active_intent_path, &intent)?;
+        }
         if let Some(expected_ref_version) = session.expected_ref_version {
             validate_sync_identifier("branch token", &session.target_branch_token)?;
             let current = self.remote_backend.read_ref(&e2v_store::RefToken::new(
@@ -498,7 +507,12 @@ impl<R: RemoteBackend> TransactionPublisher for SimpleTransactionPublisher<R> {
         if let Some(lease_path) = &session.lease_path {
             let lease =
                 self.load_or_recover_lease_marker(lease_path, session, "pre-commit verify failed")?;
-            let _lease = self.renew_lease_if_needed(lease_path, &lease)?;
+            if should_renew {
+                let _lease = self.renew_lease_if_needed(lease_path, &lease)?;
+            }
+        }
+        if should_renew {
+            self.record_heartbeat_observed_now(&session.operation_id, local_now);
         }
         Ok(())
     }
@@ -665,6 +679,16 @@ mod tests {
     struct FixedRemoteTimeBackend {
         inner: e2v_store::MemoryBackend,
         fixed_time: std::sync::Arc<std::sync::Mutex<SystemTime>>,
+        counts: Arc<Mutex<MarkerIoCounts>>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct MarkerIoCounts {
+        intent_gets: usize,
+        lease_gets: usize,
+        probe_puts: usize,
+        probe_deletes: usize,
+        probe_stats: usize,
     }
 
     impl FixedRemoteTimeBackend {
@@ -672,16 +696,24 @@ mod tests {
             Self {
                 inner: e2v_store::MemoryBackend::new(),
                 fixed_time: std::sync::Arc::new(std::sync::Mutex::new(fixed_time)),
+                counts: Arc::new(Mutex::new(MarkerIoCounts::default())),
             }
         }
 
         fn set_fixed_time_for_test(&self, fixed_time: SystemTime) {
             *self.fixed_time.lock().unwrap() = fixed_time;
         }
+
+        fn marker_io_counts(&self) -> MarkerIoCounts {
+            *self.counts.lock().unwrap()
+        }
     }
 
     impl BlobStore for FixedRemoteTimeBackend {
         fn put_physical(&self, relative_path: &str, bytes: &[u8]) -> Result<()> {
+            if relative_path.ends_with(".probe") {
+                self.counts.lock().unwrap().probe_puts += 1;
+            }
             self.inner.put_physical(relative_path, bytes)?;
             if relative_path.starts_with("transactions/active/")
                 || relative_path.starts_with("leases/")
@@ -713,6 +745,11 @@ mod tests {
         }
 
         fn get_physical(&self, relative_path: &str) -> Result<Vec<u8>> {
+            if relative_path.starts_with("transactions/active/") {
+                self.counts.lock().unwrap().intent_gets += 1;
+            } else if relative_path.starts_with("leases/") {
+                self.counts.lock().unwrap().lease_gets += 1;
+            }
             self.inner.get_physical(relative_path)
         }
 
@@ -726,6 +763,9 @@ mod tests {
         }
 
         fn delete_physical(&self, relative_path: &str) -> Result<()> {
+            if relative_path.ends_with(".probe") {
+                self.counts.lock().unwrap().probe_deletes += 1;
+            }
             self.inner.delete_physical(relative_path)
         }
 
@@ -734,6 +774,9 @@ mod tests {
         }
 
         fn stat_physical(&self, relative_path: &str) -> Result<e2v_store::ObjectStat> {
+            if relative_path.ends_with(".probe") {
+                self.counts.lock().unwrap().probe_stats += 1;
+            }
             self.inner.stat_physical(relative_path)
         }
 
@@ -1640,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_skips_renewal_for_fresh_markers() {
+    fn heartbeat_if_needed_skips_renewal_for_fresh_markers() {
         let temp = tempdir().unwrap();
         let journal = OperationJournal::new(temp.path()).unwrap();
         let fixed_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
@@ -1675,7 +1718,9 @@ mod tests {
             })
             .unwrap();
 
-        publisher.heartbeat(&session).unwrap();
+        let before = remote.marker_io_counts();
+        publisher.heartbeat_if_needed(&session).unwrap();
+        let after = remote.marker_io_counts();
 
         let intent: serde_json::Value = serde_json::from_slice(
             &remote
@@ -1689,6 +1734,66 @@ mod tests {
 
         assert_eq!(intent["heartbeat"]["sequence"], 1);
         assert_eq!(lease["heartbeat"]["sequence"], 1);
+        assert_eq!(after.intent_gets - before.intent_gets, 0);
+        assert_eq!(after.lease_gets - before.lease_gets, 0);
+        assert_eq!(after.probe_puts - before.probe_puts, 0);
+    }
+
+    #[test]
+    fn pre_commit_verify_skips_remote_time_probe_for_fresh_markers() {
+        let temp = tempdir().unwrap();
+        let journal = OperationJournal::new(temp.path()).unwrap();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
+        let remote = FixedRemoteTimeBackend::new(fixed_time);
+        let _heartbeat_clock_guard = override_heartbeat_time_for_test(remote.fixed_time.clone());
+        let publisher = SimpleTransactionPublisher::new(
+            BackendCapability {
+                supports_conditional_put: false,
+                supports_range_read: true,
+                supports_atomic_rename: true,
+                supports_paged_list: true,
+                consistency_class: ConsistencyClass::UnknownOrEventual,
+                supports_remote_lock_or_lease: true,
+                supports_atomic_create_if_absent: true,
+                supports_transaction_markers: true,
+                supports_reliable_remote_time: true,
+                supports_object_generation_or_etag: true,
+                supports_layout_root_cas: true,
+                supports_oblivious_access_schedule: false,
+            },
+            journal,
+            remote.clone(),
+        );
+
+        let session = publisher
+            .begin(PublishPlan {
+                operation_id: OperationId::new("op-fresh-precommit".to_string()).unwrap(),
+                target_branch_token: "branch-token".to_string(),
+                expected_ref_version: None,
+                planned_snapshot_id: Some("snapshot-fresh-precommit".to_string()),
+                writer_mode: WriterMode::ReadOnly,
+            })
+            .unwrap();
+
+        let before = remote.marker_io_counts();
+        publisher.pre_commit_verify(&session).unwrap();
+        let after = remote.marker_io_counts();
+
+        let intent: serde_json::Value = serde_json::from_slice(
+            &remote
+                .get_physical("transactions/active/op-fresh-precommit.intent")
+                .unwrap(),
+        )
+        .unwrap();
+        let lease: serde_json::Value =
+            serde_json::from_slice(&remote.get_physical("leases/branch-token.lock").unwrap())
+                .unwrap();
+
+        assert_eq!(intent["heartbeat"]["sequence"], 1);
+        assert_eq!(lease["heartbeat"]["sequence"], 1);
+        assert_eq!(after.probe_puts - before.probe_puts, 0);
+        assert_eq!(after.probe_stats - before.probe_stats, 0);
+        assert_eq!(after.probe_deletes - before.probe_deletes, 0);
     }
 
     #[test]
@@ -2163,6 +2268,7 @@ mod tests {
         let initial_ms = initial_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let renewed_ms = renewed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let remote = FixedRemoteTimeBackend::new(initial_time);
+        let _heartbeat_clock_guard = override_heartbeat_time_for_test(remote.fixed_time.clone());
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,
@@ -2237,6 +2343,7 @@ mod tests {
         let initial_time = UNIX_EPOCH + Duration::from_secs(1_731_000_000);
         let renewed_time = initial_time + Duration::from_secs(73 * 60 * 60);
         let remote = FixedRemoteTimeBackend::new(initial_time);
+        let _heartbeat_clock_guard = override_heartbeat_time_for_test(remote.fixed_time.clone());
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,
@@ -2308,6 +2415,7 @@ mod tests {
         let initial_ms = initial_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let renewed_ms = renewed_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let remote = FixedRemoteTimeBackend::new(initial_time);
+        let _heartbeat_clock_guard = override_heartbeat_time_for_test(remote.fixed_time.clone());
         let publisher = SimpleTransactionPublisher::new(
             BackendCapability {
                 supports_conditional_put: false,

@@ -810,7 +810,7 @@ fn upload_rewrite_segments_with_resume<R: RemoteBackend + Clone>(
             operation_id,
             batch_object_ids,
             |_object_id| {
-                publisher.heartbeat(session)?;
+                publisher.heartbeat_if_needed(session)?;
                 Ok(())
             },
         )?;
