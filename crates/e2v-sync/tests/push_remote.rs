@@ -3027,6 +3027,8 @@ fn resume_skips_object_reupload_when_remote_state_is_already_complete() {
 
 #[test]
 fn resume_reuploads_only_missing_remote_objects_without_journal() {
+    let _large_guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(usize::MAX);
+    let _small_guard = e2v_sync::testing::override_small_push_pack_threshold_for_test(usize::MAX);
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
     fs::create_dir_all(&repo_root).unwrap();
