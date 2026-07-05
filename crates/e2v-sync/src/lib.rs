@@ -29,7 +29,7 @@ pub use oram::{
 };
 pub use push::{
     PushOptions, PushResult, ResumeOptions, ResumeResult, push_head,
-    push_head_with_single_writer_risk, resume_push,
+    push_head_with_single_writer_risk, resume_push, small_push_pack_threshold,
 };
 pub use remote_diagnostics::{
     RemoteDiagnosticsOptions, RemoteDiagnosticsPhaseReport, RemoteDiagnosticsReport,
@@ -65,6 +65,12 @@ pub mod testing {
         threshold: usize,
     ) -> crate::push::SmallObjectPackThresholdGuard {
         crate::push::override_small_object_pack_threshold_for_test(threshold)
+    }
+
+    pub fn override_small_push_pack_threshold_for_test(
+        threshold: usize,
+    ) -> crate::push::SmallPushPackThresholdGuard {
+        crate::push::override_small_push_pack_threshold_for_test(threshold)
     }
 
     pub fn decode_pack_index_root_value_for_test(

@@ -67,8 +67,10 @@ const RESUME_OBJECT_BATCH_SIZE: usize = 128;
 const SMALL_OBJECT_PACK_BATCH_SIZE: usize = 256;
 const SMALL_OBJECT_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_SMALL_OBJECT_PACK_THRESHOLD: usize = 100_000;
+const DEFAULT_SMALL_PUSH_PACK_THRESHOLD: usize = 2;
 thread_local! {
     static SMALL_OBJECT_PACK_THRESHOLD_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    static SMALL_PUSH_PACK_THRESHOLD_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 pub fn small_object_pack_threshold() -> usize {
@@ -106,11 +108,66 @@ impl Drop for SmallObjectPackThresholdGuard {
     }
 }
 
+pub fn small_push_pack_threshold() -> usize {
+    SMALL_PUSH_PACK_THRESHOLD_OVERRIDE.with(|override_cell| {
+        override_cell
+            .get()
+            .unwrap_or(DEFAULT_SMALL_PUSH_PACK_THRESHOLD)
+    })
+}
+
+pub(crate) fn override_small_push_pack_threshold_for_test(
+    threshold: usize,
+) -> SmallPushPackThresholdGuard {
+    let previous = SMALL_PUSH_PACK_THRESHOLD_OVERRIDE.with(|override_cell| {
+        let previous = override_cell.get();
+        override_cell.set(Some(threshold));
+        previous
+    });
+    SmallPushPackThresholdGuard { previous }
+}
+
+pub struct SmallPushPackThresholdGuard {
+    previous: Option<usize>,
+}
+
+impl Drop for SmallPushPackThresholdGuard {
+    fn drop(&mut self) {
+        SMALL_PUSH_PACK_THRESHOLD_OVERRIDE.with(|override_cell| {
+            override_cell.set(self.previous);
+        });
+    }
+}
+
 fn local_object_path(repo_root: &Path, object_id: &str) -> PathBuf {
     repo_root
         .join(".e2v")
         .join("objects")
         .join(format!("{object_id}.json"))
+}
+
+fn should_pack_current_upload_set(
+    repo_root: &Path,
+    missing_object_ids: &[String],
+    total_object_count_hint: usize,
+) -> Result<bool> {
+    if should_pack_small_objects(total_object_count_hint) {
+        return Ok(true);
+    }
+
+    let mut pack_eligible_count = 0usize;
+    for object_id in missing_object_ids {
+        validate_object_id_value(object_id)?;
+        let bytes = std::fs::read(local_object_path(repo_root, object_id))?;
+        if bytes.len() <= SMALL_OBJECT_MAX_BYTES {
+            pack_eligible_count += 1;
+            if pack_eligible_count >= small_push_pack_threshold() {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 fn inventory_has_object(
@@ -1414,10 +1471,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PackedObjectLocation, PushOptions, cleanup_completed_operation_markers,
+        PackedObjectLocation, PushOptions, cleanup_completed_operation_markers, local_object_path,
+        override_small_object_pack_threshold_for_test, override_small_push_pack_threshold_for_test,
         publish_remote_keyring_pointer, push_head, read_remote_current_keyring_bytes,
         remote_object_authenticates_for_repo, remote_snapshot_graph_authenticates_for_repo,
-        should_pack_small_objects, upload_object_batch,
+        should_pack_current_upload_set, should_pack_small_objects, upload_object_batch,
     };
     use crate::journal::OperationId;
 
@@ -1548,6 +1606,55 @@ mod tests {
     fn default_small_object_pack_threshold_starts_at_100k() {
         assert!(!should_pack_small_objects(99_999));
         assert!(should_pack_small_objects(100_000));
+    }
+
+    #[test]
+    fn current_upload_set_enables_packing_for_two_small_missing_objects() {
+        let _large_guard = override_small_object_pack_threshold_for_test(usize::MAX);
+        let _small_guard = override_small_push_pack_threshold_for_test(2);
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path();
+        let objects_dir = repo_root.join(".e2v").join("objects");
+        std::fs::create_dir_all(&objects_dir).unwrap();
+
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        std::fs::write(local_object_path(repo_root, &first), vec![1u8; 32]).unwrap();
+        std::fs::write(local_object_path(repo_root, &second), vec![2u8; 32]).unwrap();
+
+        assert!(should_pack_current_upload_set(repo_root, &[first, second], 2).unwrap());
+    }
+
+    #[test]
+    fn current_upload_set_keeps_single_small_missing_object_loose_by_default() {
+        let _large_guard = override_small_object_pack_threshold_for_test(usize::MAX);
+        let _small_guard = override_small_push_pack_threshold_for_test(2);
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path();
+        let objects_dir = repo_root.join(".e2v").join("objects");
+        std::fs::create_dir_all(&objects_dir).unwrap();
+
+        let object_id =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        std::fs::write(local_object_path(repo_root, &object_id), vec![3u8; 32]).unwrap();
+
+        assert!(!should_pack_current_upload_set(repo_root, &[object_id], 1).unwrap());
+    }
+
+    #[test]
+    fn large_repository_threshold_still_enables_packing_with_one_missing_object() {
+        let _large_guard = override_small_object_pack_threshold_for_test(3);
+        let _small_guard = override_small_push_pack_threshold_for_test(usize::MAX);
+        let temp = tempdir().unwrap();
+        let repo_root = temp.path();
+        let objects_dir = repo_root.join(".e2v").join("objects");
+        std::fs::create_dir_all(&objects_dir).unwrap();
+
+        let object_id =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
+        std::fs::write(local_object_path(repo_root, &object_id), vec![4u8; 32]).unwrap();
+
+        assert!(should_pack_current_upload_set(repo_root, &[object_id], 3).unwrap());
     }
 
     #[test]
