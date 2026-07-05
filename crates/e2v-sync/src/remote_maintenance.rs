@@ -756,7 +756,13 @@ fn retained_active_segment_paths_for_unrewritten_objects<R: RemoteBackend>(
     rewritten_object_ids: &BTreeSet<String>,
 ) -> Result<Vec<String>> {
     let secrets = sync_support::open_or_unlock_repo_secrets_for_sync(control_dir)?;
-    let active_segment_paths = load_remote_active_pack_segment_paths(remote, &secrets)?;
+    let active_segment_paths =
+        load_remote_active_pack_segment_paths(remote, &secrets).or_else(|error| {
+            let Some(historical_segment_secrets) = historical_segment_secrets else {
+                return Err(error);
+            };
+            load_remote_active_pack_segment_paths(remote, historical_segment_secrets)
+        })?;
     let mut retained = Vec::new();
     for segment_path in active_segment_paths {
         let segment_bytes = remote.get_physical(&segment_path)?;
