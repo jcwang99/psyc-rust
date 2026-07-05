@@ -2,6 +2,8 @@ pub mod app;
 pub mod domain;
 pub mod jobs;
 pub mod pages {
+    pub mod branches;
+    pub mod history;
     pub mod home;
     pub mod overview;
     pub mod workbench;

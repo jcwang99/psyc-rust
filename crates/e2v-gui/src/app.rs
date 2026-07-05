@@ -44,11 +44,13 @@ pub fn boot_with_services(services: AppServices) -> (PsycGuiApp, Task<Message>) 
 
 pub fn update(app: &mut PsycGuiApp, message: Message) -> Task<Message> {
     match message {
+        Message::Branches(message) => crate::pages::branches::update_branches(app, message),
         Message::Home(message) => crate::pages::home::update_home(app, message),
         Message::HomeJobFinished(result) => {
             handle_home_job_result(app, result);
             Task::none()
         }
+        Message::History(message) => crate::pages::history::update_history(app, message),
         Message::Overview(message) => crate::pages::overview::update_overview(app, message),
         Message::OverviewJobFinished(result) => {
             handle_overview_job_result(app, result);
@@ -129,6 +131,20 @@ pub(crate) fn activate_repository(app: &mut PsycGuiApp, card: crate::domain::Rep
         .touch_recent(card.repo_root.clone(), current_unix_ms());
     app.selected_repository = Some(card.repo_root.clone());
     sync_workbench_from_card(&mut app.workbench.overview, &card);
+    if let Ok(rows) = app
+        .services
+        .repository
+        .list_snapshots(card.repo_root.clone())
+    {
+        app.workbench.history.rows = rows;
+    }
+    if let Ok(rows) = app
+        .services
+        .repository
+        .list_branches(card.repo_root.clone())
+    {
+        app.workbench.branches.rows = rows;
+    }
     app.screen = Screen::Workbench;
 }
 

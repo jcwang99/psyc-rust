@@ -11,16 +11,30 @@ pub enum Screen {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Branches(crate::pages::branches::BranchesMessage),
     Home(crate::pages::home::HomeMessage),
     HomeJobFinished(Result<crate::pages::home::HomeJobResult, AppError>),
+    History(crate::pages::history::HistoryMessage),
     Overview(crate::pages::overview::OverviewMessage),
     OverviewJobFinished(Result<crate::pages::overview::OverviewJobResult, AppError>),
     NoOp,
 }
 
+impl From<crate::pages::branches::BranchesMessage> for Message {
+    fn from(message: crate::pages::branches::BranchesMessage) -> Self {
+        Self::Branches(message)
+    }
+}
+
 impl From<crate::pages::home::HomeMessage> for Message {
     fn from(message: crate::pages::home::HomeMessage) -> Self {
         Self::Home(message)
+    }
+}
+
+impl From<crate::pages::history::HistoryMessage> for Message {
+    fn from(message: crate::pages::history::HistoryMessage) -> Self {
+        Self::History(message)
     }
 }
 

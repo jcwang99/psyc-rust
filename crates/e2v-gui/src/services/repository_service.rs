@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use e2v_api::{
-    CloneRequest, CommitInfo, CommitRepositoryOptions, InitRepositoryOptions, Sdk, SdkErrorCode,
+    CheckoutSnapshotOptions, CloneRequest, CommitInfo, CommitRepositoryOptions,
+    InitRepositoryOptions, Sdk, SdkErrorCode,
 };
 
 use crate::domain::{AppError, RepositoryHomeCard};
@@ -29,6 +30,37 @@ pub trait RepositoryService: Send + Sync + std::fmt::Debug + 'static {
         repo_root: PathBuf,
         message: String,
     ) -> Result<CommitInfo, AppError>;
+
+    fn list_snapshots(
+        &self,
+        repo_root: PathBuf,
+    ) -> Result<Vec<crate::pages::history::SnapshotRow>, AppError>;
+
+    fn checkout_snapshot(
+        &self,
+        repo_root: PathBuf,
+        snapshot_id: String,
+        target_dir: PathBuf,
+    ) -> Result<(), AppError>;
+
+    fn list_branches(
+        &self,
+        repo_root: PathBuf,
+    ) -> Result<Vec<crate::pages::branches::BranchRow>, AppError>;
+
+    fn create_branch(
+        &self,
+        repo_root: PathBuf,
+        name: String,
+    ) -> Result<crate::pages::branches::BranchRow, AppError>;
+
+    fn checkout_branch(
+        &self,
+        repo_root: PathBuf,
+        name: String,
+    ) -> Result<RepositoryHomeCard, AppError>;
+
+    fn delete_branch(&self, repo_root: PathBuf, name: String) -> Result<(), AppError>;
 
     fn load_repository_summary(&self, repo_root: PathBuf) -> Result<RepositoryHomeCard, AppError>;
 }
@@ -96,6 +128,90 @@ impl RepositoryService for RealRepositoryService {
     ) -> Result<CommitInfo, AppError> {
         self.sdk
             .commit_repository(CommitRepositoryOptions { repo_root, message })
+            .map_err(AppError::from_sdk)
+    }
+
+    fn list_snapshots(
+        &self,
+        repo_root: PathBuf,
+    ) -> Result<Vec<crate::pages::history::SnapshotRow>, AppError> {
+        self.sdk
+            .list_snapshots(&repo_root)
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|snapshot| crate::pages::history::SnapshotRow {
+                        snapshot_id: snapshot.snapshot_id,
+                        message: snapshot.message,
+                    })
+                    .collect()
+            })
+            .map_err(AppError::from_sdk)
+    }
+
+    fn checkout_snapshot(
+        &self,
+        repo_root: PathBuf,
+        snapshot_id: String,
+        target_dir: PathBuf,
+    ) -> Result<(), AppError> {
+        self.sdk
+            .checkout_snapshot(CheckoutSnapshotOptions {
+                repo_root,
+                snapshot_id,
+                target_dir,
+            })
+            .map_err(AppError::from_sdk)
+    }
+
+    fn list_branches(
+        &self,
+        repo_root: PathBuf,
+    ) -> Result<Vec<crate::pages::branches::BranchRow>, AppError> {
+        self.sdk
+            .list_branches(&repo_root)
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|branch| crate::pages::branches::BranchRow {
+                        name: branch.name,
+                        head_snapshot_id: branch.head_snapshot_id,
+                        is_current: branch.is_current,
+                    })
+                    .collect()
+            })
+            .map_err(AppError::from_sdk)
+    }
+
+    fn create_branch(
+        &self,
+        repo_root: PathBuf,
+        name: String,
+    ) -> Result<crate::pages::branches::BranchRow, AppError> {
+        self.sdk
+            .create_branch(&repo_root, &name)
+            .map_err(AppError::from_sdk)?;
+
+        self.list_branches(repo_root)?
+            .into_iter()
+            .find(|branch| branch.name == name)
+            .ok_or_else(|| AppError::internal("created branch missing from branch table"))
+    }
+
+    fn checkout_branch(
+        &self,
+        repo_root: PathBuf,
+        name: String,
+    ) -> Result<RepositoryHomeCard, AppError> {
+        self.sdk
+            .checkout_branch(&repo_root, &name)
+            .map_err(AppError::from_sdk)?;
+        self.load_repository_summary(repo_root)
+    }
+
+    fn delete_branch(&self, repo_root: PathBuf, name: String) -> Result<(), AppError> {
+        self.sdk
+            .delete_branch(&repo_root, &name)
             .map_err(AppError::from_sdk)
     }
 

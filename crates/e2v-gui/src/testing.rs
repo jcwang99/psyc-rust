@@ -14,8 +14,10 @@ pub struct FakeRepositoryService {
 
 #[derive(Debug, Default)]
 struct FakeRepositoryServiceState {
+    branch_rows: HashMap<PathBuf, Vec<crate::pages::branches::BranchRow>>,
     summaries: HashMap<PathBuf, RepositoryHomeCard>,
     commit_results: HashMap<PathBuf, CommitInfo>,
+    snapshot_rows: HashMap<PathBuf, Vec<crate::pages::history::SnapshotRow>>,
 }
 
 impl FakeRepositoryService {
@@ -39,8 +41,10 @@ impl FakeRepositoryService {
 
         Self {
             state: Arc::new(Mutex::new(FakeRepositoryServiceState {
+                branch_rows: HashMap::new(),
                 summaries,
                 commit_results: HashMap::new(),
+                snapshot_rows: HashMap::new(),
             })),
         }
     }
@@ -78,10 +82,54 @@ impl FakeRepositoryService {
 
         Self {
             state: Arc::new(Mutex::new(FakeRepositoryServiceState {
+                branch_rows: HashMap::new(),
                 summaries,
                 commit_results,
+                snapshot_rows: HashMap::new(),
             })),
         }
+    }
+
+    pub fn with_snapshot_list(repo_root: impl Into<PathBuf>, snapshot_ids: Vec<&str>) -> Self {
+        let repo_root = repo_root.into();
+        let service =
+            Self::with_open_result(repo_root.clone(), "main", snapshot_ids.first().copied());
+        let rows = snapshot_ids
+            .into_iter()
+            .map(|snapshot_id| crate::pages::history::SnapshotRow {
+                snapshot_id: snapshot_id.to_owned(),
+                message: format!("message-{snapshot_id}"),
+            })
+            .collect::<Vec<_>>();
+        service
+            .state
+            .lock()
+            .expect("fake repository service state")
+            .snapshot_rows
+            .insert(repo_root, rows);
+        service
+    }
+
+    pub fn with_branch_table(repo_root: impl Into<PathBuf>, branch_names: Vec<&str>) -> Self {
+        let repo_root = repo_root.into();
+        let current_branch = branch_names.first().copied().unwrap_or("main");
+        let service = Self::with_open_result(repo_root.clone(), current_branch, Some("snap-1"));
+        let rows = branch_names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| crate::pages::branches::BranchRow {
+                name: name.to_owned(),
+                head_snapshot_id: Some(format!("snap-{}", index + 1)),
+                is_current: index == 0,
+            })
+            .collect::<Vec<_>>();
+        service
+            .state
+            .lock()
+            .expect("fake repository service state")
+            .branch_rows
+            .insert(repo_root, rows);
+        service
     }
 }
 
@@ -189,6 +237,104 @@ impl crate::services::RepositoryService for FakeRepositoryService {
         }
 
         Ok(result)
+    }
+
+    fn list_snapshots(
+        &self,
+        repo_root: PathBuf,
+    ) -> Result<Vec<crate::pages::history::SnapshotRow>, AppError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake repository service state poisoned"))?
+            .snapshot_rows
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn checkout_snapshot(
+        &self,
+        _repo_root: PathBuf,
+        _snapshot_id: String,
+        _target_dir: PathBuf,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn list_branches(
+        &self,
+        repo_root: PathBuf,
+    ) -> Result<Vec<crate::pages::branches::BranchRow>, AppError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake repository service state poisoned"))?
+            .branch_rows
+            .get(&repo_root)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn create_branch(
+        &self,
+        repo_root: PathBuf,
+        name: String,
+    ) -> Result<crate::pages::branches::BranchRow, AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake repository service state poisoned"))?;
+        let rows = state.branch_rows.entry(repo_root).or_default();
+        let row = crate::pages::branches::BranchRow {
+            name,
+            head_snapshot_id: rows
+                .iter()
+                .find(|branch| branch.is_current)
+                .and_then(|branch| branch.head_snapshot_id.clone()),
+            is_current: false,
+        };
+        rows.insert(0, row.clone());
+        Ok(row)
+    }
+
+    fn checkout_branch(
+        &self,
+        repo_root: PathBuf,
+        name: String,
+    ) -> Result<RepositoryHomeCard, AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake repository service state poisoned"))?;
+        let rows = state.branch_rows.entry(repo_root.clone()).or_default();
+        let mut head_snapshot_id = None;
+        for row in rows.iter_mut() {
+            let is_current = row.name == name;
+            row.is_current = is_current;
+            if is_current {
+                head_snapshot_id = row.head_snapshot_id.clone();
+            }
+        }
+
+        let summary = state
+            .summaries
+            .get_mut(&repo_root)
+            .ok_or_else(|| AppError::internal("missing fake repository summary"))?;
+        summary.branch_name = name;
+        summary.head_snapshot_id = head_snapshot_id;
+        Ok(summary.clone())
+    }
+
+    fn delete_branch(&self, repo_root: PathBuf, name: String) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake repository service state poisoned"))?;
+        if let Some(rows) = state.branch_rows.get_mut(&repo_root) {
+            rows.retain(|row| row.name != name);
+        }
+        Ok(())
     }
 
     fn load_repository_summary(&self, repo_root: PathBuf) -> Result<RepositoryHomeCard, AppError> {
