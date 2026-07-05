@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use e2v_api::{CommitInfo, FetchResponse, PullResponse, PushResponse};
+use e2v_vfs::{CachePolicy, MountLaunchState, MountLaunchSummary};
 
 use crate::domain::{AppError, RepositoryHomeCard};
 use crate::services::{
-    RepositoryService, SearchQuery, SearchService, ShareActorRow, ShareDeviceRow, SharingRoster,
-    SharingService,
+    HostShellService, LocalWebController, MountController, PreviewService, RepositoryService,
+    SearchQuery, SearchService, ShareActorRow, ShareDeviceRow, SharingRoster, SharingService,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -141,6 +142,8 @@ impl FakeRepositoryService {
 #[derive(Debug)]
 pub struct AppHarness {
     pub app: crate::app::PsycGuiApp,
+    pub host_shell: FakeHostShellService,
+    pub preview: FakePreviewService,
     pub service: FakeRepositoryService,
     pub search: FakeSearchService,
     pub sharing: FakeSharingService,
@@ -148,6 +151,8 @@ pub struct AppHarness {
 
 #[derive(Debug, Clone)]
 pub struct TestServices {
+    pub host_shell: FakeHostShellService,
+    pub preview: FakePreviewService,
     pub repository: FakeRepositoryService,
     pub search: FakeSearchService,
     pub sharing: FakeSharingService,
@@ -156,6 +161,8 @@ pub struct TestServices {
 impl TestServices {
     pub fn new(repository: FakeRepositoryService) -> Self {
         Self {
+            host_shell: FakeHostShellService::default(),
+            preview: FakePreviewService::default(),
             repository,
             search: FakeSearchService::default(),
             sharing: FakeSharingService::default(),
@@ -171,6 +178,16 @@ impl TestServices {
         self.sharing = sharing;
         self
     }
+
+    pub fn with_preview(mut self, preview: FakePreviewService) -> Self {
+        self.preview = preview;
+        self
+    }
+
+    pub fn with_host_shell(mut self, host_shell: FakeHostShellService) -> Self {
+        self.host_shell = host_shell;
+        self
+    }
 }
 
 pub fn boot_with_service(service: FakeRepositoryService) -> AppHarness {
@@ -180,12 +197,16 @@ pub fn boot_with_service(service: FakeRepositoryService) -> AppHarness {
 pub fn boot_with_test_services(services: TestServices) -> AppHarness {
     let (app, _) = crate::boot_with_services(
         crate::services::AppServices::new(Arc::new(services.repository.clone()))
+            .with_host_shell(Arc::new(services.host_shell.clone()))
+            .with_preview(Arc::new(services.preview.clone()))
             .with_search(Arc::new(services.search.clone()))
             .with_sharing(Arc::new(services.sharing.clone())),
     );
 
     AppHarness {
         app,
+        host_shell: services.host_shell,
+        preview: services.preview,
         service: services.repository,
         search: services.search,
         sharing: services.sharing,
@@ -670,6 +691,189 @@ impl SharingService for FakeSharingService {
             .devices
             .retain(|device| device.device_id != device_id);
         Ok(state.roster.clone())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FakePreviewService {
+    state: Arc<Mutex<FakePreviewServiceState>>,
+}
+
+#[derive(Debug, Default)]
+struct FakePreviewServiceState {
+    local_web_url: Option<String>,
+    snapshot_mount_summary: Option<MountLaunchSummary>,
+    live_branch_mount_summary: Option<MountLaunchSummary>,
+}
+
+impl FakePreviewService {
+    pub fn with_local_web_url(url: &str) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FakePreviewServiceState {
+                local_web_url: Some(url.into()),
+                snapshot_mount_summary: None,
+                live_branch_mount_summary: None,
+            })),
+        }
+    }
+
+    pub fn with_snapshot_mount_summary(
+        mount_point: &str,
+        read_only: bool,
+        stream_only: bool,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FakePreviewServiceState {
+                local_web_url: None,
+                snapshot_mount_summary: Some(fake_mount_summary(
+                    "snapshot-pinned",
+                    mount_point,
+                    read_only,
+                    stream_only,
+                )),
+                live_branch_mount_summary: None,
+            })),
+        }
+    }
+}
+
+impl PreviewService for FakePreviewService {
+    fn start_local_web(&self, _repo_root: PathBuf) -> Result<LocalWebController, AppError> {
+        let url = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake preview service state poisoned"))?
+            .local_web_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:0".into());
+        Ok(fake_local_web_controller(&url))
+    }
+
+    fn stop_local_web(&self, controller: LocalWebController) -> Result<(), AppError> {
+        drop(controller);
+        Ok(())
+    }
+
+    fn start_snapshot_mount(
+        &self,
+        _repo_root: PathBuf,
+        _snapshot_id: String,
+        _mount_point: PathBuf,
+    ) -> Result<MountController, AppError> {
+        let summary = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake preview service state poisoned"))?
+            .snapshot_mount_summary
+            .clone()
+            .unwrap_or_else(|| fake_snapshot_mount_summary("Q:/preview"));
+        Ok(MountController {
+            summary,
+            _filesystem: None,
+        })
+    }
+
+    fn start_live_branch_mount(
+        &self,
+        _repo_root: PathBuf,
+        _branch_token: String,
+        _mount_point: PathBuf,
+    ) -> Result<MountController, AppError> {
+        let summary = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake preview service state poisoned"))?
+            .live_branch_mount_summary
+            .clone()
+            .unwrap_or_else(|| fake_live_branch_mount_summary("R:/preview"));
+        Ok(MountController {
+            summary,
+            _filesystem: None,
+        })
+    }
+
+    fn stop_mount(&self, controller: MountController) -> Result<(), AppError> {
+        drop(controller);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FakeHostShellService {
+    state: Arc<Mutex<FakeHostShellState>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeHostShellState {
+    last_opened_path: Option<PathBuf>,
+    last_opened_url: Option<String>,
+}
+
+impl FakeHostShellService {
+    pub fn last_opened_path(&self) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .expect("fake host shell state")
+            .last_opened_path
+            .clone()
+    }
+
+    pub fn last_opened_url(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("fake host shell state")
+            .last_opened_url
+            .clone()
+    }
+}
+
+impl HostShellService for FakeHostShellService {
+    fn open_url(&self, url: &str) -> Result<(), AppError> {
+        self.state
+            .lock()
+            .map_err(|_| AppError::internal("fake host shell state poisoned"))?
+            .last_opened_url = Some(url.into());
+        Ok(())
+    }
+
+    fn open_path(&self, path: &std::path::Path) -> Result<(), AppError> {
+        self.state
+            .lock()
+            .map_err(|_| AppError::internal("fake host shell state poisoned"))?
+            .last_opened_path = Some(path.to_path_buf());
+        Ok(())
+    }
+}
+
+pub fn fake_local_web_controller(url: &str) -> LocalWebController {
+    LocalWebController {
+        local_url: url.into(),
+        _handle: None,
+    }
+}
+
+pub fn fake_snapshot_mount_summary(mount_point: &str) -> MountLaunchSummary {
+    fake_mount_summary("snapshot-pinned", mount_point, true, true)
+}
+
+pub fn fake_live_branch_mount_summary(mount_point: &str) -> MountLaunchSummary {
+    fake_mount_summary("live-branch", mount_point, false, true)
+}
+
+fn fake_mount_summary(
+    mount_mode: &str,
+    mount_point: &str,
+    read_only: bool,
+    stream_only: bool,
+) -> MountLaunchSummary {
+    MountLaunchSummary {
+        mount_mode: mount_mode.into(),
+        mount_point: PathBuf::from(mount_point),
+        cache_policy: CachePolicy::KernelCacheWithInvalidation,
+        read_only,
+        stream_only,
+        launch_state: MountLaunchState::SummaryOnly,
+        status_message: "ready".into(),
     }
 }
 

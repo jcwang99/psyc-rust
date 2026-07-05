@@ -17,6 +17,7 @@ pub enum Message {
     History(crate::pages::history::HistoryMessage),
     Overview(crate::pages::overview::OverviewMessage),
     OverviewJobFinished(Result<crate::pages::overview::OverviewJobResult, AppError>),
+    Preview(crate::pages::preview::PreviewMessage),
     Search(crate::pages::search::SearchMessage),
     Sharing(crate::pages::sharing::SharingMessage),
     Sync(crate::pages::sync::SyncMessage),
@@ -46,6 +47,12 @@ impl From<crate::pages::history::HistoryMessage> for Message {
 impl From<crate::pages::overview::OverviewMessage> for Message {
     fn from(message: crate::pages::overview::OverviewMessage) -> Self {
         Self::Overview(message)
+    }
+}
+
+impl From<crate::pages::preview::PreviewMessage> for Message {
+    fn from(message: crate::pages::preview::PreviewMessage) -> Self {
+        Self::Preview(message)
     }
 }
 

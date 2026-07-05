@@ -6,6 +6,7 @@ pub mod pages {
     pub mod history;
     pub mod home;
     pub mod overview;
+    pub mod preview;
     pub mod search;
     pub mod sharing;
     pub mod sync;

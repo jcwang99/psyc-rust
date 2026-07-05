@@ -18,6 +18,7 @@ pub enum SearchMessage {
     SetQueryText(String),
     SetPathPrefixText(String),
     SubmitSearch,
+    OpenResultInPreview(String),
 }
 
 pub fn update_search(
@@ -62,11 +63,16 @@ pub fn update_search(
             app.workbench.search.results = rows;
             iced::Task::none()
         }
+        SearchMessage::OpenResultInPreview(path) => {
+            app.workbench.preview.focused_path = Some(path);
+            app.workbench.active_page = crate::domain::WorkbenchPage::Preview;
+            iced::Task::none()
+        }
     }
 }
 
 pub fn view_search(app: &crate::app::PsycGuiApp) -> iced::Element<'_, crate::domain::Message> {
-    use iced::widget::{button, column, container, text, text_input};
+    use iced::widget::{button, column, container, row, text, text_input};
 
     let results = if app.workbench.search.results.is_empty() {
         column![text("No search results yet.")]
@@ -76,7 +82,14 @@ pub fn view_search(app: &crate::app::PsycGuiApp) -> iced::Element<'_, crate::dom
             .results
             .iter()
             .fold(column![].spacing(8), |column, row| {
-                column.push(text(format!("{} [{}]", row.path, row.source)))
+                column.push(
+                    row![
+                        text(format!("{} [{}]", row.path, row.source)).width(iced::Length::Fill),
+                        button("Preview")
+                            .on_press(SearchMessage::OpenResultInPreview(row.path.clone())),
+                    ]
+                    .spacing(8),
+                )
             })
     };
 

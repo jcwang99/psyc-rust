@@ -952,6 +952,8 @@ dependencies = [
  "base64",
  "e2v-api",
  "e2v-core",
+ "e2v-sync",
+ "e2v-vfs",
  "iced",
  "serde",
  "serde_json",

@@ -38,18 +38,19 @@ pub fn view_active_page(app: &crate::app::PsycGuiApp) -> iced::Element<'_, crate
         crate::domain::WorkbenchPage::Sync => crate::pages::sync::view_sync(app),
         crate::domain::WorkbenchPage::Search => crate::pages::search::view_search(app),
         crate::domain::WorkbenchPage::Sharing => crate::pages::sharing::view_sharing(app),
-        crate::domain::WorkbenchPage::Preview => container(text("Preview (Phase 2)")).into(),
+        crate::domain::WorkbenchPage::Preview => crate::pages::preview::view_preview(app),
         crate::domain::WorkbenchPage::Advanced => container(text("Advanced (Phase 3)")).into(),
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WorkbenchState {
     pub active_page: crate::domain::WorkbenchPage,
     pub branches: crate::pages::branches::BranchesState,
     pub branch_token: String,
     pub history: crate::pages::history::HistoryState,
     pub overview: crate::pages::overview::OverviewState,
+    pub preview: crate::pages::preview::PreviewState,
     pub search: crate::pages::search::SearchState,
     pub sharing: crate::pages::sharing::SharingState,
     pub sync: crate::pages::sync::SyncState,
@@ -63,6 +64,7 @@ impl Default for WorkbenchState {
             branch_token: String::new(),
             history: crate::pages::history::HistoryState::default(),
             overview: crate::pages::overview::OverviewState::default(),
+            preview: crate::pages::preview::PreviewState::default(),
             search: crate::pages::search::SearchState::default(),
             sharing: crate::pages::sharing::SharingState::default(),
             sync: crate::pages::sync::SyncState::default(),

@@ -58,6 +58,7 @@ pub fn update(app: &mut PsycGuiApp, message: Message) -> Task<Message> {
             handle_overview_job_result(app, result);
             Task::none()
         }
+        Message::Preview(message) => crate::pages::preview::update_preview(app, message),
         Message::Search(message) => crate::pages::search::update_search(app, message),
         Message::Sharing(message) => crate::pages::sharing::update_sharing(app, message),
         Message::Sync(message) => crate::pages::sync::update_sync(app, message),

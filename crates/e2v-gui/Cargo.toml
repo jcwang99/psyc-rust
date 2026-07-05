@@ -9,6 +9,8 @@ anyhow.workspace = true
 base64.workspace = true
 e2v-api = { path = "../e2v-api" }
 e2v-core = { path = "../e2v-core" }
+e2v-sync = { path = "../e2v-sync" }
+e2v-vfs = { path = "../e2v-vfs" }
 iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio"] }
 serde.workspace = true
 serde_json.workspace = true
