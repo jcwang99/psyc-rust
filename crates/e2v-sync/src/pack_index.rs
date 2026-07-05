@@ -25,6 +25,12 @@ const PACK_INDEX_ROOT_OBJECT_TYPE: &str = "pack-index-root";
 const PACK_INDEX_SEGMENT_OBJECT_TYPE: &str = "pack-index-segment";
 const COMPACTED_SEGMENT_STABLE_NAME_PREFIX: &str = "pack-index-segment:";
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ObservedPackIndexRootState {
+    pub(crate) root_bytes: Option<Vec<u8>>,
+    pub(crate) segment_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackIndexRoot {
     pub schema_version: u32,
@@ -55,6 +61,24 @@ pub fn publish_pack_index_root<B: BlobStore>(
     layout_generation: u64,
     segment_paths: Vec<String>,
 ) -> Result<()> {
+    publish_pack_index_root_with_observed_current(
+        remote,
+        secrets,
+        layout_id,
+        layout_generation,
+        segment_paths,
+        None,
+    )
+}
+
+pub(crate) fn publish_pack_index_root_with_observed_current<B: BlobStore>(
+    remote: &B,
+    secrets: &RepoSecrets,
+    layout_id: &str,
+    layout_generation: u64,
+    segment_paths: Vec<String>,
+    observed_current_root: Option<&ObservedPackIndexRootState>,
+) -> Result<()> {
     let compacted_segment_paths =
         compact_segment_paths_if_needed(remote, secrets, layout_generation, segment_paths)?;
     let root = PackIndexRoot {
@@ -65,7 +89,11 @@ pub fn publish_pack_index_root<B: BlobStore>(
         segments: compacted_segment_paths,
     };
     let root_bytes = encode_pack_index_root_bytes(secrets, &root)?;
-    if remote
+    if let Some(observed_current_root) = observed_current_root {
+        if observed_current_root.root_bytes.as_deref() == Some(root_bytes.as_slice()) {
+            return Ok(());
+        }
+    } else if remote
         .get_physical(PACK_INDEX_ROOT_PATH)
         .map(|existing| existing == root_bytes)
         .unwrap_or(false)
@@ -80,12 +108,30 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
     control_dir: &Path,
     secrets: Option<&RepoSecrets>,
 ) -> Result<BTreeMap<String, PackedObjectLocation>> {
+    Ok(
+        load_remote_pack_locations_with_observed_root_and_local_cache(
+            remote,
+            control_dir,
+            secrets,
+        )?
+        .1,
+    )
+}
+
+pub(crate) fn load_remote_pack_locations_with_observed_root_and_local_cache<B: BlobStore>(
+    remote: &B,
+    control_dir: &Path,
+    secrets: Option<&RepoSecrets>,
+) -> Result<(
+    ObservedPackIndexRootState,
+    BTreeMap<String, PackedObjectLocation>,
+)> {
     let cache_dir = pack_index_cache_dir(control_dir);
     ensure_pack_index_cache_layout(control_dir)?;
 
     let Some(root_bytes) = load_remote_pack_index_root_bytes(remote)? else {
         prune_pack_index_cache(&cache_dir)?;
-        return Ok(BTreeMap::new());
+        return Ok((ObservedPackIndexRootState::default(), BTreeMap::new()));
     };
     let root = decode_pack_index_root_bytes(&root_bytes, secrets)?;
     validate_pack_index_root(&root)?;
@@ -100,7 +146,13 @@ pub fn load_remote_pack_locations_with_local_cache<B: BlobStore>(
         &mut locations,
     )?;
     persist_root_cache_if_changed(&cache_dir.join("root.json"), &root_bytes)?;
-    Ok(locations)
+    Ok((
+        ObservedPackIndexRootState {
+            root_bytes: Some(root_bytes),
+            segment_paths: root.segments,
+        },
+        locations,
+    ))
 }
 
 pub(crate) fn load_remote_pack_locations_from_segment_paths_with_local_cache<B: BlobStore>(
@@ -149,13 +201,28 @@ pub fn next_pack_index_segment_paths<B: BlobStore>(
     newly_published_segments: &[String],
     secrets: Option<&RepoSecrets>,
 ) -> Result<Vec<String>> {
-    let mut segment_paths = if let Some(root_bytes) = load_remote_pack_index_root_bytes(remote)? {
+    let observed_current_root = if let Some(root_bytes) = load_remote_pack_index_root_bytes(remote)?
+    {
         let root = decode_pack_index_root_bytes(&root_bytes, secrets)?;
         validate_pack_index_root(&root)?;
-        root.segments
+        ObservedPackIndexRootState {
+            root_bytes: Some(root_bytes),
+            segment_paths: root.segments,
+        }
     } else {
-        Vec::new()
+        ObservedPackIndexRootState::default()
     };
+    next_pack_index_segment_paths_from_observed_root(
+        &observed_current_root,
+        newly_published_segments,
+    )
+}
+
+pub(crate) fn next_pack_index_segment_paths_from_observed_root(
+    observed_current_root: &ObservedPackIndexRootState,
+    newly_published_segments: &[String],
+) -> Result<Vec<String>> {
+    let mut segment_paths = observed_current_root.segment_paths.clone();
     for segment_path in newly_published_segments {
         validate_segment_path(segment_path)?;
         if !segment_paths.contains(segment_path) {

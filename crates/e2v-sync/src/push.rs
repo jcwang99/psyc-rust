@@ -16,8 +16,9 @@ use crate::object_type::infer_object_type_from_hint;
 use crate::oram::load_remote_active_pack_locations_with_observed_layout_root;
 use crate::pack::{ObjectPackBuilder, ObjectPackIndex, PackedObjectLocation, pack_paths};
 use crate::pack_index::{
-    encode_pack_index_segment_bytes_for_sync, next_pack_index_segment_paths,
-    publish_pack_index_root,
+    ObservedPackIndexRootState, encode_pack_index_segment_bytes_for_sync,
+    next_pack_index_segment_paths, next_pack_index_segment_paths_from_observed_root,
+    publish_pack_index_root_with_observed_current,
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::remote_maintenance::load_remote_loose_object_ids;
@@ -186,6 +187,7 @@ fn load_remote_object_inventory<R: RemoteBackend>(
     u64,
     BTreeSet<String>,
     BTreeMap<String, PackedObjectLocation>,
+    Option<ObservedPackIndexRootState>,
 )> {
     let control_dir = repo_root.join(".e2v");
     let observed =
@@ -194,6 +196,7 @@ fn load_remote_object_inventory<R: RemoteBackend>(
         observed.layout_root_generation,
         load_remote_loose_object_ids(remote)?,
         observed.pack_locations,
+        observed.observed_pack_index_root,
     ))
 }
 
@@ -332,7 +335,7 @@ fn ensure_remote_object_inventory_loaded<'a, R: RemoteBackend>(
     match inventory {
         Some(inventory) => Ok(inventory),
         None => {
-            let (_, remote_loose_object_ids, remote_pack_locations) =
+            let (_, remote_loose_object_ids, remote_pack_locations, _) =
                 load_remote_object_inventory(repo_root, remote, secrets)?;
             Ok(inventory.insert((remote_loose_object_ids, remote_pack_locations)))
         }
@@ -1090,8 +1093,12 @@ fn push_head_inner<R: RemoteBackend + Clone>(
         };
     let control_dir = options.repo_root.join(".e2v");
     let pack_index_secrets = sync_support::open_or_unlock_repo_secrets_for_sync(&control_dir)?;
-    let (observed_layout_root_generation, mut remote_loose_object_ids, mut remote_pack_locations) =
-        load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
+    let (
+        observed_layout_root_generation,
+        mut remote_loose_object_ids,
+        mut remote_pack_locations,
+        observed_pack_index_root,
+    ) = load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
     let mut remote_pack_cache = BTreeMap::new();
     for ancestor_snapshot_id in &snapshot.ancestor_snapshot_ids {
         if !inventory_has_object(
@@ -1210,17 +1217,26 @@ fn push_head_inner<R: RemoteBackend + Clone>(
     )?;
     publisher.publish_layout_if_needed(&session)?;
     if !published_pack_uploads.index_paths.is_empty() {
-        let segment_paths = next_pack_index_segment_paths(
-            remote,
-            &published_pack_uploads.index_paths,
-            Some(&pack_index_secrets),
-        )?;
-        publish_pack_index_root(
+        let segment_paths =
+            if let Some(observed_pack_index_root) = observed_pack_index_root.as_ref() {
+                next_pack_index_segment_paths_from_observed_root(
+                    observed_pack_index_root,
+                    &published_pack_uploads.index_paths,
+                )?
+            } else {
+                next_pack_index_segment_paths(
+                    remote,
+                    &published_pack_uploads.index_paths,
+                    Some(&pack_index_secrets),
+                )?
+            };
+        publish_pack_index_root_with_observed_current(
             remote,
             &pack_index_secrets,
             &layout_root.layout_id,
             layout_root.generation,
             segment_paths,
+            observed_pack_index_root.as_ref(),
         )?;
     }
     publisher.pre_commit_verify(&session)?;
@@ -1310,6 +1326,7 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         load_remote_resume_pack_locations(&control_dir, remote, &operation_id)?;
     let mut remote_inventory = None;
     let mut observed_layout_root_generation = None;
+    let mut observed_pack_index_root = None;
     let mut remote_pack_cache = BTreeMap::new();
     let mut resume_remote_auth = ResumeRemoteAuthContext {
         repo_root: &options.repo_root,
@@ -1383,9 +1400,14 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     }
 
     if !saw_journal_objects {
-        let (inventory_layout_root_generation, remote_loose_object_ids, mut remote_pack_locations) =
-            load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
+        let (
+            inventory_layout_root_generation,
+            remote_loose_object_ids,
+            mut remote_pack_locations,
+            inventory_observed_pack_index_root,
+        ) = load_remote_object_inventory(&options.repo_root, remote, &pack_index_secrets)?;
         observed_layout_root_generation = Some(inventory_layout_root_generation);
+        observed_pack_index_root = inventory_observed_pack_index_root;
         let manifest_store = ManifestStore::new(&options.repo_root);
         let reachable_object_ids =
             manifest_store.collect_reachable_object_ids(&snapshot.snapshot_id)?;
@@ -1493,17 +1515,26 @@ pub fn resume_push<R: RemoteBackend + Clone>(
         mirror_remote_keyring_pointer(remote, &pointer_bytes)?;
         publisher.publish_layout_if_needed(&session)?;
         if !published_pack_index_segments.is_empty() {
-            let segment_paths = next_pack_index_segment_paths(
-                remote,
-                &published_pack_index_segments,
-                Some(&pack_index_secrets),
-            )?;
-            publish_pack_index_root(
+            let segment_paths =
+                if let Some(observed_pack_index_root) = observed_pack_index_root.as_ref() {
+                    next_pack_index_segment_paths_from_observed_root(
+                        observed_pack_index_root,
+                        &published_pack_index_segments,
+                    )?
+                } else {
+                    next_pack_index_segment_paths(
+                        remote,
+                        &published_pack_index_segments,
+                        Some(&pack_index_secrets),
+                    )?
+                };
+            publish_pack_index_root_with_observed_current(
                 remote,
                 &pack_index_secrets,
                 &layout_root.layout_id,
                 layout_root.generation,
                 segment_paths,
+                observed_pack_index_root.as_ref(),
             )?;
         }
         publisher.complete(session)?;
@@ -1519,17 +1550,26 @@ pub fn resume_push<R: RemoteBackend + Clone>(
     )?;
     publisher.publish_layout_if_needed(&session)?;
     if !published_pack_index_segments.is_empty() {
-        let segment_paths = next_pack_index_segment_paths(
-            remote,
-            &published_pack_index_segments,
-            Some(&pack_index_secrets),
-        )?;
-        publish_pack_index_root(
+        let segment_paths =
+            if let Some(observed_pack_index_root) = observed_pack_index_root.as_ref() {
+                next_pack_index_segment_paths_from_observed_root(
+                    observed_pack_index_root,
+                    &published_pack_index_segments,
+                )?
+            } else {
+                next_pack_index_segment_paths(
+                    remote,
+                    &published_pack_index_segments,
+                    Some(&pack_index_secrets),
+                )?
+            };
+        publish_pack_index_root_with_observed_current(
             remote,
             &pack_index_secrets,
             &layout_root.layout_id,
             layout_root.generation,
             segment_paths,
+            observed_pack_index_root.as_ref(),
         )?;
     }
     publisher.pre_commit_verify(&session)?;

@@ -15,9 +15,10 @@ use crate::journal::{OperationId, OperationJournal};
 use crate::pack::PackedObjectLocation;
 use crate::pack_index::publish_pack_index_root;
 use crate::pack_index::{
-    load_remote_pack_index_segment_paths,
+    ObservedPackIndexRootState, load_remote_pack_index_segment_paths,
     load_remote_pack_locations_from_segment_paths_with_local_cache,
     load_remote_pack_locations_with_local_cache,
+    load_remote_pack_locations_with_observed_root_and_local_cache,
 };
 use crate::publisher::{SimpleTransactionPublisher, TransactionPublisher};
 use crate::push::{
@@ -37,6 +38,7 @@ const OBLIVIOUS_OBJECT_BATCH_SIZE: usize = 256;
 pub(crate) struct ObservedRemoteActivePackLocations {
     pub(crate) layout_root_generation: u64,
     pub(crate) pack_locations: BTreeMap<String, PackedObjectLocation>,
+    pub(crate) observed_pack_index_root: Option<ObservedPackIndexRootState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,9 +183,17 @@ pub(crate) fn load_remote_active_pack_locations_with_local_cache<R: RemoteBacken
     control_dir: &Path,
     secrets: &RepoSecrets,
 ) -> Result<BTreeMap<String, PackedObjectLocation>> {
-    Ok(
-        load_remote_active_pack_locations_with_observed_layout_root(remote, control_dir, secrets)?
-            .pack_locations,
+    let layout_root = remote.read_layout_root()?;
+    if !matches!(layout_root.mode, LayoutMode::Oblivious) {
+        return load_remote_pack_locations_with_local_cache(remote, control_dir, Some(secrets));
+    }
+
+    let segment_paths = active_pack_segment_paths_for_layout_root(remote, &layout_root, secrets)?;
+    load_remote_pack_locations_from_segment_paths_with_local_cache(
+        remote,
+        control_dir,
+        Some(secrets),
+        &segment_paths,
     )
 }
 
@@ -193,21 +203,32 @@ pub(crate) fn load_remote_active_pack_locations_with_observed_layout_root<R: Rem
     secrets: &RepoSecrets,
 ) -> Result<ObservedRemoteActivePackLocations> {
     let layout_root = remote.read_layout_root()?;
-    let pack_locations = if !matches!(layout_root.mode, LayoutMode::Oblivious) {
-        load_remote_pack_locations_with_local_cache(remote, control_dir, Some(secrets))?
-    } else {
-        let segment_paths =
-            active_pack_segment_paths_for_layout_root(remote, &layout_root, secrets)?;
-        load_remote_pack_locations_from_segment_paths_with_local_cache(
-            remote,
-            control_dir,
-            Some(secrets),
-            &segment_paths,
-        )?
-    };
+    let (pack_locations, observed_pack_index_root) =
+        if !matches!(layout_root.mode, LayoutMode::Oblivious) {
+            let (observed_pack_index_root, pack_locations) =
+                load_remote_pack_locations_with_observed_root_and_local_cache(
+                    remote,
+                    control_dir,
+                    Some(secrets),
+                )?;
+            (pack_locations, Some(observed_pack_index_root))
+        } else {
+            let segment_paths =
+                active_pack_segment_paths_for_layout_root(remote, &layout_root, secrets)?;
+            (
+                load_remote_pack_locations_from_segment_paths_with_local_cache(
+                    remote,
+                    control_dir,
+                    Some(secrets),
+                    &segment_paths,
+                )?,
+                None,
+            )
+        };
     Ok(ObservedRemoteActivePackLocations {
         layout_root_generation: layout_root.generation,
         pack_locations,
+        observed_pack_index_root,
     })
 }
 

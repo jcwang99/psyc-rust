@@ -7219,6 +7219,52 @@ fn packed_push_does_not_reread_current_operation_pack_indexes_after_upload() {
 }
 
 #[test]
+fn packed_push_reads_pack_index_root_only_once_per_publish() {
+    let _guard = e2v_sync::testing::override_small_object_pack_threshold_for_test(1);
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    let facade = RepositoryFacade::new();
+    let state = facade
+        .init(InitOptions {
+            repo_root: repo_root.clone(),
+            password: "correct horse battery staple".to_string(),
+            branch_name: "main".to_string(),
+        })
+        .unwrap();
+    fs::write(repo_root.join("hello.txt"), b"hello packed root").unwrap();
+    facade
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "packed-single-root-read".to_string(),
+        })
+        .unwrap();
+
+    let remote = ExistsCountingBackend::new();
+    push_head(
+        &facade,
+        &remote,
+        PushOptions {
+            repo_root,
+            branch_token: state.branch.token_hex,
+            operation_id: "packed-single-root-read-op".to_string(),
+        },
+    )
+    .unwrap();
+
+    let pack_index_root_reads = remote
+        .get_paths()
+        .into_iter()
+        .filter(|path| path == "pack-index/root.json")
+        .count();
+    assert_eq!(
+        pack_index_root_reads, 1,
+        "packed push should reuse the first observed pack-index root instead of rereading pack-index/root.json later in the same publish"
+    );
+}
+
+#[test]
 fn push_reuses_the_first_remote_current_keyring_read_for_inventory_loading() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");
