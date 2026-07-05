@@ -220,6 +220,34 @@ fn repeated_reads_can_use_plaintext_memory_cache_after_local_objects_become_unre
 }
 
 #[test]
+fn partial_plaintext_cache_miss_falls_back_to_backing_store_without_panicking() {
+    let temp = tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    init_repo(&repo_root);
+
+    let body = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    fs::write(repo_root.join("tracked.txt"), body).unwrap();
+    let snapshot_id = RepositoryFacade::new()
+        .commit(CommitOptions {
+            repo_root: repo_root.clone(),
+            message: "seed".to_string(),
+        })
+        .unwrap()
+        .snapshot_id;
+    let vfs =
+        ReadOnlyVfs::mount_snapshot(VfsMountConfig::snapshot(repo_root, snapshot_id)).unwrap();
+
+    let handle = vfs.open_file("tracked.txt").unwrap();
+
+    let first = vfs.read(&handle, 0, 24).unwrap();
+    assert_eq!(String::from_utf8(first).unwrap(), &body[..24]);
+
+    let second = vfs.read(&handle, 33, 8).unwrap();
+    assert_eq!(String::from_utf8(second).unwrap(), body[33..41].to_string());
+}
+
+#[test]
 fn repeated_range_reads_can_use_encrypted_disk_cache_after_local_objects_become_unreadable() {
     let temp = tempdir().unwrap();
     let repo_root = temp.path().join("repo");

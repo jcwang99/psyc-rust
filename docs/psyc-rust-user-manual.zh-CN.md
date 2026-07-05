@@ -18,6 +18,7 @@
 - 用 `verify`、`repair`、`doctor`、`gc` 等命令检查和修复仓库。
 - 用 `historical-rewrite` 和 `oram` 处理更高级的安全与访问模式需求。
 - 用 `serve` 在本地启动 Web 只读浏览界面。
+- 用 `mount` 把仓库内容挂载到 Windows 盘符中。
 
 ## 2. 手册适用范围
 
@@ -32,7 +33,7 @@
 
 - Rust crate 级架构细节
 - C ABI 或 SDK 的二次开发接口
-- VFS `mount` 命令的完整平台级使用流程
+- 所有平台相关的 VFS `mount` 边界情况，但会给出一个可直接上手的 Windows 快速说明
 
 ## 3. 目录结构与基本概念
 
@@ -361,6 +362,46 @@ cargo run -p e2v-cli -- serve --repo .\demo-repo
 - 这是本地服务，不是公网托管能力。
 - 服务启动后进程会保持运行，直到你手动停止。
 
+### 8.3 `mount`（Windows VFS 快速说明）
+
+用法：
+
+```powershell
+cargo run -p e2v-cli -- mount --repo <REPO> snapshot --snapshot <SNAPSHOT_ID> --mount-point <DRIVE_LETTER:>
+cargo run -p e2v-cli -- mount --repo <REPO> branch --branch-token <BRANCH_TOKEN> --mount-point <DRIVE_LETTER:>
+```
+
+适用范围：
+
+- 当前已验证的挂载路径是 Windows + WinFSP。
+- 对普通使用者来说，`snapshot` 挂载最容易直接上手。
+- `branch` 挂载更偏高级用法，因为 CLI 目前要求显式传入 `branch token`。
+
+行为说明：
+
+- `snapshot` 挂载会固定在单一快照上，并保持只读。
+- `branch` 挂载暴露的是 live branch 视图，适合更高级的工作流。
+- 挂载成功后，CLI 进程会持续运行；停止该进程就会卸载。
+- `--mount-point` 最好使用空闲盘符，例如 `X:`。
+
+一个最实用的快照挂载示例：
+
+```powershell
+cargo run -p e2v-cli -- snapshots --repo .\demo-repo
+cargo run -p e2v-cli -- mount --repo .\demo-repo snapshot --snapshot <SNAPSHOT_ID> --mount-point X:
+```
+
+挂载激活后，可以直接在资源管理器或其他本地程序中打开 `X:\`。
+
+图片预览行为：
+
+- 当前 Windows 挂载实现已经针对资源管理器和 WPF 风格预览器常见的碎片化图片读取模式做过验证。
+- 挂载盘里的 `png`、`jpg` / `jpeg`、`webp` 文件可以直接从挂载路径预览，不需要先复制到本地普通目录。
+
+当前限制：
+
+- CLI 目前还没有“按分支名直接挂载当前分支”的一键入口；如果你需要 `branch` 挂载，仍然要从可信的仓库工具链或控制状态中取得 `branch token`。
+
 ## 9. 远端配置与同步
 
 ### 9.1 远端类型概览
@@ -643,6 +684,15 @@ cargo run -p e2v-cli -- doctor --repo <REPO> --bundle .\doctor-bundle
 - 排障
 - 向团队成员共享诊断材料
 - 在不暴露敏感路径或密钥的前提下留存问题快照
+
+### 10.6 挂载与预览排障
+
+针对 Windows VFS 问题：
+
+- 如果 `mount` 因为盘符占用或 WinFSP 注册失败而报错，先停止旧的 `e2v-cli` 挂载进程，再换一个空闲盘符重试。
+- 如果资源管理器或其他 WPF 风格预览器提示挂载盘里的图片无法识别，先确认你运行的是包含 2026 年 7 月 5 日碎片化读取兼容修复的二进制，然后重新挂载后再试。
+- 重新测试时，要确认当前访问的是新启动的挂载进程，而不是旧的后台残留挂载。
+- 如果你需要区分“仓库对象损坏”和“挂载层行为异常”，先对同一份内容执行 `verify snapshot`，不要一开始就假设底层对象字节已经坏了。
 
 ## 11. 共享协作
 

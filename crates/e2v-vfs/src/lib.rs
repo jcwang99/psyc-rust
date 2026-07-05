@@ -1506,14 +1506,20 @@ impl OpenedFile {
         let cached = lock_or_recover(&self.plaintext_cache);
         let cached = cached.as_ref()?;
         let cache_end = cached.offset.saturating_add(cached.bytes.len());
-        let request_end = offset.saturating_add(length).min(cache_end);
-        if offset < cached.offset || request_end > cache_end {
+        if offset < cached.offset {
             return None;
         }
         let start = offset - cached.offset;
-        let end = start + length;
-        let clamped_end = end.min(cached.bytes.len());
-        Some(cached.bytes[start..clamped_end].to_vec())
+        if start > cached.bytes.len() {
+            return None;
+        }
+        let request_end = offset.saturating_add(length);
+        let file_size = self.file_size() as usize;
+        if request_end > cache_end && cache_end != file_size {
+            return None;
+        }
+        let end = start.saturating_add(length).min(cached.bytes.len());
+        Some(cached.bytes[start..end].to_vec())
     }
 
     pub fn snapshot_id(&self) -> &str {

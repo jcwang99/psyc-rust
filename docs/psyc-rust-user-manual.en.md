@@ -18,6 +18,7 @@ From a user perspective, you can think of it as a toolset that lets you:
 - inspect and repair state with `verify`, `repair`, `doctor`, and `gc`
 - use stronger security and access-pattern workflows with `historical-rewrite` and `oram`
 - browse repository contents through a local read-only web server with `serve`
+- mount repository content into a Windows drive letter with `mount`
 
 ## 2. Scope of This Manual
 
@@ -32,7 +33,7 @@ This manual does not focus on:
 
 - Rust crate-level architecture
 - secondary development with the SDK or C ABI
-- the full platform-specific `mount` and VFS workflow
+- every platform-specific `mount` and VFS edge case, although a practical Windows quick reference is included
 
 ## 3. Directory Layout and Core Concepts
 
@@ -361,6 +362,46 @@ Notes:
 - this is a local service, not a hosted public sharing surface
 - the process remains running until you stop it manually
 
+### 8.3 `mount` (Windows VFS Quick Reference)
+
+Usage:
+
+```powershell
+cargo run -p e2v-cli -- mount --repo <REPO> snapshot --snapshot <SNAPSHOT_ID> --mount-point <DRIVE_LETTER:>
+cargo run -p e2v-cli -- mount --repo <REPO> branch --branch-token <BRANCH_TOKEN> --mount-point <DRIVE_LETTER:>
+```
+
+Availability:
+
+- the current tested mount path is Windows plus WinFSP
+- snapshot mounts are the easiest starting point for normal users
+- branch mounts are more advanced because the CLI currently requires an explicit `branch token`
+
+Behavior:
+
+- a snapshot mount is pinned to one snapshot and stays read-only
+- a branch mount exposes a live branch view and is intended for more advanced workflows
+- the mount process keeps running until you stop the CLI process
+- the mount point should be a free drive letter such as `X:`
+
+Practical snapshot example:
+
+```powershell
+cargo run -p e2v-cli -- snapshots --repo .\demo-repo
+cargo run -p e2v-cli -- mount --repo .\demo-repo snapshot --snapshot <SNAPSHOT_ID> --mount-point X:
+```
+
+After the mount becomes active, open `X:\` in Explorer or another local application.
+
+Preview behavior:
+
+- the current Windows mount implementation has been verified with the fragmented image reads used by Explorer and WPF-style previewers
+- mounted `png`, `jpg` / `jpeg`, and `webp` files can be previewed directly from the mounted path without copying them out first
+
+Current limitation:
+
+- there is not yet a first-class "mount current branch by name" shortcut in the CLI; if you need a branch mount today, obtain the `branch token` from trusted repository tooling or repository control state
+
 ## 9. Remote Configuration and Synchronization
 
 ### 9.1 Remote Types Overview
@@ -645,6 +686,15 @@ Good for:
 - troubleshooting
 - sharing structured diagnostics with teammates
 - preserving a sanitized state snapshot for investigation
+
+### 10.6 Mount and Preview Troubleshooting
+
+For Windows VFS issues:
+
+- if `mount` fails with a mount-point or WinFSP registration error, stop older `e2v-cli` mount processes and retry with a free drive letter
+- if Explorer or another WPF-style previewer reports that a mounted image is unrecognized, make sure you are running a binary that includes the July 5, 2026 fragmented-read compatibility fix, then remount and retry
+- when retesting, verify that you are talking to the fresh mount process rather than a stale background mount
+- if you need to separate repository corruption from mount-layer behavior, start with `verify snapshot` against the same content before assuming the stored object bytes are damaged
 
 ## 11. Sharing and Collaboration
 
