@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use e2v_api::{CloneRequest, InitRepositoryOptions, Sdk, SdkErrorCode};
+use e2v_api::{
+    CloneRequest, CommitInfo, CommitRepositoryOptions, InitRepositoryOptions, Sdk, SdkErrorCode,
+};
 
 use crate::domain::{AppError, RepositoryHomeCard};
 
@@ -21,6 +23,12 @@ pub trait RepositoryService: Send + Sync + std::fmt::Debug + 'static {
         password: String,
         branch_token: String,
     ) -> Result<RepositoryHomeCard, AppError>;
+
+    fn commit_repository(
+        &self,
+        repo_root: PathBuf,
+        message: String,
+    ) -> Result<CommitInfo, AppError>;
 
     fn load_repository_summary(&self, repo_root: PathBuf) -> Result<RepositoryHomeCard, AppError>;
 }
@@ -79,6 +87,16 @@ impl RepositoryService for RealRepositoryService {
             .map_err(AppError::from_sdk)?;
 
         self.load_repository_summary(target_repo_root)
+    }
+
+    fn commit_repository(
+        &self,
+        repo_root: PathBuf,
+        message: String,
+    ) -> Result<CommitInfo, AppError> {
+        self.sdk
+            .commit_repository(CommitRepositoryOptions { repo_root, message })
+            .map_err(AppError::from_sdk)
     }
 
     fn load_repository_summary(&self, repo_root: PathBuf) -> Result<RepositoryHomeCard, AppError> {

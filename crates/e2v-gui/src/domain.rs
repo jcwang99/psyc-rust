@@ -13,12 +13,20 @@ pub enum Screen {
 pub enum Message {
     Home(crate::pages::home::HomeMessage),
     HomeJobFinished(Result<crate::pages::home::HomeJobResult, AppError>),
+    Overview(crate::pages::overview::OverviewMessage),
+    OverviewJobFinished(Result<crate::pages::overview::OverviewJobResult, AppError>),
     NoOp,
 }
 
 impl From<crate::pages::home::HomeMessage> for Message {
     fn from(message: crate::pages::home::HomeMessage) -> Self {
         Self::Home(message)
+    }
+}
+
+impl From<crate::pages::overview::OverviewMessage> for Message {
+    fn from(message: crate::pages::overview::OverviewMessage) -> Self {
+        Self::Overview(message)
     }
 }
 
@@ -124,4 +132,27 @@ pub struct RepositoryHomeCard {
     pub branch_name: String,
     pub head_snapshot_id: Option<String>,
     pub remote_configured: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkbenchPage {
+    Overview,
+    History,
+    Branches,
+    Sync,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    Succeeded,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRecord {
+    pub id: u64,
+    pub label: String,
+    pub repo_root: Option<PathBuf>,
+    pub state: JobState,
 }

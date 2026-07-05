@@ -3,13 +3,19 @@ pub mod domain;
 pub mod jobs;
 pub mod pages {
     pub mod home;
+    pub mod overview;
+    pub mod workbench;
 }
 pub mod services;
 pub mod testing;
+pub mod widgets {
+    pub mod job_drawer;
+}
 
 pub use app::{PsycGuiApp, boot, boot_with_services};
 pub use domain::{
-    AppError, Message, RecentRepositoryEntry, RepositoryHomeCard, RepositoryRegistry, Screen,
+    AppError, JobRecord, JobState, Message, RecentRepositoryEntry, RepositoryHomeCard,
+    RepositoryRegistry, Screen, WorkbenchPage,
 };
 
 pub fn run() -> iced::Result {

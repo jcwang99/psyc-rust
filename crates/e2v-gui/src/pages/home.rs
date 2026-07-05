@@ -94,10 +94,20 @@ pub fn update_home(
             )
         }
         HomeMessage::SelectRepository(repo_root) => {
-            app.registry
-                .touch_recent(repo_root.clone(), current_unix_ms());
-            app.selected_repository = Some(repo_root);
-            app.screen = crate::domain::Screen::Workbench;
+            if let Some(card) = app
+                .home
+                .cards
+                .iter()
+                .find(|card| card.repo_root == repo_root)
+                .cloned()
+            {
+                crate::app::activate_repository(app, card);
+            } else {
+                app.registry
+                    .touch_recent(repo_root.clone(), current_unix_ms());
+                app.selected_repository = Some(repo_root);
+                app.screen = crate::domain::Screen::Workbench;
+            }
             iced::Task::none()
         }
     }
