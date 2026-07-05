@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use e2v_api::{CommitInfo, FetchResponse, PullResponse, PushResponse};
 
 use crate::domain::{AppError, RepositoryHomeCard};
-use crate::services::RepositoryService;
+use crate::services::{RepositoryService, SearchQuery, SearchService};
 
 #[derive(Debug, Default, Clone)]
 pub struct FakeRepositoryService {
@@ -139,18 +139,59 @@ impl FakeRepositoryService {
 pub struct AppHarness {
     pub app: crate::app::PsycGuiApp,
     pub service: FakeRepositoryService,
+    pub search: FakeSearchService,
+}
+
+#[derive(Debug, Clone)]
+pub struct TestServices {
+    pub repository: FakeRepositoryService,
+    pub search: FakeSearchService,
+}
+
+impl TestServices {
+    pub fn new(repository: FakeRepositoryService) -> Self {
+        Self {
+            repository,
+            search: FakeSearchService::default(),
+        }
+    }
+
+    pub fn with_search(mut self, search: FakeSearchService) -> Self {
+        self.search = search;
+        self
+    }
 }
 
 pub fn boot_with_service(service: FakeRepositoryService) -> AppHarness {
-    let (app, _) =
-        crate::boot_with_services(crate::services::AppServices::new(Arc::new(service.clone())));
+    boot_with_test_services(TestServices::new(service))
+}
 
-    AppHarness { app, service }
+pub fn boot_with_test_services(services: TestServices) -> AppHarness {
+    let (app, _) = crate::boot_with_services(
+        crate::services::AppServices::new(Arc::new(services.repository.clone()))
+            .with_search(Arc::new(services.search.clone())),
+    );
+
+    AppHarness {
+        app,
+        service: services.repository,
+        search: services.search,
+    }
 }
 
 pub fn boot_into_workbench(service: FakeRepositoryService, repo_root: &str) -> AppHarness {
     let mut harness = boot_with_service(service.clone());
     let card = service
+        .load_repository_summary(PathBuf::from(repo_root))
+        .expect("fake repository summary");
+    crate::app::activate_repository(&mut harness.app, card);
+    harness
+}
+
+pub fn boot_into_workbench_with_services(services: TestServices, repo_root: &str) -> AppHarness {
+    let mut harness = boot_with_test_services(services);
+    let card = harness
+        .service
         .load_repository_summary(PathBuf::from(repo_root))
         .expect("fake repository summary");
     crate::app::activate_repository(&mut harness.app, card);
@@ -401,6 +442,63 @@ impl crate::services::RepositoryService for FakeRepositoryService {
             .get(&repo_root)
             .cloned()
             .ok_or_else(|| AppError::internal("missing fake repository summary"))
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FakeSearchService {
+    state: Arc<Mutex<FakeSearchServiceState>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeSearchServiceState {
+    rows: Vec<crate::pages::search::SearchResultRow>,
+    call_count: usize,
+    last_query: Option<SearchQuery>,
+}
+
+impl FakeSearchService {
+    pub fn with_rows(rows: Vec<crate::pages::search::SearchResultRow>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FakeSearchServiceState {
+                rows,
+                call_count: 0,
+                last_query: None,
+            })),
+        }
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fake search service state")
+            .call_count
+    }
+
+    pub fn last_query(&self) -> Option<SearchQuery> {
+        self.state
+            .lock()
+            .expect("fake search service state")
+            .last_query
+            .clone()
+    }
+}
+
+impl SearchService for FakeSearchService {
+    fn search(
+        &self,
+        _repo_root: PathBuf,
+        _branch_token: String,
+        _head_snapshot_id: Option<String>,
+        query: SearchQuery,
+    ) -> Result<Vec<crate::pages::search::SearchResultRow>, AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake search service state poisoned"))?;
+        state.call_count += 1;
+        state.last_query = Some(query);
+        Ok(state.rows.clone())
     }
 }
 

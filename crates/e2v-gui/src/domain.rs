@@ -17,6 +17,7 @@ pub enum Message {
     History(crate::pages::history::HistoryMessage),
     Overview(crate::pages::overview::OverviewMessage),
     OverviewJobFinished(Result<crate::pages::overview::OverviewJobResult, AppError>),
+    Search(crate::pages::search::SearchMessage),
     Sync(crate::pages::sync::SyncMessage),
     SyncJobFinished(Result<crate::pages::sync::SyncJobResult, AppError>),
     Workbench(crate::pages::workbench::WorkbenchMessage),
@@ -44,6 +45,12 @@ impl From<crate::pages::history::HistoryMessage> for Message {
 impl From<crate::pages::overview::OverviewMessage> for Message {
     fn from(message: crate::pages::overview::OverviewMessage) -> Self {
         Self::Overview(message)
+    }
+}
+
+impl From<crate::pages::search::SearchMessage> for Message {
+    fn from(message: crate::pages::search::SearchMessage) -> Self {
+        Self::Search(message)
     }
 }
 

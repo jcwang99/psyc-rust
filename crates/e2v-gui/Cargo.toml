@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 e2v-api = { path = "../e2v-api" }
+e2v-core = { path = "../e2v-core" }
 iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio"] }
 serde.workspace = true
 serde_json.workspace = true
