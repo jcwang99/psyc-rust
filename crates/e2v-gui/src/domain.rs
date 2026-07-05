@@ -18,6 +18,7 @@ pub enum Message {
     Overview(crate::pages::overview::OverviewMessage),
     OverviewJobFinished(Result<crate::pages::overview::OverviewJobResult, AppError>),
     Search(crate::pages::search::SearchMessage),
+    Sharing(crate::pages::sharing::SharingMessage),
     Sync(crate::pages::sync::SyncMessage),
     SyncJobFinished(Result<crate::pages::sync::SyncJobResult, AppError>),
     Workbench(crate::pages::workbench::WorkbenchMessage),
@@ -51,6 +52,12 @@ impl From<crate::pages::overview::OverviewMessage> for Message {
 impl From<crate::pages::search::SearchMessage> for Message {
     fn from(message: crate::pages::search::SearchMessage) -> Self {
         Self::Search(message)
+    }
+}
+
+impl From<crate::pages::sharing::SharingMessage> for Message {
+    fn from(message: crate::pages::sharing::SharingMessage) -> Self {
+        Self::Sharing(message)
     }
 }
 
@@ -195,6 +202,16 @@ pub enum PendingConfirmation {
     SingleWriterRiskPush {
         repo_root: PathBuf,
         branch_token: String,
+    },
+    RevokeMember {
+        repo_root: PathBuf,
+        actor_id: String,
+        password: String,
+    },
+    RevokeDevice {
+        repo_root: PathBuf,
+        device_id: String,
+        password: String,
     },
 }
 

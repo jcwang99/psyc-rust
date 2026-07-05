@@ -28,6 +28,46 @@ pub fn view_confirmation_sheet(
             .padding(16)
             .into(),
         ),
+        Some(crate::domain::PendingConfirmation::RevokeMember { .. }) => Some(
+            container(
+                column![
+                    text("Confirm member revoke").size(20),
+                    text("This will remove the selected member from the repository roster."),
+                    row![
+                        button("Cancel").on_press(
+                            crate::pages::sharing::SharingMessage::CancelPendingAction.into()
+                        ),
+                        button("Continue").on_press(
+                            crate::pages::sharing::SharingMessage::ConfirmPendingAction.into()
+                        ),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(12),
+            )
+            .padding(16)
+            .into(),
+        ),
+        Some(crate::domain::PendingConfirmation::RevokeDevice { .. }) => Some(
+            container(
+                column![
+                    text("Confirm device revoke").size(20),
+                    text("This will remove the selected device from the repository roster."),
+                    row![
+                        button("Cancel").on_press(
+                            crate::pages::sharing::SharingMessage::CancelPendingAction.into()
+                        ),
+                        button("Continue").on_press(
+                            crate::pages::sharing::SharingMessage::ConfirmPendingAction.into()
+                        ),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(12),
+            )
+            .padding(16)
+            .into(),
+        ),
         None => None,
     }
 }

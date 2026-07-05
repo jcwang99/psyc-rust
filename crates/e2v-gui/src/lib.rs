@@ -7,6 +7,7 @@ pub mod pages {
     pub mod home;
     pub mod overview;
     pub mod search;
+    pub mod sharing;
     pub mod sync;
     pub mod workbench;
 }

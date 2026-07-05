@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use e2v_api::{CommitInfo, FetchResponse, PullResponse, PushResponse};
 
 use crate::domain::{AppError, RepositoryHomeCard};
-use crate::services::{RepositoryService, SearchQuery, SearchService};
+use crate::services::{
+    RepositoryService, SearchQuery, SearchService, ShareActorRow, ShareDeviceRow, SharingRoster,
+    SharingService,
+};
 
 #[derive(Debug, Default, Clone)]
 pub struct FakeRepositoryService {
@@ -140,12 +143,14 @@ pub struct AppHarness {
     pub app: crate::app::PsycGuiApp,
     pub service: FakeRepositoryService,
     pub search: FakeSearchService,
+    pub sharing: FakeSharingService,
 }
 
 #[derive(Debug, Clone)]
 pub struct TestServices {
     pub repository: FakeRepositoryService,
     pub search: FakeSearchService,
+    pub sharing: FakeSharingService,
 }
 
 impl TestServices {
@@ -153,11 +158,17 @@ impl TestServices {
         Self {
             repository,
             search: FakeSearchService::default(),
+            sharing: FakeSharingService::default(),
         }
     }
 
     pub fn with_search(mut self, search: FakeSearchService) -> Self {
         self.search = search;
+        self
+    }
+
+    pub fn with_sharing(mut self, sharing: FakeSharingService) -> Self {
+        self.sharing = sharing;
         self
     }
 }
@@ -169,13 +180,15 @@ pub fn boot_with_service(service: FakeRepositoryService) -> AppHarness {
 pub fn boot_with_test_services(services: TestServices) -> AppHarness {
     let (app, _) = crate::boot_with_services(
         crate::services::AppServices::new(Arc::new(services.repository.clone()))
-            .with_search(Arc::new(services.search.clone())),
+            .with_search(Arc::new(services.search.clone()))
+            .with_sharing(Arc::new(services.sharing.clone())),
     );
 
     AppHarness {
         app,
         service: services.repository,
         search: services.search,
+        sharing: services.sharing,
     }
 }
 
@@ -499,6 +512,164 @@ impl SearchService for FakeSearchService {
         state.call_count += 1;
         state.last_query = Some(query);
         Ok(state.rows.clone())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FakeSharingService {
+    state: Arc<Mutex<FakeSharingServiceState>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeSharingServiceState {
+    roster: SharingRoster,
+    member_invite_bundle: Vec<u8>,
+    device_invite_bundle: Vec<u8>,
+}
+
+impl FakeSharingService {
+    pub fn with_member_invite_bundle(bundle: Vec<u8>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FakeSharingServiceState {
+                roster: SharingRoster::default(),
+                member_invite_bundle: bundle,
+                device_invite_bundle: Vec::new(),
+            })),
+        }
+    }
+
+    pub fn with_roster(
+        actors: Vec<(&str, &str, &str)>,
+        devices: Vec<(&str, &str, &str, &str)>,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FakeSharingServiceState {
+                roster: SharingRoster {
+                    actors: actors
+                        .into_iter()
+                        .map(|(actor_id, display_name, role)| ShareActorRow {
+                            actor_id: actor_id.into(),
+                            display_name: display_name.into(),
+                            role: role.into(),
+                        })
+                        .collect(),
+                    devices: devices
+                        .into_iter()
+                        .map(|(device_id, actor_id, label, status)| ShareDeviceRow {
+                            device_id: device_id.into(),
+                            actor_id: actor_id.into(),
+                            label: label.into(),
+                            status: status.into(),
+                        })
+                        .collect(),
+                },
+                member_invite_bundle: Vec::new(),
+                device_invite_bundle: Vec::new(),
+            })),
+        }
+    }
+
+    pub fn with_revocable_device(device_id: &str) -> Self {
+        Self::with_roster(
+            vec![("actor-1", "Alice", "owner")],
+            vec![(device_id, "actor-1", "Laptop", "active")],
+        )
+    }
+}
+
+impl SharingService for FakeSharingService {
+    fn load_roster(&self, _repo_root: PathBuf) -> Result<SharingRoster, AppError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake sharing service state poisoned"))?
+            .roster
+            .clone())
+    }
+
+    fn invite_member(
+        &self,
+        _repo_root: PathBuf,
+        _display_name: String,
+    ) -> Result<String, AppError> {
+        use base64::Engine as _;
+
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake sharing service state poisoned"))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&state.member_invite_bundle))
+    }
+
+    fn accept_member(
+        &self,
+        _repo_root: PathBuf,
+        _invite_bundle_base64: String,
+        _local_device_label: String,
+    ) -> Result<SharingRoster, AppError> {
+        self.load_roster(PathBuf::new())
+    }
+
+    fn invite_device(
+        &self,
+        _repo_root: PathBuf,
+        _actor_id: String,
+        _device_label: String,
+    ) -> Result<String, AppError> {
+        use base64::Engine as _;
+
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake sharing service state poisoned"))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&state.device_invite_bundle))
+    }
+
+    fn accept_device(
+        &self,
+        _repo_root: PathBuf,
+        _invite_bundle_base64: String,
+        _local_device_label: String,
+    ) -> Result<SharingRoster, AppError> {
+        self.load_roster(PathBuf::new())
+    }
+
+    fn revoke_member(
+        &self,
+        _repo_root: PathBuf,
+        actor_id: String,
+        _password: String,
+    ) -> Result<SharingRoster, AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake sharing service state poisoned"))?;
+        state
+            .roster
+            .actors
+            .retain(|actor| actor.actor_id != actor_id);
+        state
+            .roster
+            .devices
+            .retain(|device| device.actor_id != actor_id);
+        Ok(state.roster.clone())
+    }
+
+    fn revoke_device(
+        &self,
+        _repo_root: PathBuf,
+        device_id: String,
+        _password: String,
+    ) -> Result<SharingRoster, AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("fake sharing service state poisoned"))?;
+        state
+            .roster
+            .devices
+            .retain(|device| device.device_id != device_id);
+        Ok(state.roster.clone())
     }
 }
 

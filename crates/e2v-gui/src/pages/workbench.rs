@@ -9,6 +9,19 @@ pub fn update_workbench(
 ) -> iced::Task<crate::domain::Message> {
     match message {
         WorkbenchMessage::SelectPage(page) => {
+            if matches!(page, crate::domain::WorkbenchPage::Sharing) {
+                if let Some(repo_root) = app.selected_repository.clone() {
+                    match app.services.sharing.load_roster(repo_root) {
+                        Ok(roster) => {
+                            app.workbench.sharing.roster = roster;
+                            app.workbench.sharing.validation_error = None;
+                        }
+                        Err(error) => {
+                            app.workbench.sharing.validation_error = Some(error.message);
+                        }
+                    }
+                }
+            }
             app.workbench.active_page = page;
             iced::Task::none()
         }
@@ -24,7 +37,7 @@ pub fn view_active_page(app: &crate::app::PsycGuiApp) -> iced::Element<'_, crate
         crate::domain::WorkbenchPage::Branches => crate::pages::branches::view_branches(app),
         crate::domain::WorkbenchPage::Sync => crate::pages::sync::view_sync(app),
         crate::domain::WorkbenchPage::Search => crate::pages::search::view_search(app),
-        crate::domain::WorkbenchPage::Sharing => container(text("Sharing (Phase 2)")).into(),
+        crate::domain::WorkbenchPage::Sharing => crate::pages::sharing::view_sharing(app),
         crate::domain::WorkbenchPage::Preview => container(text("Preview (Phase 2)")).into(),
         crate::domain::WorkbenchPage::Advanced => container(text("Advanced (Phase 3)")).into(),
     }
@@ -38,6 +51,7 @@ pub struct WorkbenchState {
     pub history: crate::pages::history::HistoryState,
     pub overview: crate::pages::overview::OverviewState,
     pub search: crate::pages::search::SearchState,
+    pub sharing: crate::pages::sharing::SharingState,
     pub sync: crate::pages::sync::SyncState,
 }
 
@@ -50,6 +64,7 @@ impl Default for WorkbenchState {
             history: crate::pages::history::HistoryState::default(),
             overview: crate::pages::overview::OverviewState::default(),
             search: crate::pages::search::SearchState::default(),
+            sharing: crate::pages::sharing::SharingState::default(),
             sync: crate::pages::sync::SyncState::default(),
         }
     }
