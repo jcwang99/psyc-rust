@@ -1,7 +1,15 @@
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use base64::Engine;
+use native_tls::TlsConnector;
+use quick_xml::Reader as XmlReader;
+use quick_xml::events::Event as XmlEvent;
+use url::Url;
 
 use crate::{
     BackendCapability, BlobStore, CasResult, ConsistencyClass, EncryptedRef, LayoutRoot,
@@ -273,6 +281,7 @@ pub struct OpendalWebdavBackend {
     operator: TelemetryOperator,
     capability: BackendCapability,
     flavor: WebdavFlavor,
+    compat_lister: Option<WebdavCompatLister>,
 }
 
 #[derive(Clone)]
@@ -397,11 +406,449 @@ impl OpendalWebdavBackend {
             operator: TelemetryOperator::new(operator, telemetry),
             capability: webdav_capability(&config.verified_capabilities),
             flavor: config.flavor,
+            compat_lister: Some(WebdavCompatLister::new(&config)?),
         })
     }
 
     pub fn flavor(&self) -> WebdavFlavor {
         self.flavor
+    }
+
+    fn list_paths_via_shallow_walk(&self, root: &str) -> Result<Vec<String>> {
+        let mut pending = vec![root.to_string()];
+        let mut visited = HashSet::new();
+        let mut files = Vec::new();
+
+        while let Some(prefix) = pending.pop() {
+            if !visited.insert(prefix.clone()) {
+                continue;
+            }
+
+            let entries = self.list_entries_shallow(&prefix)?;
+
+            for entry in entries {
+                let path = entry.path;
+                if path == prefix {
+                    continue;
+                }
+                if entry.is_dir {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+
+        files.sort();
+        Ok(files)
+    }
+
+    fn read_listed_refs_from_paths(&self, paths: Vec<String>) -> Result<Vec<ListedRef>> {
+        let mut listed = paths
+            .into_iter()
+            .filter_map(|path| {
+                let token = path
+                    .strip_prefix("control/refs/by-token/")?
+                    .strip_suffix(".json")?
+                    .to_string();
+                Some((path, token))
+            })
+            .map(|(path, token)| -> Result<ListedRef> {
+                let token = RefToken::new(token);
+                token.validate()?;
+                Ok(ListedRef {
+                    token,
+                    stored: serde_json::from_slice(&self.get_physical(&path)?)
+                        .context("failed to decode remote branch ref")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        listed.sort_by(|left, right| left.token.value.cmp(&right.token.value));
+        Ok(listed)
+    }
+
+    fn list_entries_shallow(&self, prefix: &str) -> Result<Vec<WebdavListEntry>> {
+        if let Some(compat_lister) = &self.compat_lister {
+            return compat_lister.list_one_level(prefix);
+        }
+
+        let entries = match self.operator.list(prefix) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(entries
+            .into_iter()
+            .map(|entry| WebdavListEntry {
+                is_dir: entry.path().ends_with('/'),
+                path: entry.path().to_string(),
+            })
+            .collect())
+    }
+
+    #[cfg(test)]
+    fn from_operator(operator: opendal::blocking::Operator, flavor: WebdavFlavor) -> Self {
+        Self {
+            operator: TelemetryOperator::new(operator, None),
+            capability: webdav_capability(&WebdavVerifiedCapabilities::default()),
+            flavor,
+            compat_lister: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebdavListEntry {
+    path: String,
+    is_dir: bool,
+}
+
+impl WebdavListEntry {
+    fn dir(path: &str) -> Self {
+        Self {
+            is_dir: true,
+            path: path.to_string(),
+        }
+    }
+
+    fn file(path: &str) -> Self {
+        Self {
+            is_dir: false,
+            path: path.to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WebdavCompatLister {
+    endpoint: String,
+    root: String,
+    auth: WebdavCompatAuth,
+}
+
+#[derive(Clone)]
+enum WebdavCompatAuth {
+    None,
+    Basic { password: String, username: String },
+    Bearer(String),
+}
+
+impl WebdavCompatLister {
+    fn new(config: &WebdavRemoteConfig) -> Result<Self> {
+        let auth = match (&config.username, &config.password, &config.token) {
+            (Some(username), Some(password), _) => WebdavCompatAuth::Basic {
+                password: password.clone(),
+                username: username.clone(),
+            },
+            (_, _, Some(token)) => WebdavCompatAuth::Bearer(token.clone()),
+            _ => WebdavCompatAuth::None,
+        };
+        Ok(Self {
+            endpoint: config.endpoint.clone(),
+            root: config.root.clone(),
+            auth,
+        })
+    }
+
+    fn build_rooted_abs_path(root: &str, path: &str) -> String {
+        let normalized_root = if root.is_empty() {
+            "/"
+        } else {
+            root.trim_end_matches('/')
+        };
+        let normalized_path = path.trim_start_matches('/');
+        if normalized_path.is_empty() {
+            if normalized_root == "/" {
+                "/".to_string()
+            } else {
+                format!("{normalized_root}/")
+            }
+        } else if normalized_root == "/" {
+            format!("/{normalized_path}")
+        } else {
+            format!("{normalized_root}/{normalized_path}")
+        }
+    }
+
+    fn build_host_header(url: &Url) -> Result<String> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("webdav endpoint must include a host"))?;
+        let default_port = match url.scheme() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        };
+        Ok(match url.port() {
+            Some(port) if Some(port) != default_port => format!("{host}:{port}"),
+            _ => host.to_string(),
+        })
+    }
+
+    fn authorization_header(&self) -> Option<String> {
+        match &self.auth {
+            WebdavCompatAuth::None => None,
+            WebdavCompatAuth::Basic { username, password } => Some(format!(
+                "Authorization: Basic {}\r\n",
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+            )),
+            WebdavCompatAuth::Bearer(token) => Some(format!("Authorization: Bearer {token}\r\n")),
+        }
+    }
+
+    fn build_propfind_request(&self, url: &Url, rooted_path: &str) -> Result<Vec<u8>> {
+        let host_header = Self::build_host_header(url)?;
+        let authorization_header = self.authorization_header().unwrap_or_default();
+        Ok(format!(
+            "PROPFIND {rooted_path} HTTP/1.1\r\n\
+Depth: 1\r\n\
+Content-Length: 0\r\n\
+Accept: */*\r\n\
+Host: {host_header}\r\n\
+{authorization_header}\
+Connection: close\r\n\
+\r\n"
+        )
+        .into_bytes())
+    }
+
+    fn exchange_http_bytes<S: Read + Write>(
+        stream: &mut S,
+        request_bytes: &[u8],
+    ) -> Result<Vec<u8>> {
+        stream
+            .write_all(request_bytes)
+            .context("failed to write webdav PROPFIND request")?;
+        stream
+            .flush()
+            .context("failed to flush webdav PROPFIND request")?;
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .context("failed to read webdav PROPFIND response")?;
+        Ok(response)
+    }
+
+    fn send_propfind_request(url: &Url, request_bytes: &[u8]) -> Result<Vec<u8>> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("webdav endpoint must include a host"))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("webdav endpoint must include a known port"))?;
+        let mut tcp = TcpStream::connect((host, port))
+            .with_context(|| format!("failed to connect to webdav host {host}:{port}"))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(30)))
+            .context("failed to configure webdav read timeout")?;
+        tcp.set_write_timeout(Some(Duration::from_secs(30)))
+            .context("failed to configure webdav write timeout")?;
+        match url.scheme() {
+            "http" => Self::exchange_http_bytes(&mut tcp, request_bytes),
+            "https" => {
+                let connector =
+                    TlsConnector::new().context("failed to build webdav TLS connector")?;
+                let mut tls = connector.connect(host, tcp).with_context(|| {
+                    format!("failed to establish webdav TLS session for {host}")
+                })?;
+                Self::exchange_http_bytes(&mut tls, request_bytes)
+            }
+            scheme => Err(anyhow::anyhow!(
+                "unsupported webdav endpoint scheme: {scheme}"
+            )),
+        }
+    }
+
+    fn parse_http_response(response_bytes: &[u8]) -> Result<(u16, Vec<u8>)> {
+        let header_end = response_bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| anyhow::anyhow!("webdav PROPFIND response missing header terminator"))?;
+        let header_text = std::str::from_utf8(&response_bytes[..header_end])
+            .context("webdav PROPFIND response headers were not valid UTF-8")?;
+        let status_line = header_text
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("webdav PROPFIND response missing status line"))?;
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow::anyhow!("webdav PROPFIND response missing status code"))?
+            .parse::<u16>()
+            .context("webdav PROPFIND status code was not numeric")?;
+        Ok((status, response_bytes[header_end + 4..].to_vec()))
+    }
+
+    fn list_one_level(&self, path: &str) -> Result<Vec<WebdavListEntry>> {
+        let rooted_path = Self::build_rooted_abs_path(&self.root, path);
+        let url = Url::parse(&self.endpoint).context("invalid webdav endpoint for listing")?;
+        let request_bytes = self.build_propfind_request(&url, &rooted_path)?;
+        let response_bytes = Self::send_propfind_request(&url, &request_bytes)
+            .with_context(|| format!("failed to list webdav path {rooted_path}"))?;
+        let (status, body_bytes) = Self::parse_http_response(&response_bytes)?;
+        match status {
+            207 => {
+                let xml = String::from_utf8(body_bytes).with_context(|| {
+                    format!("failed to decode webdav listing body for {rooted_path}")
+                })?;
+                Self::parse_propfind_entries(&self.root, &rooted_path, &xml)
+            }
+            404 => Ok(Vec::new()),
+            _ => Err(anyhow::anyhow!(
+                "webdav shallow PROPFIND returned {} for {}",
+                status,
+                rooted_path
+            )),
+        }
+    }
+
+    fn parse_propfind_entries(
+        root: &str,
+        requested_rooted_path: &str,
+        xml: &str,
+    ) -> Result<Vec<WebdavListEntry>> {
+        let mut reader = XmlReader::from_str(xml);
+        reader.config_mut().trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut entries = Vec::new();
+        let mut current_href: Option<String> = None;
+        let mut current_is_dir = false;
+        let mut in_response = false;
+        let mut in_href = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(XmlEvent::Start(event)) => match Self::local_name(event.name().as_ref()) {
+                    b"response" => {
+                        current_href = None;
+                        current_is_dir = false;
+                        in_response = true;
+                        in_href = false;
+                    }
+                    b"href" if in_response => in_href = true,
+                    b"collection" if in_response => current_is_dir = true,
+                    _ => {}
+                },
+                Ok(XmlEvent::Empty(event)) => {
+                    if Self::local_name(event.name().as_ref()) == b"collection" && in_response {
+                        current_is_dir = true;
+                    }
+                }
+                Ok(XmlEvent::Text(text)) if in_href => {
+                    current_href = Some(
+                        text.decode()
+                            .context("failed to decode webdav href text")?
+                            .into_owned(),
+                    );
+                }
+                Ok(XmlEvent::CData(text)) if in_href => {
+                    current_href = Some(
+                        text.decode()
+                            .context("failed to decode webdav href CDATA")?
+                            .into_owned(),
+                    );
+                }
+                Ok(XmlEvent::End(event)) => match Self::local_name(event.name().as_ref()) {
+                    b"href" => in_href = false,
+                    b"response" => {
+                        if let Some(href) = current_href.take() {
+                            if let Some(entry) = Self::entry_from_href(
+                                root,
+                                requested_rooted_path,
+                                &href,
+                                current_is_dir,
+                            )? {
+                                entries.push(entry);
+                            }
+                        }
+                        current_is_dir = false;
+                        in_response = false;
+                        in_href = false;
+                    }
+                    _ => {}
+                },
+                Ok(XmlEvent::Eof) => break,
+                Err(error) => {
+                    return Err(
+                        anyhow::anyhow!(error).context("failed to parse webdav PROPFIND response")
+                    );
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(entries)
+    }
+
+    fn entry_from_href(
+        root: &str,
+        requested_rooted_path: &str,
+        href: &str,
+        current_is_dir: bool,
+    ) -> Result<Option<WebdavListEntry>> {
+        let href_path = if let Ok(url) = Url::parse(href) {
+            url.path().to_string()
+        } else {
+            href.to_string()
+        };
+        let is_dir = current_is_dir || href_path.ends_with('/');
+        let normalized_href = Self::normalize_href_path(&href_path, is_dir);
+        let normalized_requested = Self::normalize_href_path(requested_rooted_path, true);
+
+        if Self::trim_trailing_slash(&normalized_href)
+            == Self::trim_trailing_slash(&normalized_requested)
+        {
+            return Ok(None);
+        }
+
+        let relative = Self::path_relative_to_root(root, &normalized_href).ok_or_else(|| {
+            anyhow::anyhow!(
+                "webdav PROPFIND href {} is outside configured root {}",
+                normalized_href,
+                root
+            )
+        })?;
+
+        Ok(Some(if is_dir {
+            WebdavListEntry::dir(&relative)
+        } else {
+            WebdavListEntry::file(&relative)
+        }))
+    }
+
+    fn normalize_href_path(path: &str, is_dir: bool) -> String {
+        let mut normalized = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        if is_dir && !normalized.ends_with('/') {
+            normalized.push('/');
+        }
+        normalized
+    }
+
+    fn path_relative_to_root(root: &str, absolute_path: &str) -> Option<String> {
+        let normalized_root = root.trim_end_matches('/');
+        if normalized_root.is_empty() || normalized_root == "/" {
+            return Some(absolute_path.trim_start_matches('/').to_string());
+        }
+        absolute_path
+            .strip_prefix(normalized_root)
+            .map(|rest| rest.trim_start_matches('/').to_string())
+    }
+
+    fn trim_trailing_slash(path: &str) -> &str {
+        if path == "/" {
+            return path;
+        }
+        path.trim_end_matches('/')
+    }
+
+    fn local_name(name: &[u8]) -> &[u8] {
+        name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
     }
 }
 
@@ -730,15 +1177,13 @@ impl BlobStore for OpendalWebdavBackend {
 
     fn list_physical(&self, prefix: &str) -> Result<Vec<String>> {
         let mut listed = self
-            .operator
-            .list(prefix)?
+            .list_entries_shallow(prefix)?
             .into_iter()
-            .filter_map(|entry: opendal::Entry| {
-                let path = entry.path().to_string();
-                if path == prefix || path.ends_with('/') {
+            .filter_map(|entry| {
+                if entry.path == prefix || entry.is_dir {
                     None
                 } else {
-                    Some(path)
+                    Some(entry.path)
                 }
             })
             .collect::<Vec<_>>();
@@ -886,36 +1331,8 @@ impl RefStore for OpendalWebdavBackend {
     }
 
     fn list_refs(&self) -> Result<Vec<ListedRef>> {
-        let mut listed = self
-            .operator
-            .list_options(
-                "control/refs/by-token/",
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-            .into_iter()
-            .filter_map(|entry: opendal::Entry| {
-                let path = entry.path().to_string();
-                let token = path
-                    .strip_prefix("control/refs/by-token/")?
-                    .strip_suffix(".json")?
-                    .to_string();
-                Some((path, token))
-            })
-            .map(|(path, token)| -> Result<ListedRef> {
-                let token = RefToken::new(token);
-                token.validate()?;
-                Ok(ListedRef {
-                    token,
-                    stored: serde_json::from_slice(&self.get_physical(&path)?)
-                        .context("failed to decode remote branch ref")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        listed.sort_by(|left, right| left.token.value.cmp(&right.token.value));
-        Ok(listed)
+        let paths = self.list_paths_via_shallow_walk("control/refs/by-token/")?;
+        self.read_listed_refs_from_paths(paths)
     }
 
     fn compare_and_swap_ref(
@@ -1353,12 +1770,16 @@ impl RemoteBackend for crate::memory_backend::MemoryBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, VecDeque};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
     use opendal::raw::oio;
-    use opendal::raw::{Access, AccessorInfo, OpRead, OpStat, RpRead, RpStat};
-    use opendal::{Buffer, Capability, EntryMode, Metadata, Operator};
+    use opendal::raw::{Access, AccessorInfo, OpList, OpRead, OpStat, RpList, RpRead, RpStat};
+    use opendal::{Buffer, Capability, EntryMode, Error, ErrorKind, Metadata, Operator};
 
     use super::*;
     use crate::WriterMode;
@@ -1610,6 +2031,85 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct StaticLister {
+        entries: VecDeque<oio::Entry>,
+    }
+
+    impl oio::List for StaticLister {
+        async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
+            Ok(self.entries.pop_front())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DepthOneOnlyListService {
+        directories: Arc<HashMap<String, Vec<(String, EntryMode)>>>,
+        files: Arc<HashMap<String, Vec<u8>>>,
+        info: Arc<AccessorInfo>,
+    }
+
+    impl DepthOneOnlyListService {
+        fn with_layout(
+            directories: HashMap<String, Vec<(String, EntryMode)>>,
+            files: HashMap<String, Vec<u8>>,
+        ) -> Self {
+            let info = AccessorInfo::default();
+            info.set_scheme("memory");
+            info.set_native_capability(Capability {
+                read: true,
+                list: true,
+                ..Default::default()
+            });
+            Self {
+                directories: Arc::new(directories),
+                files: Arc::new(files),
+                info: Arc::new(info),
+            }
+        }
+    }
+
+    impl Access for DepthOneOnlyListService {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+
+        fn info(&self) -> Arc<AccessorInfo> {
+            self.info.clone()
+        }
+
+        async fn read(&self, path: &str, _: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            let content = self
+                .files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::new(ErrorKind::NotFound, "missing file"))?;
+            let metadata = Metadata::new(EntryMode::FILE).with_content_length(content.len() as u64);
+            Ok((RpRead::new(metadata), Box::new(Buffer::from(content))))
+        }
+
+        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+            if args.recursive() {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "recursive Depth: infinity listing unsupported",
+                ));
+            }
+
+            let entries = self
+                .directories
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::new(ErrorKind::NotFound, "missing directory"))?
+                .into_iter()
+                .map(|(path, mode)| oio::Entry::new(&path, Metadata::new(mode)))
+                .collect::<VecDeque<_>>();
+            Ok((RpList::default(), Box::new(StaticLister { entries })))
+        }
+    }
+
     impl Access for RangeRecordingService {
         type Reader = oio::Reader;
         type Writer = oio::Writer;
@@ -1681,6 +2181,156 @@ mod tests {
                 .any(|listed| listed.token == token),
             "nested ref token should be discoverable via list_refs"
         );
+    }
+
+    #[test]
+    fn opendal_webdav_backend_lists_nested_refs_without_recursive_depth_infinity() {
+        let token = RefToken::new("keyring/repo-123".to_string());
+        let stored = StoredRef {
+            version: RefVersion { value: 1 },
+            value: EncryptedRef::new(br#"{"generation":1,"current":"keyring.1"}"#.to_vec()),
+        };
+        let mut directories = HashMap::new();
+        directories.insert(
+            "control/refs/by-token/".to_string(),
+            vec![("control/refs/by-token/keyring/".to_string(), EntryMode::DIR)],
+        );
+        directories.insert(
+            "control/refs/by-token/keyring/".to_string(),
+            vec![(
+                "control/refs/by-token/keyring/repo-123.json".to_string(),
+                EntryMode::FILE,
+            )],
+        );
+        let mut files = HashMap::new();
+        files.insert(
+            "control/refs/by-token/keyring/repo-123.json".to_string(),
+            serde_json::to_vec(&stored).unwrap(),
+        );
+        let service = DepthOneOnlyListService::with_layout(directories, files);
+        let _guard = opendal_runtime().unwrap().enter();
+        let operator =
+            opendal::blocking::Operator::new(Operator::from_inner(Arc::new(service))).unwrap();
+        let backend = OpendalWebdavBackend::from_operator(operator, WebdavFlavor::Webdav);
+
+        let listed = backend.list_refs().unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].token, token);
+        assert_eq!(listed[0].stored, stored);
+    }
+
+    #[test]
+    fn opendal_webdav_backend_treats_missing_ref_directory_as_empty() {
+        let service = DepthOneOnlyListService::with_layout(HashMap::new(), HashMap::new());
+        let _guard = opendal_runtime().unwrap().enter();
+        let operator =
+            opendal::blocking::Operator::new(Operator::from_inner(Arc::new(service))).unwrap();
+        let backend = OpendalWebdavBackend::from_operator(operator, WebdavFlavor::Webdav);
+
+        let listed = backend.list_refs().unwrap();
+
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn webdav_propfind_parser_extracts_relative_entries_from_depth_one_listing() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/dav/repo/control/refs/by-token/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/></D:resourcetype>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/repo/control/refs/by-token/keyring/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/></D:resourcetype>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/repo/control/refs/by-token/default.json</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype/>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let entries = WebdavCompatLister::parse_propfind_entries(
+            "/dav/repo",
+            "/dav/repo/control/refs/by-token/",
+            xml,
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                WebdavListEntry::dir("control/refs/by-token/keyring/"),
+                WebdavListEntry::file("control/refs/by-token/default.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn webdav_compat_lister_sends_bodyless_depth_one_propfind_with_basic_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let lister = WebdavCompatLister::new(&WebdavRemoteConfig {
+            flavor: WebdavFlavor::Webdav,
+            endpoint: format!("http://{addr}"),
+            root: "/repo".to_string(),
+            username: Some("alice".to_string()),
+            password: Some("secret".to_string()),
+            token: None,
+            disable_create_dir: false,
+            verified_capabilities: WebdavVerifiedCapabilities::default(),
+        })
+        .unwrap();
+
+        let entries = lister.list_one_level("control/refs/by-token/").unwrap();
+        let request = server.join().unwrap();
+        let request_lower = request.to_ascii_lowercase();
+
+        assert!(entries.is_empty());
+        assert!(request.starts_with("PROPFIND /repo/control/refs/by-token/ HTTP/1.1\r\n"));
+        assert!(request_lower.contains("\r\ndepth: 1\r\n"));
+        assert!(request_lower.contains("\r\nauthorization: basic ywxpy2u6c2vjcmv0\r\n"));
+        assert!(request_lower.contains("\r\ncontent-length: 0\r\n"));
+        assert!(!request.contains("<?xml"));
+        assert!(!request.contains("Content-Type:"));
     }
 
     #[test]

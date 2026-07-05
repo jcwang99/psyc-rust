@@ -5,6 +5,7 @@ use e2v_store::{
     LocalFolderBackend, OpendalS3Backend, OpendalWebdavBackend, RemoteTelemetryHandle,
     S3RemoteConfig, WebdavFlavor, WebdavRemoteConfig, WebdavVerifiedCapabilities,
 };
+use percent_encoding::percent_decode_str;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteSpec {
@@ -49,20 +50,24 @@ impl RemoteSpec {
             format!("{}://{}", parsed.scheme(), host)
         };
         let root = normalize_webdav_root(flavor, parsed.path());
+        let decoded_username = decode_userinfo(parsed.username(), "username")?;
         let username = if parsed.username().is_empty() {
             None
         } else if flavor == WebdavFlavor::Webdav {
-            Some(parsed.username().to_string())
+            Some(decoded_username.clone())
         } else {
             None
         };
         let password = if flavor == WebdavFlavor::Webdav {
-            parsed.password().map(ToString::to_string)
+            parsed
+                .password()
+                .map(|password| decode_userinfo(password, "password"))
+                .transpose()?
         } else {
             None
         };
         let token = if flavor == WebdavFlavor::Alist && !parsed.username().is_empty() {
-            Some(parsed.username().to_string())
+            Some(decoded_username)
         } else {
             None
         };
@@ -119,6 +124,13 @@ impl RemoteSpec {
             }
         }
     }
+}
+
+fn decode_userinfo(value: &str, field: &str) -> Result<String> {
+    percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|error| anyhow::anyhow!("invalid percent-encoded remote {field}: {error}"))
 }
 
 fn normalize_webdav_root(flavor: WebdavFlavor, raw_path: &str) -> String {

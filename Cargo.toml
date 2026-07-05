@@ -17,6 +17,7 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0"
 argon2 = "0.5"
+base64 = "0.22"
 blake3 = "1.8"
 chacha20poly1305 = "0.10"
 fastcdc = "3.1"
@@ -26,7 +27,9 @@ postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.23"
+native-tls = "0.2"
 opendal = { version = "0.57.0", default-features = false, features = ["blocking", "reqwest-rustls-tls", "services-memory", "services-s3", "services-webdav"] }
+quick-xml = "0.38"
 tokio = { version = "1.52.0", features = ["macros", "net", "rt-multi-thread"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 axum = "0.8"
@@ -35,5 +38,6 @@ tower = { version = "0.5", features = ["util"] }
 serde_urlencoded = "0.7"
 bytes = "1.10"
 futures-util = "0.3"
+percent-encoding = "2.3"
 url = "2.5"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }

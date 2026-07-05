@@ -18,6 +18,7 @@ tokio.workspace = true
 serde_urlencoded.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+percent-encoding.workspace = true
 url.workspace = true
 e2v-core = { path = "../e2v-core" }
 e2v-store = { path = "../e2v-store" }

@@ -195,6 +195,28 @@ fn parse_remote_spec_decodes_webdav_url_into_remote_config() {
 }
 
 #[test]
+fn parse_remote_spec_percent_decodes_webdav_userinfo() {
+    let spec = e2v_sync::RemoteSpec::parse(
+        "webdav+https://xueyihanfeng%40gmail.com:secret@example.com/repo",
+    )
+    .unwrap();
+
+    assert_eq!(
+        spec,
+        e2v_sync::RemoteSpec::Webdav(WebdavRemoteConfig {
+            flavor: WebdavFlavor::Webdav,
+            endpoint: "https://example.com".to_string(),
+            root: "/repo".to_string(),
+            username: Some("xueyihanfeng@gmail.com".to_string()),
+            password: Some("secret".to_string()),
+            token: None,
+            disable_create_dir: false,
+            verified_capabilities: WebdavVerifiedCapabilities::default(),
+        })
+    );
+}
+
+#[test]
 fn parse_remote_spec_decodes_alist_token_url_into_remote_config() {
     let spec = e2v_sync::RemoteSpec::parse("alist+https://token@example.com/remote-root").unwrap();
 
